@@ -4,7 +4,8 @@
 -- Purpose : Collects the facts the purge and reclaim design depends on:
 --           version, container, tablespace layout of the application schemas,
 --           owners and object kinds in those tablespaces, LONG columns,
---           foreign keys into purge tables, indexes on purge paths.
+--           foreign keys into purge tables, indexes on purge paths, placement
+--           of the tool tablespace.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/tests/verify/environment.sql
 --           Writes epf_environment.txt in the current directory.
 -- Requires: SYS AS SYSDBA (or a user with SELECT ANY DICTIONARY).
@@ -200,6 +201,18 @@ SELECT grantee AS owner, privilege AS name
   FROM dba_tab_privs
  WHERE table_name = 'SYS' AND privilege = 'INHERIT PRIVILEGES'
  ORDER BY grantee;
+
+PROMPT ==== 16. Tool tablespace EPFPG_DATA: datafiles and segment owners
+SELECT f.tablespace_name, f.file_id, f.file_name, ROUND(f.bytes / 1073741824, 2) AS gb,
+       f.autoextensible, ROUND(f.maxbytes / 1073741824, 2) AS max_gb
+  FROM dba_data_files f
+ WHERE f.tablespace_name = 'EPFPG_DATA'
+ ORDER BY f.file_id;
+SELECT s.tablespace_name, s.owner, COUNT(*) AS segments, ROUND(SUM(s.bytes) / 1048576, 1) AS mb
+  FROM dba_segments s
+ WHERE s.tablespace_name = 'EPFPG_DATA'
+ GROUP BY s.tablespace_name, s.owner
+ ORDER BY s.owner;
 
 PROMPT ==== end of survey
 SPOOL OFF

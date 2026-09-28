@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft 3 - decisions D1-D14 applied; pre-drop reference check and revert path added; phase 1 delivered. Change history: `.local/changes.md`. |
+| Status | Draft 3 - decisions D1-D14 applied; pre-drop reference check and revert path added; phase 1 delivered; tool tablespace created by the installer, application tablespaces always detected. Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -185,7 +185,7 @@ Each named step is a row in `EPF_STEP` (status PENDING/RUNNING/DONE/FAILED/SKIPP
 
 | Account | Used for | Rights |
 |---------|----------|--------|
-| `EPFPG` (tool schema, created by `install.sql` as SYS) | purge, report, preflight, event logging | `CREATE SESSION/TABLE/PROCEDURE`, quota on its own tablespace (never a reclaim target); `SELECT, DELETE` on every registry table and `UPDATE` on tables with `lob_clear = Y` (generated from the registry); `CREATE ANY INDEX`, `DROP ANY INDEX` (temporary purge indexes); direct `SELECT` on the dictionary views the preflight and report read (`DBA_SEGMENTS`, `DBA_DATA_FILES`, `DBA_FREE_SPACE`, `DBA_TABLES`, `DBA_INDEXES`, `DBA_CONSTRAINTS`, `DBA_LOBS`, `DBA_TAB_COLUMNS`, `DBA_DEPENDENCIES`, `DBA_USERS`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$TRANSACTION`, `V_$DATABASE`, ...); `ANALYZE ANY` (for `DBMS_SPACE.SPACE_USAGE`); `ALTER ANY TABLE` only if compaction (6.7) is used |
+| `EPFPG` (tool schema, created by `install.sql` as SYS) | purge, report, preflight, event logging | `CREATE SESSION/TABLE/PROCEDURE`, quota on its own tablespace `EPFPG_DATA` (created by the installer, never a reclaim target); `SELECT, DELETE` on every registry table and `UPDATE` on tables with `lob_clear = Y` (generated from the registry); `CREATE ANY INDEX`, `DROP ANY INDEX` (temporary purge indexes); direct `SELECT` on the dictionary views the preflight and report read (`DBA_SEGMENTS`, `DBA_DATA_FILES`, `DBA_FREE_SPACE`, `DBA_TABLES`, `DBA_INDEXES`, `DBA_CONSTRAINTS`, `DBA_LOBS`, `DBA_TAB_COLUMNS`, `DBA_DEPENDENCIES`, `DBA_USERS`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$TRANSACTION`, `V_$DATABASE`, ...); `ANALYZE ANY` (for `DBMS_SPACE.SPACE_USAGE`); `ALTER ANY TABLE` only if compaction (6.7) is used |
 | `SYS` (asked at startup only when reclaim is selected) | reclaim | runs `EPFPG.epf_reclaim`, an invoker-rights package, so all DDL executes with SYS rights; the installer grants `INHERIT PRIVILEGES ON USER SYS TO EPFPG` for this. Logging still goes through `EPFPG.epf_log` (definer rights). |
 
 Purge never needs SYS. Passwords are handled as in 10.2. In a multitenant database both accounts connect to the **PDB service**; a connection to `CDB$ROOT` is refused with a message.
@@ -255,7 +255,7 @@ legacy/                      previous implementation (bin/, sql/, config/), unch
 
 ## 5. Database objects (data model)
 
-All tables live in the tool schema, in a tablespace that is never reclaimed.
+All tables live in the tool schema, in tablespace `EPFPG_DATA`, which is never reclaimed. `install.sql` creates it when missing, with one datafile (128 MB, autoextend 128 MB, maxsize unlimited) in the directory of the first datafile of the tablespace holding most of the OPPAYMENTS segments, whatever that tablespace is named (fallbacks: OP, OPREPORTS, their default tablespaces, the database default tablespace, SYSTEM). On ASM the file goes to the same disk group. An existing file is never reused: a name already on disk is skipped (`epfpg_data01.dbf`, `02`, ...). `uninstall.sql` drops the tablespace and its datafiles once nothing else references it.
 
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
@@ -359,7 +359,7 @@ Offered in the wizard only when reclaim is not selected (default No; `--compact`
 
 ## 7. Space reclaim engine design (deep dive)
 
-This is the part that currently gets stuck, stops half way and sometimes grows the HWM. The redesign replaces in-place drain/refill with a **tablespace swap**: every segment of every owner is moved once into a freshly created tablespace, the old tablespace is dropped, and the new one takes over the original name (DATA in standard installs).
+This is the part that currently gets stuck, stops half way and sometimes grows the HWM. The redesign replaces in-place drain/refill with a **tablespace swap**: every segment of every owner is moved once into a freshly created tablespace, the old tablespace is dropped, and the new one takes over the original name. The tablespace is never assumed to be named DATA: targets are detected from where the segments of the application schemas (OPPAYMENTS first) actually live (7.4). DATA is used below only as an example name.
 
 ### 7.1 Why the swap
 
@@ -454,7 +454,7 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 | REPOINT | Segmentless objects, partition default attributes, user default tablespaces and quotas, database default tablespace -> target. | After this step, nothing should reference the old tablespace. |
 | REFERENCE_CHECK | Re-run the full inventory query set against the old tablespace (every dictionary view listed in 7.4, plus `DBA_SEGMENTS` and `DBA_RECYCLEBIN`). Any remaining reference -> no drop; the REVERT path runs instead. | Predicts the drop outcome from the same dictionary sources; the drop itself stays the final guard. |
 | DROP_OLD | `DROP TABLESPACE <old>` **without** `INCLUDING CONTENTS` - Oracle refuses if anything remains, which is the final safety net. If Oracle refuses (ORA-01549 or any other error), the REVERT path runs. Non-OMF datafiles left on disk are deleted through a temporary directory object; if that fails, their paths are reported for manual deletion. | Never `INCLUDING CONTENTS`, never `CASCADE CONSTRAINTS`. |
-| RENAME | `ALTER TABLESPACE <name>_R RENAME TO <old name>`. User defaults and quotas follow automatically. | Final name = original name (DATA). |
+| RENAME | `ALTER TABLESPACE <name>_R RENAME TO <old name>`. User defaults and quotas follow automatically. | Final name = original name of the detected tablespace. |
 | RESTORE_PATHS | On EE, move each new datafile online to the original path (copy of the compacted file). On SE2 or if disabled (`restore_datafile_paths`), the new path is kept and reported. | |
 | REBUILD_INDEXES | REBUILD for every unusable index, largest first; serial below `parallel_min_mb` (default 1024 MB), parallel above it on EE only; then restore recorded degree and logging. | LOGGING always (D9). |
 | CLEANUP | Recompile objects that became invalid during the run (only those, compared to the baseline); drop the temporary directory object. | |
@@ -797,7 +797,7 @@ Each phase is one reviewable pull request on this branch lineage.
 |----|----------|--------|
 | D1 | Where the tool's objects live | Dedicated tool schema `EPFPG` |
 | D2 | Index/constraint handling during reclaim | Indexes UNUSABLE -> REBUILD; constraints never dropped |
-| D3 | Reclaim strategy | Tablespace swap, all owners moved; index-only tablespaces compacted in place; final name = original (DATA) |
+| D3 | Reclaim strategy | Tablespace swap, all owners moved; index-only tablespaces compacted in place; final name = original name of the detected tablespace (not assumed to be DATA) |
 | D4 | Wrapper runtime | `.bat` launcher + Windows PowerShell 5.1; bash `.sh` in phase 8 |
 | D5 | Database-level operations | Only temporary supporting indexes for the purge; everything else removed; all kept operations work in a PDB |
 | D6 | Purge modes | FULL, CLOB (renamed from CLOB_ONLY), LOGS (new: delete the log tables only), CLOB_N_LOGS |
@@ -812,7 +812,8 @@ Each phase is one reviewable pull request on this branch lineage.
 
 Also settled:
 
-- Application schemas default to `OP, OPPAYMENTS, OPREPORTS`; target tablespaces are the ones they occupy; every owner inside a target is inventoried and moved (7.4).
+- Application schemas default to `OP, OPPAYMENTS, OPREPORTS`; target tablespaces are the ones they occupy, detected from their segments and never assumed by name; every owner inside a target is inventoried and moved (7.4).
+- Tool tablespace: `EPFPG_DATA`, created by the installer next to the datafile of the tablespace OPPAYMENTS uses (section 5); the installer takes only the EPFPG password.
 - Datafile paths are restored to the original on EE (online move); on SE2 the new path is kept and reported.
 - Run history is kept 180 days (setting).
 - Row-count parity for reclaim uses PK index fast full scans.

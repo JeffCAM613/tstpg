@@ -1,12 +1,16 @@
 -- ============================================================================
 -- EPF Data Purge - Uninstaller
 -- ============================================================================
--- Purpose : Removes the EPFPG tool schema and everything it owns.
+-- Purpose : Removes the EPFPG tool schema, everything it owns, and the tool
+--           tablespace EPFPG_DATA.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/install/uninstall.sql
 -- Requires: SYS AS SYSDBA; in a multitenant database, the PDB service.
 -- Effects : Refuses while a run holds the run lock, while application accounts
 --           locked by a reclaim are not yet restored, or while temporary purge
---           indexes are still present. Otherwise drops user EPFPG CASCADE.
+--           indexes are still present. Otherwise drops user EPFPG CASCADE, then
+--           drops EPFPG_DATA and its datafiles when nothing else references
+--           the tablespace; otherwise the tablespace is kept and the remaining
+--           references are counted in the output.
 -- ============================================================================
 SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
@@ -68,6 +72,51 @@ BEGIN
 
     EXECUTE IMMEDIATE 'DROP USER epfpg CASCADE';
     DBMS_OUTPUT.PUT_LINE('  EPFPG removed.');
+END;
+/
+
+PROMPT == EPF uninstall: tool tablespace
+DECLARE
+    c_ts    CONSTANT VARCHAR2(30) := 'EPFPG_DATA';
+    l_count PLS_INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name = c_ts;
+    IF l_count = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('  ' || c_ts || ' is not present; nothing to remove.');
+        RETURN;
+    END IF;
+
+    -- Every dictionary reference to the tablespace: segments, segmentless
+    -- objects, partition defaults, recycle bin, user and database defaults.
+    SELECT COUNT(*)
+      INTO l_count
+      FROM (SELECT 1 FROM dba_segments          WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_tables            WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_indexes           WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_lobs              WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_tab_partitions    WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_tab_subpartitions WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_ind_partitions    WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_ind_subpartitions WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_lob_partitions    WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_lob_subpartitions WHERE tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_part_tables       WHERE def_tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_part_indexes      WHERE def_tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_part_lobs         WHERE def_tablespace_name = c_ts
+            UNION ALL SELECT 1 FROM dba_recyclebin        WHERE ts_name = c_ts
+            UNION ALL SELECT 1 FROM dba_users             WHERE default_tablespace = c_ts
+            UNION ALL SELECT 1 FROM database_properties
+                       WHERE property_name = 'DEFAULT_PERMANENT_TABLESPACE' AND property_value = c_ts);
+    IF l_count > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('  WARN  ' || c_ts || ' kept: ' || l_count
+                             || ' objects or settings of other owners still reference it.');
+        RETURN;
+    END IF;
+
+    -- Nothing references the tablespace, so INCLUDING CONTENTS removes no
+    -- object; it is required by AND DATAFILES, which deletes the files.
+    EXECUTE IMMEDIATE 'DROP TABLESPACE ' || c_ts || ' INCLUDING CONTENTS AND DATAFILES';
+    DBMS_OUTPUT.PUT_LINE('  ' || c_ts || ' and its datafiles removed.');
 END;
 /
 EXIT SUCCESS

@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-28 - Phase 1: tool tablespace created by the installer
+
+What changed
+- `install.sql` takes one argument (the EPFPG password). It creates tablespace `EPFPG_DATA` when missing: one datafile (128 MB, autoextend 128 MB, maxsize unlimited) in the directory of the first datafile of the tablespace holding most of the OPPAYMENTS segments. Fallbacks: OP, OPREPORTS, their default tablespaces, the database default tablespace, SYSTEM. ASM: same disk group, Oracle-named file. File name `epfpg_data01.dbf` in the letter case of the reference file; a name already on disk is skipped (`02`, `03`, ...), an existing file is never reused. On re-run an existing `EPFPG_DATA` is reused after checking it is online, permanent and holds no segments of other owners.
+- The installer prints the reference tablespace, the reason it was chosen and the reference datafile.
+- `uninstall.sql` drops `EPFPG_DATA` with its datafiles after the user, only when no segment, segmentless object, partition default, recycle-bin object, user default or database default references it; otherwise it keeps it with a WARN.
+- `environment.sql`: section 16 lists the datafiles of `EPFPG_DATA` and the owners of its segments.
+- Plan: sections 3.4, 5, 7, 7.7 and 15 state that the application tablespace is detected from where OPPAYMENTS (then OP, OPREPORTS) segments live and is never assumed to be named DATA.
+
+Why
+- The tool's objects get a tablespace of their own that can never be a reclaim target, without asking the operator to choose one.
+- Installations where the application data is not in a tablespace named DATA.
+
+How to test (replaces step 1 of the phase 1 test)
+1. `sqlplus -L "sys@<pdb_service> AS SYSDBA" @src/sql/install/install.sql <epfpg_password>`. Check the `reference tablespace` / `reference datafile` lines and the `created tablespace EPFPG_DATA, datafile ...` line. Run it a second time: it must print `present tablespace EPFPG_DATA` and succeed.
+2. Steps 2-4 of the phase 1 test unchanged; `epf_environment.txt` now includes section 16.
+3. Optional: `@src/sql/install/uninstall.sql` as SYS must end with `EPFPG_DATA and its datafiles removed.`; then install again.
+
 ## 2026-09-28 - Phase 1 (foundation)
 
 Repository
