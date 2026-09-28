@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft 1 - design decisions D1-D12 pending (section 15). Recommended options are applied throughout; alternatives are noted where they change the design. |
+| Status | Draft 2 - all design decisions D1-D14 answered (section 15) and applied throughout. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -41,9 +41,9 @@ Every goal has a check the tool itself performs, so "did the run happen 100% as 
 | G1 | Purge is complete | Residual eligible rows = 0 for every in-scope table (FULL mode); residual non-empty LOBs = 0 (CLOB modes). |
 | G2 | Purge is exact | Rows deleted per table = rows eligible at start (key snapshot). No row newer than the cutoff is deleted (retention-safety check). |
 | G3 | No referential damage | Orphan count = 0 on every registry relationship that is not protected by an enabled, validated FK. |
-| G4 | Reclaim never makes things worse | Per datafile: size after <= size before, HWM after <= HWM before. Enforced as an invariant at every checkpoint, not only at the end. |
-| G5 | Reclaim reaches the achievable minimum | Final datafile size <= achievable size + max(1 %, 256 MB), where achievable = in-scope segment bytes + position of non-movable anchors. Anything short of that is explained (named anchors). |
-| G6 | Zero schema drift | After reclaim: same indexes (all VALID/USABLE, same tablespace, same degree/logging), same constraints (same status/validated flags), no new invalid objects, row counts unchanged. |
+| G4 | Reclaim never makes things worse | Per datafile: size after <= size before. Old files only shrink during the move; the swapped tablespace ends smaller than it started. Checked at every checkpoint. |
+| G5 | Reclaim reaches the achievable minimum | Swapped tablespace: final size <= total segment bytes + max(1 %, 256 MB). A tablespace that could not be swapped is named with its blockers. |
+| G6 | Zero schema drift | After reclaim: same indexes (VALID/USABLE, same degree/logging), same constraints (status/validated), no new invalid objects, row counts unchanged, tablespace name unchanged, accounts back to their original status. The only permitted change is each LONG column you approved for conversion, reported individually. |
 | G7 | Always recoverable | Any interruption (error, kill, instance restart) leaves a state that the next `reclaim` run detects and finishes automatically. No separate recovery scripts. |
 | G8 | Always visible | Live events within ~2 s; a heartbeat line at least every 15 s while a single statement runs (progress %, wait event, blocking session). |
 | G9 | Machine-checkable output | Each run folder contains a human log, a report, and stable `EPF_CHECK|...` lines plus a `manifest.txt` that can be pasted back for review. |
@@ -152,7 +152,7 @@ IDs are referenced from the design sections ("fixes R-01").
           +-------------------+----------------------+
           | worker            | monitor (every 2 s)  | report
           v                   v                      v
- +--------------------------- EPF_ADMIN schema (D1) ------------------------------+
+ +--------------------------- EPFPG schema (D1) ------------------------------+
  | packages : epf_util  epf_log  epf_run  epf_registry  epf_space                 |
  |            epf_purge  epf_reclaim  epf_report                                  |
  | tables   : EPF_SETTING EPF_MODULE EPF_TABLE EPF_LINK                           |
@@ -160,41 +160,35 @@ IDs are referenced from the design sections ("fixes R-01").
  |            EPF_SEGMENT_SNAP EPF_FILE_SNAP EPF_OBJECT_BASELINE                  |
  |            EPF_RECLAIM_OBJECT EPF_TEMP_INDEX                                   |
  +--------------------------------------------------------------------------------+
-          | DELETE / UPDATE (object grants)       | MOVE / REBUILD / RESIZE (system privileges)
+          | DELETE / UPDATE (object grants)       | MOVE / REBUILD / SWAP (SYS, invoker rights)
           v                                       v
-   OPPAYMENTS, OP tables                 data + index tablespaces, EPF_SCRATCH
+   OPPAYMENTS, OP tables                 target tablespaces (swap), run as SYS
 ```
 
 ### 3.3 Run lifecycle
 
 ```
 START (epf_run.start -> run_id)
-  PREFLIGHT         read-only checks, forecasts, blockers            (always)
-  PURGE             SNAPSHOT_KEYS -> PROCESS_BATCHES -> TABLE_STATS   (purge actions)
-  RECLAIM           BASELINE -> PREPARE -> RELEASE_INDEXES -> DRAIN -> COMPACT
-                    -> REFILL -> REBUILD_INDEXES -> FINAL_RESIZE -> CLEANUP -> VERIFY
-  REPORT            integrity + results + verdict                     (always)
+  INPUT             every question, confirmation and password up front (10.3)
+  PREFLIGHT         read-only checks, inventories, forecasts, blockers  (always)
+  PURGE             SNAPSHOT_KEYS -> PROCESS_BATCHES -> TABLE_STATS -> SPACE_USAGE [-> COMPACT]
+  RECLAIM           INVENTORY -> BASELINE -> LOCK_ACCOUNTS -> CONVERT_LONG -> CREATE_TARGET
+                    -> RELEASE_INDEXES -> MOVE -> REPOINT -> DROP_OLD -> RENAME -> RESTORE_PATHS
+                    -> REBUILD_INDEXES -> CLEANUP -> UNLOCK_ACCOUNTS -> VERIFY
+  REPORT            integrity + results + verdict                         (always)
 END (status, verdict, exit code)
 ```
 
-Each named step is a row in `EPF_STEP` (status PENDING/RUNNING/DONE/FAILED/SKIPPED) and emits `STEP_START` / `STEP_END` events. The console shows the step list as a checklist.
+Each named step is a row in `EPF_STEP` (status PENDING/RUNNING/DONE/FAILED/SKIPPED) and emits `STEP_START` / `STEP_END` events. The console shows the step list as a checklist. No step ever asks for input.
 
-### 3.4 Privileges (with D1 = dedicated tool schema)
+### 3.4 Privileges and credentials
 
-Installed once by a DBA (`sql/install/install.sql`, run as SYS). Runtime needs only the tool schema password - no SYS at runtime.
+| Account | Used for | Rights |
+|---------|----------|--------|
+| `EPFPG` (tool schema, created by `install.sql` as SYS) | purge, report, preflight, event logging | `CREATE SESSION/TABLE/PROCEDURE`, quota on its own tablespace (never a reclaim target); `SELECT, DELETE` on every registry table and `UPDATE` on tables with `lob_clear = Y` (generated from the registry); `CREATE ANY INDEX`, `DROP ANY INDEX` (temporary purge indexes); direct `SELECT` on the dictionary views the preflight and report read (`DBA_SEGMENTS`, `DBA_DATA_FILES`, `DBA_FREE_SPACE`, `DBA_TABLES`, `DBA_INDEXES`, `DBA_CONSTRAINTS`, `DBA_LOBS`, `DBA_TAB_COLUMNS`, `DBA_DEPENDENCIES`, `DBA_USERS`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$TRANSACTION`, `V_$DATABASE`, ...); `ANALYZE ANY` (for `DBMS_SPACE.SPACE_USAGE`); `ALTER ANY TABLE` only if compaction (6.7) is used |
+| `SYS` (asked at startup only when reclaim is selected) | reclaim | runs `EPFPG.epf_reclaim`, an invoker-rights package, so all DDL executes with SYS rights; the installer grants `INHERIT PRIVILEGES ON USER SYS TO EPFPG` for this. Logging still goes through `EPFPG.epf_log` (definer rights). |
 
-| Grant | Why |
-|-------|-----|
-| `CREATE SESSION`, `CREATE TABLE`, `CREATE PROCEDURE`, quota on its own tablespace | own objects |
-| `SELECT, DELETE` on every registry table; `UPDATE` on tables with `lob_clear = Y` | purge (generated from the registry at install) |
-| `ALTER ANY TABLE`, `ALTER ANY INDEX`, `CREATE ANY INDEX`, `DROP ANY INDEX` | MOVE, UNUSABLE/REBUILD, temporary supporting indexes |
-| `ALTER DATABASE`, `ALTER TABLESPACE` | datafile resize / autoextend, scratch datafile management |
-| direct `SELECT` on `DBA_SEGMENTS`, `DBA_EXTENTS`, `DBA_FREE_SPACE`, `DBA_DATA_FILES`, `DBA_TABLESPACES`, `DBA_TABLES`, `DBA_TAB_PARTITIONS`, `DBA_TAB_SUBPARTITIONS`, `DBA_INDEXES`, `DBA_IND_PARTITIONS`, `DBA_CONSTRAINTS`, `DBA_CONS_COLUMNS`, `DBA_LOBS`, `DBA_LOB_PARTITIONS`, `DBA_TAB_COLUMNS`, `DBA_OBJECTS`, `DBA_RECYCLEBIN`, `DBA_MVIEWS`, `DBA_RESUMABLE`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$LOCKED_OBJECT`, `V_$TRANSACTION`, `V_$DATABASE`, `V_$INSTANCE`, `V_$PARAMETER`, `V_$RECOVERY_FILE_DEST`, `V_$LOG` | definer-rights PL/SQL cannot use roles, so grants are direct |
-| `SELECT` on every table of the scope schemas (refreshed by re-running `install`; preflight reports tables without the grant) | baseline row counts, eligibility counts |
-
-`EPF_SCRATCH` is created **at install** (64 MB, autoextend) and quotas for the scoped schemas are granted there once. Runtime only grows, shrinks, adds or drops *datafiles* of it. This avoids giving the tool `ALTER USER` (which can change any password) or `CREATE/DROP TABLESPACE`.
-
-If D1 = "keep in OPPAYMENTS": tool tables are created with an explicit non-data tablespace; purge/report packages live in OPPAYMENTS; the reclaim stays a SYS-run script set (`sql/run/reclaim_*.sql`, one idempotent anonymous block per step, orchestrated step by step by the wrapper) because SYS must not execute code owned by the application schema (S-02).
+Purge never needs SYS. Passwords are handled as in 10.2. In a multitenant database both accounts connect to the **PDB service**; a connection to `CDB$ROOT` is refused with a message.
 
 ---
 
@@ -212,8 +206,8 @@ config/
   epf_purge.conf.example     all keys documented; real epf_purge.conf is git-ignored
 sql/
   install/
-    install.sql              master installer (SYS): tool schema, grants, EPF_SCRATCH, then every file below in order
-    uninstall.sql            removes tool schema and EPF_SCRATCH (refuses if a reclaim is in progress)
+    install.sql              master installer (SYS): tool schema, grants, then every file below in order
+    uninstall.sql            removes the tool schema (refuses if a reclaim is incomplete)
     tables.sql               every EPF_* table; idempotent create + column-level upgrades
     registry_data.sql        MERGE of modules, tables, links, settings - the only place table lists exist
     grants.sql               object grants generated from the registry
@@ -271,9 +265,13 @@ All tables live in the tool schema, in a tablespace that is never reclaimed.
 | `EPF_TABLE_STAT` | Per-table counts per phase | `run_id`, `table_id`, `phase`, `total_rows`, `eligible_rows`, `retained_rows`, `nonempty_lob_rows`, `processed_rows`, `orphan_rows` |
 | `EPF_SEGMENT_SNAP` | Segment sizes per phase (BASELINE, POST_PURGE, POST_RECLAIM) | `run_id`, `phase`, `owner`, `segment_name`, `partition_name`, `segment_type`, `parent_owner`, `parent_table`, `tablespace_name`, `bytes`, `module_code` |
 | `EPF_FILE_SNAP` | Datafile geometry per phase | `run_id`, `phase`, `tablespace_name`, `file_id`, `file_name`, `bytes`, `hwm_bytes`, `free_bytes`, `autoextensible`, `increment_by`, `maxbytes` |
-| `EPF_OBJECT_BASELINE` | Reclaim fingerprint (indexes, constraints, invalid objects, row counts) | `run_id`, `object_type`, `owner`, `name`, `table_name`, `tablespace_name`, `status`, `validated`, `degree`, `logging`, `row_count` |
-| `EPF_RECLAIM_OBJECT` | Reclaim journal per segment | `run_id`, `owner`, `table_name`, `partition_name`, `lob_column`, `original_ts`, `current_ts`, `bytes`, `drain_status`, `refill_status`, `attempts`, `last_ora`, timestamps |
+| `EPF_OBJECT_BASELINE` | Reclaim fingerprint (indexes, constraints, invalid objects, row counts, account status) | `run_id`, `object_type`, `owner`, `name`, `table_name`, `tablespace_name`, `status`, `validated`, `degree`, `logging`, `row_count` |
+| `EPF_RECLAIM_OBJECT` | Reclaim journal per movable unit | `run_id`, `owner`, `object_name`, `sub_name`, `unit_type`, `source_ts`, `target_ts`, `bytes`, `move_status`, `attempts`, `last_ora`, timestamps |
 | `EPF_TEMP_INDEX` | Temporary supporting indexes created by a run | `run_id`, `owner`, `index_name`, `table_name`, `column_name`, `created_at`, `dropped_at` |
+| `EPF_SPACE_USAGE` | Space used inside segments (from `DBMS_SPACE`) per phase | `run_id`, `phase`, `owner`, `segment_name`, `partition_name`, `segment_type`, `allocated_bytes`, `used_bytes`, `free_bytes`, `method` |
+| `EPF_TS_INVENTORY` | Everything that lives in or points at a target tablespace | `run_id`, `tablespace_name`, `kind` (SEGMENT, SEGMENTLESS, DEFAULT_ATTR, USER_DEFAULT, QUOTA, DB_DEFAULT, RECYCLEBIN), `owner`, `object_name`, `sub_name`, `segment_type`, `bytes`, `handler`, `blocker_reason` |
+| `EPF_LONG_CONVERSION` | LONG / LONG RAW columns found, the decision taken, and the result | `run_id`, `owner`, `table_name`, `column_name`, `original_type`, `new_type`, `decision` (CONVERT/SKIP), `row_count`, `bytes`, `dependents`, `status`, `converted_at`, `ora_code` |
+| `EPF_ACCOUNT_ACTION` | Accounts locked and sessions disconnected for the reclaim window | `run_id`, `username`, `original_status`, `locked_at`, `unlocked_at`, `sessions_disconnected`, `detail` |
 
 History older than `history_retention_days` (default 180) is pruned at run start.
 
@@ -285,9 +283,9 @@ Registry content (seeded by `registry_data.sql`) reproduces today's scope exactl
 | PAYMENTS | `file_integration.integration_date` | none |
 | LOGS | `audit_trail.audit_timestamp` | `audit_archive.audit_archive_id` <- `audit_trail.audit_archive_id` |
 | LOGS | `op.spec_trt_log.dtlog` | none |
-| BANK_STATEMENTS | `file_dispatching.date_reception` | `directory_dispatching.file_dispatching_id` <- `file_dispatching` |
+| BANK_STATEMENTS | `file_dispatching.date_reception` | `directory_dispatching.file_dispatching_id` <- `file_dispatching` (every eligible `file_dispatching` row is purged, with or without children - D8) |
 
-`delete_order` reproduces today's order (leaves first, roots last). At preflight `epf_registry.validate` checks it against the live FK graph: an FK from a registered table that would be violated by the order is a FAIL; an FK from an *unregistered* table into a registered one is a coverage-gap WARN (this replaces utility 16).
+`delete_order` reproduces today's order (leaves first, roots last). At preflight `epf_registry.validate` checks it against the live FK graph of **all schemas**: an FK that the order would violate is a FAIL; an FK from an unregistered table (including client-added schemas) into a registered one is a FAIL if it is `ON DELETE CASCADE` or `SET NULL` (the purge would silently change client data) and a WARN otherwise (the purge would fail on it). This replaces utility 16.
 
 ---
 
@@ -312,13 +310,14 @@ Fixes F-01..F-06, F-08, P-01..P-04.
 
 ### 6.2 Modes
 
-| Mode | PAYMENTS / BANK_STATEMENTS | LOGS |
-|------|----------------------------|------|
+| Mode | PAYMENTS / BANK_STATEMENTS | LOGS module |
+|------|----------------------------|-------------|
 | FULL | delete | delete |
-| CLOB_ONLY | set LOB columns to `EMPTY_CLOB()` / `EMPTY_BLOB()` where length > 0 (tables with `lob_clear = Y`, LOB columns discovered from the dictionary) | same as left |
-| CLOB_N_LOGS | as CLOB_ONLY | delete |
+| CLOB | set LOB columns to `EMPTY_CLOB()` / `EMPTY_BLOB()` where length > 0 (tables with `lob_clear = Y`, LOB columns discovered from the dictionary) | same as left |
+| LOGS | not touched | delete |
+| CLOB_N_LOGS | as CLOB | delete |
 
-Counters are per table and per mode, so reporting is exact (F-04). The LOB throttle (`lob_throttle_ms`, default 500) between LOB batches is kept as a setting (workaround for the dw00 space-management crash on unpatched 19c). Final list of modes depends on D6.
+`--depth` selects modules; the mode says what happens to each selected module. LOGS mode processes only the LOGS module whatever the depth (the wizard does not ask for depth in LOGS mode). Counters are per table and per action, so reporting is exact (F-04). The LOB throttle (`lob_throttle_ms`, default 500) between LOB batches is kept as a setting (workaround for the dw00 space-management crash on unpatched 19c).
 
 ### 6.3 Errors, stop and re-run
 
@@ -326,10 +325,10 @@ Counters are per table and per mode, so reporting is exact (F-04). The LOB throt
 - `epf_purge.bat stop` sets `stop_requested`; the engine stops after the current batch; run status STOPPED; the report shows the expected residuals.
 - Re-running a purge is idempotent (a new key snapshot of what is still eligible).
 
-### 6.4 Supporting indexes and statistics (per D5)
+### 6.4 Supporting indexes (D5)
 
 - Preflight lists missing indexes on every link `match_column` and root `date_column` (P-03). The purge creates the missing ones as `EPF_TMP_<n>` (tracked in `EPF_TEMP_INDEX`) and drops them at the end of the purge; any left over from an interrupted run are dropped at the next run start.
-- Optional statistics gathering is limited to registry tables (not the whole schema).
+- No other database-level change is made: no statistics gathering, no redo log changes, no `undo_retention` change, no UNDO/TEMP resizing. Everything kept works inside a PDB.
 
 ### 6.5 Session instrumentation
 
@@ -337,103 +336,139 @@ Every worker session sets `DBMS_APPLICATION_INFO` (module `EPF`, action = curren
 
 Progress events are time-throttled: first batch, last batch, and at most one per `progress_interval_s` (default 5 s) per module (P-04).
 
+### 6.6 Measuring the effect of a purge (D7)
+
+A DELETE frees space inside blocks; segment and tablespace sizes do not change, which is why a purge-only report used to show nothing. Before and after the purge the engine records, for every registry table and its indexes and LOB segments, the space actually used inside the segment with `DBMS_SPACE.SPACE_USAGE` (reads only the space-management bitmaps, not the data) into `EPF_SPACE_USAGE`. Where a segment type is not supported by `SPACE_USAGE` (e.g. manual segment space management), the report falls back to `rows x avg_row_len` and labels the figure as estimated. The report then shows, per table and module: allocated (unchanged), used before -> after, and "freed inside segments, reusable now".
+
+### 6.7 Optional compaction (D7, opt-in)
+
+Offered in the wizard only when reclaim is not selected (default No; `--compact`). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
+
+- only registry tables whose freed-inside ratio is above `compact_min_free_pct` (default 20 %) are processed, largest benefit first;
+- per table: record `row_movement`, `ENABLE ROW MOVEMENT`, `SHRINK SPACE COMPACT` (online), `SHRINK SPACE` (short lock, bounded by `ddl_lock_timeout`), LOB segments where the LOB type supports shrink, then restore the recorded `row_movement` value;
+- tables where shrink is not supported (function-based or domain indexes, ROWID materialized views, compressed tables, unsupported LOB type) are skipped with the reason;
+- progress and heartbeat per table; honors stop requests between tables; space usage is measured again afterwards.
+
+
 ---
 
 ## 7. Space reclaim engine design (deep dive)
 
-This is the part that currently gets stuck, stops half way and sometimes grows the HWM. The redesign attacks each root cause from 2.2 and adds invariants so the tool can never silently make things worse.
+This is the part that currently gets stuck, stops half way and sometimes grows the HWM. The redesign replaces in-place drain/refill with a **tablespace swap**: every segment of every owner is moved once into a freshly created tablespace, the old tablespace is dropped, and the new one takes over the original name (DATA in standard installs).
 
-### 7.1 What really limits a datafile shrink
+### 7.1 Why the swap
 
-A datafile can only be resized down to the highest allocated block **in that file**. `SHRINK SPACE` compacts rows inside a segment but cannot relocate the segment's extents, so a segment sitting at the end of the file pins the size no matter how empty it is. The only deterministic way to pack a tablespace is to **rebuild segments into empty space from the bottom up** - which is what drain/refill does. The current script has the right idea; it fails on the details listed in R-01..R-15.
+A datafile can only be resized down to the highest allocated block in that file. In-place approaches depend on *everything* above the target leaving the file; any segment that stays (another schema's object, an unmoved partition, a LONG table, a LOB sent to the wrong place) pins the size, and refilled segments fill the holes below it. That is the behavior seen with the current script. A swap does not depend on the old file's layout at all: the new tablespace starts empty and is packed from its first block, the old tablespace disappears entirely, and the data moves once instead of twice.
 
 ### 7.2 Symptom -> cause -> fix
 
 | Symptom | Root cause(s) | Fix in the new engine |
 |---------|---------------|-----------------------|
-| Gets stuck | R-07 slow dictionary queries in loops; R-08 lock/library-cache waits; R-09 archiver stuck; R-13 LOB shrink; L-02/L-04 no visibility | Per-file HWM from `DBA_FREE_SPACE` (fallback `DBA_EXTENTS` per file) computed only at checkpoints; preflight blocks on connected app sessions / active transactions; `ddl_lock_timeout` + bounded retries; redo forecast vs recovery-area headroom; post-purge shrink removed (D7); heartbeat with wait event, blocker and longops % |
-| Doesn't rearrange fully | R-01 first file only; R-02 partitions/IOTs/LOB partitions not moved; R-10 disk full mid-drain; R-12 recycle bin; R-14 resize gives up | Per-file geometry everywhere; partition-level and IOT moves; peak-disk forecast + configurable scratch location; recycle-bin segments reported up front with the purge command (treated as anchors until purged); binary-search resize |
-| HWM increases | R-03 LOBs relocated to the data TS; R-05 parallel index builds; R-06 autoextend forced; segments moved within the same tablespace when drain failed | Every segment returns to its **original** tablespace; serial rebuild below a size threshold; autoextend recorded and restored; invariant check "HWM must not rise" at every checkpoint |
-| Inconsistent results between runs | R-04 drop/recreate from DDL; R-15 separate recovery scripts; heuristics on run_id | Constraints never dropped; indexes UNUSABLE + REBUILD; single state machine with built-in resume; explicit run_id |
+| Gets stuck | R-07 slow dictionary queries in loops; R-08 lock/library-cache waits; R-09 archiver stuck; R-13 LOB shrink; L-02/L-04 no visibility | Geometry read only at checkpoints; accounts locked and sessions disconnected before any DDL (7.6); `ddl_lock_timeout` + bounded retries; redo forecast vs recovery-area headroom (D9); no shrink in the purge path unless opted in; heartbeat with wait event, blocker and longops % |
+| Doesn't rearrange fully | R-01 first file only; R-02 partitions/IOTs/LOB partitions not moved; foreign schemas' segments left in place; R-10 disk full; R-12 recycle bin; R-14 resize gives up | Every segment of every owner moves; complete inventory with a handler per kind (7.4); LONG columns converted (7.5); peak-disk forecast; recycle bin reported before the run; old tablespace is dropped, not resized |
+| HWM increases | R-03 LOBs relocated to the wrong tablespace; R-05 parallel index builds; R-06 autoextend forced; segments re-placed above anchors | New tablespace is empty and packs from the bottom; LOBs follow a per-segment source->target map; serial index rebuild below a size threshold; autoextend cloned from the original |
+| Inconsistent results between runs | R-04 drop/recreate from DDL; R-15 separate recovery scripts; run_id heuristics | Constraints never dropped (7.3); one state machine with built-in resume (7.8); explicit run_id |
 
-### 7.3 Index and constraint strategy (D2, recommended)
+### 7.3 Index and constraint strategy (D2)
 
-Instead of capturing DDL and dropping PK/UK/FK constraints and indexes:
+1. Mark every index on the tables being moved `UNUSABLE` (all owners). Since 11.2 this drops the index segment while the index and its constraint stay defined.
+2. Move the tables.
+3. `ALTER INDEX ... REBUILD TABLESPACE <target>` for each unusable index (target = the new tablespace if the index lived in the swapped tablespace, otherwise its original tablespace), then restore the recorded degree and logging attribute.
 
-1. Mark every index on in-scope tables `UNUSABLE`. Since 11.2 this **drops the index segment** (space is freed immediately) while the index and its constraint stay defined.
-2. Move the tables (drain, then refill). A table move would make its indexes unusable anyway, so no work is lost.
-3. `ALTER INDEX ... REBUILD TABLESPACE <original>` for each unusable index, then restore its recorded degree and logging attribute.
+PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on that table fails with ORA-01502, so writes fail loudly instead of bypassing uniqueness; reads keep working. Recovery from any failure is "rebuild whatever is UNUSABLE" - discoverable from `DBA_INDEXES` and idempotent. No DDL capture, no backup table, no recovery scripts.
 
-Why this is safer:
+**Index-only tablespaces** (a separate index tablespace) need no swap: once every index in them is unusable they are empty, so they are resized to their minimum, and the rebuild packs them from the bottom.
 
-- PK/UK/FK constraints are never dropped. There is nothing to capture, back up or replay; the `EPF_DDL_BACKUP` table and the two recovery scripts disappear.
-- While a unique index is unusable, DML on that table fails with ORA-01502. The quiesced window is *enforced* (writes fail loudly) instead of *assumed* (writes accepted without uniqueness checks).
-- Recovery from any failure is "rebuild whatever is UNUSABLE" - discoverable from `DBA_INDEXES`, always idempotent.
-- Reads keep working throughout (full scans).
+### 7.4 Scope and inventory (dynamic, nothing missed)
 
-This behavior is verified in phase 0 on your target version (V1, V2 in 12.3).
+- **Application schemas** (setting `app_schemas`, default `OP,OPPAYMENTS,OPREPORTS`) decide which tablespaces are candidates: every permanent tablespace holding their segments, excluding SYSTEM, SYSAUX, UNDO and TEMP. The wizard shows each candidate with size, used space and owners, and you select the targets (default: all candidates).
+- **Everything in a target tablespace is in scope, whatever the owner** - client-added schemas included. The inventory (`EPF_TS_INVENTORY`) is built from:
+  - `DBA_SEGMENTS` (every segment type),
+  - segmentless objects: tables, indexes, LOBs, partitions and subpartitions with the tablespace assigned but no segment yet (deferred segment creation),
+  - default attributes: `DBA_PART_TABLES`, `DBA_PART_INDEXES`, `DBA_PART_LOBS`, subpartition templates,
+  - `DBA_USERS.default_tablespace`, `DBA_TS_QUOTAS`, the database default permanent tablespace,
+  - `DBA_RECYCLEBIN`.
+- **Every inventory row must map to a handler**; an unknown kind or segment type is a blocker (fail-closed):
 
-### 7.4 Scope detection
+| Kind | Handler |
+|------|---------|
+| Heap table, table partition/subpartition, IOT (+ overflow), nested table, MV container table, MV log | `MOVE` / `MOVE PARTITION` / `MOVE SUBPARTITION` to the target, with each LOB mapped explicitly |
+| LOB segment, LOB partition | moved with its table (explicit `STORE AS (TABLESPACE ...)` per LOB) |
+| Index, index partition | UNUSABLE, then REBUILD (7.3) |
+| Segmentless table / index / LOB / partition | `MOVE` / `REBUILD` / `MODIFY DEFAULT ATTRIBUTES` - dictionary-only change |
+| Partition default attributes | `MODIFY DEFAULT ATTRIBUTES TABLESPACE <target>` |
+| Table with LONG / LONG RAW column | converted with your per-item approval (7.5), then moved |
+| User default tablespace, quota, database default | re-pointed / copied to the target before the old tablespace is dropped |
+| Recycle-bin object | blocker: reported with the `PURGE` command for the DBA (the tool never purges it) |
+| Cluster, queue table, SYS/SYSTEM-owned segment, anything unknown | blocker |
 
-- Scope schemas: setting `scope_schemas` (default `OPPAYMENTS,OP`).
-- Scoped tablespaces: every permanent tablespace holding segments of the scope schemas, excluding SYSTEM, SYSAUX, UNDO and TEMP; overridable with `--tablespaces`. Data and index tablespaces are both handled; there is no "primary data file".
-- Movable units: non-partitioned tables, table partitions and subpartitions, IOTs (with overflow), and all their LOB / LOB-partition segments. Each unit's **original tablespace is recorded per segment** (table and each LOB separately).
-- Non-movable units (reported as anchors with their top position): tables with LONG/LONG RAW columns, clustered tables, object/nested tables, queue tables, domain-index storage, and any segment owned by a schema outside the scope ("foreign tenants").
+- A target tablespace with any blocker (including a LONG column you skipped) is **not swapped**; the other targets still proceed. The report names each blocker with the recommended manual path (manual conversion, or `expdp`/`impdp` of the table into the new tablespace).
+- **Before the swap is committed, the new tablespace is cloned from the old one:** bigfile/smallfile, block size, extent management (autoallocate/uniform size), segment space management, encryption (TDE keystore must be open), default compression, logging and autoextend settings.
 
-### 7.5 Preflight (read-only; FAIL blocks the reclaim, WARN needs confirmation)
+### 7.5 LONG / LONG RAW conversion (per-item approval)
 
-| Check | FAIL when | Output |
-|-------|-----------|--------|
-| Version / edition / privileges | unsupported version or missing privilege | features enabled (parallel DDL on EE only) |
-| Interrupted reclaim | journal or dictionary shows work in progress | offer resume (7.8) |
-| Pre-existing damage | UNUSABLE indexes or disabled constraints not caused by the tool | list; they are included in the baseline so they are not "fixed" silently |
-| Application activity | sessions connected as scope schemas (other than the tool), active transactions or locks on scoped tables, running scheduler jobs owned by them | who, from where, program (D10) |
-| Geometry | - | per tablespace and file: size, HWM, used, free, autoextend settings |
-| Anchors | - | foreign / non-movable segments with top position; resulting **floor** per file |
-| Recycle bin | - | WARN: dropped objects in scoped tablespaces, with the `PURGE` command for the DBA; they are anchors until purged (the tool never purges them, since that removes the ability to flash back a dropped table) |
-| Redo | ARCHIVELOG and estimated redo > recovery-area headroom (unless D9 = NOLOGGING allowed and not FORCE LOGGING) | estimated redo, FRA free, log_mode, force_logging |
-| Disk forecast | - | simulated peak extra disk (7.6) and projected final size per file |
-| Materialized views WITH ROWID on scoped tables | - | WARN: they need a complete refresh after the moves |
-| Dictionary speed | - | time of one HWM query; WARN with advice if slow |
+- Found during the startup preflight for every target tablespace, all owners.
+- Each candidate is presented **one at a time** in the input phase:
 
-Result: a **reclaim forecast** block (current size, projected final size, reclaimable GB, peak extra disk, anchors) that the wizard shows before confirmation.
+```
+ LONG column 2 of 5
+   OPPAYMENTS.OLD_BATCH_NOTES.NOTE_TEXT      LONG -> CLOB   (irreversible)
+   rows 18,204   size 212 MB   used by: 1 view, 0 packages, 0 triggers
+   Convert? [Enter = yes, n = skip]
+```
 
-### 7.6 Algorithm (in-place drain -> refill, D3 recommended)
+- If any item is skipped, the tool shows which tablespace can therefore not be swapped, states that the reclaim will not reach 100 % of its capability, recommends manual conversion or `expdp`/`impdp`, and asks once more whether to proceed.
+- Non-interactive runs use `LONG_CONVERSION=ALL|NONE|<owner.table.column,...>` from the config; `--yes` alone never approves a conversion.
+- Execution (step CONVERT_LONG, after the accounts are locked): `ALTER TABLE ... MODIFY (col CLOB|BLOB)` with the LOB stored directly in the target tablespace. The table is then moved with everything else. Dependent objects are recompiled in CLEANUP.
+- Every conversion is recorded in `EPF_LONG_CONVERSION` and listed in the report: `OWNER.TABLE.COLUMN  LONG -> CLOB  rows 18,204  OK`.
+
+### 7.6 Accounts and sessions (D10)
+
+- **At startup** the preflight lists every owner with objects in the target tablespaces: account status, and each session (SID, OS user, machine, program, logon time, open transaction yes/no). You confirm this list once, together with the rest of the run.
+- **When the reclaim starts** (possibly hours later, after the purge): the list is refreshed and printed to console and log; sessions that appeared since the confirmation are flagged "new since confirmation". Then, per owner:
+  1. record the original account status;
+  2. `ALTER USER ... ACCOUNT LOCK`;
+  3. disconnect its sessions with `ALTER SYSTEM DISCONNECT SESSION ... POST_TRANSACTION`, waiting up to `disconnect_timeout_s` (default 300); sessions still present after the timeout are disconnected `IMMEDIATE`, and this is logged per session.
+- The tool's own sessions (EPFPG, SYS) are never touched.
+- **UNLOCK_ACCOUNTS always runs** - after success, failure or stop - and restores exactly the recorded status (accounts that were already locked stay locked). If the reclaim session itself dies, the next run (`reclaim`, `status` or `resume`) detects accounts still locked by the tool and restores them first.
+- Every action is recorded in `EPF_ACCOUNT_ACTION` and listed in the report with timestamps.
+
+### 7.7 Algorithm (per target tablespace)
 
 | Step | What happens | Invariants / notes |
 |------|--------------|--------------------|
-| BASELINE | Record fingerprint: indexes (status, tablespace, degree, logging), constraints (status, validated), invalid objects, row count per table via PK index fast full scan (full scan if no PK), segment + file snapshots. | Basis of the VERIFY step and the report. |
-| PREPARE | Session: `ddl_lock_timeout`, resumable space allocation with a timeout (a space error suspends and shows as `SUSPENDED` in the live view instead of failing). Record autoextend settings of every scoped datafile. Grow `EPF_SCRATCH` or add a datafile at `--scratch-dir` if given. | Nothing is dropped. |
-| RELEASE_INDEXES | `ALTER INDEX ... UNUSABLE` for every index on movable units. Resize every scoped *index* tablespace file to its HWM immediately. | Index space is back on disk before any data moves, lowering peak disk. |
-| DRAIN | Move units from each data tablespace to `EPF_SCRATCH`, ordered by top block **per file**, descending. After each unit (or every `resize_every_mb` moved) resize the affected file(s) to their HWM + margin. | Per-file HWM must never rise (it can only fall, since units only leave). A rise stops the step with ERROR. |
-| COMPACT | Every scoped data file now holds only anchors. Resize each to HWM + margin. Enable autoextend with the original `MAXSIZE` and an `increment_by` of 256 MB while refilling. | Floor reached = anchors only. |
-| REFILL | Move units back to their **original** tablespace, ordered by top block in `EPF_SCRATCH` descending, so scratch can shrink as it empties. The target files are empty above the anchors, so segments pack from the bottom. | After each checkpoint: file HWM <= anchor floor + bytes refilled + tolerance, otherwise WARN with the fragmentation detail. |
-| REBUILD_INDEXES | `REBUILD TABLESPACE <original>` for every unusable index, largest first. Serial below `parallel_min_mb` (default 1024 MB); above it, parallel on EE only; then restore recorded degree/logging. | Serial by default avoids PX extent holes (R-05). |
-| FINAL_RESIZE | Resize every scoped file to HWM + margin using binary search between target and current size (a failed RESIZE is cheap; replaces +1 GB x 10). Restore recorded autoextend settings. Shrink `EPF_SCRATCH` to its minimum, drop any added scratch datafile. | File size never above its baseline. |
-| CLEANUP | Recompile objects that became invalid during the run (only those - compared to the baseline). Optional UNDO/TEMP datafile resize (resize only, never swap; per D5). | |
-| VERIFY | Compare with BASELINE: every index VALID/USABLE in its original tablespace with original degree/logging; constraints identical; no new invalid objects; row counts identical; nothing left in scratch; per-file size and HWM <= baseline. | Any mismatch = FAIL with the exact object list. |
+| INVENTORY | Rebuild the inventory and compare with the startup one; a new blocker stops this tablespace cleanly (no prompt). | Fail-closed. |
+| BASELINE | Fingerprint: indexes (status, tablespace, degree, logging), constraints (status, validated), invalid objects, row count per table (PK index fast full scan; full scan if no PK), segment + file snapshots, account status. | Basis of VERIFY and the report. |
+| LOCK_ACCOUNTS | 7.6. | |
+| CONVERT_LONG | Approved conversions (7.5). | Per-item status recorded. |
+| CREATE_TARGET | Create the clone tablespace `<name>_R` with a small initial size and the original autoextend policy, in the same directory as the original datafile(s). Quotas and user defaults are copied onto it. | |
+| RELEASE_INDEXES | UNUSABLE for every index on tables being moved (all owners); a separate index tablespace is resized to its minimum right away. | Frees index space before any data moves. |
+| MOVE | Move every movable unit into the target, ordered by highest extent in the old files first. After every `resize_every_mb` moved (default 1024), resize each old datafile down to its own HWM + margin (per file, binary search), so peak extra disk stays near the size of the largest unit. | Old files only shrink. A unit that cannot be locked within the retry budget stops the step with its name. |
+| REPOINT | Segmentless objects, partition default attributes, user default tablespaces and quotas, database default tablespace -> target. | After this step, nothing references the old tablespace. |
+| DROP_OLD | `DROP TABLESPACE <old>` **without** `INCLUDING CONTENTS` - Oracle refuses if anything remains, which is the final safety net. Non-OMF datafiles left on disk are deleted through a temporary directory object; if that fails, their paths are reported for manual deletion. | Never `INCLUDING CONTENTS`, never `CASCADE CONSTRAINTS`. |
+| RENAME | `ALTER TABLESPACE <name>_R RENAME TO <old name>`. User defaults and quotas follow automatically. | Final name = original name (DATA). |
+| RESTORE_PATHS | On EE, move each new datafile online to the original path (copy of the compacted file). On SE2 or if disabled (`restore_datafile_paths`), the new path is kept and reported. | |
+| REBUILD_INDEXES | REBUILD for every unusable index, largest first; serial below `parallel_min_mb` (default 1024 MB), parallel above it on EE only; then restore recorded degree and logging. | LOGGING always (D9). |
+| CLEANUP | Recompile objects that became invalid during the run (only those, compared to the baseline); drop the temporary directory object. | |
+| UNLOCK_ACCOUNTS | 7.6. | Runs on every exit path. |
+| VERIFY | Compare with BASELINE: every index VALID/USABLE with original degree/logging; constraints identical; no new invalid objects; row counts identical; tablespace name identical; accounts restored; total file size <= baseline. | Any mismatch = FAIL with the exact object list. |
 
-The engine logs the reason for every unit it does not move (anchor type, lock timeout, error), so "didn't rearrange fully" is always explained by name.
+**Peak disk forecast.** The preflight replays MOVE on the extent map: after unit *k*, old files = top of the highest remaining unit per file, new tablespace = sum of moved units. The maximum over *k* is the peak extra disk, shown before confirmation.
 
-**Peak disk simulation.** Before running, the preflight replays DRAIN on the extent map: after moving unit *k*, file size = top of the highest remaining unit, scratch = sum of moved units. The maximum over *k* is the peak extra disk. Refill is estimated the same way on the scratch side. This number is shown in the forecast; with `--scratch-dir` the scratch share can go to another disk.
+**Redo (D9).** Always LOGGING. The preflight estimates redo (moved bytes + rebuilt index bytes) and, in ARCHIVELOG mode, compares it with the recovery-area headroom; if it does not fit, the reclaim is blocked at startup with the numbers.
 
-**Alternative (D3 = "move once and swap").** Move units once into a new tablespace, drop the old one, rename the new one to the old name. Half the data movement; but datafile paths change, quotas must be re-granted, and it is impossible when foreign tenants share the tablespace (falls back to drain/refill). Only the DRAIN/COMPACT/REFILL rows above change.
+### 7.8 Lock, wait, space; interruption and resume
 
-### 7.7 Lock, wait and space handling
+- `ddl_lock_timeout` (default 30 s) on every DDL; ORA-00054 retried `ddl_retries` times (default 3, backoff 30/60/120 s).
+- Resumable space allocation (`resumable_timeout_s`, default 1800): a full disk suspends the statement; the live view shows `SUSPENDED: unable to extend ...`; adding space lets it continue by itself.
+- The live view always shows the wait event and the blocking session (8.1).
+- **Stop request**: honored between units. Before DROP_OLD, the engine takes the restore path: units already moved stay in the target, the old tablespace is left in place, indexes are rebuilt, accounts unlocked. The report shows the tablespace as "partially moved - resume to complete". After DROP_OLD, a stop is deferred until RENAME completes.
+- **Hard interruption** (killed session, lost connection, instance restart): tables are intact (a MOVE is atomic), some indexes may be unusable, accounts may still be locked. The next `reclaim` detects this from the dictionary + journal, restores account status first, then offers Resume (continue from the current step). Non-interactive runs need `--resume`.
+- `status` prints the exact degraded objects and locked accounts at any time.
 
-- `ddl_lock_timeout` (setting, default 30 s) on every DDL; ORA-00054 is retried `ddl_retries` times (default 3, backoff 30/60/120 s). A unit that still cannot be locked is skipped in DRAIN (it stays in place as an anchor, reported), and retried until success in REFILL (a unit must never be left in scratch; the step pauses with a clear message and the live view shows the blocker).
-- Resumable space allocation (setting `resumable_timeout_s`, default 1800): a full disk suspends the statement, the live view shows `SUSPENDED: unable to extend EPF_SCRATCH by 1024 MB`; adding space lets it continue by itself.
-- The live view always shows the wait event and the blocking session (8.3); the tool never kills sessions.
+### 7.9 Removed from the reclaim
 
-### 7.8 Interruption, stop and resume
-
-- **Stop request during DRAIN**: the engine switches to the restore path (skip remaining drain, then REFILL -> REBUILD_INDEXES -> FINAL_RESIZE -> CLEANUP -> VERIFY). A stop therefore always ends with every table in its original tablespace and every index usable.
-- **Hard interruption** (killed session, lost connection, instance restart): tables are intact (a MOVE is atomic), some units may be in scratch, some indexes unusable (writes fail, reads work). The next `reclaim` detects this from the dictionary + journal and offers **Resume** (continue from the current step) or **Restore** (take the restore path). Non-interactive runs need `--resume` or `--restore`, otherwise they exit with code 3 and a clear message.
-- `status` action prints the exact degraded objects at any time.
-
-### 7.9 UNDO/TEMP and instance-level items
-
-Removed from the reclaim: redo log enlargement, `undo_retention` changes, UNDO tablespace swap (R-11). Optional, per D5: resize UNDO/TEMP datafiles to their minimum usable size (resize only). No instance parameter is changed.
+Redo log changes, `undo_retention` changes, the UNDO tablespace swap and UNDO/TEMP resizing (R-11, D5). No instance parameter is changed.
 
 ---
 
@@ -449,6 +484,7 @@ Fixes L-01..L-05. Recommended upgrade: one console, event stream + heartbeat, on
    - `EPF_STEP` state (checklist),
    - heartbeat: the worker's `V$SESSION` row (current step, SQL, wait event, seconds waiting, blocking session with user/machine/program) and `V$SESSION_LONGOPS` (% done, time remaining), plus `DBA_RESUMABLE` (suspended statements).
    A watchdog restarts the monitor session if a poll does not answer within 60 s.
+   The monitor connects as EPFPG, so it keeps working while the application accounts are locked.
 3. When the worker exits, one final poll drains the remaining events. No sleeps, no timestamp guessing.
 4. The worker's exit code (`WHENEVER SQLERROR EXIT FAILURE`) and `EPF_RUN.status` decide what happens next.
 
@@ -459,7 +495,7 @@ Only one process writes the console log file (no file-sharing workarounds, no pe
 ```
  EPF Data Purge                                                     run R-000124
  --------------------------------------------------------------------------------
- Database  EPFPROD 19.21 EE on dbsrv01        tool schema EPF_ADMIN
+ Database  EPFPROD 19.21 EE on dbsrv01        tool schema EPFPG
  Run folder logs\2026-09-28_104200_R-000124\
 
  PREFLIGHT                                                               00:00:41
@@ -476,14 +512,16 @@ Only one process writes the console log file (no file-sharing workarounds, no pe
  10:58:40  PAYMENTS   done     7,811,402 rows in 21 tables                              16m33s
  [ OK ] PAYMENTS  residual 0 . orphans 0 . retention-safe
 
- RECLAIM  tablespaces OPPAY_DATA (1 file), OPPAY_IDX (1 file)
- [ OK ] Forecast: 118.0 GB -> ~41.6 GB . peak extra disk 9.8 GB . anchors: none
- 11:02:10  RELEASE    214 indexes unusable . OPPAY_IDX 38.2 GB -> 0.3 GB
- 11:03:55  DRAIN      [ 41/212] OPPAYMENTS.AUDIT_TRAIL  3.2 GB   DATA 88.4 GB  SCRATCH 22.1 GB
- ..        DRAIN      MOVE OPPAYMENTS.SPEC_TRT_LOG  62% (4m12s left) . direct path write
- [WARN] 11:21:40  DRAIN waiting 45s on enq: TM - contention . blocked by SID 812 APPUSER@appsrv01 (java.exe)
+ RECLAIM  DATA (1 file, 118.0 GB) -> swap . owners OPPAYMENTS OP OPREPORTS CUSTOMX
+ [ OK ] Forecast: 118.0 GB -> ~41.6 GB . peak extra disk 9.8 GB . blockers: none
+ 10:59:02  LOCK       4 accounts locked . 7 sessions disconnected (list in log)
+ 10:59:40  CONVERT    OPPAYMENTS.OLD_BATCH_NOTES.NOTE_TEXT  LONG -> CLOB  18,204 rows
+ 11:02:10  RELEASE    214 indexes unusable
+ 11:03:55  MOVE       [ 41/612] OPPAYMENTS.AUDIT_TRAIL  3.2 GB   DATA 88.4 GB  DATA_R 22.1 GB
+ ..        MOVE       OP.SPEC_TRT_LOG  62% (4m12s left) . direct path write
+ 11:48:12  DROP_OLD   DATA dropped . RENAME DATA_R -> DATA . path restored
  ...
- [ OK ] VERIFY  indexes 214/214 usable . constraints identical . rows identical . HWM never rose
+ [ OK ] VERIFY  indexes 214/214 usable . constraints identical . rows identical . accounts restored
 
  RESULT  PASS                                               total 01:48:12 . exit 0
  Report  logs\2026-09-28_104200_R-000124\report.txt
@@ -536,9 +574,13 @@ logs/2026-09-28_104200_R-000124/
 | R2 | Constraints: same set, same status/validated | identical | - | any difference |
 | R3 | Invalid objects: none new | none new | - | new invalid objects |
 | R4 | Row counts per table unchanged across reclaim | identical | - | differs |
-| R5 | Nothing left in `EPF_SCRATCH`, added scratch files removed | clean | - | segments left |
-| R6 | Per file: size and HWM <= baseline; autoextend settings restored | yes | - | no |
-| R7 | Efficiency: final size within max(1 %, 256 MB) of achievable | yes | no, anchors named | - |
+| R5 | Old tablespace dropped and its datafiles removed from disk | clean | files left, paths listed | old tablespace still referenced |
+| R6 | Total datafile size <= baseline; autoextend policy identical to the original | yes | - | no |
+| R7 | Efficiency: swapped tablespace within max(1 %, 256 MB) of total segment bytes | yes | tablespace not swapped, blockers named | - |
+| R8 | LONG conversions: each approved conversion done, original -> new type listed | all done | skipped items listed | an approved conversion failed |
+| R9 | Accounts restored to their recorded status; disconnected sessions listed | yes | - | an account not restored |
+| R10 | Tablespace name and user defaults/quotas identical to baseline | yes | - | differs |
+| P7 | Space measured inside segments before/after purge (6.6) | measured | estimated (fallback) | - |
 
 Verdict: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Exit code follows the verdict.
 
@@ -552,8 +594,10 @@ Verdict: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Exit code follows the verdict.
  P3  Retention safety ...................................... PASS   retained rows unchanged
  P4  Orphans ............................................... PASS   22 links (9 by FK, 13 scanned)
  R1  Indexes identical and usable .......................... PASS   214/214
- R6  Datafiles never grew, HWM never rose .................. PASS   2 files
- R7  Efficiency ............................................ PASS   41.7 GB vs 41.4 GB achievable
+ R6  Datafile size never above baseline ..................... PASS   DATA 118.0 -> 41.6 GB
+ R7  Efficiency ............................................ PASS   41.6 GB vs 41.2 GB of segments
+ R8  LONG conversions ...................................... PASS   2 of 2 (LONG -> CLOB)
+ R9  Accounts restored ..................................... PASS   4 locked / 4 restored
  ------------------------------------------------------------------------------------
  VERDICT  PASS
 
@@ -575,40 +619,41 @@ epf_purge.bat [action] [options]
 Actions
   (none)       interactive wizard
   purge        purge; add --reclaim to reclaim afterwards
-  reclaim      space reclaim only (detects and offers resume/restore)
-  preflight    read-only checks and forecasts; changes nothing
+  reclaim      tablespace reclaim only (detects and offers resume)
+  preflight    read-only checks, inventories and forecasts; changes nothing
   report       report for a run (default: latest)          --run R-000124
-  status       state of the latest/current run, degraded objects if any
+  status       state of the latest/current run, degraded objects, locked accounts
   stop         request a graceful stop of the running run
-  install      install or upgrade database objects (needs SYS once)
+  install      install or upgrade database objects (SYS)
   uninstall    remove database objects (refuses while a reclaim is incomplete)
 
 Options
   --config FILE           configuration file (CLI overrides file values)
-  --tns NAME              TNS alias or EZConnect string
+  --tns NAME              TNS alias or EZConnect string (PDB service in multitenant)
   --retention DAYS        default 30
   --depth LIST            ALL | PAYMENTS | LOGS | BANK_STATEMENTS (comma-separated)
-  --mode MODE             FULL | CLOB_ONLY | CLOB_N_LOGS (per D6)
+  --mode MODE             FULL | CLOB | LOGS | CLOB_N_LOGS
   --batch-size N          default 1000
   --dry-run               snapshot and count only
-  --reclaim               run reclaim after a successful purge
-  --tablespaces LIST      override scoped tablespaces for reclaim
-  --scratch-dir PATH      directory for an additional scratch datafile
-  --resume | --restore    how to continue an interrupted reclaim (non-interactive)
-  --yes                   no confirmation prompt
+  --compact               shrink worthwhile purged tables after a purge-only run (6.7)
+  --reclaim               reclaim after a successful purge
+  --tablespaces LIST      target tablespaces (default: all candidates, 7.4)
+  --long-conversion V     ALL | NONE | owner.table.column,...  (non-interactive only)
+  --resume                continue an interrupted reclaim (non-interactive)
+  --yes                   skip the final confirmation (never approves LONG conversions)
   --non-interactive       never prompt; missing input is an error (exit 4)
   --log-dir DIR           default .\logs
   --no-color
   --help
 
 Environment
-  EPF_PASSWORD            tool schema password
-  EPF_SYS_PASSWORD        SYS password (install/uninstall only)
+  EPF_PASSWORD            EPFPG password
+  EPF_SYS_PASSWORD        SYS password (reclaim, install, uninstall)
 ```
 
-Exit codes: `0` PASS, `1` FAIL, `2` PASS WITH WARNINGS, `3` aborted (user, preflight blocker, interrupted reclaim without --resume/--restore), `4` usage/configuration error.
+Exit codes: `0` PASS, `1` FAIL, `2` PASS WITH WARNINGS, `3` aborted (user, preflight blocker, interrupted reclaim without --resume), `4` usage/configuration error.
 
-The configuration file uses the same names as the options (`RETENTION_DAYS=30`, `DEPTH=ALL`, ...). Passwords in the file are allowed but discouraged; the file is git-ignored.
+The configuration file uses the same names as the options (`RETENTION_DAYS=30`, `DEPTH=ALL`, `LONG_CONVERSION=NONE`, ...). Passwords in the file are allowed but discouraged; the file is git-ignored.
 
 ### 10.2 Credentials
 
@@ -616,19 +661,26 @@ The configuration file uses the same names as the options (`RETENTION_DAYS=30`, 
 - Every `sqlplus` starts as `sqlplus -S -L /nolog`; the wrapper writes `CONNECT user/"password"@tns` to its stdin with echo off.
 - Values are cleared from memory at exit.
 
-### 10.3 Interactive flow ("smooth transitions")
+### 10.3 Interactive flow ("all input at the beginning")
 
-All questions come first, then the run proceeds to the end without further input.
+Every question, confirmation and password is collected before the first change. After the final confirmation the run proceeds to the end without any further input - the operator can leave and come back to a finished run.
 
-1. **Connect**: TNS, password; connection test; version and install check (offers `install` if objects are missing or outdated).
-2. **Choose action**: Purge / Purge + reclaim / Reclaim / Preflight only / Report / Status. If an interrupted reclaim exists, the choices are Resume / Restore / Cancel instead.
-3. **Purge parameters**, each with its default and a live preview:
-   - retention -> shows the cutoff date and eligible roots per module,
-   - depth -> shows per-module size and estimated reclaimable space,
-   - mode, batch size, dry run.
-4. **Reclaim options** (if chosen): scoped tablespaces, scratch location; the reclaim forecast (7.5) and any blockers are shown here.
-5. **Review screen**: every parameter, forecasts, warnings, what will change. One confirmation (`Proceed? [y/N]`; destructive actions require typing `yes` unless `--yes`).
-6. **Run**: live view (8.2) through to the verdict.
+1. **Connect**: TNS, EPFPG password; connection test; container check (refuses `CDB$ROOT`); version and install check (offers `install` if objects are missing or outdated).
+2. **Choose action**: Purge / Purge + reclaim / Reclaim / Preflight only / Report / Status. If an interrupted reclaim exists, the choices are Resume / Cancel.
+3. **SYS password** - asked here, only if the action includes reclaim.
+4. **Purge parameters**, each with its default and a live preview:
+   - retention -> cutoff date and eligible roots per module,
+   - mode (FULL / CLOB / LOGS / CLOB_N_LOGS), depth (not asked in LOGS mode) with per-module size and estimate,
+   - batch size, dry run,
+   - compaction (only when reclaim is not selected; default No).
+5. **Reclaim preparation** (if chosen), all read-only:
+   - candidate tablespaces with size, used space and owners -> select targets;
+   - blockers per tablespace;
+   - LONG conversions, one item at a time (7.5), then the "not 100 %" warning and extra confirmation if anything was skipped;
+   - accounts and sessions that will be locked/disconnected when the reclaim starts (7.6);
+   - forecast: final size, peak extra disk, redo vs recovery area.
+6. **Review screen**: every parameter, forecasts, warnings, what will change. One confirmation (`Proceed? [y/N]`; destructive actions require typing `yes` unless `--yes`).
+7. **Run**: live view (8.2) through to the verdict.
 
 Every prompt validates immediately and re-asks on invalid input, shows `[default]`, and accepts Enter. Supplying an option on the command line skips its prompt.
 
@@ -660,22 +712,24 @@ I cannot run Oracle in this environment, so each phase ships test scripts and ex
 |----|------------------------|
 | V1 | `ALTER INDEX ... UNUSABLE` drops the segment, including PK-backing and partitioned indexes. |
 | V2 | DML on a table whose PK index is unusable fails with ORA-01502; reads work. |
-| V3 | `MOVE` / `MOVE PARTITION` preserves BASICFILE/SECUREFILE type and LOB settings; LOB tablespaces can be targeted individually. |
-| V4 | Per-file HWM from `DBA_FREE_SPACE` equals `DBA_EXTENTS` (with recycle-bin segments accounted for); timing of both on a production-sized dictionary. |
-| V5 | Resumable space allocation suspends and resumes; visible in `DBA_RESUMABLE`. |
-| V6 | `V$SESSION_LONGOPS` reports progress for MOVE and index REBUILD. |
-| V7 | Extent placement when refilling an emptied file (AUTOALLOCATE and UNIFORM). |
-| V8 | The tool-schema privilege set performs every reclaim operation without SYS. |
+| V3 | `MOVE` / `MOVE PARTITION` preserves BASICFILE/SECUREFILE type and LOB settings with explicit LOB storage clauses. |
+| V4 | `DROP TABLESPACE` without `INCLUDING CONTENTS` refuses while segmentless objects or default attributes still reference it. |
+| V5 | `ALTER TABLE ... MODIFY (long_col CLOB)` with a LOB storage clause targeting another tablespace; dependents recompile. |
+| V6 | SYS executing an EPFPG invoker-rights package with `INHERIT PRIVILEGES ON USER SYS TO EPFPG`, inside a PDB. |
+| V7 | `ALTER TABLESPACE ... RENAME` keeps user defaults and quotas; online `ALTER DATABASE MOVE DATAFILE` to the original path. |
+| V8 | `DBMS_SPACE.SPACE_USAGE` for table, index, BASICFILE and SECUREFILE LOB segments; cost on large segments. |
+| V9 | `ALTER SYSTEM DISCONNECT SESSION ... POST_TRANSACTION` and account lock/unlock from inside a PDB. |
+| V10 | Resumable space allocation suspends and resumes; `V$SESSION_LONGOPS` reports MOVE and REBUILD progress. |
 
 ### 12.2 Test matrix
 
 - **Purge parity**: on a clone, current tool vs new engine: identical per-table deleted counts for the same cutoff (plus the D8 difference if chosen).
-- **Purge integrity**: P1-P6 PASS; injected orphan and injected newer-than-cutoff rows are detected.
-- **Reclaim layouts**: shared data/index tablespace; separate index tablespace; multi-file tablespace; bigfile tablespace; foreign-tenant segment near the top; LONG table; partitioned table with LOB partitions; IOT; BASICFILE and SECUREFILE LOBs; LOB in a separate tablespace; recycle-bin objects; autoextend capped.
-- **Fault injection**: kill the worker session in each reclaim step, then `reclaim` -> resume and -> restore; both must end with VERIFY PASS.
-- **Concurrency**: an application session holding a row lock on a scoped table during DRAIN and REFILL (lock timeout path, blocker shown).
-- **Disk pressure**: scratch limited so drain hits the limit (resumable suspend path, then space added).
-- **Stop**: stop requested during purge and during drain.
+- **Purge integrity**: P1-P7 PASS; injected orphan and injected newer-than-cutoff rows are detected; a client-schema FK with ON DELETE CASCADE into a registry table is caught by preflight.
+- **Reclaim layouts**: shared data/index tablespace; separate index tablespace; multi-file and bigfile tablespaces; client-added schema in the tablespace; segmentless tables; partitioned table with LOB partitions and default attributes; IOT; BASICFILE and SECUREFILE LOBs; LONG table (convert / skip); recycle-bin object; cluster (blocker); TDE-encrypted tablespace; user default and quotas on the tablespace; PDB and non-CDB.
+- **Fault injection**: kill the worker session in each reclaim step (including between DROP_OLD and RENAME), then `reclaim --resume`; must end with VERIFY PASS and all accounts restored.
+- **Concurrency**: application sessions connected and one holding an open transaction when the reclaim starts (lock + disconnect path, list shown).
+- **Disk pressure**: target tablespace growth limited so MOVE hits it (resumable suspend path, then space added).
+- **Stop**: stop requested during purge, during compaction and during MOVE.
 
 ### 12.3 Acceptance
 
@@ -692,7 +746,7 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 | 2. Purge engine | `epf_purge`, `epf_space` snapshots, `run/preflight.sql`, `run/purge.sql`. | Parity with baseline; dry-run exact counts. |
 | 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P6, `run/report.sql`. | Purge runs self-verify. |
 | 4. Wrapper | `epf_purge.bat` launcher, `lib/epf.ps1`: CLI, config, wizard, credentials, runner, live view, run folder, exit codes. | End-to-end purge from the wizard and non-interactively. |
-| 5. Reclaim engine | `epf_reclaim` (preflight checks, forecast, state machine, resume/restore), `run/reclaim.sql`, `run/status.sql`, `run/stop.sql`. | Full test matrix 12.2 for reclaim. |
+| 5. Reclaim engine | `epf_reclaim` (inventory, blockers, LONG conversion, account lock/unlock, forecast, swap state machine, resume), `run/reclaim.sql`, `run/status.sql`, `run/stop.sql`. | Full test matrix 12.2 for reclaim. |
 | 6. Report (reclaim part) | Sections 4-5, checks R1-R7, manifest. | Reclaim runs self-verify. |
 | 7. Hardening | Production-sized clone run, tuning of settings defaults, `tools/` diagnostics, removal of superseded files. | Acceptance 12.3. |
 | 8. Linux wrapper | `bin/epf_purge.sh` (bash; same CLI, prompts, live view, run folder, exit codes). | Same run on Linux produces the same report and manifest. |
@@ -712,8 +766,8 @@ Each phase is one reviewable pull request on this branch lineage.
 | `sql/02_/03_epf_purge_pkg_*` | `epf_purge`, `epf_space`, `epf_report`, `epf_log` packages |
 | `sql/04_drop_epf_purge_pkg.sql` | `sql/install/uninstall.sql` |
 | `sql/05_reclaim_tablespace.sql` | `epf_reclaim` package |
-| `sql/05a_shrink_tables.sql` | Removed (D7) |
-| `sql/06_optimize_db.sql` | Redo enlargement removed; stats gathering becomes an option (D5) |
+| `sql/05a_shrink_tables.sql` | Measurement always (6.6); opt-in compaction of purged tables only (6.7) |
+| `sql/06_optimize_db.sql` | Removed (D5) |
 | `sql/06b/06c_*_purge_indexes.sql` | Temporary supporting indexes inside `epf_purge` (6.4) |
 | `sql/12_capture_module_sizes.sql` | `epf_space` + preflight |
 | `utility/07_diagnostic_queries.sql` | Split into preflight checks and `tools/run_history.sql` |
@@ -724,37 +778,35 @@ Each phase is one reviewable pull request on this branch lineage.
 | `utility/15_segment_map.sql` | `tools/segment_map.sql` (per-file) |
 | `utility/16_fk_coverage_scan.sql` | `epf_registry.validate` + `tools/fk_coverage.sql` |
 | Tables `EPF_PURGE_LOG`, `EPF_PURGE_SPACE_SNAPSHOT`, `EPF_DDL_BACKUP`, type `EPF_NUMBER_TAB` | Replaced by section 5 tables; `install.sql` offers to remove the old objects from OPPAYMENTS (after checking that no reclaim is incomplete) |
-| Flags `--reclaim-only`, `--reclaim-online`, `--reclaim-online-only`, `--max-iterations`, `--no-stall-check`, `--allow-offline-index-rebuild`, `--show-sizes`, `--optimize-db`, `--drop-pkg`, `--drop-logs`, `--truncate-logs`, `--sys-password`, `--user`, `--password` | Removed (D12); replaced by actions and the options in 10.1 |
+| Flags `--reclaim-only`, `--reclaim-online`, `--reclaim-online-only`, `--max-iterations`, `--no-stall-check`, `--allow-offline-index-rebuild`, `--show-sizes`, `--optimize-db`, `--drop-pkg`, `--drop-logs`, `--truncate-logs`, `--sys-password`, `--user`, `--password` | Removed (D12); replaced by actions and the options in 10.1. Mode `CLOB_ONLY` is renamed `CLOB`. |
 
 ---
 
-## 15. Design decisions (need your answers)
+## 15. Design decisions
 
-Recommended options are already applied in this plan. Each row states what changes if you choose otherwise.
+| ID | Decision | Answer |
+|----|----------|--------|
+| D1 | Where the tool's objects live | Dedicated tool schema `EPFPG` |
+| D2 | Index/constraint handling during reclaim | Indexes UNUSABLE -> REBUILD; constraints never dropped |
+| D3 | Reclaim strategy | Tablespace swap, all owners moved; index-only tablespaces compacted in place; final name = original (DATA) |
+| D4 | Wrapper runtime | `.bat` launcher + Windows PowerShell 5.1; bash `.sh` in phase 8 |
+| D5 | Database-level operations | Only temporary supporting indexes for the purge; everything else removed; all kept operations work in a PDB |
+| D6 | Purge modes | FULL, CLOB (renamed from CLOB_ONLY), LOGS (new: delete the log tables only), CLOB_N_LOGS |
+| D7 | Showing the effect of a purge | Always measure space inside segments; compaction opt-in (purge-only runs) |
+| D8 | `file_dispatching` rows without children | Purge them too |
+| D9 | Redo during reclaim | Always LOGGING; preflight blocks if the recovery area cannot hold the estimated redo |
+| D10 | Application activity at reclaim start | Show owners and sessions at startup for confirmation; at reclaim start lock accounts and disconnect sessions; always restore account status at the end |
+| D11 | Console layout | Single console: event stream + heartbeat |
+| D12 | Old CLI flags | Clean CLI, no aliases |
+| D13 | Reclaim credentials | SYS, asked at startup only when reclaim is selected; purge never needs SYS; all input at the beginning |
+| D14 | LONG / LONG RAW columns | Convert to CLOB/BLOB with per-item approval at startup; skipped items leave their tablespace unswapped with a warning, a recommended manual path, and a final confirmation; every conversion reported with original and new type |
 
-| ID | Decision | Recommended | If you choose the alternative |
-|----|----------|-------------|-------------------------------|
-| D1 | Where the tool's objects live | Dedicated tool schema `EPF_ADMIN` (name configurable); SYS only at install | Keep in OPPAYMENTS: tool tables in a non-data tablespace; reclaim stays a SYS-run step script (3.4) |
-| D2 | Index/constraint handling during reclaim | Indexes UNUSABLE -> REBUILD; constraints never dropped | Drop/recreate from captured DDL (current): DDL backup table and recovery path stay |
-| D3 | Relocation strategy | In-place drain -> refill (keeps tablespace and datafile identity) | Move once into a new tablespace and swap (7.6 alternative) |
-| D4 | Wrapper runtime | `.bat` launcher + Windows PowerShell 5.1; bash `.sh` in phase 8 | PowerShell 7 on both OSes (one script, `pwsh` required on Linux) |
-| D5 | Database-level operations kept | Temporary supporting indexes (on by default); UNDO/TEMP resize-only (opt-in); registry-table stats (opt-in); remove redo enlargement, `undo_retention` tuning, UNDO swap | Any removed item can be kept as an opt-in option |
-| D6 | Purge modes | Keep FULL, CLOB_ONLY, CLOB_N_LOGS (the engine handles them uniformly) | FULL only, or FULL + CLOB_ONLY |
-| D7 | Post-purge SHRINK SPACE | Remove; disk is returned only by reclaim; purge-only runs report freed-inside-segment space | Keep as opt-in `--compact`, limited to purged tables, SECUREFILE LOBs only |
-| D8 | `file_dispatching` rows without `directory_dispatching` children | Purge them too (all rows older than the cutoff) | Keep current behavior (only parents that have children) |
-| D9 | NOLOGGING for reclaim moves/rebuilds | No: always LOGGING; preflight blocks if redo would exceed recovery-area headroom | Allowed when the DB is not in FORCE LOGGING; much less redo; a backup is required afterwards |
-| D10 | Quiesce enforcement for reclaim | Preflight blocks when application sessions / transactions / jobs are active | Also lock the application accounts for the window (unlocked at the end), or warn only |
-| D11 | Console layout | Single console: event stream + heartbeat | Keep a separate monitor window (same data source) |
-| D12 | Old CLI flags | Clean CLI, no aliases | Keep aliases for existing scheduled jobs |
+Also settled:
 
-Decided without asking (tell me if you disagree):
-
-- Scope schemas and scoped tablespaces are auto-detected and overridable (7.4).
-- `EPF_SCRATCH` is created at install and kept small between runs (3.4).
+- Application schemas default to `OP, OPPAYMENTS, OPREPORTS`; target tablespaces are the ones they occupy; every owner inside a target is inventoried and moved (7.4).
+- Datafile paths are restored to the original on EE (online move); on SE2 the new path is kept and reported.
 - Run history is kept 180 days (setting).
-- Row-count parity for reclaim uses PK index fast full scans (7.6 BASELINE).
-
----
+- Row-count parity for reclaim uses PK index fast full scans.
 
 ## 16. Risks and mitigations
 
@@ -764,6 +816,9 @@ Decided without asking (tell me if you disagree):
 | Registry-driven engine deletes differently from the current hand-written code | Phase 2 parity test against the current tool on a clone; registry reproduces today's links and order exactly. |
 | Reclaim takes longer than a maintenance window | Forecast with throughput sampling; stop request always ends in a consistent state (restore path); resume later. |
 | Recovery area / disk pressure | Preflight redo and peak-disk forecasts; resumable suspend instead of failure; `--scratch-dir`. |
-| Application writes during reclaim | Preflight blocks (D10); unusable unique indexes make writes fail instead of corrupting. |
-| Tool-schema privileges considered too broad by security | Privilege list is explicit (3.4), no `ALTER USER`, no `CREATE/DROP TABLESPACE`; alternative D1 keeps SYS for reclaim only. |
+| Application writes during reclaim | Accounts locked and sessions disconnected (D10); unusable unique indexes make any remaining write fail instead of corrupting. |
+| Accounts left locked after a crash | Every run and `status` restores accounts recorded in `EPF_ACCOUNT_ACTION` before anything else. |
+| LONG conversion changes an application contract | Per-item approval with dependents shown; irreversible nature stated; every conversion reported. |
+| Client objects of an unsupported kind in a target tablespace | Fail-closed inventory; that tablespace is not swapped; `DROP TABLESPACE` without `INCLUDING CONTENTS` as final safety net. |
+| Tool-schema privileges considered too broad by security | EPFPG holds only purge/report rights (3.4); DBA-level work runs only as SYS, supplied per run. |
 | Two wrapper implementations drift (bat/ps1 vs sh) | Logic in the database; wrappers only render events; phase 8 compares manifests from both. |
