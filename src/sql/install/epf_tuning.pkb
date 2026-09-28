@@ -1,15 +1,34 @@
-CREATE OR REPLACE PACKAGE BODY epf_redo AS
+CREATE OR REPLACE PACKAGE BODY epf_tuning AS
 
     c_rounds    CONSTANT PLS_INTEGER  := 12;
     c_directory CONSTANT VARCHAR2(30) := 'EPF_REDO_OLD';
 
     PROCEDURE say(p_severity IN VARCHAR2, p_code IN VARCHAR2, p_message IN VARCHAR2) IS
     BEGIN
-        DBMS_OUTPUT.PUT_LINE('  ' || RPAD(p_code, 20) || ' ' || p_message);
+        DBMS_OUTPUT.PUT_LINE('  ' || RPAD(p_code, 22) || ' ' || p_message);
         IF epfpg.epf_log.current_run IS NOT NULL THEN
             epfpg.epf_log.event(p_severity, p_code, p_message);
         END IF;
     END say;
+
+    -- SYS on a single-instance, non-CDB database.
+    PROCEDURE check_instance IS
+        l_cdb     VARCHAR2(3);
+        l_threads NUMBER;
+    BEGIN
+        IF SYS_CONTEXT('USERENV', 'SESSION_USER') <> 'SYS' THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Run as SYS AS SYSDBA.');
+        END IF;
+        SELECT cdb INTO l_cdb FROM v$database;
+        IF l_cdb = 'YES' THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Multitenant database: online redo logs and instance parameters belong '
+                                            || 'to the CDB and are tuned by the DBA in CDB$ROOT.');
+        END IF;
+        SELECT COUNT(DISTINCT thread#) INTO l_threads FROM v$log;
+        IF l_threads > 1 THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Several redo threads (RAC): tune each instance manually.');
+        END IF;
+    END check_instance;
 
     PROCEDURE show_groups(p_label IN VARCHAR2) IS
     BEGIN
@@ -52,11 +71,9 @@ CREATE OR REPLACE PACKAGE BODY epf_redo AS
             say('WARN', 'REDO_FILE_KEPT', p_file || ' could not be deleted (' || SQLERRM || '); delete it manually');
     END remove_file;
 
-    PROCEDURE enlarge(p_size_mb IN NUMBER DEFAULT 1024, p_groups IN NUMBER DEFAULT 4) IS
+    PROCEDURE enlarge_redo(p_size_mb IN NUMBER DEFAULT 1024, p_groups IN NUMBER DEFAULT 4) IS
         l_bytes      NUMBER;
-        l_cdb        VARCHAR2(3);
         l_log_mode   VARCHAR2(12);
-        l_threads    NUMBER;
         l_big        NUMBER;
         l_small      NUMBER;
         l_next       NUMBER;
@@ -71,9 +88,7 @@ CREATE OR REPLACE PACKAGE BODY epf_redo AS
         l_left       NUMBER;
         l_removed    BOOLEAN := FALSE;
     BEGIN
-        IF SYS_CONTEXT('USERENV', 'SESSION_USER') <> 'SYS' THEN
-            RAISE_APPLICATION_ERROR(-20150, 'Run as SYS AS SYSDBA.');
-        END IF;
+        check_instance;
         IF p_size_mb IS NULL OR p_size_mb <> TRUNC(p_size_mb) OR p_size_mb NOT BETWEEN 64 AND 16384 THEN
             RAISE_APPLICATION_ERROR(-20150, 'Log size must be a whole number of MB between 64 and 16384, got: '
                                             || p_size_mb);
@@ -82,17 +97,7 @@ CREATE OR REPLACE PACKAGE BODY epf_redo AS
             RAISE_APPLICATION_ERROR(-20150, 'Group count must be a whole number between 2 and 16, got: ' || p_groups);
         END IF;
         l_bytes := p_size_mb * 1048576;
-
-        SELECT cdb, log_mode INTO l_cdb, l_log_mode FROM v$database;
-        IF l_cdb = 'YES' THEN
-            RAISE_APPLICATION_ERROR(-20150, 'Multitenant database: the online redo logs belong to the CDB and are '
-                                            || 'sized by the DBA in CDB$ROOT.');
-        END IF;
-        SELECT COUNT(DISTINCT thread#) INTO l_threads FROM v$log;
-        IF l_threads > 1 THEN
-            RAISE_APPLICATION_ERROR(-20150, 'Several redo threads (RAC): size the online redo logs of each thread '
-                                            || 'manually.');
-        END IF;
+        SELECT log_mode INTO l_log_mode FROM v$database;
 
         show_groups('before');
         SELECT COUNT(CASE WHEN bytes >= l_bytes THEN 1 END), COUNT(CASE WHEN bytes < l_bytes THEN 1 END), MAX(group#)
@@ -212,7 +217,153 @@ CREATE OR REPLACE PACKAGE BODY epf_redo AS
         show_groups('after');
         SELECT COUNT(*), MIN(bytes) INTO l_big, l_bytes FROM v$log;
         say('OK', 'REDO_ENLARGED', l_big || ' online redo log groups, smallest ' || ROUND(l_bytes / 1048576) || ' MB');
-    END enlarge;
+    END enlarge_redo;
 
-END epf_redo;
+    -- ------------------------------------------------------------------
+    -- Undo
+    -- ------------------------------------------------------------------
+
+    FUNCTION undo_tablespace RETURN VARCHAR2 IS
+        l_value VARCHAR2(128);
+    BEGIN
+        SELECT UPPER(value) INTO l_value FROM v$parameter WHERE name = 'undo_tablespace';
+        RETURN l_value;
+    END undo_tablespace;
+
+    PROCEDURE undo_status IS
+        l_ts        VARCHAR2(128) := undo_tablespace;
+        l_retention VARCHAR2(40);
+        l_guarantee VARCHAR2(11);
+    BEGIN
+        SELECT value INTO l_retention FROM v$parameter WHERE name = 'undo_retention';
+        SELECT MAX(retention) INTO l_guarantee FROM dba_tablespaces WHERE tablespace_name = l_ts;
+        DBMS_OUTPUT.PUT_LINE('  undo tablespace        ' || l_ts || ' (' || l_guarantee || '), undo_retention '
+                             || l_retention || ' s');
+        FOR f IN (SELECT file_id, file_name, ROUND(bytes / 1048576) AS mb, autoextensible,
+                         ROUND(maxbytes / 1048576) AS max_mb
+                    FROM dba_data_files
+                   WHERE tablespace_name = l_ts
+                   ORDER BY file_id) LOOP
+            DBMS_OUTPUT.PUT_LINE('  undo datafile          ' || f.file_id || ' ' || f.file_name || ': ' || f.mb
+                                 || ' MB, autoextend ' || f.autoextensible
+                                 || CASE WHEN f.autoextensible = 'YES' THEN ' up to ' || f.max_mb || ' MB' END);
+        END LOOP;
+        FOR c IN (SELECT change_id, item, target, original_value, original_maxbytes, applied_value, applied_at
+                    FROM epfpg.epf_instance_change
+                   WHERE restored_at IS NULL AND item LIKE 'UNDO%'
+                   ORDER BY change_id) LOOP
+            DBMS_OUTPUT.PUT_LINE('  active change          ' || c.item || ' ' || c.target || ': '
+                                 || CASE c.item WHEN 'UNDO_RETENTION'
+                                        THEN c.original_value || ' s -> ' || c.applied_value || ' s'
+                                        ELSE 'max ' || ROUND(c.original_maxbytes / 1048576) || ' MB -> '
+                                             || ROUND(c.applied_value / 1048576) || ' MB' END
+                                 || ' since ' || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS'));
+        END LOOP;
+    END undo_status;
+
+    PROCEDURE undo_apply IS
+        l_retention NUMBER := epfpg.epf_util.setting_num('undo_retention_s');
+        l_max_bytes NUMBER := epfpg.epf_util.setting_num('undo_max_mb') * 1048576;
+        l_ts        VARCHAR2(128);
+        l_guarantee VARCHAR2(11);
+        l_block     NUMBER;
+        l_current   NUMBER;
+        l_active    NUMBER;
+        l_cap       NUMBER;
+        l_run       NUMBER := epfpg.epf_log.current_run;
+    BEGIN
+        check_instance;
+        SELECT COUNT(*) INTO l_active
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item LIKE 'UNDO%';
+        IF l_active > 0 THEN
+            say('INFO', 'UNDO_ALREADY_APPLIED', l_active || ' undo changes are active; restore them first to apply again');
+            undo_status;
+            RETURN;
+        END IF;
+
+        l_ts := undo_tablespace;
+        SELECT retention, block_size INTO l_guarantee, l_block FROM dba_tablespaces WHERE tablespace_name = l_ts;
+        IF l_guarantee = 'GUARANTEE' THEN
+            RAISE_APPLICATION_ERROR(-20152, 'Undo tablespace ' || l_ts || ' has RETENTION GUARANTEE: lowering the '
+                                            || 'retention would make transactions fail (ORA-30036).');
+        END IF;
+        undo_status;
+
+        SELECT TO_NUMBER(value) INTO l_current FROM v$parameter WHERE name = 'undo_retention';
+        IF l_retention < l_current THEN
+            INSERT INTO epfpg.epf_instance_change (item, target, original_value, applied_value, applied_at,
+                                                   applied_run_id)
+            VALUES ('UNDO_RETENTION', 'undo_retention', l_current, l_retention, CAST(SYSTIMESTAMP AS TIMESTAMP), l_run);
+            COMMIT;
+            EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_retention = ' || l_retention || ' SCOPE = MEMORY';
+            say('OK', 'UNDO_RETENTION_SET', 'undo_retention ' || l_current || ' s -> ' || l_retention || ' s');
+        ELSE
+            say('INFO', 'UNDO_RETENTION_KEPT', 'undo_retention is already ' || l_current || ' s');
+        END IF;
+
+        FOR f IN (SELECT file_id, file_name, bytes, autoextensible, maxbytes, increment_by
+                    FROM dba_data_files
+                   WHERE tablespace_name = l_ts
+                   ORDER BY file_id) LOOP
+            l_cap := CEIL(GREATEST(f.bytes, l_max_bytes) / 1048576) * 1048576;
+            IF f.autoextensible = 'YES' AND l_cap < f.maxbytes THEN
+                INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_autoextend, original_maxbytes,
+                                                       original_increment, applied_value, applied_at,
+                                                       applied_run_id)
+                VALUES ('UNDO_DATAFILE', f.file_name, f.file_id, 'YES', f.maxbytes,
+                        GREATEST(f.increment_by, 1) * l_block, l_cap, CAST(SYSTIMESTAMP AS TIMESTAMP), l_run);
+                COMMIT;
+                EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || f.file_id || ' AUTOEXTEND ON NEXT '
+                                  || GREATEST(f.increment_by, 1) * l_block / 1024 || 'K MAXSIZE ' || l_cap / 1024 || 'K';
+                say('OK', 'UNDO_GROWTH_CAPPED', f.file_name || ': may grow to ' || ROUND(l_cap / 1048576) || ' MB (was '
+                                                || ROUND(f.maxbytes / 1048576) || ' MB)');
+            ELSE
+                say('INFO', 'UNDO_GROWTH_KEPT', f.file_name || ': '
+                                                || CASE WHEN f.autoextensible = 'YES'
+                                                        THEN 'already limited to ' || ROUND(f.maxbytes / 1048576) || ' MB'
+                                                        ELSE 'autoextend is off' END);
+            END IF;
+        END LOOP;
+        say('WARN', 'UNDO_APPLIED', 'Undo tuning is active until undo_restore: long queries of other sessions may fail '
+                                    || 'with ORA-01555 meanwhile');
+    END undo_apply;
+
+    PROCEDURE undo_restore IS
+        l_count  NUMBER := 0;
+        l_exists NUMBER;
+    BEGIN
+        check_instance;
+        FOR c IN (SELECT change_id, item, target, file_id, original_value, original_maxbytes, original_increment
+                    FROM epfpg.epf_instance_change
+                   WHERE restored_at IS NULL AND item LIKE 'UNDO%'
+                   ORDER BY change_id DESC) LOOP
+            IF c.item = 'UNDO_RETENTION' THEN
+                EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_retention = ' || c.original_value || ' SCOPE = MEMORY';
+                say('OK', 'UNDO_RETENTION_RESTORED', 'undo_retention ' || c.original_value || ' s');
+            ELSE
+                SELECT COUNT(*) INTO l_exists FROM dba_data_files WHERE file_id = c.file_id AND file_name = c.target;
+                IF l_exists > 0 THEN
+                    EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || c.file_id || ' AUTOEXTEND ON NEXT '
+                                      || c.original_increment / 1024 || 'K MAXSIZE ' || c.original_maxbytes / 1024 || 'K';
+                    say('OK', 'UNDO_GROWTH_RESTORED', c.target || ': may grow to '
+                                                      || ROUND(c.original_maxbytes / 1048576) || ' MB');
+                ELSE
+                    say('WARN', 'UNDO_FILE_GONE', c.target || ' (file ' || c.file_id || ') no longer exists; nothing '
+                                                  || 'to restore');
+                END IF;
+            END IF;
+            UPDATE epfpg.epf_instance_change
+               SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+             WHERE change_id = c.change_id;
+            COMMIT;
+            l_count := l_count + 1;
+        END LOOP;
+        IF l_count = 0 THEN
+            say('INFO', 'UNDO_NOTHING_TO_RESTORE', 'No active undo change');
+        END IF;
+        undo_status;
+    END undo_restore;
+
+END epf_tuning;
 /

@@ -56,6 +56,27 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     TYPE t_numbers IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
     TYPE t_key_map IS TABLE OF NUMBER INDEX BY VARCHAR2(200);
 
+    -- An index the purge of a module relies on:
+    --   link  the match column of every link into its tables and the source
+    --         column of a reverse link: read once per batch, indexed when the
+    --         table is at least temp_index_min_mb
+    --   fk    when the module deletes, the columns of every enabled FK into
+    --         its tables (any schema): Oracle looks up child rows for each
+    --         deleted parent row, scanning the child table when these columns
+    --         are not indexed, so they are indexed whatever the size
+    -- table_id is NULL for a child table outside the registry, which the tool
+    -- cannot index.
+    TYPE t_need IS RECORD (
+        table_id   NUMBER,
+        owner      VARCHAR2(128),
+        table_name VARCHAR2(128),
+        col_list   SYS.ODCIVARCHAR2LIST,
+        fk         BOOLEAN,
+        detail     VARCHAR2(400)
+    );
+    TYPE t_needs IS TABLE OF t_need INDEX BY PLS_INTEGER;
+    TYPE t_position_map IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(4000);
+
     g_run      epf_run%ROWTYPE;
     g_tables   t_tables;
     g_links    t_links;
@@ -935,34 +956,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Temporary supporting indexes
     -- ------------------------------------------------------------------
 
-    -- Indexes the purge of a module relies on:
-    --   link     the match column of every link into its tables and the source
-    --            column of a reverse link: read once per batch, indexed when
-    --            the table is at least temp_index_min_mb
-    --   fk       when the module deletes, the columns of every enabled FK into
-    --            its tables (any schema): Oracle looks up child rows for each
-    --            deleted parent row, scanning the child table when these
-    --            columns are not indexed, so they are indexed whatever the size
-    -- table_id is NULL for a child table outside the registry, which the tool
-    -- cannot index.
-    TYPE t_need IS RECORD (
-        table_id   NUMBER,
-        owner      VARCHAR2(128),
-        table_name VARCHAR2(128),
-        columns    SYS.ODCIVARCHAR2LIST,
-        fk         BOOLEAN,
-        detail     VARCHAR2(400)
-    );
-    TYPE t_needs IS TABLE OF t_need INDEX BY PLS_INTEGER;
-    TYPE t_position_map IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(4000);
-
+    -- Indexes the purge of a module relies on (see t_need).
     FUNCTION index_needs(p_module IN VARCHAR2) RETURN t_needs IS
         l_out  t_needs;
         l_seen t_position_map;
         l_cols SYS.ODCIVARCHAR2LIST;
         i      PLS_INTEGER := g_links.FIRST;
 
-        PROCEDURE add(p_table_id IN NUMBER, p_owner IN VARCHAR2, p_table IN VARCHAR2,
+        PROCEDURE add_need(p_table_id IN NUMBER, p_owner IN VARCHAR2, p_table IN VARCHAR2,
                       p_columns IN SYS.ODCIVARCHAR2LIST, p_fk IN BOOLEAN, p_detail IN VARCHAR2) IS
             l_key VARCHAR2(4000) := p_owner || '.' || p_table || ':' || column_text(p_columns);
             l_new t_need;
@@ -974,19 +975,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_new.table_id   := p_table_id;
             l_new.owner      := p_owner;
             l_new.table_name := p_table;
-            l_new.columns    := p_columns;
+            l_new.col_list   := p_columns;
             l_new.fk         := p_fk;
             l_new.detail     := p_detail;
             l_out(l_out.COUNT + 1) := l_new;
             l_seen(l_key) := l_out.COUNT;
-        END add;
+        END add_need;
     BEGIN
         WHILE i IS NOT NULL LOOP
             IF g_links(i).usable AND g_tables(g_links(i).table_id).module_code = p_module THEN
-                add(g_links(i).table_id, g_tables(g_links(i).table_id).owner, g_tables(g_links(i).table_id).table_name,
+                add_need(g_links(i).table_id, g_tables(g_links(i).table_id).owner, g_tables(g_links(i).table_id).table_name,
                     SYS.ODCIVARCHAR2LIST(g_links(i).match_column), FALSE, 'link ' || g_links(i).link_id);
                 IF NOT g_links(i).direct THEN
-                    add(g_links(i).source_table_id, g_tables(g_links(i).source_table_id).owner,
+                    add_need(g_links(i).source_table_id, g_tables(g_links(i).source_table_id).owner,
                         g_tables(g_links(i).source_table_id).table_name,
                         SYS.ODCIVARCHAR2LIST(g_links(i).source_column), FALSE, 'link ' || g_links(i).link_id);
                 END IF;
@@ -1014,7 +1015,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                   FROM dba_cons_columns
                  WHERE owner = f.c_owner AND constraint_name = f.constraint_name
                  ORDER BY position;
-                add(f.c_id, f.c_owner, f.c_table, l_cols, TRUE, 'FK ' || f.constraint_name || ' -> ' || f.p_table);
+                add_need(f.c_id, f.c_owner, f.c_table, l_cols, TRUE, 'FK ' || f.constraint_name || ' -> ' || f.p_table);
             END LOOP;
         END IF;
         RETURN l_out;
@@ -1051,8 +1052,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     BEGIN
         p_created := 0;
         FOR k IN 1 .. l_needs.COUNT LOOP
-            CONTINUE WHEN index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).columns);
-            l_cols  := column_text(l_needs(k).columns);
+            CONTINUE WHEN index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).col_list);
+            l_cols  := column_text(l_needs(k).col_list);
             l_bytes := table_bytes(l_needs(k).owner, l_needs(k).table_name);
             IF l_needs(k).table_id IS NULL THEN
                 g_warnings := g_warnings + 1;
@@ -1072,7 +1073,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             BEGIN
                 EXECUTE IMMEDIATE 'CREATE INDEX ' || qc(l_name) || ' ON '
                                   || epf_util.qname(l_needs(k).owner, l_needs(k).table_name)
-                                  || ' (' || column_text(l_needs(k).columns, p_quoted => TRUE) || ')' || l_online;
+                                  || ' (' || column_text(l_needs(k).col_list, p_quoted => TRUE) || ')' || l_online;
                 p_created := p_created + 1;
                 epf_log.event(epf_log.c_info, 'TEMP_INDEX_CREATED',
                               l_name || ' on ' || l_cols || ' (' || l_needs(k).detail || ', table '
@@ -1167,21 +1168,32 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_out;
     END batch_statements;
 
-    -- Redo generated by this session so far (V$MYSTAT 'redo size').
-    FUNCTION session_redo RETURN NUMBER IS
+    -- Statistic of this session so far (V$MYSTAT), e.g. 'redo size' or
+    -- 'undo change vector size'.
+    FUNCTION session_stat(p_name IN VARCHAR2) RETURN NUMBER IS
         l_value NUMBER;
     BEGIN
         SELECT m.value
           INTO l_value
           FROM v$mystat m
           JOIN v$statname n ON n.statistic# = m.statistic#
-         WHERE n.name = 'redo size';
+         WHERE n.name = p_name;
         RETURN l_value;
+    END session_stat;
+
+    FUNCTION session_redo RETURN NUMBER IS
+    BEGIN
+        RETURN session_stat('redo size');
     END session_redo;
+
+    FUNCTION session_undo RETURN NUMBER IS
+    BEGIN
+        RETURN session_stat('undo change vector size');
+    END session_undo;
 
     PROCEDURE process_batches(p_module IN VARCHAR2, p_action IN VARCHAR2, p_roots IN SYS.ODCINUMBERLIST,
                               p_total IN NUMBER, p_processed IN OUT NOCOPY t_numbers, p_result OUT VARCHAR2,
-                              p_redo OUT NUMBER) IS
+                              p_redo OUT NUMBER, p_undo OUT NUMBER) IS
         l_stmts      t_stmts;
         l_batch      t_numbers;
         l_max        NUMBER;
@@ -1201,22 +1213,36 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_error      VARCHAR2(4000);
         l_run        NUMBER := g_run.run_id;
         l_redo_start NUMBER := session_redo;
+        l_undo_start NUMBER := session_undo;
         l_tree_redo  NUMBER;
+        l_tree_undo  NUMBER;
+        l_tree_start TIMESTAMP;
         l_tree_roots NUMBER;
         k            PLS_INTEGER;
 
-        -- Records the redo of one root tree (TREE_REDO: rows = roots processed,
-        -- bytes = redo); preflight uses it to recommend a batch size.
+        -- Records the redo and undo of one root tree (TREE_REDO / TREE_UNDO:
+        -- rows = roots processed, bytes = redo or undo, elapsed seconds);
+        -- preflight uses them to recommend a batch size and to estimate undo
+        -- growth.
         PROCEDURE tree_done(p_root_id IN NUMBER) IS
-            l_bytes NUMBER := session_redo - l_tree_redo;
+            l_redo    NUMBER := session_redo - l_tree_redo;
+            l_undo    NUMBER := session_undo - l_tree_undo;
+            l_elapsed NUMBER := epf_util.elapsed_s(l_tree_start);
         BEGIN
             IF l_tree_roots > 0 THEN
                 epf_log.event(epf_log.c_info, 'TREE_REDO',
-                              epf_util.fmt_bytes(l_bytes) || ' redo for ' || epf_util.fmt_int(l_tree_roots)
-                              || ' roots (' || epf_util.fmt_bytes(l_bytes / l_tree_roots) || ' per root)',
+                              epf_util.fmt_bytes(l_redo) || ' redo for ' || epf_util.fmt_int(l_tree_roots)
+                              || ' roots (' || epf_util.fmt_bytes(l_redo / l_tree_roots) || ' per root)',
                               p_object_owner => g_tables(p_root_id).owner,
                               p_object_name => g_tables(p_root_id).table_name,
-                              p_rows => l_tree_roots, p_bytes => l_bytes);
+                              p_rows => l_tree_roots, p_bytes => l_redo, p_elapsed_s => l_elapsed);
+                epf_log.event(epf_log.c_info, 'TREE_UNDO',
+                              epf_util.fmt_bytes(l_undo) || ' undo for ' || epf_util.fmt_int(l_tree_roots)
+                              || ' roots (' || epf_util.fmt_bytes(l_undo / l_tree_roots) || ' per root, '
+                              || epf_util.fmt_bytes(l_undo / GREATEST(l_elapsed, 1)) || '/s)',
+                              p_object_owner => g_tables(p_root_id).owner,
+                              p_object_name => g_tables(p_root_id).table_name,
+                              p_rows => l_tree_roots, p_bytes => l_undo, p_elapsed_s => l_elapsed);
             END IF;
         END tree_done;
     BEGIN
@@ -1229,6 +1255,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
               FROM epf_work_key
              WHERE run_id = l_run AND table_id = p_roots(r);
             l_tree_redo  := session_redo;
+            l_tree_undo  := session_undo;
+            l_tree_start := epf_util.now_ts;
             l_tree_roots := 0;
             FOR b IN 1 .. l_max LOOP
                 IF epf_control.stop_requested(l_run) THEN
@@ -1276,6 +1304,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 l_done := l_done + 1;
                 l_rows := l_rows + l_batch_rows;
                 p_redo := session_redo - l_redo_start;
+                p_undo := session_undo - l_undo_start;
                 epf_log.step_progress(l_done, p_redo);
 
                 IF l_done = 1 OR l_done = p_total OR l_last IS NULL OR epf_util.elapsed_s(l_last) >= l_interval THEN
@@ -1286,6 +1315,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                   || ' ' || TO_CHAR(l_pct, 'FM990.0') || '% ' || l_unit || ' ' || epf_util.fmt_int(l_rows)
                                   || ' ' || epf_util.fmt_int(CASE WHEN l_elapsed > 0 THEN l_rows / l_elapsed END) || '/s'
                                   || ' redo ' || epf_util.fmt_bytes(p_redo / l_done) || '/batch'
+                                  || ' undo ' || epf_util.fmt_bytes(p_undo / l_done) || '/batch'
                                   || ' ETA ' || epf_util.fmt_duration(l_elapsed / l_done * (p_total - l_done)),
                                   p_rows => l_rows, p_bytes => p_redo, p_pct => l_pct, p_elapsed_s => l_elapsed);
                     l_last := epf_util.now_ts;
@@ -1298,9 +1328,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END LOOP trees;
 
         p_redo := session_redo - l_redo_start;
+        p_undo := session_undo - l_undo_start;
         epf_log.step_end(CASE p_result WHEN 'FAILED' THEN 'FAILED' ELSE 'DONE' END,
                          epf_util.fmt_int(l_done) || '/' || epf_util.fmt_int(p_total) || ' batches, '
-                         || epf_util.fmt_int(l_rows) || ' ' || l_unit || ', ' || epf_util.fmt_bytes(p_redo) || ' redo'
+                         || epf_util.fmt_int(l_rows) || ' ' || l_unit || ', ' || epf_util.fmt_bytes(p_redo) || ' redo, '
+                         || epf_util.fmt_bytes(p_undo) || ' undo'
                          || CASE p_result WHEN 'STOPPED' THEN ', stopped on request' END);
     END process_batches;
 
@@ -1320,6 +1352,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_failed    BOOLEAN := FALSE;
         l_batch_res VARCHAR2(10) := 'DONE';
         l_redo      NUMBER;
+        l_undo      NUMBER;
         l_sum       NUMBER := 0;
         l_start     TIMESTAMP := epf_util.now_ts;
         k           PLS_INTEGER;
@@ -1375,7 +1408,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             IF NOT l_failed THEN
                 BEGIN
-                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_batch_res, l_redo);
+                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_batch_res, l_redo, l_undo);
                     l_failed := l_batch_res = 'FAILED';
                 EXCEPTION
                     WHEN OTHERS THEN
@@ -1418,7 +1451,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       || CASE WHEN g_run.dry_run = 'Y' THEN ' (dry run, nothing changed)'
                               ELSE ': ' || epf_util.fmt_int(l_sum) || ' '
                                    || CASE l_action WHEN c_delete THEN 'rows deleted' ELSE 'LOB values cleared' END
-                                   || CASE WHEN l_redo IS NOT NULL THEN ', ' || epf_util.fmt_bytes(l_redo) || ' redo' END
+                                   || CASE WHEN l_redo IS NOT NULL THEN ', ' || epf_util.fmt_bytes(l_redo) || ' redo, '
+                                                                        || epf_util.fmt_bytes(l_undo) || ' undo' END
                          END
                       || ' in ' || epf_util.fmt_duration(epf_util.elapsed_s(l_start)),
                       p_rows => l_sum, p_bytes => l_redo, p_elapsed_s => epf_util.elapsed_s(l_start));
@@ -1480,7 +1514,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_needs := index_needs(g_modules(m));
             FOR k IN 1 .. l_needs.COUNT LOOP
                 l_needed := l_needed + 1;
-                IF index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).columns) THEN
+                IF index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).col_list) THEN
                     l_indexed := l_indexed + 1;
                 ELSE
                     l_bytes := table_bytes(l_needs(k).owner, l_needs(k).table_name);
@@ -1501,7 +1535,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                     END IF;
                     epf_log.event(CASE WHEN l_needs(k).table_id IS NULL THEN epf_log.c_warn ELSE epf_log.c_info END,
                                   'IDX_MISSING',
-                                  'No index on ' || column_text(l_needs(k).columns) || ' (' || l_needs(k).detail
+                                  'No index on ' || column_text(l_needs(k).col_list) || ' (' || l_needs(k).detail
                                   || ', table ' || epf_util.fmt_bytes(l_bytes) || '): ' || l_note,
                                   p_object_owner => l_needs(k).owner, p_object_name => l_needs(k).table_name,
                                   p_bytes => l_bytes);
@@ -1674,6 +1708,117 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END IF;
     END check_redo;
 
+    -- Active undo tuning recorded by epf_tuning (NULL when none).
+    FUNCTION undo_tuning_text RETURN VARCHAR2 IS
+        l_text VARCHAR2(4000);
+    BEGIN
+        FOR c IN (SELECT item, target, original_value, original_maxbytes, applied_value
+                    FROM epf_instance_change
+                   WHERE restored_at IS NULL AND item LIKE 'UNDO%'
+                   ORDER BY change_id) LOOP
+            l_text := l_text || CASE WHEN l_text IS NOT NULL THEN '; ' END
+                      || CASE c.item
+                             WHEN 'UNDO_RETENTION'
+                             THEN 'undo_retention ' || c.original_value || ' s -> ' || c.applied_value || ' s'
+                             ELSE c.target || ' growth limit ' || epf_util.fmt_bytes(c.original_maxbytes) || ' -> '
+                                  || epf_util.fmt_bytes(c.applied_value)
+                         END;
+        END LOOP;
+        RETURN l_text;
+    END undo_tuning_text;
+
+    -- Undo tablespace against the undo of a batch and of the purge. Undo per
+    -- root comes from the latest measurement of the tree (TREE_UNDO), else it
+    -- is estimated as 45% of the redo estimate. With a measured rate, the undo
+    -- kept for undo_retention is estimated as rate x undo_retention: when that
+    -- exceeds the current size, the undo tablespace grows during the purge
+    -- unless undo tuning is applied.
+    PROCEDURE check_undo IS
+        l_ts        VARCHAR2(128);
+        l_retention NUMBER;
+        l_tuned     NUMBER;
+        l_size      NUMBER;
+        l_max       NUMBER;
+        l_guarantee VARCHAR2(11);
+        l_tuning    VARCHAR2(4000) := undo_tuning_text;
+        l_owner     VARCHAR2(128);
+        l_table     VARCHAR2(128);
+        l_per_root  NUMBER;
+        l_rate      NUMBER;
+        l_run       NUMBER;
+        l_redo      NUMBER;
+        l_source    VARCHAR2(400);
+        l_batch     NUMBER;
+        l_kept      NUMBER;
+        l_warn      BOOLEAN;
+    BEGIN
+        SELECT UPPER(value) INTO l_ts FROM v$parameter WHERE name = 'undo_tablespace';
+        SELECT TO_NUMBER(value) INTO l_retention FROM v$parameter WHERE name = 'undo_retention';
+        SELECT MAX(tuned_undoretention) INTO l_tuned FROM v$undostat WHERE begin_time > SYSDATE - 1;
+        SELECT SUM(bytes), SUM(CASE WHEN autoextensible = 'YES' THEN GREATEST(maxbytes, bytes) ELSE bytes END)
+          INTO l_size, l_max
+          FROM dba_data_files
+         WHERE tablespace_name = l_ts;
+        SELECT MAX(retention) INTO l_guarantee FROM dba_tablespaces WHERE tablespace_name = l_ts;
+        epf_log.event(epf_log.c_info, 'UNDO',
+                      l_ts || ' ' || epf_util.fmt_bytes(l_size) || ', can grow to ' || epf_util.fmt_bytes(l_max)
+                      || '; undo_retention ' || l_retention || ' s (tuned up to ' || NVL(TO_CHAR(l_tuned), '-')
+                      || ' s in the last 24 hours), retention ' || LOWER(l_guarantee)
+                      || CASE WHEN l_tuning IS NOT NULL THEN '; undo tuning active: ' || l_tuning
+                              ELSE '; undo tuning not applied' END,
+                      p_bytes => l_size);
+
+        FOR r IN (SELECT e.table_id
+                    FROM epf_table e
+                    JOIN epf_module m ON m.module_code = e.module_code
+                   WHERE e.active = 'Y' AND e.role = 'ROOT'
+                   ORDER BY m.display_order, e.table_id) LOOP
+            CONTINUE WHEN NOT in_scope(g_tables(r.table_id).module_code)
+                          OR NOT g_tables(r.table_id).reachable
+                          OR module_action(g_tables(r.table_id).module_code) <> c_delete;
+            l_owner := g_tables(r.table_id).owner;
+            l_table := g_tables(r.table_id).table_name;
+            SELECT MAX(bytes / rows_affected) KEEP (DENSE_RANK LAST ORDER BY event_id),
+                   MAX(bytes / GREATEST(elapsed_s, 1)) KEEP (DENSE_RANK LAST ORDER BY event_id),
+                   MAX(run_id) KEEP (DENSE_RANK LAST ORDER BY event_id)
+              INTO l_per_root, l_rate, l_run
+              FROM epf_event
+             WHERE event_code = 'TREE_UNDO'
+               AND object_owner = l_owner AND object_name = l_table
+               AND rows_affected > 0 AND bytes > 0;
+            IF l_per_root IS NOT NULL THEN
+                l_source := 'measured by ' || epf_util.run_label(l_run);
+            ELSE
+                tree_redo(r.table_id, l_redo, l_source);
+                CONTINUE WHEN l_redo IS NULL;
+                l_per_root := 0.45 * l_redo;
+                l_source   := 'estimated from the redo, ' || l_source;
+                l_rate     := NULL;
+            END IF;
+            l_batch := l_per_root * g_run.batch_size;
+            l_kept  := l_rate * l_retention;
+            l_warn  := l_batch > 0.5 * l_max OR (l_tuning IS NULL AND l_kept > l_size);
+            IF l_warn THEN
+                g_warnings := g_warnings + 1;
+            END IF;
+            epf_log.event(CASE WHEN l_warn THEN epf_log.c_warn ELSE epf_log.c_info END, 'UNDO_ESTIMATE',
+                          'about ' || epf_util.fmt_bytes(l_per_root) || ' undo per root (' || l_source || '): '
+                          || epf_util.fmt_bytes(l_batch) || ' per batch of ' || epf_util.fmt_int(g_run.batch_size)
+                          || CASE WHEN l_kept IS NOT NULL THEN
+                                 '; at ' || epf_util.fmt_bytes(l_rate) || '/s, undo_retention ' || l_retention
+                                 || ' s keeps about ' || epf_util.fmt_bytes(l_kept)
+                             END
+                          || CASE WHEN l_batch > 0.5 * l_max THEN
+                                 '; a batch needs more than half of what ' || l_ts || ' can hold: lower the batch size'
+                             END
+                          || CASE WHEN l_tuning IS NULL AND l_kept > l_size THEN
+                                 '; ' || l_ts || ' grows during the purge (up to ' || epf_util.fmt_bytes(l_max)
+                                 || ') unless undo tuning is applied (undo.sql APPLY as SYS)'
+                             END,
+                          p_object_owner => l_owner, p_object_name => l_table, p_bytes => l_per_root);
+        END LOOP;
+    END check_undo;
+
     PROCEDURE check_roots IS
         l_total    NUMBER;
         l_eligible NUMBER;
@@ -1721,6 +1866,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             epf_log.step_start('REDO_LOGS');
             check_redo;
             epf_log.step_end('DONE');
+            epf_log.step_start('UNDO');
+            check_undo;
+            epf_log.step_end('DONE');
         END IF;
         p_warnings := l_warnings + g_warnings;
     END preflight;
@@ -1732,6 +1880,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_failed   BOOLEAN := FALSE;
         l_stopped  BOOLEAN := FALSE;
         l_dropped  NUMBER;
+        l_tuning   VARCHAR2(4000);
         l_start    TIMESTAMP := epf_util.now_ts;
     BEGIN
         init(p_run_id, 'PURGE');
@@ -1740,6 +1889,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                           || TO_CHAR(TRUNC(epf_util.setting_num('ddl_lock_timeout_s')));
         plan_steps;
         scope_event;
+        l_tuning := undo_tuning_text;
+        epf_log.info('UNDO_TUNING',
+                     CASE WHEN l_tuning IS NOT NULL THEN 'Undo tuning active: ' || l_tuning
+                          ELSE 'Undo tuning not applied: the undo tablespace keeps undo for undo_retention and may '
+                               || 'grow during the purge (preflight step UNDO)' END);
 
         epf_log.step_start('REGISTRY');
         epf_registry.validate(l_errors, l_warnings);
@@ -1796,6 +1950,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
         epf_log.step_skip_pending(CASE WHEN l_stopped THEN 'stop requested'
                                        WHEN l_failed THEN 'an earlier step failed' END);
+        IF undo_tuning_text IS NOT NULL THEN
+            epf_log.info('UNDO_TUNING', 'Undo tuning is still active; restore it with src/sql/run/undo.sql RESTORE '
+                                        || 'as SYS');
+        END IF;
         p_status := CASE WHEN l_failed THEN 'FAILED'
                          WHEN l_stopped THEN 'STOPPED'
                          WHEN g_warnings > 0 THEN 'WARNING'

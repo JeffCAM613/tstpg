@@ -5,8 +5,9 @@
 --           tablespace EPFPG_DATA.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/install/uninstall.sql
 -- Requires: SYS AS SYSDBA; in a multitenant database, the PDB service.
--- Effects : Refuses while a run holds the run lock or while application
---           accounts locked by a reclaim are not yet restored. Otherwise drops
+-- Effects : Refuses while a run holds the run lock, while application
+--           accounts locked by a reclaim are not yet restored, or while undo
+--           tuning (EPF_INSTANCE_CHANGE) is not restored. Otherwise drops
 --           user EPFPG CASCADE (temporary purge indexes are owned by EPFPG
 --           and are dropped with it), then
 --           drops EPFPG_DATA and its datafiles when nothing else references
@@ -57,6 +58,15 @@ BEGIN
         IF l_count > 0 THEN
             RAISE_APPLICATION_ERROR(-20903, l_count || ' application accounts locked by a reclaim are not '
                                             || 'restored yet. Run the reclaim resume first.');
+        END IF;
+    END IF;
+
+    SELECT COUNT(*) INTO l_count FROM dba_tables WHERE owner = 'EPFPG' AND table_name = 'EPF_INSTANCE_CHANGE';
+    IF l_count > 0 THEN
+        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL' INTO l_count;
+        IF l_count > 0 THEN
+            RAISE_APPLICATION_ERROR(-20905, l_count || ' instance changes (undo tuning) are not restored yet. '
+                                            || 'Run src/sql/run/undo.sql RESTORE as SYS first.');
         END IF;
     END IF;
 

@@ -59,9 +59,9 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   KEYS_SNAPSHOT, ROOTS_HELD, ROOTS_GROUPED, TABLE_ELIGIBLE, TEMP_INDEX_CREATED,
 --   TEMP_INDEX_FAILED, TEMP_INDEX_DROPPED, TEMP_INDEX_KEPT, FK_UNINDEXED,
 --   BATCH_PROGRESS, BATCH_FAILED,
---   STOP_HONORED, TREE_REDO, TABLE_RESULT, MODULE_END, STEP_FAILED,
+--   STOP_HONORED, TREE_REDO, TREE_UNDO, TABLE_RESULT, MODULE_END, STEP_FAILED,
 --   IDX_MISSING, IDX_SUMMARY, ROOTS_ELIGIBLE, REDO_LOGS, REDO_ESTIMATE,
---   REDO_SUMMARY, PURGE_END.
+--   REDO_SUMMARY, UNDO, UNDO_ESTIMATE, UNDO_TUNING, PURGE_END.
 --
 -- Redo
 --   The redo written by each root tree is measured (V$MYSTAT) and recorded
@@ -70,6 +70,14 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   size; it uses the latest measurement of each tree, or an estimate from
 --   optimizer statistics when the tree has not been purged yet.
 --
+-- Undo
+--   Undo is measured the same way (TREE_UNDO, with the elapsed time, so the
+--   undo rate is known). Preflight (step UNDO) reports the undo tablespace,
+--   the undo of a batch and, from the measured rate, how much undo
+--   undo_retention keeps during the purge. Undo tuning (epf_tuning, SYS)
+--   lowers undo_retention and caps undo growth for the purge; a run reports
+--   at its start and end whether it is active.
+--
 -- Error codes
 --   ORA-20130  run is not a purge / preflight run, or session not bound to it
 --   ORA-20131  held roots did not converge
@@ -77,9 +85,9 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 
     -- Read-only checks for run p_run_id (action PURGE or PREFLIGHT) in the
     -- session bound to it: registry validation (step REGISTRY), supporting
-    -- indexes (SUPPORTING_INDEXES), eligible roots (ELIGIBLE_ROOTS) and
-    -- online redo logs with the recommended batch size (REDO_LOGS) of the
-    -- modules in scope.
+    -- indexes (SUPPORTING_INDEXES), eligible roots (ELIGIBLE_ROOTS), online
+    -- redo logs with the recommended batch size (REDO_LOGS) and undo (UNDO)
+    -- of the modules in scope.
     PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER);
 
     -- Runs the purge phase of run p_run_id (action PURGE) in the session bound

@@ -139,7 +139,7 @@ IDs are referenced from the design sections ("fixes R-01").
 6. **One place per fact.** Tables, modules, relationships, tunables live in registry/settings tables seeded by one install file.
 7. **Tool objects never live in a tablespace being reclaimed** (removes the "relocate log tables" step and its anchor problems).
 8. **Fail loud.** Any ERROR event makes the run FAILED (or WARNING for tolerated conditions) and produces a non-zero exit code.
-9. **No silent instance changes.** Anything the tool changes outside the application schemas (file autoextend, parallel degree, logging) is recorded first and restored to the recorded value. The only permanent instance change is the opt-in redo log sizing (D17), which is asked for explicitly and reported.
+9. **No silent instance changes.** Anything the tool changes outside the application schemas (file autoextend, parallel degree, logging) is recorded first and restored to the recorded value. The only permanent instance change is the opt-in redo log sizing (D17), which is asked for explicitly and reported. The opt-in undo tuning (D18) is recorded in `EPF_INSTANCE_CHANGE` and restored.
 
 ### 3.2 Components
 
@@ -219,12 +219,13 @@ src/sql/
     epf_registry.pks / .pkb  registry access and validation against the FK graph
     epf_space.pks / .pkb     segment/file snapshots, per-file HWM, resize helper
     epf_purge.pks / .pkb     purge engine
-    epf_redo.pks / .pkb      opt-in online redo log sizing (invoker rights, run as SYS)
+    epf_tuning.pks / .pkb    opt-in instance tuning for purges: redo log sizing, undo (invoker rights, run as SYS)
     epf_reclaim.pks / .pkb   reclaim engine
     epf_report.pks / .pkb    integrity and results report
   run/                       one entry script per action; the wrapper calls only these
     start_run.sql  preflight.sql  purge.sql  reclaim.sql  report.sql  status.sql  stop.sql  poll.sql
     redo_logs.sql            opt-in redo log sizing (SYS)
+    undo.sql                 opt-in undo tuning for a purge: APPLY / RESTORE / STATUS (SYS)
   tools/                     read-only diagnostics (no DML, no DDL)
     segment_map.sql          physical layout / HWM anchors per datafile
     fk_coverage.sql          FK graph vs registry (coverage gaps)
@@ -359,15 +360,6 @@ Progress events are time-throttled: first batch, last batch, and at most one per
 
 A DELETE frees space inside blocks; segment and tablespace sizes do not change, which is why a purge-only report used to show nothing. Before and after the purge the engine records, for every registry table and its indexes and LOB segments, the space actually used inside the segment with `DBMS_SPACE.SPACE_USAGE` (reads only the space-management bitmaps, not the data) into `EPF_SPACE_USAGE`. Where a segment type is not supported by `SPACE_USAGE` (e.g. manual segment space management), the report falls back to `rows x avg_row_len` and labels the figure as estimated. The report then shows, per table and module: allocated (unchanged), used before -> after, and "freed inside segments, reusable now".
 
-### 6.8 Redo (D17)
-
-A DELETE writes about twice the row length plus overhead for the row and for every index entry (about 1 KB per row on EPFPG781, close to 1 GB per batch of 1,000 bulk payments). Redo cannot be switched off for DML; what matters is that the online redo logs can absorb it.
-
-- **Measured:** each root tree records the redo it wrote (`TREE_REDO`: roots processed, bytes); progress events show redo per batch, `MODULE_END` the module total.
-- **Preflight (`REDO_LOGS`):** online log groups and sizes, log mode, switches in the last 24 hours; per deleting tree the redo per root (latest measurement on this database, otherwise estimated from optimizer statistics: rows per root x (2 x avg_row_len + 300 + per index 2 x key length + 270)), the redo of one batch at the run's batch size, and a recommended batch size that keeps one batch within half of the smallest online log. A batch larger than a whole log is a WARN: the session will wait on `log file switch (checkpoint incomplete)`; larger logs remove the waits, a smaller batch only spreads them.
-- **Opt-in sizing:** `epf_redo.enlarge(size_mb, groups)` as SYS (`run/redo_logs.sql`, default 4 x 1024 MB): adds the new groups (same directories and multiplexing, or Oracle-managed), switches and checkpoints until the smaller groups are inactive (archived in ARCHIVELOG mode), drops them and deletes their files. Non-CDB single instance only; in a CDB the logs belong to CDB$ROOT and the DBA sizes them.
-- **Wizard (phase 4):** shows the `REDO_LOGS` findings, offers the recommended batch size as the default, and offers the redo log sizing (SYS password required) when a batch exceeds a whole log.
-
 ### 6.7 Optional compaction (D7, opt-in)
 
 Delivered with phase 3; until then `start_run` refuses `with_compact = Y`. Offered in the wizard only when reclaim is not selected (default No; `--compact`). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
@@ -377,6 +369,23 @@ Delivered with phase 3; until then `start_run` refuses `with_compact = Y`. Offer
 - tables where shrink is not supported (function-based or domain indexes, ROWID materialized views, compressed tables, unsupported LOB type) are skipped with the reason;
 - progress and heartbeat per table; honors stop requests between tables; space usage is measured again afterwards.
 
+### 6.8 Redo (D17)
+
+A DELETE writes about twice the row length plus overhead for the row and for every index entry (about 1 KB per row on EPFPG781, close to 1 GB per batch of 1,000 bulk payments). Redo cannot be switched off for DML; what matters is that the online redo logs can absorb it.
+
+- **Measured:** each root tree records the redo it wrote (`TREE_REDO`: roots processed, bytes); progress events show redo per batch, `MODULE_END` the module total.
+- **Preflight (`REDO_LOGS`):** online log groups and sizes, log mode, switches in the last 24 hours; per deleting tree the redo per root (latest measurement on this database, otherwise estimated from optimizer statistics: rows per root x (2 x avg_row_len + 300 + per index 2 x key length + 270)), the redo of one batch at the run's batch size, and a recommended batch size that keeps one batch within half of the smallest online log. A batch larger than a whole log is a WARN: the session will wait on `log file switch (checkpoint incomplete)`; larger logs remove the waits, a smaller batch only spreads them.
+- **Opt-in sizing:** `epf_tuning.enlarge_redo(size_mb, groups)` as SYS (`run/redo_logs.sql`, default 4 x 1024 MB): adds the new groups (same directories and multiplexing, or Oracle-managed), switches and checkpoints until the smaller groups are inactive (archived in ARCHIVELOG mode), drops them and deletes their files. Non-CDB single instance only; in a CDB the logs belong to CDB$ROOT and the DBA sizes them.
+- **Wizard (phase 4):** shows the `REDO_LOGS` findings, offers the recommended batch size as the default, and offers the redo log sizing (SYS password required) when a batch exceeds a whole log.
+
+### 6.9 Undo (D18)
+
+A DELETE writes undo (about half of its redo, 400-450 MB per batch of 1,000 bulk payments on EPFPG781). One batch fits easily; the problem is retention: after each commit Oracle keeps the undo for `undo_retention` (900 s by default) and, with an autoextensible undo datafile, grows the file to do so rather than reuse it (about rate x retention, 12-14 GB at the target pace). The file does not shrink afterwards.
+
+- **Measured:** each root tree records its undo and elapsed time (`TREE_UNDO`); progress events show undo per batch, `MODULE_END` the module total.
+- **Preflight (`UNDO`):** undo tablespace size and growth limit, `undo_retention` and the tuned retention of the last 24 hours, retention guarantee, active undo tuning; per deleting tree the undo per root (measured, otherwise 45% of the redo estimate), the undo of a batch, and at the measured rate the undo kept by retention. WARN when a batch needs more than half of what the undo tablespace can hold, or when the kept undo exceeds its current size and undo tuning is not applied.
+- **Opt-in tuning (`run/undo.sql APPLY|RESTORE|STATUS`, SYS):** APPLY records, then sets `undo_retention` to `undo_retention_s` (60, SCOPE=MEMORY, so a restart also restores it) and each autoextensible undo datafile's MAXSIZE to `undo_max_mb` (8192, never below the current size); refused with RETENTION GUARANTEE. RESTORE puts back every recorded original value. `EPF_INSTANCE_CHANGE` keeps the records outside history pruning; uninstall refuses while a change is active. A purge reports at start and end whether undo tuning is active.
+- **Wizard (phase 4):** offered with the redo sizing (SYS password); applied just before PROCESS_BATCHES and restored on every exit path, and restored first by the next run if a session died.
 
 ---
 
@@ -708,6 +717,7 @@ Every question, confirmation and password is collected before the first change. 
    - mode (FULL / CLOB / LOGS / CLOB_N_LOGS), depth (not asked in LOGS mode) with per-module size and estimate,
    - batch size (default: the preflight's recommended batch size, 6.8), dry run,
    - redo log sizing, offered when a batch exceeds a whole online log (D17, SYS password required),
+   - undo tuning for the purge, offered when preflight expects the undo tablespace to grow (D18, SYS password required; restored at the end),
    - compaction (only when reclaim is not selected; default No).
 5. **Reclaim preparation** (if chosen), all read-only:
    - candidate tablespaces with size, used space and owners -> select targets;
@@ -844,7 +854,7 @@ Each phase is one reviewable pull request on this branch lineage.
 | D2 | Index/constraint handling during reclaim | Indexes UNUSABLE -> REBUILD; constraints never dropped |
 | D3 | Reclaim strategy | Tablespace swap, all owners moved; index-only tablespaces compacted in place; final name = original name of the detected tablespace (not assumed to be DATA) |
 | D4 | Wrapper runtime | `.bat` launcher + Windows PowerShell 5.1; bash `.sh` in phase 8 |
-| D5 | Database-level operations | Only temporary supporting indexes for the purge; everything else removed; all kept operations work in a PDB. Revised by D17 (opt-in redo log sizing). |
+| D5 | Database-level operations | Only temporary supporting indexes for the purge; everything else removed; all kept operations work in a PDB. Revised by D17 (opt-in redo log sizing) and D18 (opt-in undo tuning, restored). |
 | D6 | Purge modes | FULL, CLOB (renamed from CLOB_ONLY), LOGS (new: delete the log tables only), CLOB_N_LOGS |
 | D7 | Showing the effect of a purge | Always measure space inside segments; compaction opt-in (purge-only runs) |
 | D8 | `file_dispatching` rows without children | Purge them too |
@@ -856,7 +866,8 @@ Each phase is one reviewable pull request on this branch lineage.
 | D14 | LONG / LONG RAW columns | Convert to CLOB/BLOB with per-item approval at startup; skipped items leave their tablespace unswapped with a warning, a recommended manual path, and a final confirmation; every conversion reported with original and new type |
 | D15 | Accounts locked and disconnected at reclaim start | Owners of objects in the target tablespaces, plus accounts with INSERT/UPDATE/DELETE on those objects (direct or through a role), plus accounts with sessions using them; listed with the reason at startup (7.6) |
 | D16 | Kept rows that reference rows being purged (cross-references, ON DELETE CASCADE, shared audit archives) | Hold back: the referenced rows and the whole root they belong to stay until a later run; counted and reported with the referencing table; the run never fails on it and nothing newer than the cutoff is deleted (6.1.1) |
-| D17 | Online redo logs too small for the purge (log file switch (checkpoint incomplete)) | Opt-in: `epf_redo.enlarge` (SYS, `run/redo_logs.sql`, later a wizard option) replaces undersized groups, default 4 x 1 GB, like the previous tool; permanent, reported, not reverted. Preflight always reports the online logs, the redo per batch (measured by earlier runs, otherwise estimated) and a recommended batch size (6.8) |
+| D17 | Online redo logs too small for the purge (log file switch (checkpoint incomplete)) | Opt-in: `epf_tuning.enlarge_redo` (SYS, `run/redo_logs.sql`, later a wizard option) replaces undersized groups, default 4 x 1 GB, like the previous tool; permanent, reported, not reverted. Preflight always reports the online logs, the redo per batch (measured by earlier runs, otherwise estimated) and a recommended batch size (6.8) |
+| D18 | Undo growth during a purge | Opt-in, like the previous tool: `epf_tuning.undo_apply` (SYS, `run/undo.sql APPLY`) lowers `undo_retention` to 60 s (SCOPE=MEMORY) and caps each undo datafile at 8 GB (never below its size) for the purge; `undo_restore` puts back the recorded original values (`EPF_INSTANCE_CHANGE`). Preflight reports undo size, undo per batch and the undo kept by retention at the measured rate (6.9). Side effect while applied: long queries of other sessions can hit ORA-01555 |
 
 Also settled:
 

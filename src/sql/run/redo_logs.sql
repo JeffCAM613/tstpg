@@ -2,7 +2,7 @@
 -- EPF Data Purge - Online redo log sizing (opt-in)
 -- ============================================================================
 -- Purpose : Replaces undersized online redo log groups with larger ones
---           (epf_redo.enlarge), so that a purge does not wait on 'log file
+--           (epf_tuning.enlarge_redo), so that a purge does not wait on 'log file
 --           switch (checkpoint incomplete)'.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/run/redo_logs.sql <size_mb|-> <groups|->
 --             size_mb  size of each group in MB (- for 1024)
@@ -27,8 +27,8 @@ DECLARE
         RETURN CASE WHEN TRIM(p_value) = '-' THEN NULL ELSE TRIM(p_value) END;
     END arg;
 BEGIN
-    epfpg.epf_redo.enlarge(p_size_mb => NVL(TO_NUMBER(arg('&size_mb')), 1024),
-                           p_groups  => NVL(TO_NUMBER(arg('&groups')), 4));
+    epfpg.epf_tuning.enlarge_redo(p_size_mb => NVL(TO_NUMBER(arg('&size_mb')), 1024),
+                                  p_groups  => NVL(TO_NUMBER(arg('&groups')), 4));
 END;
 /
 

@@ -192,7 +192,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.2.1', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.2.2', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -208,6 +208,8 @@ BEGIN
     put_setting('resize_every_mb',        '1024',  'Old datafiles are resized after this many MB have been moved');
     put_setting('compact_min_free_pct',   '20',    'Compaction only processes tables with at least this share freed inside');
     put_setting('temp_index_min_mb',      '64',    'A missing index on a link column is created for the purge only on tables at least this large');
+    put_setting('undo_retention_s',       '60',    'undo_retention set by undo tuning (undo.sql APPLY) for the duration of a purge');
+    put_setting('undo_max_mb',            '8192',  'Growth limit of each undo datafile set by undo tuning (never below its current size)');
     put_setting('restore_datafile_paths', 'Y',     'Move swapped datafiles back to their original path (Enterprise Edition)');
 
     COMMIT;

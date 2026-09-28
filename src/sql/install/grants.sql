@@ -55,13 +55,14 @@ BEGIN
                          'DBA_TAB_PRIVS', 'DBA_RESUMABLE', 'DATABASE_PROPERTIES',
                          'V_$SESSION', 'V_$SESSION_LONGOPS', 'V_$TRANSACTION', 'V_$LOCKED_OBJECT',
                          'V_$DATABASE', 'V_$INSTANCE', 'V_$VERSION', 'V_$PARAMETER',
-                         'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME'))) LOOP
+                         'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME',
+                         'V_$UNDOSTAT'))) LOOP
         run_grant('GRANT SELECT ON sys.' || v.view_name || ' TO epfpg');
     END LOOP;
 
     run_grant('GRANT EXECUTE ON sys.dbms_lock TO epfpg');
     run_grant('GRANT EXECUTE ON sys.dbms_space TO epfpg');
-    -- epf_redo (invoker rights, run by SYS) removes retired redo log files.
+    -- epf_tuning (invoker rights, run by SYS) removes retired redo log files.
     run_grant('GRANT EXECUTE ON sys.utl_file TO epfpg');
 
     -- Allows SYS to execute EPFPG invoker-rights code (reclaim) with SYS rights.

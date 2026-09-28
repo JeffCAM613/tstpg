@@ -196,16 +196,33 @@ PROMPT == EPF install: packages
 @@epf_registry.pks
 @@epf_space.pks
 @@epf_purge.pks
-@@epf_redo.pks
+@@epf_tuning.pks
 @@epf_util.pkb
 @@epf_log.pkb
 @@epf_control.pkb
 @@epf_registry.pkb
 @@epf_space.pkb
 @@epf_purge.pkb
-@@epf_redo.pkb
+@@epf_tuning.pkb
 
 ALTER SESSION SET CURRENT_SCHEMA = SYS;
+
+PROMPT == EPF install: packages not part of this version
+DECLARE
+    l_delivered SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST(
+        'EPF_UTIL', 'EPF_LOG', 'EPF_CONTROL', 'EPF_REGISTRY', 'EPF_SPACE', 'EPF_PURGE', 'EPF_TUNING');
+BEGIN
+    FOR p IN (SELECT object_name
+                FROM dba_objects
+               WHERE owner = 'EPFPG'
+                 AND object_type = 'PACKAGE'
+                 AND object_name NOT IN (SELECT column_value FROM TABLE(l_delivered))
+               ORDER BY object_name) LOOP
+        EXECUTE IMMEDIATE 'DROP PACKAGE epfpg.' || DBMS_ASSERT.ENQUOTE_NAME(p.object_name, FALSE);
+        DBMS_OUTPUT.PUT_LINE('  dropped  package ' || p.object_name);
+    END LOOP;
+END;
+/
 
 PROMPT == EPF install: verification
 DECLARE

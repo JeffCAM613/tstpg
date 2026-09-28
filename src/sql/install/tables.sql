@@ -419,6 +419,27 @@ BEGIN
             CONSTRAINT epf_long_conv_ck  CHECK (decision IN ('CONVERT', 'SKIP'))
         )]');
 
+    -- Instance changes made by epf_tuning for the duration of a purge, with
+    -- the original values needed to restore them (restored_at NULL while
+    -- active). Kept outside history pruning: applied_run_id is not RUN_ID.
+    create_table('EPF_INSTANCE_CHANGE', q'[
+        CREATE TABLE epf_instance_change (
+            change_id            NUMBER GENERATED ALWAYS AS IDENTITY NOT NULL,
+            item                 VARCHAR2(30)   NOT NULL,
+            target               VARCHAR2(513)  NOT NULL,
+            file_id              NUMBER,
+            original_value       NUMBER,
+            original_autoextend  VARCHAR2(3),
+            original_maxbytes    NUMBER,
+            original_increment   NUMBER,
+            applied_value        NUMBER,
+            applied_at           TIMESTAMP      NOT NULL,
+            restored_at          TIMESTAMP,
+            applied_run_id       NUMBER,
+            CONSTRAINT epf_instance_change_pk PRIMARY KEY (change_id),
+            CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE'))
+        )]');
+
     -- Accounts locked and sessions disconnected for the reclaim window.
     create_table('EPF_ACCOUNT_ACTION', q'[
         CREATE TABLE epf_account_action (
