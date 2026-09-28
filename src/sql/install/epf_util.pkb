@@ -44,7 +44,7 @@ CREATE OR REPLACE PACKAGE BODY epf_util AS
         IF p_bytes IS NULL THEN
             RETURN NULL;
         ELSIF l_abs < c_kb THEN
-            RETURN TO_CHAR(p_bytes) || ' B';
+            RETURN TO_CHAR(ROUND(p_bytes)) || ' B';
         ELSIF l_abs < c_mb THEN
             RETURN TO_CHAR(p_bytes / c_kb, 'FM999999990.0') || ' KB';
         ELSIF l_abs < c_gb THEN

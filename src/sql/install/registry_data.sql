@@ -7,8 +7,9 @@
 -- Effects : Modules, tables and links are synchronised with the content of
 --           this file (rows no longer listed are deactivated or removed).
 --           Settings are inserted when missing; values already present are
---           kept, only their description is refreshed. tool_version is
---           always set to the value in this file.
+--           kept, only their description is refreshed; settings no longer
+--           listed are removed. tool_version is always set to the value in
+--           this file.
 --
 -- Table roles
 --   ROOT       selected by date_column < cutoff date
@@ -19,8 +20,9 @@
 -- ============================================================================
 
 DECLARE
-    g_tables SYS.ODCINUMBERLIST := SYS.ODCINUMBERLIST();
-    g_links  SYS.ODCINUMBERLIST := SYS.ODCINUMBERLIST();
+    g_tables   SYS.ODCINUMBERLIST   := SYS.ODCINUMBERLIST();
+    g_links    SYS.ODCINUMBERLIST   := SYS.ODCINUMBERLIST();
+    g_settings SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
 
     PROCEDURE put_module(p_code IN VARCHAR2, p_order IN NUMBER, p_description IN VARCHAR2) IS
     BEGIN
@@ -109,6 +111,8 @@ DECLARE
                SET value = p_value, updated_at = SYSTIMESTAMP
              WHERE name = p_name;
         END IF;
+        g_settings.EXTEND;
+        g_settings(g_settings.COUNT) := p_name;
     END put_setting;
 BEGIN
     -- ------------------------------------------------------------------
@@ -192,7 +196,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.2.2', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.2.3', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -209,7 +213,10 @@ BEGIN
     put_setting('compact_min_free_pct',   '20',    'Compaction only processes tables with at least this share freed inside');
     put_setting('temp_index_min_mb',      '64',    'A missing index on a link column is created for the purge only on tables at least this large');
     put_setting('undo_retention_s',       '60',    'undo_retention set by undo tuning (undo.sql APPLY) for the duration of a purge');
-    put_setting('undo_max_mb',            '8192',  'Growth limit of each undo datafile set by undo tuning (never below its current size)');
+
+    -- Remove settings that are no longer listed above.
+    DELETE FROM epf_setting
+     WHERE name NOT IN (SELECT column_value FROM TABLE(g_settings));
     put_setting('restore_datafile_paths', 'Y',     'Move swapped datafiles back to their original path (Enterprise Edition)');
 
     COMMIT;

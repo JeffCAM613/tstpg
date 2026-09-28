@@ -13,7 +13,7 @@
 -- Effects : Adds the new groups, drops the smaller groups once inactive and
 --           deletes their files. Permanent; printed line by line.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 400 TRIMSPOOL ON
+SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR EXIT FAILURE

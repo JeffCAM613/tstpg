@@ -13,7 +13,7 @@
 -- Effects : Writes events and steps of the run; changes nothing else.
 --           Exit code 0 when no check failed, 1 otherwise.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 400 TRIMSPOOL ON
+SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR EXIT FAILURE ROLLBACK

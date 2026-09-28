@@ -263,13 +263,10 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
 
     PROCEDURE undo_apply IS
         l_retention NUMBER := epfpg.epf_util.setting_num('undo_retention_s');
-        l_max_bytes NUMBER := epfpg.epf_util.setting_num('undo_max_mb') * 1048576;
         l_ts        VARCHAR2(128);
         l_guarantee VARCHAR2(11);
-        l_block     NUMBER;
         l_current   NUMBER;
         l_active    NUMBER;
-        l_cap       NUMBER;
         l_run       NUMBER := epfpg.epf_log.current_run;
     BEGIN
         check_instance;
@@ -283,7 +280,7 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END IF;
 
         l_ts := undo_tablespace;
-        SELECT retention, block_size INTO l_guarantee, l_block FROM dba_tablespaces WHERE tablespace_name = l_ts;
+        SELECT retention INTO l_guarantee FROM dba_tablespaces WHERE tablespace_name = l_ts;
         IF l_guarantee = 'GUARANTEE' THEN
             RAISE_APPLICATION_ERROR(-20152, 'Undo tablespace ' || l_ts || ' has RETENTION GUARANTEE: lowering the '
                                             || 'retention would make transactions fail (ORA-30036).');
@@ -301,30 +298,6 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         ELSE
             say('INFO', 'UNDO_RETENTION_KEPT', 'undo_retention is already ' || l_current || ' s');
         END IF;
-
-        FOR f IN (SELECT file_id, file_name, bytes, autoextensible, maxbytes, increment_by
-                    FROM dba_data_files
-                   WHERE tablespace_name = l_ts
-                   ORDER BY file_id) LOOP
-            l_cap := CEIL(GREATEST(f.bytes, l_max_bytes) / 1048576) * 1048576;
-            IF f.autoextensible = 'YES' AND l_cap < f.maxbytes THEN
-                INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_autoextend, original_maxbytes,
-                                                       original_increment, applied_value, applied_at,
-                                                       applied_run_id)
-                VALUES ('UNDO_DATAFILE', f.file_name, f.file_id, 'YES', f.maxbytes,
-                        GREATEST(f.increment_by, 1) * l_block, l_cap, CAST(SYSTIMESTAMP AS TIMESTAMP), l_run);
-                COMMIT;
-                EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || f.file_id || ' AUTOEXTEND ON NEXT '
-                                  || GREATEST(f.increment_by, 1) * l_block / 1024 || 'K MAXSIZE ' || l_cap / 1024 || 'K';
-                say('OK', 'UNDO_GROWTH_CAPPED', f.file_name || ': may grow to ' || ROUND(l_cap / 1048576) || ' MB (was '
-                                                || ROUND(f.maxbytes / 1048576) || ' MB)');
-            ELSE
-                say('INFO', 'UNDO_GROWTH_KEPT', f.file_name || ': '
-                                                || CASE WHEN f.autoextensible = 'YES'
-                                                        THEN 'already limited to ' || ROUND(f.maxbytes / 1048576) || ' MB'
-                                                        ELSE 'autoextend is off' END);
-            END IF;
-        END LOOP;
         say('WARN', 'UNDO_APPLIED', 'Undo tuning is active until undo_restore: long queries of other sessions may fail '
                                     || 'with ORA-01555 meanwhile');
     END undo_apply;

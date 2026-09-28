@@ -969,7 +969,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_new t_need;
         BEGIN
             IF l_seen.EXISTS(l_key) THEN
-                l_out(l_seen(l_key)).fk := l_out(l_seen(l_key)).fk OR p_fk;
+                IF p_fk AND NOT l_out(l_seen(l_key)).fk THEN
+                    l_out(l_seen(l_key)).fk     := TRUE;
+                    l_out(l_seen(l_key)).detail := l_out(l_seen(l_key)).detail || ', ' || p_detail;
+                END IF;
                 RETURN;
             END IF;
             l_new.table_id   := p_table_id;
