@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft 2 - all design decisions D1-D14 answered (section 15) and applied throughout. |
+| Status | Draft 3 - decisions D1-D14 applied; pre-drop reference check and revert path added; phase 1 delivered. Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -132,7 +132,7 @@ IDs are referenced from the design sections ("fixes R-01").
 ### 3.1 Principles
 
 1. **The database is the engine, the shell is a thin client.** All purge, reclaim and report logic lives in PL/SQL packages. The wrapper collects input, starts steps, streams events and writes files. This keeps the later `.sh` port small and identical in behavior.
-2. **One run, one run_id.** The wrapper creates the run first (`epf_run.start`) and passes the id explicitly to every step and to the monitor. Nothing is discovered by timestamp.
+2. **One run, one run_id.** The wrapper creates the run first (`epf_control.start_run`) and passes the id explicitly to every step and to the monitor. Nothing is discovered by timestamp.
 3. **The data dictionary is the source of truth for reclaim state.** The journal records intent; every step recomputes remaining work from the dictionary, so every step is idempotent and resumable.
 4. **Integrity is never weakened.** Constraints are never dropped (D2).
 5. **Structured facts.** Every number displayed or checked comes from a typed column (`rows_affected`, `bytes`, `pct`), never from message text.
@@ -153,7 +153,7 @@ IDs are referenced from the design sections ("fixes R-01").
           | worker            | monitor (every 2 s)  | report
           v                   v                      v
  +--------------------------- EPFPG schema (D1) ------------------------------+
- | packages : epf_util  epf_log  epf_run  epf_registry  epf_space                 |
+ | packages : epf_util  epf_log  epf_control  epf_registry  epf_space                 |
  |            epf_purge  epf_reclaim  epf_report                                  |
  | tables   : EPF_SETTING EPF_MODULE EPF_TABLE EPF_LINK                           |
  |            EPF_RUN EPF_STEP EPF_EVENT EPF_WORK_KEY EPF_TABLE_STAT              |
@@ -168,7 +168,7 @@ IDs are referenced from the design sections ("fixes R-01").
 ### 3.3 Run lifecycle
 
 ```
-START (epf_run.start -> run_id)
+START (epf_control.start_run -> run_id)
   INPUT             every question, confirmation and password up front (10.3)
   PREFLIGHT         read-only checks, inventories, forecasts, blockers  (always)
   PURGE             SNAPSHOT_KEYS -> PROCESS_BATCHES -> TABLE_STATS -> SPACE_USAGE [-> COMPACT]
@@ -196,15 +196,17 @@ Purge never needs SYS. Passwords are handled as in 10.2. In a multitenant databa
 
 ### 4.1 Layout
 
+The new implementation lives in `src/`; the previous implementation is kept unchanged in `legacy/` for comparison and is not used by the new tool.
+
 ```
-bin/
+src/bin/
   epf_purge.bat              launcher only (~20 lines): finds PowerShell, forwards arguments, returns exit code
   epf_purge.sh               final phase: bash equivalent of launcher + wrapper
   lib/
     epf.ps1                  wrapper implementation (CLI, config, wizard, credentials, runner, live view, files)
-config/
+src/config/
   epf_purge.conf.example     all keys documented; real epf_purge.conf is git-ignored
-sql/
+src/sql/
   install/
     install.sql              master installer (SYS): tool schema, grants, then every file below in order
     uninstall.sql            removes the tool schema (refuses if a reclaim is incomplete)
@@ -213,7 +215,7 @@ sql/
     grants.sql               object grants generated from the registry
     epf_util.pks / .pkb      formatting, elapsed time, dictionary helpers
     epf_log.pks / .pkb       events, steps, heartbeat (module/action/client_info)
-    epf_run.pks / .pkb       run lifecycle, stop requests, status
+    epf_control.pks / .pkb   run lifecycle, run lock, stop requests
     epf_registry.pks / .pkb  registry access and validation against the FK graph
     epf_space.pks / .pkb     segment/file snapshots, per-file HWM, resize helper
     epf_purge.pks / .pkb     purge engine
@@ -225,14 +227,17 @@ sql/
     segment_map.sql          physical layout / HWM anchors per datafile
     fk_coverage.sql          FK graph vs registry (coverage gaps)
     run_history.sql          last N runs with status and verdict
-tests/
+src/tests/
+  verify/                    read-only verification queries for the target database
   fixtures/                  synthetic scope schema + data generator for a test database
   scenarios/                 reclaim layouts and fault-injection scripts (section 12)
 logs/                        git-ignored; one folder per run
-plan/
-  PLAN.md
+legacy/                      previous implementation (bin/, sql/, config/), unchanged
+.local/
+  PLAN.md                    this plan
+  changes.md                 change history of the plan and of each phase
 .gitattributes               CRLF for .bat/.ps1, LF for .sh/.sql/.md
-.gitignore                   logs/, config/epf_purge.conf
+.gitignore                   logs/, src/config/epf_purge.conf
 ```
 
 ### 4.2 Rules that keep SQL organized permanently
@@ -412,7 +417,9 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 
 ```
  LONG column 2 of 5
-   OPPAYMENTS.OLD_BATCH_NOTES.NOTE_TEXT      LONG -> CLOB   (irreversible)
+   owner      OPPAYMENTS
+   column     OLD_BATCH_NOTES.NOTE_TEXT          LONG -> CLOB   (irreversible)
+   table in   DATA   -> new LOB segment in DATA_R (renamed to DATA at the end)
    rows 18,204   size 212 MB   used by: 1 view, 0 packages, 0 triggers
    Convert? [Enter = yes, n = skip]
 ```
@@ -444,8 +451,9 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 | CREATE_TARGET | Create the clone tablespace `<name>_R` with a small initial size and the original autoextend policy, in the same directory as the original datafile(s). Quotas and user defaults are copied onto it. | |
 | RELEASE_INDEXES | UNUSABLE for every index on tables being moved (all owners); a separate index tablespace is resized to its minimum right away. | Frees index space before any data moves. |
 | MOVE | Move every movable unit into the target, ordered by highest extent in the old files first. After every `resize_every_mb` moved (default 1024), resize each old datafile down to its own HWM + margin (per file, binary search), so peak extra disk stays near the size of the largest unit. | Old files only shrink. A unit that cannot be locked within the retry budget stops the step with its name. |
-| REPOINT | Segmentless objects, partition default attributes, user default tablespaces and quotas, database default tablespace -> target. | After this step, nothing references the old tablespace. |
-| DROP_OLD | `DROP TABLESPACE <old>` **without** `INCLUDING CONTENTS` - Oracle refuses if anything remains, which is the final safety net. Non-OMF datafiles left on disk are deleted through a temporary directory object; if that fails, their paths are reported for manual deletion. | Never `INCLUDING CONTENTS`, never `CASCADE CONSTRAINTS`. |
+| REPOINT | Segmentless objects, partition default attributes, user default tablespaces and quotas, database default tablespace -> target. | After this step, nothing should reference the old tablespace. |
+| REFERENCE_CHECK | Re-run the full inventory query set against the old tablespace (every dictionary view listed in 7.4, plus `DBA_SEGMENTS` and `DBA_RECYCLEBIN`). Any remaining reference -> no drop; the REVERT path runs instead. | Predicts the drop outcome from the same dictionary sources; the drop itself stays the final guard. |
+| DROP_OLD | `DROP TABLESPACE <old>` **without** `INCLUDING CONTENTS` - Oracle refuses if anything remains, which is the final safety net. If Oracle refuses (ORA-01549 or any other error), the REVERT path runs. Non-OMF datafiles left on disk are deleted through a temporary directory object; if that fails, their paths are reported for manual deletion. | Never `INCLUDING CONTENTS`, never `CASCADE CONSTRAINTS`. |
 | RENAME | `ALTER TABLESPACE <name>_R RENAME TO <old name>`. User defaults and quotas follow automatically. | Final name = original name (DATA). |
 | RESTORE_PATHS | On EE, move each new datafile online to the original path (copy of the compacted file). On SE2 or if disabled (`restore_datafile_paths`), the new path is kept and reported. | |
 | REBUILD_INDEXES | REBUILD for every unusable index, largest first; serial below `parallel_min_mb` (default 1024 MB), parallel above it on EE only; then restore recorded degree and logging. | LOGGING always (D9). |
@@ -462,6 +470,7 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 - `ddl_lock_timeout` (default 30 s) on every DDL; ORA-00054 retried `ddl_retries` times (default 3, backoff 30/60/120 s).
 - Resumable space allocation (`resumable_timeout_s`, default 1800): a full disk suspends the statement; the live view shows `SUSPENDED: unable to extend ...`; adding space lets it continue by itself.
 - The live view always shows the wait event and the blocking session (8.1).
+- **REVERT path** (reference check failed, drop refused, or `--revert`): the old tablespace still exists, so every moved unit is moved back to it, segmentless objects / default attributes / user defaults / quotas / database default are re-pointed to it, indexes are rebuilt into it, the clone tablespace is dropped (it is empty by then, again without `INCLUDING CONTENTS`), and accounts are unlocked. The result is the original layout; the report shows the reclaim as REVERTED with the exact reference that prevented the drop. A revert is not guaranteed to succeed in every case (for example if the old tablespace ran out of space while moving back), which is why REFERENCE_CHECK runs first and the preflight inventory is fail-closed.
 - **Stop request**: honored between units. Before DROP_OLD, the engine takes the restore path: units already moved stay in the target, the old tablespace is left in place, indexes are rebuilt, accounts unlocked. The report shows the tablespace as "partially moved - resume to complete". After DROP_OLD, a stop is deferred until RENAME completes.
 - **Hard interruption** (killed session, lost connection, instance restart): tables are intact (a MOVE is atomic), some indexes may be unusable, accounts may still be locked. The next `reclaim` detects this from the dictionary + journal, restores account status first, then offers Resume (continue from the current step). Non-interactive runs need `--resume`.
 - `status` prints the exact degraded objects and locked accounts at any time.
@@ -741,8 +750,8 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 
 | Phase | Deliverables | Exit criteria |
 |-------|--------------|---------------|
-| 0. Verify and baseline | Spike scripts for V1-V8; parity baseline from the current tool on a clone; test fixtures generator. | V1-V8 answered; baseline numbers stored. |
-| 1. Foundation | Layout, `.gitattributes`/`.gitignore`, `install.sql`/`uninstall.sql`, `tables.sql`, `registry_data.sql`, `grants.sql`, `epf_util`, `epf_log`, `epf_run`, `epf_registry`. | Install/upgrade/uninstall idempotent; registry validation runs. |
+| 0. Verify and baseline | Now: read-only environment survey (`src/tests/verify/environment.sql`). Before phase 5: behavior spikes V1-V10 on a test database; parity baseline from the previous tool on a clone. | Survey output reviewed; V1-V10 answered before reclaim work starts. |
+| 1. Foundation | Layout, `.gitattributes`/`.gitignore`, `install.sql`/`uninstall.sql`, `tables.sql`, `registry_data.sql`, `grants.sql`, `epf_util`, `epf_log`, `epf_control`, `epf_registry`. | Install/upgrade/uninstall idempotent; registry validation runs. |
 | 2. Purge engine | `epf_purge`, `epf_space` snapshots, `run/preflight.sql`, `run/purge.sql`. | Parity with baseline; dry-run exact counts. |
 | 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P6, `run/report.sql`. | Purge runs self-verify. |
 | 4. Wrapper | `epf_purge.bat` launcher, `lib/epf.ps1`: CLI, config, wizard, credentials, runner, live view, run folder, exit codes. | End-to-end purge from the wizard and non-interactively. |
@@ -820,5 +829,6 @@ Also settled:
 | Accounts left locked after a crash | Every run and `status` restores accounts recorded in `EPF_ACCOUNT_ACTION` before anything else. |
 | LONG conversion changes an application contract | Per-item approval with dependents shown; irreversible nature stated; every conversion reported. |
 | Client objects of an unsupported kind in a target tablespace | Fail-closed inventory; that tablespace is not swapped; `DROP TABLESPACE` without `INCLUDING CONTENTS` as final safety net. |
+| DROP of the old tablespace refused after all moves | REFERENCE_CHECK predicts it; if Oracle still refuses, the REVERT path restores the original layout (7.8). |
 | Tool-schema privileges considered too broad by security | EPFPG holds only purge/report rights (3.4); DBA-level work runs only as SYS, supplied per run. |
 | Two wrapper implementations drift (bat/ps1 vs sh) | Logic in the database; wrappers only render events; phase 8 compares manifests from both. |

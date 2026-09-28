@@ -1,0 +1,4 @@
+logs/
+src/config/epf_purge.conf
+epf_environment.txt
+*.lst
