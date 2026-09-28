@@ -656,8 +656,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     END hold_back;
 
     -- Gives roots whose trees reference each other through an FK the same
-    -- group, so that they are processed in the same batch. Returns the number
-    -- of roots in shared groups.
+    -- group and moves them to the batch of the group's smallest key (the
+    -- earliest batch of the group, since batches follow key order). Returns
+    -- the number of roots in shared groups.
     FUNCTION group_roots(p_root_id IN NUMBER) RETURN NUMBER IS
         l_fks    t_fks := tree_fks(p_root_id);
         l_parent t_key_map;
@@ -717,31 +718,16 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_k := l_parent.NEXT(l_k);
         END LOOP;
         FORALL i IN 1 .. l_keys.COUNT
-            UPDATE epf_work_key
-               SET group_key = l_reps(i)
-             WHERE run_id = l_run AND table_id = p_root_id AND root_key = l_keys(i);
+            UPDATE epf_work_key w
+               SET w.group_key = l_reps(i),
+                   w.batch_no  = (SELECT r.batch_no
+                                    FROM epf_work_key r
+                                   WHERE r.run_id = l_run AND r.table_id = p_root_id
+                                     AND r.root_key = l_reps(i))
+             WHERE w.run_id = l_run AND w.table_id = p_root_id AND w.root_key = l_keys(i);
         COMMIT;
         RETURN l_keys.COUNT;
     END group_roots;
-
-    -- Numbers the roots into batches of batch_size in group order; a group
-    -- is never split.
-    PROCEDURE assign_batches(p_root_id IN NUMBER) IS
-        l_run   NUMBER := g_run.run_id;
-        l_size  NUMBER := g_run.batch_size;
-    BEGIN
-        MERGE INTO epf_work_key w
-        USING (SELECT g.group_key,
-                      CEIL((SUM(g.cnt) OVER (ORDER BY g.group_key ROWS UNBOUNDED PRECEDING) - g.cnt + 1)
-                           / l_size) AS batch_no
-                 FROM (SELECT group_key, COUNT(*) AS cnt
-                         FROM epf_work_key
-                        WHERE run_id = l_run AND table_id = p_root_id
-                        GROUP BY group_key) g) b
-           ON (w.run_id = l_run AND w.table_id = p_root_id AND w.group_key = b.group_key)
-         WHEN MATCHED THEN UPDATE SET w.batch_no = b.batch_no;
-        COMMIT;
-    END assign_batches;
 
     PROCEDURE gather_work_key_stats IS
     BEGIN
@@ -773,7 +759,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         ELSE
             EXECUTE IMMEDIATE
                 'INSERT INTO epf_work_key (run_id, table_id, batch_no, key_num, root_key, group_key)'
-                || ' SELECT ' || l_run || ', ' || p_root_id || ', 0, t.' || qc(l_root.key_column)
+                || ' SELECT ' || l_run || ', ' || p_root_id || ', CEIL(ROW_NUMBER() OVER (ORDER BY t.'
+                || qc(l_root.key_column) || ') / ' || g_run.batch_size || '), t.' || qc(l_root.key_column)
                 || ', t.' || qc(l_root.key_column) || ', t.' || qc(l_root.key_column)
                 || ' FROM ' || tq(p_root_id) || ' t WHERE t.' || qc(l_root.date_column) || ' < ' || cutoff_literal;
             COMMIT;
@@ -784,11 +771,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                     COMMIT;
                 END IF;
             END LOOP;
-            IF p_action = c_delete THEN
-                hold_back(p_root_id, l_held);
-                l_grouped := group_roots(p_root_id);
-            END IF;
-            assign_batches(p_root_id);
+        END IF;
+        gather_work_key_stats;
+
+        IF p_action = c_delete AND NOT by_rowid(p_root_id) THEN
+            hold_back(p_root_id, l_held);
+            l_grouped := group_roots(p_root_id);
         END IF;
 
         l_tree := tree_tables(p_root_id);
@@ -1225,7 +1213,6 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                  g_tables(l_roots(r)).owner, g_tables(l_roots(r)).table_name);
                 END IF;
             END LOOP;
-            gather_work_key_stats;
             epf_log.step_end('DONE', epf_util.fmt_int(l_total) || ' batches');
         EXCEPTION
             WHEN OTHERS THEN

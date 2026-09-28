@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-28 - Phase 2: batch numbering fix
+
+Results so far (EPFPG781)
+- `install.sql` upgrade: columns, indexes and EPF_HELD_ROOT added; CREATE/DROP ANY INDEX revoked; all packages valid, tool version 0.2.0. PASS.
+- `preflight.sql NEW` (R-000002): registry 0 errors / 0 warnings; 13/24 link columns indexed, 1 temporary index planned (TRANSMISSION_EXECUTION_AUDIT.BULK_PAYMENT_ID, 445 MB), 10 small tables scanned; every root row is older than the 30-day cutoff (BULK_PAYMENT 138,296, FILE_INTEGRATION 11,794, AUDIT_TRAIL 1,658,823, SPEC_TRT_LOG 63,071, FILE_DISPATCHING 198,890). PASS.
+- Dry run `purge.sql NEW 30 ALL FULL 1000 Y`: did not finish. The batch-numbering MERGE joined EPF_WORK_KEY to itself on group_key (no index), so every root rescanned all roots of its table; with 1.66 M AUDIT_TRAIL roots this never completes. Cancelled; nothing in the application schemas was changed.
+
+Fix (`epf_purge`)
+- Batch numbers are assigned in the root snapshot INSERT (`ROW_NUMBER` in key order); the MERGE is removed.
+- Roots grouped because their trees reference each other are moved to the batch of the group's smallest key, updated by root key (index).
+- EPF_WORK_KEY statistics are gathered after each tree's snapshot, before the held-back and grouping queries run.
+
+How to test
+1. `git pull`, re-run `install.sql` as SYS (packages only change).
+2. Repeat the dry runs of the phase 2 test (FULL, then CLOB). Expected duration: minutes, mostly the exact counts of the largest tables (PAYMENT_ADDITIONAL_INFO 57 M rows, PAYMENT_AUDIT 25 M rows).
+
 ## 2026-09-28 - Phase 2 (purge engine)
 
 Decision

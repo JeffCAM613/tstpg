@@ -301,7 +301,7 @@ Fixes F-01..F-06, F-08, P-01..P-04.
 
 ### 6.1 Flow per module
 
-1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`; the keys of every link source below the root (payment, import_audit, workflow executions, invoice) are derived once, each tagged with the root it belongs to (`root_key`). For deleting modules, roots are then held back (D16, 6.1.1) and roots whose trees reference each other share a group. Roots are numbered into batches of `batch_size` in key order without splitting a group; a derived key belongs to the batch of its root. Roots without key column (no dependents: `file_integration`, `spec_trt_log`) snapshot `ROWID`s in physical order instead, and each delete re-checks the cutoff. Consequences:
+1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`; the keys of every link source below the root (payment, import_audit, workflow executions, invoice) are derived once, each tagged with the root it belongs to (`root_key`). For deleting modules, roots are then held back (D16, 6.1.1) and roots whose trees reference each other share a group. Roots are numbered into batches of `batch_size` in key order while the snapshot is taken; the roots of a group move to the batch of the group's smallest key; a derived key belongs to the batch of its root. Roots without key column (no dependents: `file_integration`, `spec_trt_log`) snapshot `ROWID`s in physical order instead, and each delete re-checks the cutoff. Consequences:
    - no cursor is held across commits: ORA-01555 cannot happen (F-01);
    - the total number of batches is known: progress % and ETA;
    - deletes join a real, indexed table with correct statistics instead of a collection (P-01);
