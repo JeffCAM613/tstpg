@@ -1,11 +1,12 @@
 -- ============================================================================
 -- EPF Data Purge - Tool tables
 -- ============================================================================
--- Purpose : Creates every table of the tool schema. Existing tables are left
---           unchanged, so the script can be re-run at any time.
+-- Purpose : Creates every table of the tool schema. Existing tables are kept
+--           with their data; columns and indexes missing from them are added,
+--           so the script can be re-run at any time.
 -- Usage   : Called by install.sql with CURRENT_SCHEMA set to EPFPG.
 --           Can also be run while connected as EPFPG.
--- Effects : Creates missing tables and indexes in the current schema.
+-- Effects : Creates missing tables, columns and indexes in the current schema.
 -- ============================================================================
 
 DECLARE
@@ -38,6 +39,22 @@ DECLARE
             DBMS_OUTPUT.PUT_LINE('  created  index ' || p_name);
         END IF;
     END create_index;
+
+    -- Adds a column to an existing table when it is missing.
+    PROCEDURE add_column(p_table IN VARCHAR2, p_column IN VARCHAR2, p_definition IN VARCHAR2) IS
+        l_count PLS_INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+          INTO l_count
+          FROM all_tab_columns
+         WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+           AND table_name = p_table
+           AND column_name = p_column;
+        IF l_count = 0 THEN
+            EXECUTE IMMEDIATE 'ALTER TABLE ' || p_table || ' ADD (' || p_column || ' ' || p_definition || ')';
+            DBMS_OUTPUT.PUT_LINE('  added    column ' || p_table || '.' || p_column);
+        END IF;
+    END add_column;
 BEGIN
     -- Settings: tunables with defaults. Values changed by the operator are
     -- kept on upgrade (registry_data.sql inserts missing names only).
@@ -180,19 +197,53 @@ BEGIN
     create_index('EPF_EVENT_RUN_IX',
         'CREATE INDEX epf_event_run_ix ON epf_event (run_id, event_id)');
 
-    -- Key snapshot of eligible rows, numbered into batches.
+    -- Key snapshot of eligible rows during a purge.
+    --   Root rows      key_num (or key_rowid for roots purged by ROWID),
+    --                  batch_no, root_key = key_num, group_key = smallest
+    --                  root key of the roots that must share a batch.
+    --   Derived rows   keys of link sources below the root: key_num and the
+    --                  root_key they derive from; batch_no = 0 (their batch is
+    --                  the batch of root_key). A key derived from several
+    --                  roots has one row per root.
     create_table('EPF_WORK_KEY', q'[
         CREATE TABLE epf_work_key (
             run_id     NUMBER  NOT NULL,
             table_id   NUMBER  NOT NULL,
             batch_no   NUMBER  NOT NULL,
             key_num    NUMBER,
-            key_rowid  UROWID
+            key_rowid  UROWID,
+            root_key   NUMBER,
+            group_key  NUMBER
         )]');
+    add_column('EPF_WORK_KEY', 'ROOT_KEY', 'NUMBER');
+    add_column('EPF_WORK_KEY', 'GROUP_KEY', 'NUMBER');
     create_index('EPF_WORK_KEY_IX',
         'CREATE INDEX epf_work_key_ix ON epf_work_key (run_id, table_id, batch_no)');
+    create_index('EPF_WORK_KEY_ROOT_IX',
+        'CREATE INDEX epf_work_key_root_ix ON epf_work_key (run_id, table_id, root_key)');
+    create_index('EPF_WORK_KEY_KEY_IX',
+        'CREATE INDEX epf_work_key_key_ix ON epf_work_key (run_id, table_id, key_num)');
 
-    -- Per-table row counts per phase (BEFORE / AFTER).
+    -- Roots left out of a purge because a row that is kept references a row
+    -- of their tree (one row per root, with the first reference found).
+    create_table('EPF_HELD_ROOT', q'[
+        CREATE TABLE epf_held_root (
+            run_id           NUMBER         NOT NULL,
+            table_id         NUMBER         NOT NULL,
+            root_key         NUMBER         NOT NULL,
+            child_owner      VARCHAR2(128)  NOT NULL,
+            child_table      VARCHAR2(128)  NOT NULL,
+            constraint_name  VARCHAR2(128)  NOT NULL,
+            parent_owner     VARCHAR2(128)  NOT NULL,
+            parent_table     VARCHAR2(128)  NOT NULL,
+            iteration        NUMBER         NOT NULL,
+            CONSTRAINT epf_held_root_pk PRIMARY KEY (run_id, table_id, root_key)
+        )]');
+
+    -- Per-table row counts per phase (BEFORE / AFTER). In LOB-clearing modes
+    -- nonempty_lob_rows counts non-empty LOB values (row x LOB column).
+    -- held_rows: roots held back (root tables) or rows kept because a
+    -- retained row still references them (tables reached by a reverse link).
     create_table('EPF_TABLE_STAT', q'[
         CREATE TABLE epf_table_stat (
             run_id             NUMBER        NOT NULL,
@@ -204,9 +255,11 @@ BEGIN
             nonempty_lob_rows  NUMBER,
             processed_rows     NUMBER,
             orphan_rows        NUMBER,
+            held_rows          NUMBER,
             measured_at        TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
             CONSTRAINT epf_table_stat_pk PRIMARY KEY (run_id, table_id, phase)
         )]');
+    add_column('EPF_TABLE_STAT', 'HELD_ROWS', 'NUMBER');
 
     -- Segment sizes per phase.
     create_table('EPF_SEGMENT_SNAP', q'[
@@ -326,18 +379,22 @@ BEGIN
     create_index('EPF_RECLAIM_OBJECT_IX',
         'CREATE INDEX epf_reclaim_object_ix ON epf_reclaim_object (run_id, move_status)');
 
-    -- Temporary supporting indexes created for a purge.
+    -- Temporary supporting indexes created for a purge. owner is the index
+    -- owner (the tool schema); table_owner.table_name is the indexed table.
+    -- dropped_at is set when the index is dropped or could not be created.
     create_table('EPF_TEMP_INDEX', q'[
         CREATE TABLE epf_temp_index (
             run_id       NUMBER         NOT NULL,
             owner        VARCHAR2(128)  NOT NULL,
             index_name   VARCHAR2(128)  NOT NULL,
+            table_owner  VARCHAR2(128),
             table_name   VARCHAR2(128)  NOT NULL,
             column_name  VARCHAR2(128)  NOT NULL,
             created_at   TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
             dropped_at   TIMESTAMP,
             CONSTRAINT epf_temp_index_pk PRIMARY KEY (owner, index_name)
         )]');
+    add_column('EPF_TEMP_INDEX', 'TABLE_OWNER', 'VARCHAR2(128)');
 
     -- LONG / LONG RAW columns found, decision and result.
     create_table('EPF_LONG_CONVERSION', q'[

@@ -9,6 +9,7 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
         l_fk_covered PLS_INTEGER := 0;
         l_count      PLS_INTEGER;
         l_label      VARCHAR2(1000);
+        l_type       VARCHAR2(128);
 
         PROCEDURE add_error(p_code IN VARCHAR2, p_message IN VARCHAR2,
                             p_owner IN VARCHAR2 DEFAULT NULL, p_object IN VARCHAR2 DEFAULT NULL) IS
@@ -32,6 +33,16 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                           p_owner, p_table);
             END IF;
         END check_column;
+
+        FUNCTION column_type(p_owner IN VARCHAR2, p_table IN VARCHAR2, p_column IN VARCHAR2) RETURN VARCHAR2 IS
+            l_result VARCHAR2(128);
+        BEGIN
+            SELECT MAX(data_type)
+              INTO l_result
+              FROM dba_tab_columns
+             WHERE owner = p_owner AND table_name = p_table AND column_name = p_column;
+            RETURN l_result;
+        END column_type;
     BEGIN
         p_errors   := 0;
         p_warnings := 0;
@@ -41,7 +52,13 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                          e.key_column, e.date_column,
                          (SELECT COUNT(*) FROM dba_tables d
                            WHERE d.owner = e.owner AND d.table_name = e.table_name) AS present,
-                         (SELECT COUNT(*) FROM epf_link k WHERE k.table_id = e.table_id) AS links
+                         (SELECT COUNT(*) FROM epf_link k WHERE k.table_id = e.table_id) AS links,
+                         (SELECT COUNT(*) FROM epf_link k WHERE k.source_table_id = e.table_id) AS sourced,
+                         (SELECT COUNT(*)
+                            FROM epf_link k
+                            JOIN epf_table s ON s.table_id = k.source_table_id
+                           WHERE k.table_id = e.table_id
+                             AND (s.key_column IS NULL OR k.source_column <> s.key_column)) AS reverse_links
                     FROM epf_table e
                    WHERE e.active = 'Y'
                    ORDER BY e.table_id) LOOP
@@ -54,6 +71,14 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                 add_error('REG_DEPENDENT_UNLINKED', 'Dependent table has no link to a source table',
                           t.owner, t.table_name);
             END IF;
+            IF t.sourced > 0 AND t.key_column IS NULL THEN
+                add_error('REG_SOURCE_KEY', 'Table is the source of ' || t.sourced
+                          || ' links but has no key column', t.owner, t.table_name);
+            END IF;
+            IF t.sourced > 0 AND t.reverse_links > 0 THEN
+                add_error('REG_REVERSE_SOURCE', 'Table is reached through a link on a column other than the '
+                          || 'source key and cannot be the source of other links', t.owner, t.table_name);
+            END IF;
 
             IF t.present = 0 THEN
                 add_warning('REG_TABLE_MISSING', 'Table not present in this database; it is skipped',
@@ -63,15 +88,45 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                 check_column(t.owner, t.table_name, t.key_column, 'Key');
                 check_column(t.owner, t.table_name, t.date_column, 'Date');
 
+                IF t.key_column IS NOT NULL THEN
+                    l_type := column_type(t.owner, t.table_name, t.key_column);
+                    IF l_type IS NOT NULL AND l_type <> 'NUMBER' THEN
+                        add_error('REG_KEY_TYPE', 'Key column ' || t.key_column || ' must be NUMBER, found '
+                                  || l_type, t.owner, t.table_name);
+                    END IF;
+                    SELECT COUNT(*)
+                      INTO l_count
+                      FROM dba_indexes i
+                     WHERE i.table_owner = t.owner
+                       AND i.table_name = t.table_name
+                       AND i.uniqueness = 'UNIQUE'
+                       AND (SELECT COUNT(*) FROM dba_ind_columns c
+                             WHERE c.index_owner = i.owner AND c.index_name = i.index_name) = 1
+                       AND EXISTS (SELECT 1 FROM dba_ind_columns c
+                                    WHERE c.index_owner = i.owner AND c.index_name = i.index_name
+                                      AND c.column_name = t.key_column);
+                    IF l_type IS NOT NULL AND l_count = 0 THEN
+                        add_error('REG_KEY_UNIQUE', 'Key column ' || t.key_column
+                                  || ' has no single-column unique index', t.owner, t.table_name);
+                    END IF;
+                END IF;
+                IF t.date_column IS NOT NULL THEN
+                    l_type := column_type(t.owner, t.table_name, t.date_column);
+                    IF l_type IS NOT NULL AND l_type <> 'DATE' AND l_type NOT LIKE 'TIMESTAMP%' THEN
+                        add_error('REG_DATE_TYPE', 'Date column ' || t.date_column
+                                  || ' must be DATE or TIMESTAMP, found ' || l_type, t.owner, t.table_name);
+                    END IF;
+                END IF;
+
                 SELECT COUNT(DISTINCT privilege)
                   INTO l_count
                   FROM dba_tab_privs
                  WHERE grantee = l_tool
                    AND owner = t.owner
                    AND table_name = t.table_name
-                   AND privilege IN ('SELECT', 'DELETE');
-                IF l_count < 2 THEN
-                    add_warning('REG_GRANT_MISSING', 'SELECT/DELETE not granted to ' || l_tool
+                   AND privilege IN ('SELECT', 'DELETE', 'INDEX');
+                IF l_count < 3 THEN
+                    add_warning('REG_GRANT_MISSING', 'SELECT/DELETE/INDEX not granted to ' || l_tool
                                 || '; re-run install.sql', t.owner, t.table_name);
                 END IF;
             END IF;
@@ -113,6 +168,7 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                          c.delete_rule, c.status,
                          p.owner AS p_owner, p.table_name AS p_table,
                          pt.table_id AS p_id, pt.delete_order AS p_order, pt.root_table_id AS p_root,
+                         pt.role AS p_role, pt.key_column AS p_key,
                          ct.table_id AS c_id, ct.delete_order AS c_order, ct.root_table_id AS c_root
                     FROM dba_constraints c
                     JOIN dba_constraints p
@@ -133,6 +189,10 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                        || f.p_owner || '.' || f.p_table;
             IF f.status <> 'ENABLED' THEN
                 epf_log.info('REG_FK_DISABLED', 'Disabled FK ignored: ' || l_label, f.c_owner, f.c_table);
+            ELSIF f.p_role = 'ROOT' AND f.p_key IS NULL THEN
+                add_error('REG_ROOT_KEY_FK', 'FK into a root without key column: ' || l_label
+                          || '; such a root is purged by ROWID and referenced rows cannot be held back',
+                          f.c_owner, f.c_table);
             ELSIF f.c_id IS NOT NULL AND f.c_id = f.p_id THEN
                 add_warning('REG_FK_SELF', 'Self-referencing FK: ' || l_label
                             || '; a batch may fail if a row references a row of a later batch',
@@ -154,7 +214,7 @@ CREATE OR REPLACE PACKAGE BODY epf_registry AS
                           f.c_owner, f.c_table);
             ELSE
                 add_warning('REG_FK_EXTERNAL', 'FK from a table outside the registry: ' || l_label
-                            || '; the purge fails if it references an eligible row',
+                            || '; roots whose rows it references are held back by the purge',
                             f.c_owner, f.c_table);
             END IF;
         END LOOP;

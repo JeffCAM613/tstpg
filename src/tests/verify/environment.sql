@@ -189,12 +189,20 @@ SELECT i.table_owner AS owner, i.table_name, c.column_name, i.index_name, i.stat
         UNION ALL SELECT 'OPPAYMENTS', 'INVOICE_ADDITIONAL_INFO', 'INVOICE_ID' FROM dual)
  ORDER BY 1, 2, 3;
 
-PROMPT ==== 14. Previous tool objects in OPPAYMENTS
+PROMPT ==== 14. Objects of the previous purge tool (exact names; application EPF_* objects are not listed)
 SELECT owner, object_name AS table_name, object_type AS name, status AS value
   FROM dba_objects
- WHERE owner = 'OPPAYMENTS'
-   AND object_name LIKE 'EPF%'
- ORDER BY object_type, object_name;
+ WHERE (owner = 'OPPAYMENTS'
+        AND object_name IN ('EPF_PURGE_PKG', 'EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT', 'EPF_DDL_BACKUP',
+                            'EPF_NUMBER_TAB', 'IDX_EPF_PURGE_LOG_RUN', 'IDX_EPF_PURGE_LOG_TS',
+                            'IDX_EPF_PURGE_LOG_MODULE', 'IDX_EPF_SPACE_SNAP_RUN', 'IDX_EPF_DDL_BACKUP_RUN'))
+    OR (object_type = 'INDEX' AND object_name LIKE 'EPF\_TMP\_%' ESCAPE '\')
+    OR (object_type = 'DIRECTORY' AND object_name = 'EPF_REDO_CLEANUP')
+UNION ALL
+SELECT 'SYS', tablespace_name, 'TABLESPACE', status
+  FROM dba_tablespaces
+ WHERE tablespace_name = 'EPF_SCRATCH'
+ ORDER BY 3, 2;
 
 PROMPT ==== 15. INHERIT PRIVILEGES granted on SYS
 SELECT grantee AS owner, privilege AS name

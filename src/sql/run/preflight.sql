@@ -1,13 +1,14 @@
 -- ============================================================================
 -- EPF Data Purge - Preflight
 -- ============================================================================
--- Purpose : Read-only checks before a run. Current checks: registry
---           validation against the live database (epf_registry.validate).
+-- Purpose : Read-only checks before a run: registry validation against the
+--           live database, supporting indexes of the link columns, eligible
+--           roots per root table (epf_purge.preflight).
 -- Usage   : sqlplus -L -S "epfpg@<service>" @src/sql/run/preflight.sql <run_id|NEW>
 --             <run_id>  bind to a run created by start_run.sql and attached by
 --                       the caller's monitor session
 --             NEW       create, attach and finish a standalone PREFLIGHT run in
---                       this session (manual use)
+--                       this session with default purge parameters (manual use)
 -- Requires: EPFPG (or SYS).
 -- Effects : Writes events and steps of the run; changes nothing else.
 --           Exit code 0 when no check failed, 1 otherwise.
@@ -37,10 +38,7 @@ DECLARE
     l_errors   PLS_INTEGER;
     l_warnings PLS_INTEGER;
 BEGIN
-    epfpg.epf_log.step_start('REGISTRY');
-    epfpg.epf_registry.validate(l_errors, l_warnings);
-    epfpg.epf_log.step_end(CASE WHEN l_errors > 0 THEN 'FAILED' ELSE 'DONE' END,
-                           l_errors || ' errors, ' || l_warnings || ' warnings');
+    epfpg.epf_purge.preflight(:run_id, l_errors, l_warnings);
     :rc := CASE WHEN l_errors > 0 THEN 1 ELSE 0 END;
 
     IF UPPER('&run_arg') = 'NEW' THEN

@@ -76,6 +76,13 @@ CREATE OR REPLACE PACKAGE epf_log AUTHID DEFINER AS
     -- ORA-20112 when no step is running in this session.
     PROCEDURE step_end(p_status IN VARCHAR2 DEFAULT 'DONE', p_message IN VARCHAR2 DEFAULT NULL);
 
+    -- Step running in this session (NULL when none).
+    FUNCTION current_step RETURN VARCHAR2;
+
+    -- Marks every PENDING step of the session's phase as SKIPPED. Emits
+    -- STEPS_SKIPPED when at least one step was pending.
+    PROCEDURE step_skip_pending(p_message IN VARCHAR2 DEFAULT NULL);
+
     -- Prints the events of a run through DBMS_OUTPUT, one line per event.
     PROCEDURE print_events(p_run_id IN NUMBER, p_after_event_id IN NUMBER DEFAULT 0);
 

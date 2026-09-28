@@ -125,6 +125,9 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
             RAISE_APPLICATION_ERROR(-20121, 'Unknown action: ' || p_action
                                             || '. Valid values: PURGE, RECLAIM, PREFLIGHT');
         END IF;
+        IF l_compact = 'Y' THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Compaction (with_compact=Y) is not supported by this tool version.');
+        END IF;
         IF NOT lock_is_free THEN
             RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '
                                             || NVL(epf_util.run_label(active_run_id), 'unknown run'));

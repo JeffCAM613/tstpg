@@ -192,7 +192,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.1.0', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.2.0', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -207,6 +207,7 @@ BEGIN
     put_setting('parallel_min_mb',        '1024',  'Indexes at least this large are rebuilt in parallel (Enterprise Edition)');
     put_setting('resize_every_mb',        '1024',  'Old datafiles are resized after this many MB have been moved');
     put_setting('compact_min_free_pct',   '20',    'Compaction only processes tables with at least this share freed inside');
+    put_setting('temp_index_min_mb',      '64',    'A missing index on a link column is created for the purge only on tables at least this large');
     put_setting('restore_datafile_paths', 'Y',     'Move swapped datafiles back to their original path (Enterprise Edition)');
 
     COMMIT;

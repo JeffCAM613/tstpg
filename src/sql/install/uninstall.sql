@@ -5,9 +5,10 @@
 --           tablespace EPFPG_DATA.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/install/uninstall.sql
 -- Requires: SYS AS SYSDBA; in a multitenant database, the PDB service.
--- Effects : Refuses while a run holds the run lock, while application accounts
---           locked by a reclaim are not yet restored, or while temporary purge
---           indexes are still present. Otherwise drops user EPFPG CASCADE, then
+-- Effects : Refuses while a run holds the run lock or while application
+--           accounts locked by a reclaim are not yet restored. Otherwise drops
+--           user EPFPG CASCADE (temporary purge indexes are owned by EPFPG
+--           and are dropped with it), then
 --           drops EPFPG_DATA and its datafiles when nothing else references
 --           the tablespace; otherwise the tablespace is kept and the remaining
 --           references are counted in the output.
@@ -56,17 +57,6 @@ BEGIN
         IF l_count > 0 THEN
             RAISE_APPLICATION_ERROR(-20903, l_count || ' application accounts locked by a reclaim are not '
                                             || 'restored yet. Run the reclaim resume first.');
-        END IF;
-    END IF;
-
-    SELECT COUNT(*) INTO l_count FROM dba_tables WHERE owner = 'EPFPG' AND table_name = 'EPF_TEMP_INDEX';
-    IF l_count > 0 THEN
-        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_temp_index t WHERE t.dropped_at IS NULL '
-                       || 'AND EXISTS (SELECT 1 FROM dba_indexes i '
-                       || 'WHERE i.owner = t.owner AND i.index_name = t.index_name)' INTO l_count;
-        IF l_count > 0 THEN
-            RAISE_APPLICATION_ERROR(-20904, l_count || ' temporary purge indexes still exist. '
-                                            || 'Finish or re-run the purge first.');
         END IF;
     END IF;
 

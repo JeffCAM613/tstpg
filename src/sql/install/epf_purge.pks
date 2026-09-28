@@ -1,0 +1,75 @@
+CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
+-- ============================================================================
+-- EPF Data Purge - Purge engine
+-- ============================================================================
+-- Purges the registry tables of the modules selected by a run, driven only by
+-- the registry (EPF_TABLE, EPF_LINK) and the live foreign keys.
+--
+-- Eligibility
+--   Root       date_column < cutoff date of the run.
+--   Dependent  match_column in the keys of an eligible source row (per link;
+--              several links are combined). A link whose source column is not
+--              the source key column is a reverse link: the source row points
+--              at the dependent row. A dependent row still pointed at by a
+--              retained source row is kept (held row).
+--   Held root  when a row that is kept (outside the eligible set, or in a
+--              table outside the registry) references, through an enabled
+--              FK, a row of an eligible root's tree, that root and its whole
+--              tree are left for a later run. Repeated until no reference
+--              remains. Applies to deleting modules.
+--
+-- Key snapshot (EPF_WORK_KEY)
+--   Root keys are taken once, then the keys of every link source below the
+--   root are derived with the root they belong to. Roots are numbered into
+--   batches of batch_size in key order; roots whose trees reference each
+--   other through an FK share a batch. A root without key column (and
+--   without dependents) is snapshot by ROWID in physical order and its rows
+--   are re-checked against the cutoff when processed.
+--
+-- Actions per module
+--   DELETE  modes FULL and LOGS, and the LOGS module in mode CLOB_N_LOGS.
+--   CLEAR   modes CLOB and CLOB_N_LOGS (other modules): LOB columns of
+--           eligible rows (tables with lob_clear = Y) are set to an empty
+--           LOB where their length is above zero. lob_throttle_ms is waited
+--           after every batch.
+--   Each batch is one transaction: tables in ascending delete_order (leaves
+--   first, root last). A failing batch is rolled back and stops its module;
+--   the other modules continue. A stop request is honoured between batches.
+--
+-- Supporting indexes
+--   A link column (and the source column of a reverse link) without an
+--   index is indexed for the duration of a module when its table is at least
+--   temp_index_min_mb large: EPF_TMP_<run>_<n>, owned by the tool schema in
+--   its default tablespace, recorded in EPF_TEMP_INDEX and dropped when the
+--   module ends. Indexes left by an interrupted run are dropped at the start
+--   of the next purge.
+--
+-- Counts (EPF_TABLE_STAT, phases BEFORE and AFTER)
+--   total, eligible, retained (total - eligible), non-empty LOB values
+--   (CLEAR), processed (AFTER), held. Space inside segments is captured with
+--   epf_space (BASELINE, and POST_PURGE unless dry run).
+--
+-- Events: PURGE_SCOPE, TABLE_SKIPPED, ROOT_MISSING, TEMP_INDEX_LEFTOVER,
+--   KEYS_SNAPSHOT, ROOTS_HELD, ROOTS_GROUPED, TABLE_ELIGIBLE, TEMP_INDEX_CREATED,
+--   TEMP_INDEX_FAILED, TEMP_INDEX_DROPPED, BATCH_PROGRESS, BATCH_FAILED,
+--   STOP_HONORED, TABLE_RESULT, MODULE_END, STEP_FAILED, IDX_MISSING,
+--   IDX_SUMMARY, ROOTS_ELIGIBLE, PURGE_END.
+--
+-- Error codes
+--   ORA-20130  run is not a purge / preflight run, or session not bound to it
+--   ORA-20131  held roots did not converge
+-- ============================================================================
+
+    -- Read-only checks for run p_run_id (action PURGE or PREFLIGHT) in the
+    -- session bound to it: registry validation (step REGISTRY), supporting
+    -- indexes (SUPPORTING_INDEXES) and eligible roots (ELIGIBLE_ROOTS) of the
+    -- modules in scope.
+    PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER);
+
+    -- Runs the purge phase of run p_run_id (action PURGE) in the session bound
+    -- to it (epf_control.attach / enter). p_status returns SUCCESS, WARNING,
+    -- FAILED or STOPPED. A dry run stops after the counts.
+    PROCEDURE run(p_run_id IN NUMBER, p_status OUT VARCHAR2);
+
+END epf_purge;
+/

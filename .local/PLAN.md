@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft 3 - decisions D1-D14 applied; pre-drop reference check and revert path added; phase 1 delivered; tool tablespace created by the installer, application tablespaces always detected. Change history: `.local/changes.md`. |
+| Status | Draft 3 - decisions D1-D16 applied; phase 1 delivered and tested; phase 2 (purge engine) delivered, not yet run. Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -185,7 +185,7 @@ Each named step is a row in `EPF_STEP` (status PENDING/RUNNING/DONE/FAILED/SKIPP
 
 | Account | Used for | Rights |
 |---------|----------|--------|
-| `EPFPG` (tool schema, created by `install.sql` as SYS) | purge, report, preflight, event logging | `CREATE SESSION/TABLE/PROCEDURE`, quota on its own tablespace `EPFPG_DATA` (created by the installer, never a reclaim target); `SELECT, DELETE` on every registry table and `UPDATE` on tables with `lob_clear = Y` (generated from the registry); `CREATE ANY INDEX`, `DROP ANY INDEX` (temporary purge indexes); direct `SELECT` on the dictionary views the preflight and report read (`DBA_SEGMENTS`, `DBA_DATA_FILES`, `DBA_FREE_SPACE`, `DBA_TABLES`, `DBA_INDEXES`, `DBA_CONSTRAINTS`, `DBA_LOBS`, `DBA_TAB_COLUMNS`, `DBA_DEPENDENCIES`, `DBA_USERS`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$TRANSACTION`, `V_$DATABASE`, ...); `ANALYZE ANY` (for `DBMS_SPACE.SPACE_USAGE`); `ALTER ANY TABLE` only if compaction (6.7) is used |
+| `EPFPG` (tool schema, created by `install.sql` as SYS) | purge, report, preflight, event logging | `CREATE SESSION/TABLE/PROCEDURE`, quota on its own tablespace `EPFPG_DATA` (created by the installer, never a reclaim target); `SELECT, DELETE, INDEX` on every registry table and `UPDATE` on tables with `lob_clear = Y` (generated from the registry; `INDEX` lets EPFPG create the temporary purge indexes in its own schema, so no `CREATE/DROP ANY INDEX`); `SELECT` on tables outside the registry that have an FK into it (hold-back check, D16); `EXECUTE` on `DBMS_SPACE`; direct `SELECT` on the dictionary views the preflight and report read (`DBA_SEGMENTS`, `DBA_DATA_FILES`, `DBA_FREE_SPACE`, `DBA_TABLES`, `DBA_INDEXES`, `DBA_CONSTRAINTS`, `DBA_LOBS`, `DBA_TAB_COLUMNS`, `DBA_DEPENDENCIES`, `DBA_USERS`, `V_$SESSION`, `V_$SESSION_LONGOPS`, `V_$TRANSACTION`, `V_$DATABASE`, ...); `ANALYZE ANY` (for `DBMS_SPACE.SPACE_USAGE`); `ALTER ANY TABLE` only if compaction (6.7) is used |
 | `SYS` (asked at startup only when reclaim is selected) | reclaim | runs `EPFPG.epf_reclaim`, an invoker-rights package, so all DDL executes with SYS rights; the installer grants `INHERIT PRIVILEGES ON USER SYS TO EPFPG` for this. Logging still goes through `EPFPG.epf_log` (definer rights). |
 
 Purge never needs SYS. Passwords are handled as in 10.2. In a multitenant database both accounts connect to the **PDB service**; a connection to `CDB$ROOT` is refused with a message.
@@ -266,13 +266,14 @@ All tables live in the tool schema, in tablespace `EPFPG_DATA`, which is never r
 | `EPF_RUN` | One row per run | `run_id`, `action`, `status`, `verdict`, `retention_days`, `cutoff_date`, `depth`, `mode`, `batch_size`, `dry_run`, `with_reclaim`, `started_at`, `ended_at`, `stop_requested`, `db_name`, `host`, `os_user`, `exit_code` |
 | `EPF_STEP` | Step checklist / state | `run_id`, `step_seq`, `phase`, `step_code`, `status`, `started_at`, `ended_at`, `units_done`, `units_total`, `bytes_done`, `bytes_total` |
 | `EPF_EVENT` | Event stream (replaces `epf_purge_log`) | `event_id` (identity), `run_id`, `ts`, `phase`, `step_code`, `severity` (INFO/OK/WARN/ERROR/PROGRESS), `event_code`, `object_owner`, `object_name`, `rows_affected`, `bytes`, `pct`, `elapsed_s`, `ora_code`, `message` |
-| `EPF_WORK_KEY` | Key snapshot per run/table/batch | `run_id`, `table_id`, `batch_no`, `key_num`, `key_rowid`; index (`run_id`, `table_id`, `batch_no`) |
-| `EPF_TABLE_STAT` | Per-table counts per phase | `run_id`, `table_id`, `phase`, `total_rows`, `eligible_rows`, `retained_rows`, `nonempty_lob_rows`, `processed_rows`, `orphan_rows` |
+| `EPF_WORK_KEY` | Key snapshot of the running purge (truncated at purge start and end) | `run_id`, `table_id`, `batch_no`, `key_num`, `key_rowid`, `root_key`, `group_key`; indexes (`run_id`, `table_id`, `batch_no`), (`run_id`, `table_id`, `root_key`), (`run_id`, `table_id`, `key_num`) |
+| `EPF_HELD_ROOT` | Roots held back (D16) with the first reference found | `run_id`, `table_id`, `root_key`, `child_owner`, `child_table`, `constraint_name`, `parent_owner`, `parent_table`, `iteration` |
+| `EPF_TABLE_STAT` | Per-table counts per phase | `run_id`, `table_id`, `phase`, `total_rows`, `eligible_rows`, `retained_rows`, `nonempty_lob_rows`, `processed_rows`, `orphan_rows`, `held_rows` |
 | `EPF_SEGMENT_SNAP` | Segment sizes per phase (BASELINE, POST_PURGE, POST_RECLAIM) | `run_id`, `phase`, `owner`, `segment_name`, `partition_name`, `segment_type`, `parent_owner`, `parent_table`, `tablespace_name`, `bytes`, `module_code` |
 | `EPF_FILE_SNAP` | Datafile geometry per phase | `run_id`, `phase`, `tablespace_name`, `file_id`, `file_name`, `bytes`, `hwm_bytes`, `free_bytes`, `autoextensible`, `increment_by`, `maxbytes` |
 | `EPF_OBJECT_BASELINE` | Reclaim fingerprint (indexes, constraints, invalid objects, row counts, account status) | `run_id`, `object_type`, `owner`, `name`, `table_name`, `tablespace_name`, `status`, `validated`, `degree`, `logging`, `row_count` |
 | `EPF_RECLAIM_OBJECT` | Reclaim journal per movable unit | `run_id`, `owner`, `object_name`, `sub_name`, `unit_type`, `source_ts`, `target_ts`, `bytes`, `move_status`, `attempts`, `last_ora`, timestamps |
-| `EPF_TEMP_INDEX` | Temporary supporting indexes created by a run | `run_id`, `owner`, `index_name`, `table_name`, `column_name`, `created_at`, `dropped_at` |
+| `EPF_TEMP_INDEX` | Temporary supporting indexes created by a run | `run_id`, `owner` (EPFPG), `index_name`, `table_owner`, `table_name`, `column_name`, `created_at`, `dropped_at` |
 | `EPF_SPACE_USAGE` | Space used inside segments (from `DBMS_SPACE`) per phase | `run_id`, `phase`, `owner`, `segment_name`, `partition_name`, `segment_type`, `allocated_bytes`, `used_bytes`, `free_bytes`, `method` |
 | `EPF_TS_INVENTORY` | Everything that lives in or points at a target tablespace | `run_id`, `tablespace_name`, `kind` (SEGMENT, SEGMENTLESS, DEFAULT_ATTR, USER_DEFAULT, QUOTA, DB_DEFAULT, RECYCLEBIN), `owner`, `object_name`, `sub_name`, `segment_type`, `bytes`, `handler`, `blocker_reason` |
 | `EPF_LONG_CONVERSION` | LONG / LONG RAW columns found, the decision taken, and the result | `run_id`, `owner`, `table_name`, `column_name`, `original_type`, `new_type`, `decision` (CONVERT/SKIP), `row_count`, `bytes`, `dependents`, `status`, `converted_at`, `ora_code` |
@@ -300,7 +301,7 @@ Fixes F-01..F-06, F-08, P-01..P-04.
 
 ### 6.1 Flow per module
 
-1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`, ordered by key and numbered into batches (`CEIL(ROWNUM / batch_size)`); single-table roots with no dependents snapshot `ROWID`s in physical order instead. One commit. Consequences:
+1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`; the keys of every link source below the root (payment, import_audit, workflow executions, invoice) are derived once, each tagged with the root it belongs to (`root_key`). For deleting modules, roots are then held back (D16, 6.1.1) and roots whose trees reference each other share a group. Roots are numbered into batches of `batch_size` in key order without splitting a group; a derived key belongs to the batch of its root. Roots without key column (no dependents: `file_integration`, `spec_trt_log`) snapshot `ROWID`s in physical order instead, and each delete re-checks the cutoff. Consequences:
    - no cursor is held across commits: ORA-01555 cannot happen (F-01);
    - the total number of batches is known: progress % and ETA;
    - deletes join a real, indexed table with correct statistics instead of a collection (P-01);
@@ -312,6 +313,15 @@ Fixes F-01..F-06, F-08, P-01..P-04.
    - per-table counters are accumulated in memory; commit; `EPF_STEP` progress updated.
 4. **Totals.** Per-table processed counts are written once to `EPF_TABLE_STAT` (no double counting, F-03); per-module completion event.
 5. **After-counts.** Residual eligible rows, retained rows and orphans are recounted (phase AFTER) for the report.
+
+#### 6.1.1 Held back (D16)
+
+A row that is kept must never lose a row it references, and nothing newer than the cutoff is deleted by a cascade.
+
+- **FK references.** For every enabled FK into a registry table of a deleting tree (from any schema), rows that are kept (not eligible, or in a table outside the registry) referencing an eligible row cause the root(s) of that row to be held back with their whole tree (`EPF_HELD_ROOT`, WARN `ROOTS_HELD`). Repeated until no reference remains (a held root makes more rows "kept"). FKs whose child is derived from the parent through the same column (the normal tree FKs) cannot conflict and are skipped. On this database the checked FKs are `NOTIFICATION_EXECUTION -> IMPORT_AUDIT` (ON DELETE CASCADE), `NOTIFICATION_EXECUTION -> TRANSMISSION_EXECUTION`, `TRANSMISSION_EXECUTION -> TRANSMISSION_EXCEPTION`, `TRANSMISSION_EXECUTION_AUDIT -> TRANSMISSION_EXECUTION`.
+- **Reverse links** (the source row points at the dependent: `audit_trail.audit_archive_id -> audit_archive`). A dependent row still pointed at by a kept source row is kept (held row, `held_rows`, WARN `ROWS_HELD`); the old source row is still deleted. Applies to CLOB modes as well.
+- **Eligible rows referencing across roots** (both eligible, different roots): their roots share a batch, so the child is always deleted before or with its parent.
+- Held roots are purged by a later run once the rows that reference them are eligible too.
 
 ### 6.2 Modes
 
@@ -332,7 +342,8 @@ Fixes F-01..F-06, F-08, P-01..P-04.
 
 ### 6.4 Supporting indexes (D5)
 
-- Preflight lists missing indexes on every link `match_column` and root `date_column` (P-03). The purge creates the missing ones as `EPF_TMP_<n>` (tracked in `EPF_TEMP_INDEX`) and drops them at the end of the purge; any left over from an interrupted run are dropped at the next run start.
+- Preflight lists missing indexes on every link `match_column` (and on the source column of a reverse link) (P-03). For each module, the purge creates the missing ones on tables of at least `temp_index_min_mb` (default 64 MB) as `EPF_TMP_<run>_<n>`, **owned by EPFPG in `EPFPG_DATA`** (never in a reclaim target), `ONLINE` on EE, tracked in `EPF_TEMP_INDEX`, and drops them when the module ends; any left over from an interrupted run are dropped at the next purge start. A failed creation is a WARN; the purge continues without the index.
+- Root date columns are not indexed: the snapshot reads them once, so building an index would cost more than it saves.
 - No other database-level change is made: no statistics gathering, no redo log changes, no `undo_retention` change, no UNDO/TEMP resizing. Everything kept works inside a PDB.
 
 ### 6.5 Session instrumentation
@@ -347,7 +358,7 @@ A DELETE frees space inside blocks; segment and tablespace sizes do not change, 
 
 ### 6.7 Optional compaction (D7, opt-in)
 
-Offered in the wizard only when reclaim is not selected (default No; `--compact`). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
+Delivered with phase 3; until then `start_run` refuses `with_compact = Y`. Offered in the wizard only when reclaim is not selected (default No; `--compact`). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
 
 - only registry tables whose freed-inside ratio is above `compact_min_free_pct` (default 20 %) are processed, largest benefit first;
 - per table: record `row_movement`, `ENABLE ROW MOVEMENT`, `SHRINK SPACE COMPACT` (online), `SHRINK SPACE` (short lock, bounded by `ddl_lock_timeout`), LOB segments where the LOB type supports shrink, then restore the recorded `row_movement` value;
@@ -379,6 +390,8 @@ A datafile can only be resized down to the highest allocated block in that file.
 1. Mark every index on the tables being moved `UNUSABLE` (all owners). Since 11.2 this drops the index segment while the index and its constraint stay defined.
 2. Move the tables.
 3. `ALTER INDEX ... REBUILD TABLESPACE <target>` for each unusable index (target = the new tablespace if the index lived in the swapped tablespace, otherwise its original tablespace), then restore the recorded degree and logging attribute.
+
+The primary key index of an index-organized table holds the table's rows: it is moved with `ALTER TABLE ... MOVE` and never marked UNUSABLE. Secondary indexes on an IOT follow steps 1-3.
 
 PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on that table fails with ORA-01502, so writes fail loudly instead of bypassing uniqueness; reads keep working. Recovery from any failure is "rebuild whatever is UNUSABLE" - discoverable from `DBA_INDEXES` and idempotent. No DDL capture, no backup table, no recovery scripts.
 
@@ -431,7 +444,8 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 
 ### 7.6 Accounts and sessions (D10)
 
-- **At startup** the preflight lists every owner with objects in the target tablespaces: account status, and each session (SID, OS user, machine, program, logon time, open transaction yes/no). You confirm this list once, together with the rest of the run.
+- **Accounts in scope (D15):** every owner of objects in the target tablespaces, plus every account that holds INSERT, UPDATE or DELETE on those objects (granted directly or through a role), plus every account with a session using them at startup. System privileges (`... ANY TABLE`, DBA) do not bring an account into scope. Oracle-maintained accounts and the tool's own accounts (EPFPG, SYS) are never in scope.
+- **At startup** the preflight lists every account in scope with the reason it is in scope (owner / grant / session), its status, and each session (SID, OS user, machine, program, logon time, open transaction yes/no). You confirm this list once, together with the rest of the run.
 - **When the reclaim starts** (possibly hours later, after the purge): the list is refreshed and printed to console and log; sessions that appeared since the confirmation are flagged "new since confirmation". Then, per owner:
   1. record the original account status;
   2. `ALTER USER ... ACCOUNT LOCK`;
@@ -744,6 +758,24 @@ I cannot run Oracle in this environment, so each phase ships test scripts and ex
 
 All of section 1 measured PASS on the matrix, and on one production-sized clone run end-to-end with timings recorded.
 
+### 12.4 Target environment (survey of 2026-09-28)
+
+| Fact | Consequence for the design |
+|------|----------------------------|
+| 19c EE (19.24), non-CDB `EPFPG781`, Linux x86-64; the wrapper runs on a Windows client | The non-CDB path is the primary test case. Datafiles are on the server: the wrapper never touches them; file deletion goes through a directory object (7.7 DROP_OLD). |
+| NOARCHIVELOG | The redo vs recovery-area check (D9) does not apply. No media recovery is possible, so the reclaim preflight shows a WARN recommending a backup. |
+| No OMF; files in `/files2/oradata19/EPFPG781/`; database default permanent tablespace is SYSTEM | Named datafiles in the original directory; SYSTEM is never a target. |
+| One reclaim candidate: `DATA`, **bigfile**, one 41.6 GB file, 39.5 GB of segments, autoallocate, ASSM, not encrypted, autoextend to 32 TB | Clone `DATA_R` is bigfile; the single old file is resized down during MOVE. |
+| Segments in DATA: OPPAYMENTS 34 GB (tables 11.9, LOBs 14.0, indexes 8.1), OP 6.4 GB; OPREPORTS owns none | |
+| KDCM and SUPER: default tablespace DATA with unlimited quota, no objects in DATA | Default and quota repointed by REPOINT; locked for the reclaim if they hold DML grants on objects in DATA or use them (D15). |
+| 82 segmentless tables in DATA (OP 81, OPPAYMENTS 1) | REPOINT at real scale; V4 must include them. |
+| LONG columns: `OP.PLAN_TABLE.OTHER` (0 rows), `OP.WEB_RAPPORT.REQUETE` (46 rows) | Two items in the per-item confirmation (D14). |
+| IOT `OP.ISIN_RESERVE`; no partitioned, cluster, queue or nested tables; recycle bin empty | IOT handled by MOVE (7.3); no blockers expected. |
+| 27/27 registry tables present; 22 FKs into them, all inside OPPAYMENTS; `NOTIFICATION_EXECUTION.IMPORT_AUDIT_FK` is ON DELETE CASCADE | Rows of retained roots that reference rows of eligible roots must be handled explicitly by the purge engine (phase 2). |
+| Largest purge tables: DIRECTORY_DISPATCHING 10.6 GB (3.8 M rows), FILE_DISPATCHING 4.4 GB, PAYMENT_ADDITIONAL_INFO 3.8 GB (56.8 M rows), TRANSMISSION_EXECUTION_AUDIT 2.3 GB, PAYMENT 2.1 GB, PAYMENT_AUDIT 1.5 GB (25.3 M rows) | Index coverage of the PAYMENT_ID children decides purge speed; listed by the phase 2 preflight. |
+| Optimizer statistics of most purge tables date from 2024 | Counts always come from the key snapshot, never from statistics. |
+| OPPAYMENTS owns application packages named `EPF_*` (EPF_BIND, EPF_CONTEXT, EPF_CST, EPF_MIGRATION_133, EPF_SQLBINDING, EPF_UTILS) | Objects of the previous tool are identified by exact name only (section 14). |
+
 ---
 
 ## 13. Implementation phases
@@ -752,8 +784,8 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 |-------|--------------|---------------|
 | 0. Verify and baseline | Now: read-only environment survey (`src/tests/verify/environment.sql`). Before phase 5: behavior spikes V1-V10 on a test database; parity baseline from the previous tool on a clone. | Survey output reviewed; V1-V10 answered before reclaim work starts. |
 | 1. Foundation | Layout, `.gitattributes`/`.gitignore`, `install.sql`/`uninstall.sql`, `tables.sql`, `registry_data.sql`, `grants.sql`, `epf_util`, `epf_log`, `epf_control`, `epf_registry`. | Install/upgrade/uninstall idempotent; registry validation runs. |
-| 2. Purge engine | `epf_purge`, `epf_space` snapshots, `run/preflight.sql`, `run/purge.sql`. | Parity with baseline; dry-run exact counts. |
-| 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P6, `run/report.sql`. | Purge runs self-verify. |
+| 2. Purge engine | `epf_purge` (snapshot, held back D16, modes, batches, temporary indexes, counts), `epf_space` (segment, file and in-segment snapshots), `run/preflight.sql`, `run/purge.sql`. | Parity with baseline; dry-run exact counts. |
+| 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P7, `run/report.sql`; optional compaction (6.7). | Purge runs self-verify. |
 | 4. Wrapper | `epf_purge.bat` launcher, `lib/epf.ps1`: CLI, config, wizard, credentials, runner, live view, run folder, exit codes. | End-to-end purge from the wizard and non-interactively. |
 | 5. Reclaim engine | `epf_reclaim` (inventory, blockers, LONG conversion, account lock/unlock, forecast, swap state machine, resume), `run/reclaim.sql`, `run/status.sql`, `run/stop.sql`. | Full test matrix 12.2 for reclaim. |
 | 6. Report (reclaim part) | Sections 4-5, checks R1-R7, manifest. | Reclaim runs self-verify. |
@@ -786,7 +818,7 @@ Each phase is one reviewable pull request on this branch lineage.
 | `utility/14_recover_indexes.sql`, `17_reclaim_recovery.sql` | Built-in resume/restore (7.8) |
 | `utility/15_segment_map.sql` | `tools/segment_map.sql` (per-file) |
 | `utility/16_fk_coverage_scan.sql` | `epf_registry.validate` + `tools/fk_coverage.sql` |
-| Tables `EPF_PURGE_LOG`, `EPF_PURGE_SPACE_SNAPSHOT`, `EPF_DDL_BACKUP`, type `EPF_NUMBER_TAB` | Replaced by section 5 tables; `install.sql` offers to remove the old objects from OPPAYMENTS (after checking that no reclaim is incomplete) |
+| Tables `EPF_PURGE_LOG`, `EPF_PURGE_SPACE_SNAPSHOT`, `EPF_DDL_BACKUP`, type `EPF_NUMBER_TAB`, package `EPF_PURGE_PKG`, their `IDX_EPF_*` indexes, `EPF_TMP_*` indexes, directory `EPF_REDO_CLEANUP`, tablespace `EPF_SCRATCH` | Replaced by section 5 tables; `install.sql` offers to remove the old objects (after checking that no reclaim is incomplete). They are identified by exact name only, never by the `EPF` prefix: the application owns `EPF_*` packages in OPPAYMENTS (12.4). |
 | Flags `--reclaim-only`, `--reclaim-online`, `--reclaim-online-only`, `--max-iterations`, `--no-stall-check`, `--allow-offline-index-rebuild`, `--show-sizes`, `--optimize-db`, `--drop-pkg`, `--drop-logs`, `--truncate-logs`, `--sys-password`, `--user`, `--password` | Removed (D12); replaced by actions and the options in 10.1. Mode `CLOB_ONLY` is renamed `CLOB`. |
 
 ---
@@ -809,6 +841,8 @@ Each phase is one reviewable pull request on this branch lineage.
 | D12 | Old CLI flags | Clean CLI, no aliases |
 | D13 | Reclaim credentials | SYS, asked at startup only when reclaim is selected; purge never needs SYS; all input at the beginning |
 | D14 | LONG / LONG RAW columns | Convert to CLOB/BLOB with per-item approval at startup; skipped items leave their tablespace unswapped with a warning, a recommended manual path, and a final confirmation; every conversion reported with original and new type |
+| D15 | Accounts locked and disconnected at reclaim start | Owners of objects in the target tablespaces, plus accounts with INSERT/UPDATE/DELETE on those objects (direct or through a role), plus accounts with sessions using them; listed with the reason at startup (7.6) |
+| D16 | Kept rows that reference rows being purged (cross-references, ON DELETE CASCADE, shared audit archives) | Hold back: the referenced rows and the whole root they belong to stay until a later run; counted and reported with the referencing table; the run never fails on it and nothing newer than the cutoff is deleted (6.1.1) |
 
 Also settled:
 

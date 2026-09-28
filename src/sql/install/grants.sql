@@ -5,10 +5,14 @@
 --           reporting, and lets SYS run the tool's invoker-rights reclaim code.
 -- Usage   : Called by install.sql as SYS, after registry_data.sql.
 -- Effects : System privileges, direct SELECT on dictionary views (definer-
---           rights PL/SQL cannot use roles), EXECUTE on DBMS_LOCK, and
---           SELECT/DELETE/UPDATE on every registry table present in the
---           database. A registry table that does not exist is reported and
---           skipped. Any other failed grant stops the installation.
+--           rights PL/SQL cannot use roles), EXECUTE on DBMS_LOCK and
+--           DBMS_SPACE, and SELECT/DELETE/INDEX (UPDATE for LOB clearing) on
+--           every registry table present in the database, and SELECT on every
+--           other table with an FK into a registry table. Temporary purge
+--           indexes are created in the tool schema, so CREATE ANY INDEX and
+--           DROP ANY INDEX are revoked when present. A registry table that
+--           does not exist is reported and skipped. Any other failed grant
+--           stops the installation.
 -- ============================================================================
 
 DECLARE
@@ -28,8 +32,15 @@ BEGIN
     FOR p IN (SELECT column_value AS priv
                 FROM TABLE(SYS.ODCIVARCHAR2LIST(
                          'CREATE SESSION', 'CREATE TABLE', 'CREATE PROCEDURE', 'CREATE SEQUENCE',
-                         'CREATE ANY INDEX', 'DROP ANY INDEX', 'ANALYZE ANY', 'ALTER ANY TABLE'))) LOOP
+                         'ANALYZE ANY', 'ALTER ANY TABLE'))) LOOP
         run_grant('GRANT ' || p.priv || ' TO epfpg');
+    END LOOP;
+    FOR p IN (SELECT privilege
+                FROM dba_sys_privs
+               WHERE grantee = 'EPFPG'
+                 AND privilege IN ('CREATE ANY INDEX', 'DROP ANY INDEX')) LOOP
+        EXECUTE IMMEDIATE 'REVOKE ' || p.privilege || ' FROM epfpg';
+        DBMS_OUTPUT.PUT_LINE('  revoke ' || p.privilege || ' (not needed)');
     END LOOP;
 
     -- Dictionary views read by preflight, monitor and report
@@ -48,6 +59,7 @@ BEGIN
     END LOOP;
 
     run_grant('GRANT EXECUTE ON sys.dbms_lock TO epfpg');
+    run_grant('GRANT EXECUTE ON sys.dbms_space TO epfpg');
 
     -- Allows SYS to execute EPFPG invoker-rights code (reclaim) with SYS rights.
     BEGIN
@@ -70,10 +82,26 @@ BEGIN
             l_skipped := l_skipped + 1;
             DBMS_OUTPUT.PUT_LINE('  skip  ' || t.owner || '.' || t.table_name || ' (not present in this database)');
         ELSE
-            run_grant('GRANT SELECT, DELETE' || CASE WHEN t.lob_clear = 'Y' THEN ', UPDATE' END
+            run_grant('GRANT SELECT, DELETE, INDEX' || CASE WHEN t.lob_clear = 'Y' THEN ', UPDATE' END
                       || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(t.owner, FALSE) || '.'
                       || DBMS_ASSERT.ENQUOTE_NAME(t.table_name, FALSE) || ' TO epfpg');
         END IF;
+    END LOOP;
+
+    -- Tables outside the registry with an FK into a registry table: read by
+    -- the purge to hold back roots whose rows they reference.
+    FOR t IN (SELECT DISTINCT c.owner, c.table_name
+                FROM dba_constraints c
+                JOIN dba_constraints p
+                  ON p.owner = c.r_owner AND p.constraint_name = c.r_constraint_name
+                JOIN epfpg.epf_table e
+                  ON e.owner = p.owner AND e.table_name = p.table_name AND e.active = 'Y'
+               WHERE c.constraint_type = 'R'
+                 AND NOT EXISTS (SELECT 1 FROM epfpg.epf_table x
+                                  WHERE x.owner = c.owner AND x.table_name = c.table_name AND x.active = 'Y')
+               ORDER BY c.owner, c.table_name) LOOP
+        run_grant('GRANT SELECT ON ' || DBMS_ASSERT.ENQUOTE_NAME(t.owner, FALSE) || '.'
+                  || DBMS_ASSERT.ENQUOTE_NAME(t.table_name, FALSE) || ' TO epfpg');
     END LOOP;
 
     DBMS_OUTPUT.PUT_LINE('  grants: ' || l_granted || ' applied, ' || l_skipped || ' registry tables skipped');

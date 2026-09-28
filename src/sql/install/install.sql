@@ -194,10 +194,14 @@ PROMPT == EPF install: packages
 @@epf_log.pks
 @@epf_control.pks
 @@epf_registry.pks
+@@epf_space.pks
+@@epf_purge.pks
 @@epf_util.pkb
 @@epf_log.pkb
 @@epf_control.pkb
 @@epf_registry.pkb
+@@epf_space.pkb
+@@epf_purge.pkb
 
 ALTER SESSION SET CURRENT_SCHEMA = SYS;
 

@@ -198,6 +198,35 @@ CREATE OR REPLACE PACKAGE BODY epf_log AS
         DBMS_APPLICATION_INFO.SET_ACTION(g_phase);
     END step_end;
 
+    FUNCTION current_step RETURN VARCHAR2 IS
+    BEGIN
+        RETURN g_step;
+    END current_step;
+
+    PROCEDURE step_skip_pending(p_message IN VARCHAR2 DEFAULT NULL) IS
+        l_run_id NUMBER := require_run(NULL);
+        l_count  PLS_INTEGER;
+
+        PROCEDURE save IS
+            PRAGMA AUTONOMOUS_TRANSACTION;
+        BEGIN
+            UPDATE epf_step
+               SET status  = 'SKIPPED',
+                   message = NVL(SUBSTR(p_message, 1, 4000), message)
+             WHERE run_id = l_run_id
+               AND phase = g_phase
+               AND status = 'PENDING';
+            l_count := SQL%ROWCOUNT;
+            COMMIT;
+        END save;
+    BEGIN
+        save;
+        IF l_count > 0 THEN
+            event(c_info, 'STEPS_SKIPPED', l_count || ' planned ' || g_phase || ' steps skipped'
+                                           || CASE WHEN p_message IS NOT NULL THEN ': ' || p_message END);
+        END IF;
+    END step_skip_pending;
+
     PROCEDURE print_events(p_run_id IN NUMBER, p_after_event_id IN NUMBER DEFAULT 0) IS
     BEGIN
         FOR e IN (SELECT ts, severity, phase, event_code, object_owner, object_name, sub_name, message
