@@ -37,12 +37,18 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   the other modules continue. A stop request is honoured between batches.
 --
 -- Supporting indexes
---   A link column (and the source column of a reverse link) without an
---   index is indexed for the duration of a module when its table is at least
---   temp_index_min_mb large: EPF_TMP_<run>_<n>, owned by the tool schema in
---   its default tablespace, recorded in EPF_TEMP_INDEX and dropped when the
---   module ends. Indexes left by an interrupted run are dropped at the start
---   of the next purge.
+--   Missing indexes are created for the duration of a module:
+--   EPF_TMP_<run>_<n>, owned by the tool schema in its default tablespace,
+--   recorded in EPF_TEMP_INDEX and dropped when the module ends.
+--     link  a link column (and the source column of a reverse link), read
+--           once per batch: on tables of at least temp_index_min_mb
+--     fk    in a deleting module, the columns of every enabled FK into its
+--           tables: Oracle looks up child rows for every deleted parent row
+--           and scans the child table when these columns are not indexed,
+--           so they are indexed whatever the table size. A child table
+--           outside the registry cannot be indexed and is reported.
+--   Indexes left by an interrupted run are dropped at the start of the next
+--   purge.
 --
 -- Counts (EPF_TABLE_STAT, phases BEFORE and AFTER)
 --   total, eligible, retained (total - eligible), non-empty LOB values
@@ -51,9 +57,18 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --
 -- Events: PURGE_SCOPE, TABLE_SKIPPED, ROOT_MISSING, TEMP_INDEX_LEFTOVER,
 --   KEYS_SNAPSHOT, ROOTS_HELD, ROOTS_GROUPED, TABLE_ELIGIBLE, TEMP_INDEX_CREATED,
---   TEMP_INDEX_FAILED, TEMP_INDEX_DROPPED, BATCH_PROGRESS, BATCH_FAILED,
---   STOP_HONORED, TABLE_RESULT, MODULE_END, STEP_FAILED, IDX_MISSING,
---   IDX_SUMMARY, ROOTS_ELIGIBLE, PURGE_END.
+--   TEMP_INDEX_FAILED, TEMP_INDEX_DROPPED, TEMP_INDEX_KEPT, FK_UNINDEXED,
+--   BATCH_PROGRESS, BATCH_FAILED,
+--   STOP_HONORED, TREE_REDO, TABLE_RESULT, MODULE_END, STEP_FAILED,
+--   IDX_MISSING, IDX_SUMMARY, ROOTS_ELIGIBLE, REDO_LOGS, REDO_ESTIMATE,
+--   REDO_SUMMARY, PURGE_END.
+--
+-- Redo
+--   The redo written by each root tree is measured (V$MYSTAT) and recorded
+--   as TREE_REDO (rows = roots processed, bytes = redo). Preflight compares
+--   the redo of a batch with the online redo logs and recommends a batch
+--   size; it uses the latest measurement of each tree, or an estimate from
+--   optimizer statistics when the tree has not been purged yet.
 --
 -- Error codes
 --   ORA-20130  run is not a purge / preflight run, or session not bound to it
@@ -62,7 +77,8 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 
     -- Read-only checks for run p_run_id (action PURGE or PREFLIGHT) in the
     -- session bound to it: registry validation (step REGISTRY), supporting
-    -- indexes (SUPPORTING_INDEXES) and eligible roots (ELIGIBLE_ROOTS) of the
+    -- indexes (SUPPORTING_INDEXES), eligible roots (ELIGIBLE_ROOTS) and
+    -- online redo logs with the recommended batch size (REDO_LOGS) of the
     -- modules in scope.
     PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER);
 

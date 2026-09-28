@@ -324,34 +324,46 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_out;
     END lob_columns;
 
-    FUNCTION index_exists(p_table_id IN NUMBER, p_column IN VARCHAR2) RETURN BOOLEAN IS
-        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
-        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
+    -- TRUE when a usable index starts with exactly these columns (any order).
+    FUNCTION index_covers(p_owner IN VARCHAR2, p_table IN VARCHAR2, p_columns IN SYS.ODCIVARCHAR2LIST)
+        RETURN BOOLEAN IS
+        l_n     NUMBER := p_columns.COUNT;
         l_count NUMBER;
     BEGIN
         SELECT COUNT(*)
           INTO l_count
-          FROM dba_ind_columns c
-          JOIN dba_indexes i ON i.owner = c.index_owner AND i.index_name = c.index_name
-         WHERE c.table_owner = l_owner
-           AND c.table_name = l_table
-           AND c.column_name = p_column
-           AND c.column_position = 1
-           AND i.status IN ('VALID', 'N/A');
+          FROM (SELECT c.index_owner, c.index_name
+                  FROM dba_ind_columns c
+                  JOIN dba_indexes i ON i.owner = c.index_owner AND i.index_name = c.index_name
+                 WHERE c.table_owner = p_owner
+                   AND c.table_name = p_table
+                   AND c.column_position <= l_n
+                   AND c.column_name IN (SELECT column_value FROM TABLE(p_columns))
+                   AND i.status IN ('VALID', 'N/A')
+                 GROUP BY c.index_owner, c.index_name
+                HAVING COUNT(*) = l_n);
         RETURN l_count > 0;
-    END index_exists;
+    END index_covers;
 
-    FUNCTION table_bytes(p_table_id IN NUMBER) RETURN NUMBER IS
-        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
-        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
+    FUNCTION table_bytes(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN NUMBER IS
         l_bytes NUMBER;
     BEGIN
         SELECT NVL(SUM(bytes), 0)
           INTO l_bytes
           FROM dba_segments
-         WHERE owner = l_owner AND segment_name = l_table AND segment_type LIKE 'TABLE%';
+         WHERE owner = p_owner AND segment_name = p_table AND segment_type LIKE 'TABLE%';
         RETURN l_bytes;
     END table_bytes;
+
+    FUNCTION column_text(p_columns IN SYS.ODCIVARCHAR2LIST, p_quoted IN BOOLEAN DEFAULT FALSE) RETURN VARCHAR2 IS
+        l_out VARCHAR2(4000);
+    BEGIN
+        FOR i IN 1 .. p_columns.COUNT LOOP
+            l_out := l_out || CASE WHEN i > 1 THEN ', ' END
+                     || CASE WHEN p_quoted THEN qc(p_columns(i)) ELSE p_columns(i) END;
+        END LOOP;
+        RETURN l_out;
+    END column_text;
 
     -- ------------------------------------------------------------------
     -- Run, registry and scope
@@ -923,14 +935,98 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Temporary supporting indexes
     -- ------------------------------------------------------------------
 
-    PROCEDURE register_temp_index(p_name IN VARCHAR2, p_table_id IN NUMBER, p_column IN VARCHAR2) IS
+    -- Indexes the purge of a module relies on:
+    --   link     the match column of every link into its tables and the source
+    --            column of a reverse link: read once per batch, indexed when
+    --            the table is at least temp_index_min_mb
+    --   fk       when the module deletes, the columns of every enabled FK into
+    --            its tables (any schema): Oracle looks up child rows for each
+    --            deleted parent row, scanning the child table when these
+    --            columns are not indexed, so they are indexed whatever the size
+    -- table_id is NULL for a child table outside the registry, which the tool
+    -- cannot index.
+    TYPE t_need IS RECORD (
+        table_id   NUMBER,
+        owner      VARCHAR2(128),
+        table_name VARCHAR2(128),
+        columns    SYS.ODCIVARCHAR2LIST,
+        fk         BOOLEAN,
+        detail     VARCHAR2(400)
+    );
+    TYPE t_needs IS TABLE OF t_need INDEX BY PLS_INTEGER;
+    TYPE t_position_map IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(4000);
+
+    FUNCTION index_needs(p_module IN VARCHAR2) RETURN t_needs IS
+        l_out  t_needs;
+        l_seen t_position_map;
+        l_cols SYS.ODCIVARCHAR2LIST;
+        i      PLS_INTEGER := g_links.FIRST;
+
+        PROCEDURE add(p_table_id IN NUMBER, p_owner IN VARCHAR2, p_table IN VARCHAR2,
+                      p_columns IN SYS.ODCIVARCHAR2LIST, p_fk IN BOOLEAN, p_detail IN VARCHAR2) IS
+            l_key VARCHAR2(4000) := p_owner || '.' || p_table || ':' || column_text(p_columns);
+            l_new t_need;
+        BEGIN
+            IF l_seen.EXISTS(l_key) THEN
+                l_out(l_seen(l_key)).fk := l_out(l_seen(l_key)).fk OR p_fk;
+                RETURN;
+            END IF;
+            l_new.table_id   := p_table_id;
+            l_new.owner      := p_owner;
+            l_new.table_name := p_table;
+            l_new.columns    := p_columns;
+            l_new.fk         := p_fk;
+            l_new.detail     := p_detail;
+            l_out(l_out.COUNT + 1) := l_new;
+            l_seen(l_key) := l_out.COUNT;
+        END add;
+    BEGIN
+        WHILE i IS NOT NULL LOOP
+            IF g_links(i).usable AND g_tables(g_links(i).table_id).module_code = p_module THEN
+                add(g_links(i).table_id, g_tables(g_links(i).table_id).owner, g_tables(g_links(i).table_id).table_name,
+                    SYS.ODCIVARCHAR2LIST(g_links(i).match_column), FALSE, 'link ' || g_links(i).link_id);
+                IF NOT g_links(i).direct THEN
+                    add(g_links(i).source_table_id, g_tables(g_links(i).source_table_id).owner,
+                        g_tables(g_links(i).source_table_id).table_name,
+                        SYS.ODCIVARCHAR2LIST(g_links(i).source_column), FALSE, 'link ' || g_links(i).link_id);
+                END IF;
+            END IF;
+            i := g_links.NEXT(i);
+        END LOOP;
+
+        IF module_action(p_module) = c_delete THEN
+            FOR f IN (SELECT c.owner AS c_owner, c.table_name AS c_table, c.constraint_name,
+                             p.table_name AS p_table, pt.table_id AS p_id, ct.table_id AS c_id
+                        FROM dba_constraints c
+                        JOIN dba_constraints p
+                          ON p.owner = c.r_owner AND p.constraint_name = c.r_constraint_name
+                        JOIN epf_table pt
+                          ON pt.owner = p.owner AND pt.table_name = p.table_name
+                         AND pt.active = 'Y' AND pt.module_code = p_module
+                        LEFT JOIN epf_table ct
+                          ON ct.owner = c.owner AND ct.table_name = c.table_name AND ct.active = 'Y'
+                       WHERE c.constraint_type = 'R'
+                         AND c.status = 'ENABLED'
+                       ORDER BY c.owner, c.table_name, c.constraint_name) LOOP
+                CONTINUE WHEN NOT g_tables(f.p_id).reachable;
+                CONTINUE WHEN f.c_id IS NOT NULL AND NOT g_tables(f.c_id).reachable;
+                SELECT column_name BULK COLLECT INTO l_cols
+                  FROM dba_cons_columns
+                 WHERE owner = f.c_owner AND constraint_name = f.constraint_name
+                 ORDER BY position;
+                add(f.c_id, f.c_owner, f.c_table, l_cols, TRUE, 'FK ' || f.constraint_name || ' -> ' || f.p_table);
+            END LOOP;
+        END IF;
+        RETURN l_out;
+    END index_needs;
+
+    PROCEDURE register_temp_index(p_name IN VARCHAR2, p_owner IN VARCHAR2, p_table IN VARCHAR2,
+                                  p_columns IN VARCHAR2) IS
         PRAGMA AUTONOMOUS_TRANSACTION;
-        l_run   NUMBER        := g_run.run_id;
-        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
-        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
+        l_run NUMBER := g_run.run_id;
     BEGIN
         INSERT INTO epf_temp_index (run_id, owner, index_name, table_owner, table_name, column_name)
-        VALUES (l_run, g_owner, p_name, l_owner, l_table, p_column);
+        VALUES (l_run, g_owner, p_name, p_owner, p_table, SUBSTR(p_columns, 1, 128));
         COMMIT;
     END register_temp_index;
 
@@ -944,62 +1040,54 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     END close_temp_index;
 
     PROCEDURE create_temp_indexes(p_module IN VARCHAR2, p_created OUT NUMBER) IS
-        l_seen   t_key_map;
+        l_needs  t_needs := index_needs(p_module);
         l_min    NUMBER := epf_util.setting_num('temp_index_min_mb') * 1048576;
         l_online VARCHAR2(10) := CASE WHEN epf_util.is_enterprise THEN ' ONLINE' END;
-        i        PLS_INTEGER := g_links.FIRST;
+        l_seq    NUMBER;
+        l_bytes  NUMBER;
+        l_name   VARCHAR2(128);
+        l_cols   VARCHAR2(4000);
+        l_start  TIMESTAMP;
+    BEGIN
+        p_created := 0;
+        FOR k IN 1 .. l_needs.COUNT LOOP
+            CONTINUE WHEN index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).columns);
+            l_cols  := column_text(l_needs(k).columns);
+            l_bytes := table_bytes(l_needs(k).owner, l_needs(k).table_name);
+            IF l_needs(k).table_id IS NULL THEN
+                g_warnings := g_warnings + 1;
+                epf_log.event(epf_log.c_warn, 'FK_UNINDEXED',
+                              'No index on ' || l_cols || ' (' || l_needs(k).detail || ', table '
+                              || epf_util.fmt_bytes(l_bytes) || '); the table is outside the registry and is '
+                              || 'scanned for every deleted parent row',
+                              p_object_owner => l_needs(k).owner, p_object_name => l_needs(k).table_name);
+                CONTINUE;
+            END IF;
+            CONTINUE WHEN NOT l_needs(k).fk AND l_bytes < l_min;
 
-        PROCEDURE need(p_table_id IN NUMBER, p_column IN VARCHAR2) IS
-            l_key   VARCHAR2(200) := p_table_id || ':' || p_column;
-            l_seq   NUMBER;
-            l_bytes NUMBER;
-            l_name  VARCHAR2(128);
-            l_start TIMESTAMP;
-        BEGIN
-            IF l_seen.EXISTS(l_key) THEN
-                RETURN;
-            END IF;
-            l_seen(l_key) := 1;
-            IF index_exists(p_table_id, p_column) THEN
-                RETURN;
-            END IF;
-            l_bytes := table_bytes(p_table_id);
-            IF l_bytes < l_min THEN
-                RETURN;
-            END IF;
             SELECT COUNT(*) + 1 INTO l_seq FROM epf_temp_index WHERE run_id = g_run.run_id;
             l_name := 'EPF_TMP_' || g_run.run_id || '_' || l_seq;
-            register_temp_index(l_name, p_table_id, p_column);
+            register_temp_index(l_name, l_needs(k).owner, l_needs(k).table_name, l_cols);
             l_start := epf_util.now_ts;
             BEGIN
-                EXECUTE IMMEDIATE 'CREATE INDEX ' || qc(l_name) || ' ON ' || tq(p_table_id)
-                                  || ' (' || qc(p_column) || ')' || l_online;
+                EXECUTE IMMEDIATE 'CREATE INDEX ' || qc(l_name) || ' ON '
+                                  || epf_util.qname(l_needs(k).owner, l_needs(k).table_name)
+                                  || ' (' || column_text(l_needs(k).columns, p_quoted => TRUE) || ')' || l_online;
                 p_created := p_created + 1;
                 epf_log.event(epf_log.c_info, 'TEMP_INDEX_CREATED',
-                              l_name || ' on ' || p_column || ' (table ' || epf_util.fmt_bytes(l_bytes) || ')',
-                              p_object_owner => g_tables(p_table_id).owner,
-                              p_object_name => g_tables(p_table_id).table_name,
+                              l_name || ' on ' || l_cols || ' (' || l_needs(k).detail || ', table '
+                              || epf_util.fmt_bytes(l_bytes) || ')',
+                              p_object_owner => l_needs(k).owner, p_object_name => l_needs(k).table_name,
                               p_elapsed_s => epf_util.elapsed_s(l_start));
             EXCEPTION
                 WHEN OTHERS THEN
                     close_temp_index(l_name);
                     g_warnings := g_warnings + 1;
                     epf_log.event(epf_log.c_warn, 'TEMP_INDEX_FAILED',
-                                  'Index on ' || p_column || ' not created; the purge continues without it: ' || SQLERRM,
-                                  p_object_owner => g_tables(p_table_id).owner,
-                                  p_object_name => g_tables(p_table_id).table_name, p_ora_code => ABS(SQLCODE));
+                                  'Index on ' || l_cols || ' not created; the purge continues without it: ' || SQLERRM,
+                                  p_object_owner => l_needs(k).owner, p_object_name => l_needs(k).table_name,
+                                  p_ora_code => ABS(SQLCODE));
             END;
-        END need;
-    BEGIN
-        p_created := 0;
-        WHILE i IS NOT NULL LOOP
-            IF g_links(i).usable AND g_tables(g_links(i).table_id).module_code = p_module THEN
-                need(g_links(i).table_id, g_links(i).match_column);
-                IF NOT g_links(i).direct THEN
-                    need(g_links(i).source_table_id, g_links(i).source_column);
-                END IF;
-            END IF;
-            i := g_links.NEXT(i);
         END LOOP;
     END create_temp_indexes;
 
@@ -1079,8 +1167,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_out;
     END batch_statements;
 
+    -- Redo generated by this session so far (V$MYSTAT 'redo size').
+    FUNCTION session_redo RETURN NUMBER IS
+        l_value NUMBER;
+    BEGIN
+        SELECT m.value
+          INTO l_value
+          FROM v$mystat m
+          JOIN v$statname n ON n.statistic# = m.statistic#
+         WHERE n.name = 'redo size';
+        RETURN l_value;
+    END session_redo;
+
     PROCEDURE process_batches(p_module IN VARCHAR2, p_action IN VARCHAR2, p_roots IN SYS.ODCINUMBERLIST,
-                              p_total IN NUMBER, p_processed IN OUT NOCOPY t_numbers, p_result OUT VARCHAR2) IS
+                              p_total IN NUMBER, p_processed IN OUT NOCOPY t_numbers, p_result OUT VARCHAR2,
+                              p_redo OUT NUMBER) IS
         l_stmts      t_stmts;
         l_batch      t_numbers;
         l_max        NUMBER;
@@ -1099,7 +1200,25 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_code       NUMBER;
         l_error      VARCHAR2(4000);
         l_run        NUMBER := g_run.run_id;
+        l_redo_start NUMBER := session_redo;
+        l_tree_redo  NUMBER;
+        l_tree_roots NUMBER;
         k            PLS_INTEGER;
+
+        -- Records the redo of one root tree (TREE_REDO: rows = roots processed,
+        -- bytes = redo); preflight uses it to recommend a batch size.
+        PROCEDURE tree_done(p_root_id IN NUMBER) IS
+            l_bytes NUMBER := session_redo - l_tree_redo;
+        BEGIN
+            IF l_tree_roots > 0 THEN
+                epf_log.event(epf_log.c_info, 'TREE_REDO',
+                              epf_util.fmt_bytes(l_bytes) || ' redo for ' || epf_util.fmt_int(l_tree_roots)
+                              || ' roots (' || epf_util.fmt_bytes(l_bytes / l_tree_roots) || ' per root)',
+                              p_object_owner => g_tables(p_root_id).owner,
+                              p_object_name => g_tables(p_root_id).table_name,
+                              p_rows => l_tree_roots, p_bytes => l_bytes);
+            END IF;
+        END tree_done;
     BEGIN
         p_result := 'DONE';
         epf_log.step_start('PROCESS_BATCHES', p_module, p_units_total => p_total);
@@ -1109,11 +1228,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             SELECT NVL(MAX(batch_no), 0) INTO l_max
               FROM epf_work_key
              WHERE run_id = l_run AND table_id = p_roots(r);
+            l_tree_redo  := session_redo;
+            l_tree_roots := 0;
             FOR b IN 1 .. l_max LOOP
                 IF epf_control.stop_requested(l_run) THEN
                     p_result := 'STOPPED';
                     epf_log.warn('STOP_HONORED', p_module || ' stopped after batch ' || epf_util.fmt_int(l_done)
                                                  || ' of ' || epf_util.fmt_int(p_total));
+                    tree_done(p_roots(r));
                     EXIT trees;
                 END IF;
                 l_batch.DELETE;
@@ -1140,6 +1262,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                       p_object_name => g_tables(l_current).table_name,
                                       p_ora_code => ABS(l_code));
                         p_result := 'FAILED';
+                        tree_done(p_roots(r));
                         EXIT trees;
                 END;
 
@@ -1148,9 +1271,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                     p_processed(k) := CASE WHEN p_processed.EXISTS(k) THEN p_processed(k) ELSE 0 END + l_batch(k);
                     k := l_batch.NEXT(k);
                 END LOOP;
+                l_tree_roots := l_tree_roots
+                                + CASE WHEN l_batch.EXISTS(p_roots(r)) THEN l_batch(p_roots(r)) ELSE 0 END;
                 l_done := l_done + 1;
                 l_rows := l_rows + l_batch_rows;
-                epf_log.step_progress(l_done);
+                p_redo := session_redo - l_redo_start;
+                epf_log.step_progress(l_done, p_redo);
 
                 IF l_done = 1 OR l_done = p_total OR l_last IS NULL OR epf_util.elapsed_s(l_last) >= l_interval THEN
                     l_elapsed := epf_util.elapsed_s(l_start);
@@ -1159,19 +1285,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                   p_module || ' batch ' || epf_util.fmt_int(l_done) || '/' || epf_util.fmt_int(p_total)
                                   || ' ' || TO_CHAR(l_pct, 'FM990.0') || '% ' || l_unit || ' ' || epf_util.fmt_int(l_rows)
                                   || ' ' || epf_util.fmt_int(CASE WHEN l_elapsed > 0 THEN l_rows / l_elapsed END) || '/s'
+                                  || ' redo ' || epf_util.fmt_bytes(p_redo / l_done) || '/batch'
                                   || ' ETA ' || epf_util.fmt_duration(l_elapsed / l_done * (p_total - l_done)),
-                                  p_rows => l_rows, p_pct => l_pct, p_elapsed_s => l_elapsed);
+                                  p_rows => l_rows, p_bytes => p_redo, p_pct => l_pct, p_elapsed_s => l_elapsed);
                     l_last := epf_util.now_ts;
                 END IF;
                 IF p_action = c_clear AND l_pause > 0 THEN
                     DBMS_LOCK.SLEEP(l_pause);
                 END IF;
             END LOOP;
+            tree_done(p_roots(r));
         END LOOP trees;
 
+        p_redo := session_redo - l_redo_start;
         epf_log.step_end(CASE p_result WHEN 'FAILED' THEN 'FAILED' ELSE 'DONE' END,
                          epf_util.fmt_int(l_done) || '/' || epf_util.fmt_int(p_total) || ' batches, '
-                         || epf_util.fmt_int(l_rows) || ' ' || l_unit
+                         || epf_util.fmt_int(l_rows) || ' ' || l_unit || ', ' || epf_util.fmt_bytes(p_redo) || ' redo'
                          || CASE p_result WHEN 'STOPPED' THEN ', stopped on request' END);
     END process_batches;
 
@@ -1190,6 +1319,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_dropped   NUMBER;
         l_failed    BOOLEAN := FALSE;
         l_batch_res VARCHAR2(10) := 'DONE';
+        l_redo      NUMBER;
         l_sum       NUMBER := 0;
         l_start     TIMESTAMP := epf_util.now_ts;
         k           PLS_INTEGER;
@@ -1245,7 +1375,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             IF NOT l_failed THEN
                 BEGIN
-                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_batch_res);
+                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_batch_res, l_redo);
                     l_failed := l_batch_res = 'FAILED';
                 EXCEPTION
                     WHEN OTHERS THEN
@@ -1288,9 +1418,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       || CASE WHEN g_run.dry_run = 'Y' THEN ' (dry run, nothing changed)'
                               ELSE ': ' || epf_util.fmt_int(l_sum) || ' '
                                    || CASE l_action WHEN c_delete THEN 'rows deleted' ELSE 'LOB values cleared' END
+                                   || CASE WHEN l_redo IS NOT NULL THEN ', ' || epf_util.fmt_bytes(l_redo) || ' redo' END
                          END
                       || ' in ' || epf_util.fmt_duration(epf_util.elapsed_s(l_start)),
-                      p_rows => l_sum, p_elapsed_s => epf_util.elapsed_s(l_start));
+                      p_rows => l_sum, p_bytes => l_redo, p_elapsed_s => epf_util.elapsed_s(l_start));
     END process_module;
 
     FUNCTION capture_space(p_phase IN VARCHAR2, p_step IN VARCHAR2) RETURN BOOLEAN IS
@@ -1335,55 +1466,213 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- ------------------------------------------------------------------
 
     PROCEDURE check_indexes IS
-        l_seen    t_key_map;
+        l_needs   t_needs;
         l_min     NUMBER := epf_util.setting_num('temp_index_min_mb') * 1048576;
         l_needed  NUMBER := 0;
         l_indexed NUMBER := 0;
         l_temp    NUMBER := 0;
         l_small   NUMBER := 0;
-        i         PLS_INTEGER := g_links.FIRST;
-
-        PROCEDURE check_one(p_table_id IN NUMBER, p_column IN VARCHAR2) IS
-            l_key   VARCHAR2(200) := p_table_id || ':' || p_column;
-            l_bytes NUMBER;
-        BEGIN
-            IF l_seen.EXISTS(l_key) THEN
-                RETURN;
-            END IF;
-            l_seen(l_key) := 1;
-            l_needed := l_needed + 1;
-            IF index_exists(p_table_id, p_column) THEN
-                l_indexed := l_indexed + 1;
-                RETURN;
-            END IF;
-            l_bytes := table_bytes(p_table_id);
-            IF l_bytes >= l_min THEN
-                l_temp := l_temp + 1;
-            ELSE
-                l_small := l_small + 1;
-            END IF;
-            epf_log.event(epf_log.c_info, 'IDX_MISSING',
-                          'No index on ' || p_column || ' (table ' || epf_util.fmt_bytes(l_bytes) || '): '
-                          || CASE WHEN l_bytes >= l_min
-                                  THEN 'a temporary index is created for the purge'
-                                  ELSE 'below temp_index_min_mb, the table is scanned per batch' END,
-                          p_object_owner => g_tables(p_table_id).owner,
-                          p_object_name => g_tables(p_table_id).table_name, p_bytes => l_bytes);
-        END check_one;
+        l_outside NUMBER := 0;
+        l_bytes   NUMBER;
+        l_note    VARCHAR2(400);
     BEGIN
-        WHILE i IS NOT NULL LOOP
-            IF g_links(i).usable AND in_scope(g_tables(g_links(i).table_id).module_code) THEN
-                check_one(g_links(i).table_id, g_links(i).match_column);
-                IF NOT g_links(i).direct THEN
-                    check_one(g_links(i).source_table_id, g_links(i).source_column);
+        FOR m IN 1 .. g_modules.COUNT LOOP
+            l_needs := index_needs(g_modules(m));
+            FOR k IN 1 .. l_needs.COUNT LOOP
+                l_needed := l_needed + 1;
+                IF index_covers(l_needs(k).owner, l_needs(k).table_name, l_needs(k).columns) THEN
+                    l_indexed := l_indexed + 1;
+                ELSE
+                    l_bytes := table_bytes(l_needs(k).owner, l_needs(k).table_name);
+                    IF l_needs(k).table_id IS NULL THEN
+                        l_outside := l_outside + 1;
+                        g_warnings := g_warnings + 1;
+                        l_note := 'outside the registry, not indexed by the tool: scanned for every deleted parent '
+                                  || 'row; create this index before purging';
+                    ELSIF l_needs(k).fk THEN
+                        l_temp := l_temp + 1;
+                        l_note := 'without it every deleted parent row scans this table; a temporary index is created';
+                    ELSIF l_bytes >= l_min THEN
+                        l_temp := l_temp + 1;
+                        l_note := 'a temporary index is created for the purge';
+                    ELSE
+                        l_small := l_small + 1;
+                        l_note := 'below temp_index_min_mb, the table is scanned once per batch';
+                    END IF;
+                    epf_log.event(CASE WHEN l_needs(k).table_id IS NULL THEN epf_log.c_warn ELSE epf_log.c_info END,
+                                  'IDX_MISSING',
+                                  'No index on ' || column_text(l_needs(k).columns) || ' (' || l_needs(k).detail
+                                  || ', table ' || epf_util.fmt_bytes(l_bytes) || '): ' || l_note,
+                                  p_object_owner => l_needs(k).owner, p_object_name => l_needs(k).table_name,
+                                  p_bytes => l_bytes);
                 END IF;
-            END IF;
-            i := g_links.NEXT(i);
+            END LOOP;
         END LOOP;
-        epf_log.ok('IDX_SUMMARY', l_indexed || '/' || l_needed || ' link columns indexed; ' || l_temp
-                                  || ' temporary indexes would be created, ' || l_small
-                                  || ' small tables scanned per batch');
+        epf_log.event(CASE WHEN l_outside > 0 THEN epf_log.c_warn ELSE epf_log.c_ok END, 'IDX_SUMMARY',
+                      l_indexed || '/' || l_needed || ' link and FK columns indexed; ' || l_temp
+                      || ' temporary indexes would be created, ' || l_small || ' small tables scanned per batch'
+                      || CASE WHEN l_outside > 0 THEN ', ' || l_outside || ' unindexed FK columns outside the registry' END);
     END check_indexes;
+
+    -- Approximate redo of deleting one row: the row goes to undo and its
+    -- deletion to redo (about twice the row length plus fixed overhead), and
+    -- every index entry of the row is removed the same way.
+    FUNCTION row_redo_estimate(p_table_id IN NUMBER) RETURN NUMBER IS
+        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
+        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
+        l_row   NUMBER;
+        l_total NUMBER;
+    BEGIN
+        SELECT MAX(avg_row_len) INTO l_row FROM dba_tables WHERE owner = l_owner AND table_name = l_table;
+        l_total := 2 * NVL(l_row, 100) + 300;
+        FOR x IN (SELECT (SELECT NVL(SUM(tc.avg_col_len), 0)
+                            FROM dba_ind_columns ic
+                            JOIN dba_tab_columns tc
+                              ON tc.owner = ic.table_owner AND tc.table_name = ic.table_name
+                             AND tc.column_name = ic.column_name
+                           WHERE ic.index_owner = i.owner AND ic.index_name = i.index_name) AS key_len
+                    FROM dba_indexes i
+                   WHERE i.table_owner = l_owner AND i.table_name = l_table AND i.index_type <> 'LOB') LOOP
+            l_total := l_total + 2 * (x.key_len + 10) + 250;
+        END LOOP;
+        RETURN l_total;
+    END row_redo_estimate;
+
+    -- Redo per root of a tree: measured by the latest purge of the tree on
+    -- this database (TREE_REDO events), otherwise estimated from optimizer
+    -- statistics (rows per root of each table x row_redo_estimate).
+    PROCEDURE tree_redo(p_root_id IN NUMBER, p_per_root OUT NUMBER, p_source OUT VARCHAR2) IS
+        l_owner     VARCHAR2(128) := g_tables(p_root_id).owner;
+        l_table     VARCHAR2(128) := g_tables(p_root_id).table_name;
+        l_ids       SYS.ODCINUMBERLIST := tree_tables(p_root_id);
+        l_run       NUMBER;
+        l_root_rows NUMBER;
+        l_rows      NUMBER;
+        l_t_owner   VARCHAR2(128);
+        l_t_table   VARCHAR2(128);
+    BEGIN
+        SELECT MAX(bytes / rows_affected) KEEP (DENSE_RANK LAST ORDER BY event_id),
+               MAX(run_id) KEEP (DENSE_RANK LAST ORDER BY event_id)
+          INTO p_per_root, l_run
+          FROM epf_event
+         WHERE event_code = 'TREE_REDO'
+           AND object_owner = l_owner AND object_name = l_table
+           AND rows_affected > 0 AND bytes > 0;
+        IF p_per_root IS NOT NULL THEN
+            p_source := 'measured by ' || epf_util.run_label(l_run);
+            RETURN;
+        END IF;
+
+        SELECT MAX(num_rows) INTO l_root_rows FROM dba_tables WHERE owner = l_owner AND table_name = l_table;
+        IF NVL(l_root_rows, 0) = 0 THEN
+            p_source := 'no optimizer statistics on the root table';
+            RETURN;
+        END IF;
+        p_per_root := 0;
+        FOR k IN 1 .. l_ids.COUNT LOOP
+            CONTINUE WHEN NOT g_tables(l_ids(k)).reachable;
+            l_t_owner := g_tables(l_ids(k)).owner;
+            l_t_table := g_tables(l_ids(k)).table_name;
+            SELECT MAX(num_rows) INTO l_rows FROM dba_tables WHERE owner = l_t_owner AND table_name = l_t_table;
+            p_per_root := p_per_root + NVL(l_rows, 0) / l_root_rows * row_redo_estimate(l_ids(k));
+        END LOOP;
+        p_source := 'estimated from optimizer statistics';
+    END tree_redo;
+
+    -- Batch size rounded down to two significant digits, between 100 and 100000.
+    FUNCTION round_batch(p_value IN NUMBER) RETURN NUMBER IS
+        l_scale NUMBER;
+    BEGIN
+        IF p_value IS NULL OR p_value <= 100 THEN
+            RETURN 100;
+        ELSIF p_value >= 100000 THEN
+            RETURN 100000;
+        END IF;
+        l_scale := POWER(10, FLOOR(LOG(10, p_value)) - 1);
+        RETURN TRUNC(p_value / l_scale) * l_scale;
+    END round_batch;
+
+    -- Online redo logs against the redo a batch writes. The recommended batch
+    -- size keeps one batch within half of the smallest online log, so a batch
+    -- causes at most one log switch. A batch larger than a whole log is a
+    -- warning: the session then waits on 'log file switch (checkpoint
+    -- incomplete)'; larger online logs remove those waits, a smaller batch
+    -- only spreads them.
+    PROCEDURE check_redo IS
+        l_groups     NUMBER;
+        l_min_log    NUMBER;
+        l_log_mode   VARCHAR2(12);
+        l_switches   NUMBER;
+        l_peak       NUMBER;
+        l_per_root   NUMBER;
+        l_source     VARCHAR2(200);
+        l_batch_redo NUMBER;
+        l_recommend  NUMBER;
+        l_overall    NUMBER;
+        l_over       BOOLEAN := FALSE;
+    BEGIN
+        SELECT COUNT(*), MIN(bytes) INTO l_groups, l_min_log FROM v$log;
+        SELECT log_mode INTO l_log_mode FROM v$database;
+        SELECT NVL(SUM(cnt), 0), NVL(MAX(cnt), 0)
+          INTO l_switches, l_peak
+          FROM (SELECT COUNT(*) AS cnt
+                  FROM v$log_history
+                 WHERE first_time > SYSDATE - 1
+                 GROUP BY TRUNC(first_time, 'HH24'));
+        epf_log.event(epf_log.c_info, 'REDO_LOGS',
+                      l_groups || ' online redo log groups, smallest ' || epf_util.fmt_bytes(l_min_log)
+                      || ' (' || l_log_mode || '); ' || l_switches || ' log switches in the last 24 hours, at most '
+                      || l_peak || ' in one hour',
+                      p_bytes => l_min_log);
+
+        FOR r IN (SELECT e.table_id
+                    FROM epf_table e
+                    JOIN epf_module m ON m.module_code = e.module_code
+                   WHERE e.active = 'Y' AND e.role = 'ROOT'
+                   ORDER BY m.display_order, e.table_id) LOOP
+            CONTINUE WHEN NOT in_scope(g_tables(r.table_id).module_code)
+                          OR NOT g_tables(r.table_id).reachable
+                          OR module_action(g_tables(r.table_id).module_code) <> c_delete;
+            tree_redo(r.table_id, l_per_root, l_source);
+            IF l_per_root IS NULL THEN
+                epf_log.event(epf_log.c_info, 'REDO_ESTIMATE', 'No redo estimate: ' || l_source,
+                              p_object_owner => g_tables(r.table_id).owner,
+                              p_object_name => g_tables(r.table_id).table_name);
+                CONTINUE;
+            END IF;
+            l_batch_redo := l_per_root * g_run.batch_size;
+            l_recommend  := round_batch(0.5 * l_min_log / l_per_root);
+            l_overall    := LEAST(NVL(l_overall, l_recommend), l_recommend);
+            IF l_batch_redo > l_min_log THEN
+                l_over := TRUE;
+            END IF;
+            epf_log.event(CASE WHEN l_batch_redo > l_min_log THEN epf_log.c_warn ELSE epf_log.c_info END,
+                          'REDO_ESTIMATE',
+                          'about ' || epf_util.fmt_bytes(l_per_root) || ' redo per root (' || l_source || '): '
+                          || epf_util.fmt_bytes(l_batch_redo) || ' per batch of ' || epf_util.fmt_int(g_run.batch_size)
+                          || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_min_log, 1), 'FM999990.0')
+                          || ' online logs; recommended batch size ' || epf_util.fmt_int(l_recommend),
+                          p_object_owner => g_tables(r.table_id).owner,
+                          p_object_name => g_tables(r.table_id).table_name,
+                          p_rows => l_recommend, p_bytes => l_per_root);
+        END LOOP;
+
+        IF l_overall IS NOT NULL THEN
+            IF l_over THEN
+                g_warnings := g_warnings + 1;
+            END IF;
+            epf_log.event(CASE WHEN l_over THEN epf_log.c_warn ELSE epf_log.c_ok END, 'REDO_SUMMARY',
+                          'Recommended batch size: ' || epf_util.fmt_int(l_overall)
+                          || ' (one batch within half of a ' || epf_util.fmt_bytes(l_min_log) || ' online log)'
+                          || CASE WHEN l_over THEN
+                                 '. With batch ' || epf_util.fmt_int(g_run.batch_size)
+                                 || ' a batch fills more than one online log: expect ''log file switch (checkpoint '
+                                 || 'incomplete)'' waits. Larger online redo logs remove them (run/redo_logs.sql as '
+                                 || 'SYS); a smaller batch only spreads the switches.'
+                             END,
+                          p_rows => l_overall);
+        END IF;
+    END check_redo;
 
     PROCEDURE check_roots IS
         l_total    NUMBER;
@@ -1428,6 +1717,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             epf_log.step_end('DONE');
             epf_log.step_start('ELIGIBLE_ROOTS');
             check_roots;
+            epf_log.step_end('DONE');
+            epf_log.step_start('REDO_LOGS');
+            check_redo;
             epf_log.step_end('DONE');
         END IF;
         p_warnings := l_warnings + g_warnings;
