@@ -923,9 +923,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
 
             INSERT INTO epf_table_stat (run_id, table_id, phase, total_rows, eligible_rows, retained_rows,
-                                        nonempty_lob_rows, processed_rows, held_rows)
+                                        nonempty_lob_rows, processed_rows, held_rows, action)
             VALUES (l_run, l_tid, p_phase, l_total, l_eligible, l_total - l_eligible,
-                    l_lob, l_processed, l_held);
+                    l_lob, l_processed, l_held, p_action);
             COMMIT;
 
             IF p_phase = 'BEFORE' THEN
@@ -951,6 +951,101 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
         END LOOP;
     END count_tables;
+
+    -- Enabled, validated single-column FK from p_owner.p_table(p_column) to
+    -- p_r_owner.p_r_table(p_r_column); NULL when there is none.
+    FUNCTION protecting_fk(p_owner IN VARCHAR2, p_table IN VARCHAR2, p_column IN VARCHAR2,
+                           p_r_owner IN VARCHAR2, p_r_table IN VARCHAR2, p_r_column IN VARCHAR2)
+        RETURN VARCHAR2 IS
+        l_name VARCHAR2(128);
+    BEGIN
+        SELECT MAX(c.constraint_name)
+          INTO l_name
+          FROM dba_constraints c
+          JOIN dba_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name
+          JOIN dba_constraints p ON p.owner = c.r_owner AND p.constraint_name = c.r_constraint_name
+          JOIN dba_cons_columns pc ON pc.owner = p.owner AND pc.constraint_name = p.constraint_name
+         WHERE c.owner = p_owner
+           AND c.table_name = p_table
+           AND c.constraint_type = 'R'
+           AND c.status = 'ENABLED'
+           AND c.validated = 'VALIDATED'
+           AND cc.column_name = p_column
+           AND p.owner = p_r_owner
+           AND p.table_name = p_r_table
+           AND pc.column_name = p_r_column
+           AND (SELECT COUNT(*) FROM dba_cons_columns x
+                 WHERE x.owner = c.owner AND x.constraint_name = c.constraint_name) = 1;
+        RETURN l_name;
+    END protecting_fk;
+
+    -- Orphans of every link of the module's tables (EPF_LINK_STAT): rows on the
+    -- pointing side whose value is not found on the pointed side. A link
+    -- protected by an FK is recorded with 0 orphans and the FK name.
+    PROCEDURE count_orphans(p_module IN VARCHAR2, p_phase IN VARCHAR2) IS
+        l_links    t_links;
+        l_src      NUMBER;
+        l_from     NUMBER;
+        l_from_col VARCHAR2(128);
+        l_to       NUMBER;
+        l_to_col   VARCHAR2(128);
+        l_fk       VARCHAR2(128);
+        l_orphans  NUMBER;
+        l_run      NUMBER := g_run.run_id;
+        l_link_id  NUMBER;
+    BEGIN
+        FOR e IN (SELECT table_id
+                    FROM epf_table
+                   WHERE active = 'Y' AND module_code = p_module AND role = 'DEPENDENT'
+                   ORDER BY table_id) LOOP
+            CONTINUE WHEN NOT g_tables(e.table_id).reachable;
+            l_links := links_of(e.table_id);
+            FOR i IN 1 .. l_links.COUNT LOOP
+                l_src := l_links(i).source_table_id;
+                IF l_links(i).direct THEN
+                    l_from := e.table_id;
+                    l_from_col := l_links(i).match_column;
+                    l_to := l_src;
+                    l_to_col := l_links(i).source_column;
+                ELSE
+                    l_from := l_src;
+                    l_from_col := l_links(i).source_column;
+                    l_to := e.table_id;
+                    l_to_col := l_links(i).match_column;
+                END IF;
+                l_fk := protecting_fk(g_tables(l_from).owner, g_tables(l_from).table_name, l_from_col,
+                                      g_tables(l_to).owner, g_tables(l_to).table_name, l_to_col);
+                IF l_fk IS NOT NULL THEN
+                    l_orphans := 0;
+                ELSE
+                    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ' || tq(l_from) || ' a WHERE a.' || qc(l_from_col)
+                                      || ' IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ' || tq(l_to) || ' b WHERE b.'
+                                      || qc(l_to_col) || ' = a.' || qc(l_from_col) || ')'
+                        INTO l_orphans;
+                END IF;
+                l_link_id := l_links(i).link_id;
+                INSERT INTO epf_link_stat (run_id, link_id, phase, pointing_table_id, orphan_rows, protected_by)
+                VALUES (l_run, l_link_id, p_phase, l_from, l_orphans, l_fk);
+                COMMIT;
+                IF l_orphans > 0 THEN
+                    epf_log.event(epf_log.c_warn, 'LINK_ORPHANS',
+                                  epf_util.fmt_int(l_orphans) || ' rows point at no row of ' || tname(l_to) || ' ('
+                                  || l_from_col || ' -> ' || l_to_col || ', link ' || l_link_id || ', ' || p_phase || ')',
+                                  p_object_owner => g_tables(l_from).owner,
+                                  p_object_name => g_tables(l_from).table_name, p_rows => l_orphans);
+                END IF;
+            END LOOP;
+        END LOOP;
+        UPDATE epf_table_stat t
+           SET t.orphan_rows = (SELECT SUM(s.orphan_rows)
+                                  FROM epf_link_stat s
+                                 WHERE s.run_id = t.run_id AND s.phase = t.phase
+                                   AND s.pointing_table_id = t.table_id)
+         WHERE t.run_id = l_run AND t.phase = p_phase
+           AND t.table_id IN (SELECT s.pointing_table_id FROM epf_link_stat s
+                               WHERE s.run_id = l_run AND s.phase = p_phase);
+        COMMIT;
+    END count_orphans;
 
     -- ------------------------------------------------------------------
     -- Temporary supporting indexes
@@ -1390,6 +1485,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         BEGIN
             epf_log.step_start('COUNT_BEFORE', p_module);
             count_tables(p_module, l_action, 'BEFORE', l_processed);
+            count_orphans(p_module, 'BEFORE');
             epf_log.step_end('DONE');
         EXCEPTION
             WHEN OTHERS THEN
@@ -1423,6 +1519,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             BEGIN
                 epf_log.step_start('COUNT_AFTER', p_module);
                 count_tables(p_module, l_action, 'AFTER', l_processed);
+                count_orphans(p_module, 'AFTER');
                 epf_log.step_end('DONE');
             EXCEPTION
                 WHEN OTHERS THEN
@@ -1477,6 +1574,160 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             RETURN FALSE;
     END capture_space;
 
+    -- Optional compaction (with_compact = Y, purge-only runs): shrinks the
+    -- registry tables of the deleting modules whose table segment has at least
+    -- compact_min_free_pct of free space after the purge (POST_PURGE, ASSM
+    -- measurement), largest free space first. Per table: row movement enabled
+    -- when disabled, SHRINK SPACE COMPACT (online), SHRINK SPACE CASCADE (short
+    -- lock bounded by ddl_lock_timeout; table-only SHRINK SPACE when the
+    -- cascade is refused, e.g. SECUREFILE LOBs), row movement restored. Tables
+    -- shrink does not support are skipped with the reason; a failed shrink is
+    -- a warning. Stop requests are honoured between tables.
+    PROCEDURE compact_tables(p_compacted OUT NUMBER, p_skipped OUT NUMBER, p_stopped OUT BOOLEAN) IS
+        l_min_pct  NUMBER := epf_util.setting_num('compact_min_free_pct');
+        l_run      NUMBER := g_run.run_id;
+        l_tid      NUMBER;
+        l_owner    VARCHAR2(128);
+        l_table    VARCHAR2(128);
+        l_reason   VARCHAR2(400);
+        l_movement VARCHAR2(8);
+        l_count    NUMBER;
+        l_before   NUMBER;
+        l_after    NUMBER;
+        l_start    TIMESTAMP;
+        l_cascade  BOOLEAN;
+        l_note     VARCHAR2(4000);
+        l_code     NUMBER;
+        l_error    VARCHAR2(4000);
+
+        -- Bytes of the table, its indexes and its LOB segments.
+        FUNCTION footprint RETURN NUMBER IS
+            l_bytes NUMBER;
+        BEGIN
+            SELECT NVL(SUM(s.bytes), 0)
+              INTO l_bytes
+              FROM dba_segments s
+             WHERE (s.owner, s.segment_name) IN (
+                       SELECT l_owner, l_table FROM dual
+                       UNION ALL
+                       SELECT i.owner, i.index_name FROM dba_indexes i
+                        WHERE i.table_owner = l_owner AND i.table_name = l_table
+                       UNION ALL
+                       SELECT l.owner, l.segment_name FROM dba_lobs l
+                        WHERE l.owner = l_owner AND l.table_name = l_table);
+            RETURN l_bytes;
+        END footprint;
+    BEGIN
+        p_compacted := 0;
+        p_skipped   := 0;
+        p_stopped   := FALSE;
+        FOR c IN (SELECT e.table_id, u.allocated_bytes, u.free_bytes
+                    FROM epf_space_usage u
+                    JOIN epf_table e
+                      ON e.owner = u.owner AND e.table_name = u.segment_name AND e.active = 'Y'
+                   WHERE u.run_id = l_run
+                     AND u.phase = epf_space.c_post_purge
+                     AND u.segment_type = 'TABLE'
+                     AND u.method = 'ASSM'
+                     AND u.allocated_bytes > 0
+                     AND u.free_bytes >= u.allocated_bytes * l_min_pct / 100
+                   ORDER BY u.free_bytes DESC) LOOP
+            l_tid := c.table_id;
+            CONTINUE WHEN NOT in_scope(g_tables(l_tid).module_code)
+                          OR NOT g_tables(l_tid).reachable
+                          OR module_action(g_tables(l_tid).module_code) <> c_delete;
+            IF epf_control.stop_requested(l_run) THEN
+                p_stopped := TRUE;
+                epf_log.warn('STOP_HONORED', 'Compaction stopped before ' || tname(l_tid));
+                EXIT;
+            END IF;
+            l_owner := g_tables(l_tid).owner;
+            l_table := g_tables(l_tid).table_name;
+
+            SELECT MAX(CASE WHEN t.iot_type IS NOT NULL THEN 'index-organized table'
+                            WHEN t.cluster_name IS NOT NULL THEN 'clustered table'
+                            WHEN t.compression = 'ENABLED' THEN 'compressed table' END),
+                   MAX(t.row_movement)
+              INTO l_reason, l_movement
+              FROM dba_tables t
+             WHERE t.owner = l_owner AND t.table_name = l_table;
+            IF l_reason IS NULL THEN
+                SELECT COUNT(*) INTO l_count
+                  FROM dba_indexes
+                 WHERE table_owner = l_owner AND table_name = l_table
+                   AND (index_type LIKE 'FUNCTION-BASED%' OR index_type = 'DOMAIN' OR join_index = 'YES');
+                IF l_count > 0 THEN
+                    l_reason := 'function-based, domain or join index';
+                END IF;
+            END IF;
+            IF l_reason IS NULL THEN
+                SELECT COUNT(*) INTO l_count
+                  FROM dba_tab_columns
+                 WHERE owner = l_owner AND table_name = l_table AND data_type IN ('LONG', 'LONG RAW');
+                IF l_count > 0 THEN
+                    l_reason := 'LONG column';
+                END IF;
+            END IF;
+            IF l_reason IS NOT NULL THEN
+                p_skipped := p_skipped + 1;
+                epf_log.event(epf_log.c_info, 'COMPACT_SKIPPED', 'Not compacted: ' || l_reason,
+                              p_object_owner => l_owner, p_object_name => l_table);
+                CONTINUE;
+            END IF;
+
+            l_before := footprint;
+            l_start  := epf_util.now_ts;
+            BEGIN
+                IF l_movement = 'DISABLED' THEN
+                    EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' ENABLE ROW MOVEMENT';
+                END IF;
+                EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' SHRINK SPACE COMPACT';
+                l_cascade := TRUE;
+                l_note    := NULL;
+                BEGIN
+                    EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' SHRINK SPACE CASCADE';
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        -- The cascade is refused for some LOB or index types;
+                        -- the table itself is still shrunk.
+                        l_cascade := FALSE;
+                        l_note    := SQLERRM;
+                        EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' SHRINK SPACE';
+                END;
+                IF l_movement = 'DISABLED' THEN
+                    EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' DISABLE ROW MOVEMENT';
+                END IF;
+                l_after := footprint;
+                p_compacted := p_compacted + 1;
+                epf_log.event(epf_log.c_ok, 'COMPACTED',
+                              epf_util.fmt_bytes(l_before) || ' -> ' || epf_util.fmt_bytes(l_after)
+                              || ' (table, indexes and LOB segments)'
+                              || CASE WHEN NOT l_cascade THEN '; indexes and LOB segments not shrunk: ' || l_note END,
+                              p_object_owner => l_owner, p_object_name => l_table,
+                              p_bytes => l_before - l_after, p_elapsed_s => epf_util.elapsed_s(l_start));
+            EXCEPTION
+                WHEN OTHERS THEN
+                    l_code  := SQLCODE;
+                    l_error := SQLERRM;
+                    IF l_movement = 'DISABLED' THEN
+                        BEGIN
+                            EXECUTE IMMEDIATE 'ALTER TABLE ' || tq(l_tid) || ' DISABLE ROW MOVEMENT';
+                        EXCEPTION
+                            WHEN OTHERS THEN
+                                epf_log.event(epf_log.c_warn, 'ROW_MOVEMENT_KEPT',
+                                              'Row movement could not be disabled again: ' || SQLERRM,
+                                              p_object_owner => l_owner, p_object_name => l_table,
+                                              p_ora_code => ABS(SQLCODE));
+                        END;
+                    END IF;
+                    p_skipped  := p_skipped + 1;
+                    g_warnings := g_warnings + 1;
+                    epf_log.event(epf_log.c_warn, 'COMPACT_FAILED', 'Not compacted: ' || l_error,
+                                  p_object_owner => l_owner, p_object_name => l_table, p_ora_code => ABS(l_code));
+            END;
+        END LOOP;
+    END compact_tables;
+
     PROCEDURE plan_steps IS
     BEGIN
         epf_log.step_plan('REGISTRY');
@@ -1494,6 +1745,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END LOOP;
         IF g_run.dry_run = 'N' THEN
             epf_log.step_plan('SPACE_POST_PURGE');
+        END IF;
+        IF g_run.with_compact = 'Y' THEN
+            epf_log.step_plan('COMPACT');
+            epf_log.step_plan('SPACE_POST_COMPACT');
         END IF;
         epf_log.step_plan('CLEANUP');
     END plan_steps;
@@ -1884,6 +2139,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_stopped  BOOLEAN := FALSE;
         l_dropped  NUMBER;
         l_tuning   VARCHAR2(4000);
+        l_compacted    NUMBER;
+        l_skipped      NUMBER;
+        l_compact_stop BOOLEAN;
         l_start    TIMESTAMP := epf_util.now_ts;
     BEGIN
         init(p_run_id, 'PURGE');
@@ -1939,6 +2197,23 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
         IF g_run.dry_run = 'N' AND NOT capture_space(epf_space.c_post_purge, 'SPACE_POST_PURGE') THEN
             l_failed := TRUE;
+        END IF;
+
+        IF g_run.with_compact = 'Y' AND NOT l_stopped THEN
+            BEGIN
+                epf_log.step_start('COMPACT');
+                compact_tables(l_compacted, l_skipped, l_compact_stop);
+                l_stopped := l_compact_stop;
+                epf_log.step_end('DONE', l_compacted || ' tables compacted, ' || l_skipped || ' skipped'
+                                         || CASE WHEN l_compact_stop THEN ', stopped on request' END);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    fail_step(SQLCODE, SQLERRM, DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
+                    l_failed := TRUE;
+            END;
+            IF NOT capture_space(epf_space.c_post_compact, 'SPACE_POST_COMPACT') THEN
+                l_failed := TRUE;
+            END IF;
         END IF;
 
         BEGIN

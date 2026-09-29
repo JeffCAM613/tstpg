@@ -177,7 +177,7 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
         l_files     NUMBER;
         l_file_size NUMBER;
     BEGIN
-        IF l_phase NOT IN (c_baseline, c_post_purge, c_post_reclaim) THEN
+        IF l_phase NOT IN (c_baseline, c_post_purge, c_post_compact, c_post_reclaim) THEN
             RAISE_APPLICATION_ERROR(-20140, 'Unknown space phase: ' || p_phase);
         END IF;
         p_failed := 0;

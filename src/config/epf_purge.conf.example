@@ -1,0 +1,40 @@
+# ============================================================================
+# EPF Data Purge - Configuration file
+# ============================================================================
+# Copy to src\config\epf_purge.conf (git-ignored) or pass another file with
+# --config FILE. One KEY=VALUE per line; lines starting with # are comments.
+# Command line options override these values. In the wizard, a value here is
+# the default of its question; with --non-interactive it is the answer.
+# ============================================================================
+
+# Connection: TNS alias or EZConnect string (PDB service in multitenant).
+TNS=localhost:1521/EPFPDB
+
+# Purge parameters.
+RETENTION_DAYS=30
+# FULL | CLOB | LOGS | CLOB_N_LOGS
+MODE=FULL
+# ALL, or modules separated by commas: PAYMENTS,LOGS,BANK_STATEMENTS
+DEPTH=ALL
+# Root rows per transaction, 100-100000. Leave unset to use the preflight's
+# recommendation in the wizard, or the batch_size_default setting otherwise.
+#BATCH_SIZE=1000
+
+# Y or N.
+DRY_RUN=N
+# Shrink the purged tables afterwards (purge only, not with a dry run).
+COMPACT=N
+# Enlarge the online redo logs to 4 x 1 GB before the purge (SYS, permanent).
+REDO_LOGS=N
+# Lower undo_retention for the purge and restore it at the end (SYS).
+UNDO_TUNING=N
+
+# Output.
+#LOG_DIR=D:\epf\logs
+NO_COLOR=N
+
+# Passwords are read from the environment (EPF_PASSWORD, EPF_SYS_PASSWORD) or
+# a masked prompt. They may be set here, which is discouraged: the file is
+# then as sensitive as the passwords.
+#EPF_PASSWORD=
+#SYS_PASSWORD=

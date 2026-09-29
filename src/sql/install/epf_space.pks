@@ -7,11 +7,12 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
 -- blocks without changing segment or file sizes; comparing used bytes
 -- between BASELINE and POST_PURGE shows the space a purge made reusable.
 --
--- Phases: BASELINE, POST_PURGE, POST_RECLAIM.
+-- Phases: BASELINE, POST_PURGE, POST_COMPACT, POST_RECLAIM.
 -- ============================================================================
 
     c_baseline     CONSTANT VARCHAR2(20) := 'BASELINE';
     c_post_purge   CONSTANT VARCHAR2(20) := 'POST_PURGE';
+    c_post_compact CONSTANT VARCHAR2(20) := 'POST_COMPACT';
     c_post_reclaim CONSTANT VARCHAR2(20) := 'POST_RECLAIM';
 
     -- Captures phase p_phase of run p_run_id, replacing an earlier capture of

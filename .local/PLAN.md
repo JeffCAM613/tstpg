@@ -223,7 +223,9 @@ src/sql/
     epf_reclaim.pks / .pkb   reclaim engine
     epf_report.pks / .pkb    integrity and results report
   run/                       one entry script per action; the wrapper calls only these
-    start_run.sql  preflight.sql  purge.sql  reclaim.sql  report.sql  status.sql  stop.sql  poll.sql
+    start_run.sql  preflight.sql  purge.sql  reclaim.sql  report.sql  status.sql  stop.sql  advice.sql
+    begin_run.sql  attach.sql  poll.sql  finish.sql
+                             monitor-session scripts (no EXIT; the wrapper's persistent session, 8.1)
     redo_logs.sql            opt-in redo log sizing (SYS)
     undo.sql                 opt-in undo tuning for a purge: APPLY / RESTORE / STATUS (SYS)
   tools/                     read-only diagnostics (no DML, no DDL)
@@ -362,12 +364,12 @@ A DELETE frees space inside blocks; segment and tablespace sizes do not change, 
 
 ### 6.7 Optional compaction (D7, opt-in)
 
-Delivered with phase 3; until then `start_run` refuses `with_compact = Y`. Offered in the wizard only when reclaim is not selected (default No; `--compact`). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
+Step `COMPACT` of a purge run with `with_compact = Y`; `start_run` accepts it only for a PURGE that is not a dry run and does not reclaim (`purge.sql` 7th argument, `--compact`, wizard question default No). It returns the freed space to the tablespace (tablespace usage drops, datafile size does not):
 
-- only registry tables whose freed-inside ratio is above `compact_min_free_pct` (default 20 %) are processed, largest benefit first;
-- per table: record `row_movement`, `ENABLE ROW MOVEMENT`, `SHRINK SPACE COMPACT` (online), `SHRINK SPACE` (short lock, bounded by `ddl_lock_timeout`), LOB segments where the LOB type supports shrink, then restore the recorded `row_movement` value;
-- tables where shrink is not supported (function-based or domain indexes, ROWID materialized views, compressed tables, unsupported LOB type) are skipped with the reason;
-- progress and heartbeat per table; honors stop requests between tables; space usage is measured again afterwards.
+- only registry tables of the run's deleting modules whose free space inside the segment at `POST_PURGE` is at least `compact_min_free_pct` (default 20 %) of the segment, in ASSM tablespaces, are processed, largest benefit first;
+- pre-checks skip a table with the reason (`COMPACT_SKIPPED`): index-organized, clustered, compressed, function-based, domain or join indexes, LONG columns;
+- per table: record `row_movement`, `ENABLE ROW MOVEMENT`, `SHRINK SPACE COMPACT` (online), `SHRINK SPACE CASCADE` (short lock, bounded by `ddl_lock_timeout`; dependent indexes and LOB segments too), falling back to the table alone when CASCADE is refused, then restore the recorded `row_movement` value (`ROW_MOVEMENT_KEPT` when it cannot be restored). `COMPACTED` records the bytes returned; a failure is `COMPACT_FAILED` (WARN) and the next table follows;
+- honors stop requests between tables; space usage is measured again afterwards (`SPACE_POST_COMPACT`, phase `POST_COMPACT`); check P8 reports the result.
 
 ### 6.8 Redo (D17)
 
@@ -385,7 +387,7 @@ A DELETE writes undo (about half of its redo, 400-450 MB per batch of 1,000 bulk
 - **Measured:** each root tree records its undo and elapsed time (`TREE_UNDO`); progress events show undo per batch, `MODULE_END` the module total.
 - **Preflight (`UNDO`):** undo tablespace size and growth limit, `undo_retention` and the tuned retention of the last 24 hours, retention guarantee, active undo tuning; per deleting tree the undo per root (measured, otherwise 45% of the redo estimate), the undo of a batch, and at the measured rate the undo kept by retention. WARN when a batch needs more than half of what the undo tablespace can hold, or when the kept undo exceeds its current size and undo tuning is not applied.
 - **Opt-in tuning (`run/undo.sql APPLY|RESTORE|STATUS`, SYS):** APPLY records, then sets `undo_retention` to `undo_retention_s` (60, SCOPE=MEMORY, so a restart also restores it); the undo datafiles' size and growth limit are not changed. With autoextensible undo datafiles Oracle still keeps undo for the longest running query (tuned retention), so the tablespace can still grow when long queries run; preflight shows the tuned retention. Refused with RETENTION GUARANTEE. RESTORE puts back every recorded original value. `EPF_INSTANCE_CHANGE` keeps the records outside history pruning; uninstall refuses while a change is active. A purge reports at start and end whether undo tuning is active.
-- **Wizard (phase 4):** offered with the redo sizing (SYS password); applied just before PROCESS_BATCHES and restored on every exit path, and restored first by the next run if a session died.
+- **Wizard (phase 4):** offered when the preflight expects the undo tablespace to grow (SYS password; `--undo-tuning` or `UNDO_TUNING=Y` without the wizard); applied after the preflight, just before the purge worker starts, and restored in a `finally` block on every exit path of the wrapper. When tuning from an earlier run is still active, the wizard offers to keep it for this purge and restore it at the end; `status` lists active tuning.
 
 ---
 
@@ -532,6 +534,14 @@ Fixes L-01..L-05. Recommended upgrade: one console, event stream + heartbeat, on
 3. When the worker exits, one final poll drains the remaining events. No sleeps, no timestamp guessing.
 4. The worker's exit code (`WHENEVER SQLERROR EXIT FAILURE`) and `EPF_RUN.status` decide what happens next.
 
+Implementation (phase 4):
+
+- The monitor session runs `run/begin_run.sql` (creates the run and attaches it, so it holds the run lock for the whole run and prints `EPF_RUN_ID=<n>`), then `run/poll.sql <run> <last_event_id>` every 2 s, and finally `run/finish.sql <run> <status>` (`epf_report.close_run`: checks, verdict, `RUN_END`, lock released; prints `EPF_EXIT=<n>`). Each command is followed by `PROMPT <marker>`; the wrapper reads lines until the marker. These scripts do not exit and continue on SQL errors.
+- `epf_log.poll` prints `EV|...` (new events), `ST|...` (running steps), `HB|...` (worker session: action, wait event, blocker, SQL_ID, longops, resumable suspension) and `RUN|status|stop_requested`. The worker is found by `CLIENT_IDENTIFIER = 'EPF:<run>'` excluding the monitor's own SID.
+- Workers are one-shot sessions: `preflight.sql <run>`, `purge.sql <run> - - - - - -`, then `report.sql <run>` after the run is ended; SYS steps (`redo_logs.sql`, `undo.sql APPLY|RESTORE`) run in their own sessions. `SP2-0640`, `SP2-0310` and logon errors in a worker's output count as a failure even when sqlplus exits 0.
+- A poll that fails or does not answer within 60 s kills the monitor session, opens a new one and re-attaches the run (`run/attach.sql`, up to 5 attempts); when that fails too, the live view stops, the worker is still waited for, and the run is attached again to be ended.
+- Ctrl+C while a run is shown requests a graceful stop (`run/stop.sql` in its own session) instead of ending the wrapper; the purge stops after its current batch and the run ends STOPPED with its report (exit 3).
+
 Only one process writes the console log file (no file-sharing workarounds, no per-line PowerShell launches).
 
 ### 8.2 Console layout (mockup)
@@ -608,11 +618,11 @@ logs/2026-09-28_104200_R-000124/
 
 | ID | Check | PASS | WARN | FAIL |
 |----|-------|------|------|------|
-| P1 | Residual eligible rows (FULL) / residual non-empty LOBs (CLOB modes) | 0 | - | > 0 (unless run STOPPED: WARN) |
-| P2 | Accounting: processed = eligible at start, per table | equal | - | differs |
+| P1 | Residual eligible rows (deleting modules) / residual non-empty LOBs (clearing modules) | 0 | > 0 when the run was stopped or failed | > 0 |
+| P2 | Accounting: processed = eligible at start, per table | equal | more processed (rows became eligible during the run), or fewer when stopped or failed | fewer |
 | P3 | Retention safety: retained rows (newer than cutoff, or linked to retained roots) not reduced | not reduced | - | reduced |
-| P4 | Orphans on every registry link (links protected by an enabled validated FK pass by constraint) | 0 | - | > 0 |
-| P5 | Errors during the run | none | tolerated warnings | any ERROR event |
+| P4 | Orphans on every registry link (links protected by an enabled validated FK pass by constraint) | 0 | orphans that existed before the purge | new orphans |
+| P5 | Errors during the run (RUN_END excluded) | none | WARN events | any ERROR event, or the run ended FAILED (a step outside the database failed, or the worker session ended) |
 | P6 | Temporary supporting indexes dropped | all dropped | - | leftovers |
 | R1 | Indexes: same set, all VALID/USABLE, original tablespace, degree, logging | identical | - | any difference |
 | R2 | Constraints: same set, same status/validated | identical | - | any difference |
@@ -624,9 +634,12 @@ logs/2026-09-28_104200_R-000124/
 | R8 | LONG conversions: each approved conversion done, original -> new type listed | all done | skipped items listed | an approved conversion failed |
 | R9 | Accounts restored to their recorded status; disconnected sessions listed | yes | - | an account not restored |
 | R10 | Tablespace name and user defaults/quotas identical to baseline | yes | - | differs |
-| P7 | Space measured inside segments before/after purge (6.6) | measured | estimated (fallback) | - |
+| P7 | Space measured inside segments before/after purge (6.6) | measured | estimated or unsupported segments, or a phase missing | - |
+| P8 | Compaction (6.7), when requested | every candidate compacted | tables skipped or failed | - |
 
-Verdict: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Exit code follows the verdict.
+Checks that do not apply are `SKIP`: P1-P4, P6 and P8 for dry runs and runs without a purge; P7 for runs that are not purges.
+
+Verdict: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Exit code follows the verdict (0, 2, 1); 3 when the run was stopped.
 
 ### 9.3 Output format (mockup, end of report.txt)
 
@@ -648,7 +661,8 @@ Verdict: `PASS`, `PASS WITH WARNINGS`, `FAIL`. Exit code follows the verdict.
 EPF_CHECK|R-000124|P1|PASS|0|residual eligible rows
 EPF_CHECK|R-000124|P2|PASS|27/27|processed equals eligible
 ...
-EPF_VERDICT|R-000124|PASS|exit=0
+EPF_STEP|R-000124|PURGE|PROCESS_BATCHES|PAYMENTS|DONE|993
+...EPF_VERDICT|R-000124|PASS|exit=0
 ```
 
 ---
@@ -677,33 +691,38 @@ Options
   --retention DAYS        default 30
   --depth LIST            ALL | PAYMENTS | LOGS | BANK_STATEMENTS (comma-separated)
   --mode MODE             FULL | CLOB | LOGS | CLOB_N_LOGS
-  --batch-size N          default 1000
+  --batch-size N          100-100000; wizard default: the preflight's recommendation (6.8); otherwise
+                          the batch_size_default setting (1000)
   --dry-run               snapshot and count only
   --compact               shrink worthwhile purged tables after a purge-only run (6.7)
+  --redo-logs             enlarge the online redo logs before the purge (D17; SYS)
+  --undo-tuning           lower undo_retention for the purge, restored at the end (D18; SYS)
+  --run ID                run for report (default LATEST) and stop (default: active run); 124 or R-000124
   --reclaim               reclaim after a successful purge
   --tablespaces LIST      target tablespaces (default: all candidates, 7.4)
   --long-conversion V     ALL | NONE | owner.table.column,...  (non-interactive only)
   --resume                continue an interrupted reclaim (non-interactive)
-  --yes                   skip the final confirmation (never approves LONG conversions)
+  --yes                   skip the final confirmation (never approves LONG conversions); required with
+                          --non-interactive for a purge that deletes and for uninstall
   --non-interactive       never prompt; missing input is an error (exit 4)
-  --log-dir DIR           default .\logs
+  --log-dir DIR           default logs\ in the tool folder
   --no-color
   --help
 
 Environment
   EPF_PASSWORD            EPFPG password
-  EPF_SYS_PASSWORD        SYS password (reclaim, install, uninstall)
+  EPF_SYS_PASSWORD        SYS password (reclaim, install, uninstall, --redo-logs, --undo-tuning)
 ```
 
-Exit codes: `0` PASS, `1` FAIL, `2` PASS WITH WARNINGS, `3` aborted (user, preflight blocker, interrupted reclaim without --resume), `4` usage/configuration error.
+Exit codes: `0` PASS, `1` FAIL (including a preflight that finds errors: nothing is changed), `2` PASS WITH WARNINGS, `3` aborted or stopped (user answer, Ctrl+C / stop request, interrupted reclaim without --resume), `4` usage/configuration error (also: connection failed, run could not be created). Until phase 5, `reclaim`, `--reclaim`, `--tablespaces`, `--long-conversion` and `--resume` are refused with exit 4; `--dry-run`, `--compact`, `--redo-logs` and `--undo-tuning` are refused where they do not apply (preflight; compaction and instance tuning with a dry run).
 
-The configuration file uses the same names as the options (`RETENTION_DAYS=30`, `DEPTH=ALL`, `LONG_CONVERSION=NONE`, ...). Passwords in the file are allowed but discouraged; the file is git-ignored.
+The configuration file (`src/config/epf_purge.conf`, or `--config`; documented in `epf_purge.conf.example`) uses KEY=VALUE lines: `TNS`, `RETENTION_DAYS`, `MODE`, `DEPTH`, `BATCH_SIZE`, `DRY_RUN`, `COMPACT`, `REDO_LOGS`, `UNDO_TUNING`, `LOG_DIR`, `NO_COLOR` (later `LONG_CONVERSION`, ...). A command line value skips its question; a file value is the question's default in the wizard and the answer with `--non-interactive`. Passwords in the file (`EPF_PASSWORD`, `SYS_PASSWORD`) are allowed but discouraged; the file is git-ignored.
 
 ### 10.2 Credentials
 
 - Read with a masked prompt or from the environment; never placed in a command line, temp file or child environment (S-01).
 - Every `sqlplus` starts as `sqlplus -S -L /nolog`; the wrapper writes `CONNECT user/"password"@tns` to its stdin with echo off.
-- Values are cleared from memory at exit.
+- Passwords are kept as `SecureString` and decoded only to write the CONNECT line (and, for install, the EPFPG password argument written to the same stdin).
 
 ### 10.3 Interactive flow ("all input at the beginning")
 
@@ -727,6 +746,8 @@ Every question, confirmation and password is collected before the first change. 
    - forecast: final size, peak extra disk, redo vs recovery area.
 6. **Review screen**: every parameter, forecasts, warnings, what will change. One confirmation (`Proceed? [y/N]`; destructive actions require typing `yes` unless `--yes`).
 7. **Run**: live view (8.2) through to the verdict.
+
+Implementation of the purge flow (phase 4): after retention, mode, depth, dry run and compaction, the wizard runs a read-only PREFLIGHT run with these parameters (its own run and run folder, shown live with its report). `run/advice.sql` then returns its findings as `EPF_ADVICE|...` lines: recommended batch size, redo warning, undo warning, undo tuning still active, error count. Errors end the wizard (exit 1, nothing changed). Otherwise the redo sizing and undo tuning questions are asked when the findings call for them (not for a dry run), the batch size is asked with the recommendation as default (clamped to 100-100000), the SYS password is asked only when a SYS step was chosen, then the review. The PURGE run refers to that preflight run (`preflight_run` in the manifest) instead of repeating it. Without the wizard (`--non-interactive`), the PURGE run runs the preflight itself as its first step.
 
 Every prompt validates immediately and re-asks on invalid input, shows `[default]`, and accepts Enter. Supplying an option on the command line skips its prompt.
 
@@ -808,9 +829,9 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 | 0. Verify and baseline | Now: read-only environment survey (`src/tests/verify/environment.sql`). Before phase 5: behavior spikes V1-V10 on a test database; parity baseline from the previous tool on a clone. | Survey output reviewed; V1-V10 answered before reclaim work starts. |
 | 1. Foundation | Layout, `.gitattributes`/`.gitignore`, `install.sql`/`uninstall.sql`, `tables.sql`, `registry_data.sql`, `grants.sql`, `epf_util`, `epf_log`, `epf_control`, `epf_registry`. | Install/upgrade/uninstall idempotent; registry validation runs. |
 | 2. Purge engine | `epf_purge` (snapshot, held back D16, modes, batches, temporary indexes, counts), `epf_space` (segment, file and in-segment snapshots), `run/preflight.sql`, `run/purge.sql`. | Parity with baseline; dry-run exact counts. |
-| 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P7, `run/report.sql`; optional compaction (6.7). | Purge runs self-verify. |
-| 4. Wrapper | `epf_purge.bat` launcher, `lib/epf.ps1`: CLI, config, wizard, credentials, runner, live view, run folder, exit codes. | End-to-end purge from the wizard and non-interactively. |
-| 5. Reclaim engine | `epf_reclaim` (inventory, blockers, LONG conversion, account lock/unlock, forecast, swap state machine, resume), `run/reclaim.sql`, `run/status.sql`, `run/stop.sql`. | Full test matrix 12.2 for reclaim. |
+| 3. Report (purge part) | `epf_report` sections 1-3, checks P1-P8, `run/report.sql`; orphan counts per link (`EPF_LINK_STAT`); optional compaction (6.7). | Purge runs self-verify. |
+| 4. Wrapper | `epf_purge.bat` launcher, `lib/epf.ps1`: CLI, config, wizard, credentials, runner, live view, run folder, exit codes; `epf_log.poll`, `run/begin_run.sql`, `attach.sql`, `poll.sql`, `finish.sql`, `advice.sql`, `status.sql`, `stop.sql`; `src/config/epf_purge.conf.example`. | End-to-end purge from the wizard and non-interactively. |
+| 5. Reclaim engine | `epf_reclaim` (inventory, blockers, LONG conversion, account lock/unlock, forecast, swap state machine, resume), `run/reclaim.sql`; reclaim state in `status.sql` and stop support in `stop.sql`. | Full test matrix 12.2 for reclaim. |
 | 6. Report (reclaim part) | Sections 4-5, checks R1-R7, manifest. | Reclaim runs self-verify. |
 | 7. Hardening | Production-sized clone run, tuning of settings defaults, `tools/` diagnostics, removal of superseded files. | Acceptance 12.3. |
 | 8. Linux wrapper | `bin/epf_purge.sh` (bash; same CLI, prompts, live view, run folder, exit codes). | Same run on Linux produces the same report and manifest. |

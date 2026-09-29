@@ -256,10 +256,42 @@ BEGIN
             processed_rows     NUMBER,
             orphan_rows        NUMBER,
             held_rows          NUMBER,
+            action             VARCHAR2(10),
             measured_at        TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
             CONSTRAINT epf_table_stat_pk PRIMARY KEY (run_id, table_id, phase)
         )]');
     add_column('EPF_TABLE_STAT', 'HELD_ROWS', 'NUMBER');
+    add_column('EPF_TABLE_STAT', 'ACTION', 'VARCHAR2(10)');
+
+    -- Orphans per registry link and phase: rows on the pointing side (the
+    -- dependent for a direct link, the source for a reverse link) whose value
+    -- is not found on the pointed side. protected_by names the enabled,
+    -- validated FK that makes orphans impossible (no scan).
+    create_table('EPF_LINK_STAT', q'[
+        CREATE TABLE epf_link_stat (
+            run_id             NUMBER         NOT NULL,
+            link_id            NUMBER         NOT NULL,
+            phase              VARCHAR2(20)   NOT NULL,
+            pointing_table_id  NUMBER         NOT NULL,
+            orphan_rows        NUMBER,
+            protected_by       VARCHAR2(128),
+            measured_at        TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+            CONSTRAINT epf_link_stat_pk PRIMARY KEY (run_id, link_id, phase)
+        )]');
+
+    -- Checks of a run and their outcome (report).
+    create_table('EPF_CHECK', q'[
+        CREATE TABLE epf_check (
+            run_id        NUMBER          NOT NULL,
+            check_id      VARCHAR2(10)    NOT NULL,
+            status        VARCHAR2(10)    NOT NULL,
+            title         VARCHAR2(200)   NOT NULL,
+            value         VARCHAR2(200),
+            detail        VARCHAR2(4000),
+            evaluated_at  TIMESTAMP       DEFAULT SYSTIMESTAMP NOT NULL,
+            CONSTRAINT epf_check_pk        PRIMARY KEY (run_id, check_id),
+            CONSTRAINT epf_check_status_ck CHECK (status IN ('PASS', 'WARN', 'FAIL', 'SKIP'))
+        )]');
 
     -- Segment sizes per phase.
     create_table('EPF_SEGMENT_SNAP', q'[

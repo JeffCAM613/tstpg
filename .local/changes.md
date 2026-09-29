@@ -2,6 +2,46 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-28 - Phases 3 and 4: report, compaction, wrapper (0.4.0)
+
+Open questions answered with the plan defaults (to confirm)
+- Compaction is delivered (opt-in, purge-only runs, default No).
+- Rows not attached to any bulk payment (7,038 payments, 4,093 import audits and their children on EPFPG782) are kept, as today; they count as retained rows.
+
+Phase 3 - report and compaction
+- `epf_report` (new package): `evaluate` writes checks P1-P8 into the new table `EPF_CHECK` and derives the verdict (FAIL / PASS WITH WARNINGS / PASS, exit 1 / 2 / 0; 3 when the run was stopped); `close_run` evaluates and ends the run with the verdict; `print_report` prints header, steps, purge results per table, held roots, space inside segments per table, datafiles, redo and undo, checks, verdict and the machine-readable lines `EPF_CHECK|...`, `EPF_STEP|...`, `EPF_VERDICT|...`; `print_advice` (wizard) and `print_status`. A run ended FAILED fails P5 even without an ERROR event (a step outside the database failed, or the worker session ended).
+- Orphans: after the purge (and before, for comparison) every registry link is checked for rows on the pointing side whose value no longer exists on the pointed side (new table `EPF_LINK_STAT`; `EPF_TABLE_STAT.orphan_rows`; `LINK_ORPHANS` WARN). A link protected by an enabled, validated FK is not scanned. P4 fails on new orphans only.
+- Compaction (6.7): step `COMPACT` and `SPACE_POST_COMPACT` (phase `POST_COMPACT`). `start_run` accepts `with_compact = Y` for a PURGE that is not a dry run and does not reclaim. Events `COMPACTED` (bytes returned), `COMPACT_SKIPPED` (reason), `COMPACT_FAILED`, `ROW_MOVEMENT_KEPT`; check P8.
+- `EPF_TABLE_STAT.action` (DELETE / CLEAR) so the report distinguishes residual rows from residual LOB values.
+- `run/report.sql <run_id|LATEST>` (new). `run/purge.sql` takes a 7th argument `<compact>`; with NEW it ends the run with the report's verdict and prints the report (exit code = verdict). `run/preflight.sql` exits 2 when it finds warnings only (was 0).
+- `install.sql` compiles `epf_report`; tool version 0.4.0.
+
+Phase 4 - wrapper
+- `src/bin/epf_purge.bat` (launcher) and `src/bin/lib/epf.ps1` (Windows PowerShell 5.1): actions purge, preflight, report, status, stop, install, uninstall and the wizard; options and exit codes as in plan 10.1; configuration file `src/config/epf_purge.conf` (example `epf_purge.conf.example`).
+- Passwords: environment (`EPF_PASSWORD`, `EPF_SYS_PASSWORD`), configuration file or masked prompt; kept as SecureString; written only to sqlplus stdin (`CONNECT user/"pw"@tns`); never on a command line.
+- One run = one monitor session (holds the run lock: `begin_run.sql`, then `poll.sql` every 2 s, `finish.sql` at the end; restarted and re-attached with `attach.sql` when a poll does not answer within 60 s) and one-shot worker sessions (`preflight.sql`, `purge.sql`, `report.sql`, SYS `redo_logs.sql` / `undo.sql`). `epf_log.poll` prints events, running steps, the worker's heartbeat (wait event, blocker, SQL_ID, longops, resumable suspension) and the run status.
+- Live view: one line per event with `[ OK ]`, `[INFO]`, `[WARN]`, `[FAIL]`; heartbeat line `..` after 15 s without an event (console only unless it reports a suspension). Ctrl+C requests a graceful stop (`stop.sql`) instead of ending the wrapper.
+- Wizard purge flow: connection, retention, mode, depth, dry run, compaction; a read-only PREFLIGHT run with these parameters; `advice.sql` findings drive the redo sizing and undo tuning questions and the batch size default (the recommendation); SYS password only when a SYS step was chosen; review; typed `yes` for a purge that deletes. The PURGE run refers to that preflight instead of repeating it. Undo tuning applied by the wrapper is restored in a `finally` block on every exit path.
+- Run folder `logs/<yyyy-MM-dd_HHmmss>_R-<id>/`: `console.log`, `report.txt`, `manifest.txt` (parameters, step statuses, checks, verdict, exit code), `sqlplus_*.log` (raw worker output).
+- `run/begin_run.sql`, `attach.sql`, `poll.sql`, `finish.sql` (monitor session; no EXIT), `advice.sql`, `status.sql`, `stop.sql <run_id|ACTIVE>` (new).
+- Checked locally: PowerShell parser, ASCII only, and end-to-end runs of the wizard, non-interactive purge, failure paths and exit codes against a stand-in for sqlplus (no database here).
+- Plan: 4.1, 6.7, 6.9, 8.1, 9.2, 9.3, 10.1, 10.2, 10.3, 13 (preflight errors exit 1, not 3).
+
+How to test (EPFPG782)
+SQL level, on the database machine:
+1. If not done yet: `undo.sql RESTORE` as SYS (undo tuning from the PAYMENTS run is still active).
+2. `git pull`, `install.sql`: tool version 0.4.0, `created  table EPF_LINK_STAT` and `EPF_CHECK`, all objects valid.
+3. `report.sql LATEST` and `report.sql 2` (the PAYMENTS run R-000002): the report prints; P4 shows 0 links for runs of 0.2.x (orphans were not counted then).
+4. `purge.sql NEW 30 LOGS LOGS - Y N` (dry run): report at the end, P1-P4, P6, P8 SKIP; exit 0 or 2 (`echo $?`).
+5. `purge.sql NEW 30 LOGS LOGS - N Y` (LOGS purge with compaction): steps COMPACT and SPACE_POST_COMPACT, events COMPACTED / COMPACT_SKIPPED, P4 links counted, P8 with the bytes returned.
+6. Stop: start `purge.sql NEW 30 BANK_STATEMENTS FULL 100 N N` in one session; once batches run, `stop.sql ACTIVE` from a second session; the first stops after its current batch and ends STOPPED (P1 WARN, exit 3). `status.sql` shows the run. Step 9 purges the rest.
+Wrapper, on a Windows machine with sqlplus and a TNS alias for the PDB:
+7. `src\bin\epf_purge.bat --help`; `src\bin\epf_purge.bat status --tns <alias>` (password prompt).
+8. `src\bin\epf_purge.bat preflight --tns <alias>`: live events, report, run folder with `console.log`, `report.txt`, `manifest.txt`.
+9. `src\bin\epf_purge.bat` (wizard) -> 1 Purge, BANK_STATEMENTS, FULL, dry run N, compact Y: preflight run, redo/undo questions if the findings call for them, batch size default = recommendation, review, `yes`. Watch the live view; `echo %ERRORLEVEL%` afterwards.
+10. Ctrl+C during a purge run from the wrapper: `Stop requested`, run ends STOPPED, exit 3.
+11. Return: console output of each step, and `manifest.txt` + `report.txt` of the wrapper runs.
+
 ## 2026-09-28 - Phase 2: undo retention only, output fixes
 
 Results (EPFPG782, 0.2.2)

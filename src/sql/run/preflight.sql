@@ -11,7 +11,8 @@
 --                       this session with default purge parameters (manual use)
 -- Requires: EPFPG (or SYS).
 -- Effects : Writes events and steps of the run; changes nothing else.
---           Exit code 0 when no check failed, 1 otherwise.
+--           Exit code 0 without findings, 2 with warnings only, 1 when a
+--           check failed.
 -- ============================================================================
 SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
@@ -39,7 +40,7 @@ DECLARE
     l_warnings PLS_INTEGER;
 BEGIN
     epfpg.epf_purge.preflight(:run_id, l_errors, l_warnings);
-    :rc := CASE WHEN l_errors > 0 THEN 1 ELSE 0 END;
+    :rc := CASE WHEN l_errors > 0 THEN 1 WHEN l_warnings > 0 THEN 2 ELSE 0 END;
 
     IF UPPER('&run_arg') = 'NEW' THEN
         epfpg.epf_control.finish(
@@ -47,7 +48,7 @@ BEGIN
             p_status    => CASE WHEN l_errors > 0 THEN 'FAILED'
                                 WHEN l_warnings > 0 THEN 'WARNING'
                                 ELSE 'SUCCESS' END,
-            p_exit_code => CASE WHEN l_errors > 0 THEN 1 WHEN l_warnings > 0 THEN 2 ELSE 0 END);
+            p_exit_code => :rc);
         epfpg.epf_log.print_events(:run_id);
     END IF;
 END;

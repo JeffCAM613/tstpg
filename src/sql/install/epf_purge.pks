@@ -52,14 +52,25 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --
 -- Counts (EPF_TABLE_STAT, phases BEFORE and AFTER)
 --   total, eligible, retained (total - eligible), non-empty LOB values
---   (CLEAR), processed (AFTER), held. Space inside segments is captured with
---   epf_space (BASELINE, and POST_PURGE unless dry run).
+--   (CLEAR), processed (AFTER), held, orphans, action. Orphans per link
+--   (EPF_LINK_STAT): rows on the pointing side whose value is not found on
+--   the pointed side; a link protected by an enabled, validated FK is not
+--   scanned. Space inside segments is captured with epf_space (BASELINE, and
+--   POST_PURGE unless dry run).
+--
+-- Compaction (with_compact = Y, purge-only runs, step COMPACT)
+--   Registry tables of deleting modules whose table segment has at least
+--   compact_min_free_pct free after the purge are shrunk (row movement
+--   enabled and restored, SHRINK SPACE COMPACT, SHRINK SPACE CASCADE or the
+--   table alone when the cascade is refused), largest free space first;
+--   space is captured again (POST_COMPACT).
 --
 -- Events: PURGE_SCOPE, TABLE_SKIPPED, ROOT_MISSING, TEMP_INDEX_LEFTOVER,
 --   KEYS_SNAPSHOT, ROOTS_HELD, ROOTS_GROUPED, TABLE_ELIGIBLE, TEMP_INDEX_CREATED,
 --   TEMP_INDEX_FAILED, TEMP_INDEX_DROPPED, TEMP_INDEX_KEPT, FK_UNINDEXED,
 --   BATCH_PROGRESS, BATCH_FAILED,
---   STOP_HONORED, TREE_REDO, TREE_UNDO, TABLE_RESULT, MODULE_END, STEP_FAILED,
+--   STOP_HONORED, TREE_REDO, TREE_UNDO, TABLE_RESULT, LINK_ORPHANS, COMPACTED,
+--   COMPACT_SKIPPED, COMPACT_FAILED, ROW_MOVEMENT_KEPT, MODULE_END, STEP_FAILED,
 --   IDX_MISSING, IDX_SUMMARY, ROOTS_ELIGIBLE, REDO_LOGS, REDO_ESTIMATE,
 --   REDO_SUMMARY, UNDO, UNDO_ESTIMATE, UNDO_TUNING, PURGE_END.
 --

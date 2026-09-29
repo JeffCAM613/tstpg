@@ -86,5 +86,17 @@ CREATE OR REPLACE PACKAGE epf_log AUTHID DEFINER AS
     -- Prints the events of a run through DBMS_OUTPUT, one line per event.
     PROCEDURE print_events(p_run_id IN NUMBER, p_after_event_id IN NUMBER DEFAULT 0);
 
+    -- One poll of the live monitor, printed through DBMS_OUTPUT as
+    -- '|'-separated lines (the message is always the last field):
+    --   EV|event_id|HH24:MI:SS|severity|phase|event_code|owner.object|message
+    --      every event of the run after p_after_event_id
+    --   ST|phase|step_code|scope|units_done|units_total|bytes_done
+    --      every RUNNING step
+    --   HB|sid|status|action|event|seconds_in_wait|wait_class|blocking_sid|
+    --      blocker|sql_id|longops_pct|longops_seconds_left|longops_operation|suspended
+    --      every other session tagged EPF:<run_id> (the workers)
+    --   RUN|status|stop_requested
+    PROCEDURE poll(p_run_id IN NUMBER, p_after_event_id IN NUMBER);
+
 END epf_log;
 /

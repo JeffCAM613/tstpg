@@ -198,6 +198,54 @@ CREATE OR REPLACE PACKAGE BODY epf_log AS
         DBMS_APPLICATION_INFO.SET_ACTION(g_phase);
     END step_end;
 
+    PROCEDURE poll(p_run_id IN NUMBER, p_after_event_id IN NUMBER) IS
+        l_own_sid NUMBER := TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'));
+        l_client  VARCHAR2(64) := 'EPF:' || p_run_id;
+    BEGIN
+        FOR e IN (SELECT event_id, ts, severity, phase, event_code, object_owner, object_name, message
+                    FROM epf_event
+                   WHERE run_id = p_run_id
+                     AND event_id > NVL(p_after_event_id, 0)
+                   ORDER BY event_id) LOOP
+            DBMS_OUTPUT.PUT_LINE('EV|' || e.event_id || '|' || TO_CHAR(e.ts, 'HH24:MI:SS') || '|' || e.severity
+                                 || '|' || e.phase || '|' || e.event_code || '|'
+                                 || CASE WHEN e.object_name IS NOT NULL THEN e.object_owner || '.' || e.object_name END
+                                 || '|' || REPLACE(REPLACE(e.message, CHR(13), ' '), CHR(10), ' '));
+        END LOOP;
+        FOR s IN (SELECT phase, step_code, scope, units_done, units_total, bytes_done
+                    FROM epf_step
+                   WHERE run_id = p_run_id AND status = 'RUNNING'
+                   ORDER BY step_seq) LOOP
+            DBMS_OUTPUT.PUT_LINE('ST|' || s.phase || '|' || s.step_code || '|' || s.scope || '|' || s.units_done
+                                 || '|' || s.units_total || '|' || s.bytes_done);
+        END LOOP;
+        FOR h IN (SELECT w.sid, w.status, w.action, w.event, w.seconds_in_wait, w.wait_class, w.blocking_session,
+                         w.sql_id,
+                         (SELECT b.username || '@' || b.machine || ' ' || b.program
+                            FROM v$session b
+                           WHERE b.sid = w.blocking_session AND ROWNUM = 1) AS blocker,
+                         (SELECT ROUND(100 * lo.sofar / NULLIF(lo.totalwork, 0), 1) || '|' || lo.time_remaining
+                                 || '|' || lo.opname
+                            FROM v$session_longops lo
+                           WHERE lo.sid = w.sid AND lo.serial# = w.serial# AND lo.sofar < lo.totalwork
+                           ORDER BY lo.last_update_time DESC
+                           FETCH FIRST 1 ROWS ONLY) AS longops,
+                         (SELECT MAX(rs.error_msg)
+                            FROM dba_resumable rs
+                           WHERE rs.session_id = w.sid AND rs.status = 'SUSPENDED') AS suspended
+                    FROM v$session w
+                   WHERE w.client_identifier = l_client
+                     AND w.sid <> l_own_sid) LOOP
+            DBMS_OUTPUT.PUT_LINE('HB|' || h.sid || '|' || h.status || '|' || h.action || '|' || h.event || '|'
+                                 || h.seconds_in_wait || '|' || h.wait_class || '|' || h.blocking_session || '|'
+                                 || h.blocker || '|' || h.sql_id || '|' || NVL(h.longops, '||') || '|'
+                                 || REPLACE(REPLACE(h.suspended, CHR(13), ' '), CHR(10), ' '));
+        END LOOP;
+        FOR x IN (SELECT status, stop_requested FROM epf_run WHERE run_id = p_run_id) LOOP
+            DBMS_OUTPUT.PUT_LINE('RUN|' || x.status || '|' || x.stop_requested);
+        END LOOP;
+    END poll;
+
     FUNCTION current_step RETURN VARCHAR2 IS
     BEGIN
         RETURN g_step;
