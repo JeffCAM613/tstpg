@@ -26,6 +26,13 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
     --                                   (table and BASICFILE LOB blocks count at
     --                                   the middle of their fullness band;
     --                                   index blocks are full or free)
+    --                       BASICFILE_EST  BASICFILE LOB segments after a
+    --                                   purge: the chunks of deleted or cleared
+    --                                   values stay "used" for DBMS_SPACE until
+    --                                   new values reuse them, so the use is
+    --                                   the BASELINE measurement scaled by the
+    --                                   share of rows the purge did not process
+    --                                   (the measured value when lower)
     --                       SECUREFILE  DBMS_SPACE.SPACE_USAGE, used bytes
     --                       ESTIMATE    manual segment space management tables:
     --                                   num_rows x avg_row_len from statistics

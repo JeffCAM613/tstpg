@@ -83,6 +83,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     g_modules  SYS.ODCIVARCHAR2LIST;
     g_owner    VARCHAR2(128) := $$PLSQL_UNIT_OWNER;
     g_warnings PLS_INTEGER := 0;
+    -- Eligible roots per root table_id, counted by the preflight (check_roots).
+    g_eligible t_numbers;
 
     -- ------------------------------------------------------------------
     -- Names and SQL fragments
@@ -479,6 +481,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                             || ' (epf_control.enter).');
         END IF;
         g_warnings := 0;
+        g_eligible.DELETE;
         load_registry;
         SELECT module_code BULK COLLECT INTO g_modules
           FROM epf_module
@@ -991,6 +994,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_to_col   VARCHAR2(128);
         l_fk       VARCHAR2(128);
         l_orphans  NUMBER;
+        l_before   NUMBER;
         l_run      NUMBER := g_run.run_id;
         l_link_id  NUMBER;
     BEGIN
@@ -1028,9 +1032,24 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 VALUES (l_run, l_link_id, p_phase, l_from, l_orphans, l_fk);
                 COMMIT;
                 IF l_orphans > 0 THEN
-                    epf_log.event(epf_log.c_warn, 'LINK_ORPHANS',
+                    -- Orphans found before the purge, and orphans after it that
+                    -- were already there, describe the application data: INFO.
+                    -- Orphans the purge added are a WARN (and fail check P4).
+                    l_before := NULL;
+                    IF p_phase <> 'BEFORE' THEN
+                        SELECT MAX(orphan_rows) INTO l_before
+                          FROM epf_link_stat
+                         WHERE run_id = l_run AND link_id = l_link_id AND phase = 'BEFORE';
+                    END IF;
+                    epf_log.event(CASE WHEN p_phase <> 'BEFORE' AND l_orphans > NVL(l_before, 0)
+                                       THEN epf_log.c_warn ELSE epf_log.c_info END,
+                                  'LINK_ORPHANS',
                                   epf_util.fmt_int(l_orphans) || ' rows point at no row of ' || tname(l_to) || ' ('
-                                  || l_from_col || ' -> ' || l_to_col || ', link ' || l_link_id || ', ' || p_phase || ')',
+                                  || l_from_col || ' -> ' || l_to_col || ', link ' || l_link_id || ', ' || p_phase || ')'
+                                  || CASE WHEN p_phase = 'BEFORE' THEN '; they exist before the purge'
+                                          WHEN l_before IS NOT NULL THEN '; ' || epf_util.fmt_int(l_before)
+                                                                         || ' before the purge'
+                                     END,
                                   p_object_owner => g_tables(l_from).owner,
                                   p_object_name => g_tables(l_from).table_name, p_rows => l_orphans);
                 END IF;
@@ -1884,12 +1903,27 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN TRUNC(p_value / l_scale) * l_scale;
     END round_batch;
 
+    -- Eligible roots of a root table counted by check_roots; NULL when not counted.
+    FUNCTION eligible_roots(p_root_id IN NUMBER) RETURN NUMBER IS
+    BEGIN
+        IF g_eligible.EXISTS(p_root_id) THEN
+            RETURN g_eligible(p_root_id);
+        END IF;
+        RETURN NULL;
+    END eligible_roots;
+
+    -- Root rows in one batch: the batch size, or fewer when fewer roots are eligible.
+    FUNCTION batch_roots(p_root_id IN NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN LEAST(g_run.batch_size, NVL(eligible_roots(p_root_id), g_run.batch_size));
+    END batch_roots;
+
     -- Online redo logs against the redo a batch writes. The recommended batch
     -- size keeps one batch within half of the smallest online log, so a batch
     -- causes at most one log switch. A batch larger than a whole log is a
     -- warning: the session then waits on 'log file switch (checkpoint
     -- incomplete)'; larger online logs remove those waits, a smaller batch
-    -- only spreads them.
+    -- only spreads them. Trees without eligible roots are not estimated.
     PROCEDURE check_redo IS
         l_groups     NUMBER;
         l_min_log    NUMBER;
@@ -1925,6 +1959,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             CONTINUE WHEN NOT in_scope(g_tables(r.table_id).module_code)
                           OR NOT g_tables(r.table_id).reachable
                           OR module_action(g_tables(r.table_id).module_code) <> c_delete;
+            IF eligible_roots(r.table_id) = 0 THEN
+                epf_log.event(epf_log.c_info, 'REDO_ESTIMATE', 'No rows before the cutoff: no redo',
+                              p_object_owner => g_tables(r.table_id).owner,
+                              p_object_name => g_tables(r.table_id).table_name);
+                CONTINUE;
+            END IF;
             tree_redo(r.table_id, l_per_root, l_source);
             IF l_per_root IS NULL THEN
                 epf_log.event(epf_log.c_info, 'REDO_ESTIMATE', 'No redo estimate: ' || l_source,
@@ -1932,7 +1972,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                               p_object_name => g_tables(r.table_id).table_name);
                 CONTINUE;
             END IF;
-            l_batch_redo := l_per_root * g_run.batch_size;
+            l_batch_redo := l_per_root * batch_roots(r.table_id);
             l_recommend  := round_batch(0.5 * l_min_log / l_per_root);
             l_overall    := LEAST(NVL(l_overall, l_recommend), l_recommend);
             IF l_batch_redo > l_min_log THEN
@@ -1941,7 +1981,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             epf_log.event(CASE WHEN l_batch_redo > l_min_log THEN epf_log.c_warn ELSE epf_log.c_info END,
                           'REDO_ESTIMATE',
                           'about ' || epf_util.fmt_bytes(l_per_root) || ' redo per root (' || l_source || '): '
-                          || epf_util.fmt_bytes(l_batch_redo) || ' per batch of ' || epf_util.fmt_int(g_run.batch_size)
+                          || epf_util.fmt_bytes(l_batch_redo) || ' per batch of '
+                          || epf_util.fmt_int(batch_roots(r.table_id))
                           || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_min_log, 1), 'FM999990.0')
                           || ' online logs; recommended batch size ' || epf_util.fmt_int(l_recommend),
                           p_object_owner => g_tables(r.table_id).owner,
@@ -1988,9 +2029,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Undo tablespace against the undo of a batch and of the purge. Undo per
     -- root comes from the latest measurement of the tree (TREE_UNDO), else it
     -- is estimated as 45% of the redo estimate. With a measured rate, the undo
-    -- kept for undo_retention is estimated as rate x undo_retention: when that
-    -- exceeds the current size, the undo tablespace grows during the purge
-    -- unless undo tuning is applied.
+    -- kept for undo_retention is estimated as rate x undo_retention, at most
+    -- the undo of all eligible roots: when that exceeds the current size, the
+    -- undo tablespace grows during the purge unless undo tuning is applied.
+    -- Trees without eligible roots are not estimated.
     PROCEDURE check_undo IS
         l_ts        VARCHAR2(128);
         l_retention NUMBER;
@@ -2007,6 +2049,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_redo      NUMBER;
         l_source    VARCHAR2(400);
         l_batch     NUMBER;
+        l_eligible  NUMBER;
+        l_total     NUMBER;
         l_kept      NUMBER;
         l_warn      BOOLEAN;
     BEGIN
@@ -2036,6 +2080,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                           OR module_action(g_tables(r.table_id).module_code) <> c_delete;
             l_owner := g_tables(r.table_id).owner;
             l_table := g_tables(r.table_id).table_name;
+            l_eligible := eligible_roots(r.table_id);
+            IF l_eligible = 0 THEN
+                epf_log.event(epf_log.c_info, 'UNDO_ESTIMATE', 'No rows before the cutoff: no undo',
+                              p_object_owner => l_owner, p_object_name => l_table);
+                CONTINUE;
+            END IF;
             SELECT MAX(bytes / rows_affected) KEEP (DENSE_RANK LAST ORDER BY event_id),
                    MAX(bytes / GREATEST(elapsed_s, 1)) KEEP (DENSE_RANK LAST ORDER BY event_id),
                    MAX(run_id) KEEP (DENSE_RANK LAST ORDER BY event_id)
@@ -2053,15 +2103,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 l_source   := 'estimated from the redo, ' || l_source;
                 l_rate     := NULL;
             END IF;
-            l_batch := l_per_root * g_run.batch_size;
-            l_kept  := l_rate * l_retention;
+            l_batch := l_per_root * batch_roots(r.table_id);
+            l_total := l_per_root * l_eligible;
+            -- Retention cannot keep more undo than the purge writes.
+            l_kept  := LEAST(l_rate * l_retention, NVL(l_total, l_rate * l_retention));
             l_warn  := l_batch > 0.5 * l_max OR (l_tuning IS NULL AND l_kept > l_size);
             IF l_warn THEN
                 g_warnings := g_warnings + 1;
             END IF;
             epf_log.event(CASE WHEN l_warn THEN epf_log.c_warn ELSE epf_log.c_info END, 'UNDO_ESTIMATE',
                           'about ' || epf_util.fmt_bytes(l_per_root) || ' undo per root (' || l_source || '): '
-                          || epf_util.fmt_bytes(l_batch) || ' per batch of ' || epf_util.fmt_int(g_run.batch_size)
+                          || epf_util.fmt_bytes(l_batch) || ' per batch of ' || epf_util.fmt_int(batch_roots(r.table_id))
+                          || CASE WHEN l_total IS NOT NULL THEN
+                                 ', ' || epf_util.fmt_bytes(l_total) || ' for the ' || epf_util.fmt_int(l_eligible)
+                                 || ' eligible roots'
+                             END
                           || CASE WHEN l_kept IS NOT NULL THEN
                                  '; at ' || epf_util.fmt_bytes(l_rate) || '/s, undo_retention ' || l_retention
                                  || ' s keeps about ' || epf_util.fmt_bytes(l_kept)
@@ -2090,6 +2146,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             EXECUTE IMMEDIATE 'SELECT COUNT(*), COUNT(CASE WHEN t.' || qc(g_tables(r.table_id).date_column)
                               || ' < ' || cutoff_literal || ' THEN 1 END) FROM ' || tq(r.table_id) || ' t'
                 INTO l_total, l_eligible;
+            g_eligible(r.table_id) := l_eligible;
             epf_log.event(epf_log.c_info, 'ROOTS_ELIGIBLE',
                           epf_util.fmt_int(l_eligible) || ' of ' || epf_util.fmt_int(l_total) || ' rows before '
                           || cutoff_text || ' (' || g_tables(r.table_id).module_code || ')',

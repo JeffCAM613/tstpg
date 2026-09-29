@@ -2,6 +2,39 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-29 - Phase 3 test results (EPFPG782), fixes (0.4.1)
+
+Results (EPFPG782, 0.4.0)
+- `install.sql`: EPF_TABLE_STAT.ACTION added, EPF_LINK_STAT and EPF_CHECK created, 78 grants, all objects valid. PASS.
+- `undo.sql STATUS / RESTORE / STATUS`: the tuning applied by 0.2.2 (undo_retention 60 s, undotbs01 limit 8192 MB) restored to 900 s and 32768 MB; no active change left. PASS.
+- `report.sql 2` (R-000002, PAYMENTS, 0.2.2): report printed, verdict PASS; P4 0 links (not counted by 0.2.x), Action column empty (not recorded by 0.2.x). OIDC_REQUEST_TOKEN appeared twice in the pasted results while P1 counts 22 tables; the query cannot return a table twice (one registry row, one stat row per phase), so this is taken as a copy artifact, to be checked in a saved report.
+- `preflight.sql NEW` (R-000021): REDO_ESTIMATE and UNDO_ESTIMATE measured by R-000002. PASS, with one false warning: UNDO_ESTIMATE WARN for BULK_PAYMENT although PAYMENTS had 0 eligible roots (all purged), and the recommended batch size (740) came from that tree.
+- `purge.sql NEW 30 LOGS LOGS - N Y` (R-000022, real purge with compaction): 1,722,146 rows in 00:00:48 (35,000 rows/s); residual 0; compaction of AUDIT_ARCHIVE, AUDIT_TRAIL and SPEC_TRT_LOG returned 1.2 GB to the tablespace (free 2.1 -> 3.3 GB). Verdict PASS WITH WARNINGS only because 1,195,572 AUDIT_TRAIL rows pointed at no AUDIT_ARCHIVE row before the purge (LINK_ORPHANS WARN, phase BEFORE); none after.
+- `purge.sql NEW 30 BANK_STATEMENTS FULL 100 N N` (R-000023, undo tuning applied beforehand): 3,980,655 rows in 00:01:35 (1,989 batches); verdict PASS. Too fast to test the stop request. Space: 14.7 GB used before, 12.2 GB after although both tables are empty; to be diagnosed (LOB segments of deleted rows still counted as used).
+- `status.sql`: severity PROGRESS ran into the event code (`PROGRESSBATCH_PROGRESS`).
+- Words joined in the pasted output (`scansthis`, `0-`, `00`) are line wraps of the terminal when copying, not in the output.
+
+Changes
+- `epf_purge` preflight: REDO_ESTIMATE and UNDO_ESTIMATE skip trees with no eligible roots ("No rows before the cutoff"), a batch counts at most the eligible roots, and the undo kept by retention is at most the undo of all eligible roots (also shown). A module with nothing to purge no longer warns or lowers the recommended batch size.
+- `epf_purge` orphans: LINK_ORPHANS is INFO before the purge and for orphans that were already there, WARN only for orphans the purge added (P4 still fails on those). Orphans in the application data no longer make P5 a warning.
+- `epf_report`: column helpers never cut a value and always keep one space between columns; table column 45 characters (OPPAYMENTS.TRANSMISSION_EXECUTION_AUDIT has 39), Held 10, Orphans 12, status event columns 9 and 24.
+- Wrapper: Ctrl+C requests a graceful stop also with `--non-interactive` when the console input is a keyboard (before: it ended the wrapper and left the worker running).
+- Space diagnosis (per segment, R-000022 and R-000023): the LOB segments of DIRECTORY_DISPATCHING (7,986 MB) and FILE_DISPATCHING (4,254 MB) are BASICFILE (RETENTION 900) and read 7,947 MB and 4,189 MB used before and after the purge that emptied both tables; the table and index segments dropped as expected. `epf_space`: after a purge a BASICFILE LOB segment's use is the BASELINE measurement scaled by the share of rows the purge did not process (method `BASICFILE_EST`, the measured value when lower); `SPACE_CAPTURED` and P7 name these segments; the space section of the report explains them. R-000023 would read used 14.7 GB -> about 0.3 GB instead of 12.2 GB.
+- Wizard: when the redo log sizing is chosen, the default batch size is computed for the new 1 GB logs from the largest redo per root (`EPF_ADVICE|REDO_PER_ROOT`), not from the current small logs (on 3 x 150 MB logs the recommendation is 100, with 1 GB about 530 for bulk payments).
+- Tool version 0.4.1.
+
+How to test (wrapper, new instance EPFPG783, from the Windows clone)
+1. `epf_purge.bat install --tns <783>`: tool version 0.4.1. Optional: `environment.sql` survey of the new instance.
+2. `--help`, `status` (no run recorded), `stop` (no active run: exit 1).
+3. `preflight`: live events, report, run folder; exit 0 or 2.
+4. `purge --depth PAYMENTS --undo-tuning` through the wizard: preflight run, redo sizing question (accept), batch size default for 1 GB logs, SYS password, review, `yes`; Ctrl+C after a few batches: STOPPED, undo restored, exit 3.
+5. `status` after the stop.
+6. Non-interactive rerun of PAYMENTS to the end with `--yes --undo-tuning` (passwords from EPF_PASSWORD / EPF_SYS_PASSWORD): in-run preflight, purge, restore, report; exit 0 or 2.
+7. Wizard purge of LOGS,BANK_STATEMENTS: report shows the BASICFILE note, P7 names the scaled LOB segments.
+8. Dry run with retention 1 (P1-P4, P6, P8 SKIP); `report` latest and by run id.
+9. Usage errors: exit 4.
+Return: console output, exit codes, `manifest.txt` and `report.txt` of each run folder.
+
 ## 2026-09-28 - Phases 3 and 4: report, compaction, wrapper (0.4.0)
 
 Open questions answered with the plan defaults (to confirm)

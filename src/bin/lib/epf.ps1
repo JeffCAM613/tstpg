@@ -656,9 +656,10 @@ function Test-StopKey {
 }
 
 # Ctrl+C becomes a key the live view reads, so it cannot end the wrapper while
-# a worker session is running. Only with an interactive console.
+# a worker session is running (also with --non-interactive). Only when the
+# console input is a keyboard.
 function Enable-StopKey {
-    if (-not $script:Interactive -or [Console]::IsInputRedirected) { return $false }
+    if ([Console]::IsInputRedirected) { return $false }
     [Console]::TreatControlCAsInput = $true
     return $true
 }
@@ -989,13 +990,24 @@ function Get-Advice {
     param($Ctx)
     $run = Invoke-ToolRun $Ctx 'PREFLIGHT'
     $script:LogFile = $null
-    $advice = @{ BATCH_SIZE = ''; REDO_WARN = 'N'; UNDO_WARN = 'N'; UNDO_ACTIVE = 'N'; ERRORS = '0'; WARNINGS = '0' }
+    $advice = @{ BATCH_SIZE = ''; REDO_PER_ROOT = ''; REDO_WARN = 'N'; UNDO_WARN = 'N'; UNDO_ACTIVE = 'N'; ERRORS = '0'; WARNINGS = '0' }
     $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'advice.sql') @([string]$run.RunId)
     foreach ($line in ($result.Output -split "`r?`n")) {
         if ($line -match '^EPF_ADVICE\|([A-Z_]+)\|([^|]*)$') { $advice[$Matches[1]] = $Matches[2].Trim() }
     }
     $advice['Run'] = $run
     return $advice
+}
+
+# Batch size that keeps one batch within half of an online log of $LogBytes
+# (as the preflight's recommendation): two significant digits, 100-100000.
+function Get-BatchForLog {
+    param([double]$PerRoot, [double]$LogBytes)
+    $value = 0.5 * $LogBytes / $PerRoot
+    if ($value -le 100) { return 100 }
+    if ($value -ge 100000) { return 100000 }
+    $scale = [Math]::Pow(10, [Math]::Floor([Math]::Log10($value)) - 1)
+    return [int]([Math]::Floor($value / $scale) * $scale)
 }
 
 function Show-Review {
@@ -1052,7 +1064,11 @@ function Invoke-PurgeAction {
         if ($ctx.BatchSize -eq '') {
             $default = 1000
             $recommended = 0
-            if ([int]::TryParse($advice.BATCH_SIZE, [ref]$recommended) -and $recommended -gt 0) {
+            $perRoot = [double]0
+            if ($ctx.RedoLogs -and [double]::TryParse($advice.REDO_PER_ROOT, [ref]$perRoot) -and $perRoot -gt 0) {
+                $default = Get-BatchForLog $perRoot 1073741824
+                Write-Out (' Recommended batch size with 1 GB online logs: ' + $default + ' root rows.')
+            } elseif ([int]::TryParse($advice.BATCH_SIZE, [ref]$recommended) -and $recommended -gt 0) {
                 $default = [Math]::Min(100000, [Math]::Max(100, $recommended))
                 Write-Out (' Recommended batch size: ' + $default + ' root rows (REDO_SUMMARY above).')
             }

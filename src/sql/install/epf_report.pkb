@@ -23,14 +23,17 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         RETURN NVL(epf_util.fmt_bytes(p_value), '-');
     END b;
 
+    -- Column helpers: left- or right-aligned in p_width characters. A value
+    -- that does not fit is never cut; it widens its column by what it needs
+    -- plus one space, so neighbouring values stay separated.
     FUNCTION l(p_text IN VARCHAR2, p_width IN PLS_INTEGER) RETURN VARCHAR2 IS
     BEGIN
-        RETURN RPAD(NVL(SUBSTR(p_text, 1, p_width), ' '), p_width);
+        RETURN RPAD(NVL(p_text, ' '), GREATEST(p_width, NVL(LENGTH(p_text), 0) + 1));
     END l;
 
     FUNCTION r(p_text IN VARCHAR2, p_width IN PLS_INTEGER) RETURN VARCHAR2 IS
     BEGIN
-        RETURN LPAD(NVL(SUBSTR(p_text, 1, p_width), ' '), p_width);
+        RETURN LPAD(NVL(p_text, ' '), GREATEST(p_width, NVL(LENGTH(p_text), 0) + 1));
     END r;
 
     PROCEDURE title(p_text IN VARCHAR2) IS
@@ -87,6 +90,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_warnings  NUMBER;
         l_phases    NUMBER;
         l_estimated NUMBER;
+        l_lob_est   NUMBER;
         l_before    NUMBER;
         l_now       NUMBER;
         l_done      NUMBER;
@@ -266,9 +270,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         -- P7 space measured
         SELECT COUNT(DISTINCT phase),
                COUNT(CASE WHEN method IN ('ESTIMATE', 'UNSUPPORTED') THEN 1 END),
+               COUNT(CASE WHEN method = 'BASICFILE_EST' THEN 1 END),
                SUM(CASE WHEN phase = 'BASELINE' THEN used_bytes END),
                SUM(CASE WHEN phase = 'POST_PURGE' THEN used_bytes END)
-          INTO l_phases, l_estimated, l_before, l_now
+          INTO l_phases, l_estimated, l_lob_est, l_before, l_now
           FROM epf_space_usage
          WHERE run_id = l_run AND phase IN ('BASELINE', 'POST_PURGE');
         IF g_run.action <> 'PURGE' THEN
@@ -279,7 +284,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             add_check('P7', CASE WHEN l_estimated > 0 THEN 'WARN' ELSE 'PASS' END, 'Space measured inside segments',
                       CASE WHEN l_no_purge THEN 'used ' || b(l_before)
                            ELSE 'used ' || b(l_before) || ' -> ' || b(l_now) || ', freed ' || b(l_before - l_now) END
-                      || CASE WHEN l_estimated > 0 THEN ', ' || l_estimated || ' segments estimated or unsupported' END);
+                      || CASE WHEN l_estimated > 0 THEN ', ' || l_estimated || ' segments estimated or unsupported' END
+                      || CASE WHEN l_lob_est > 0 THEN ', ' || l_lob_est || ' BASICFILE LOB segments scaled by rows' END);
         END IF;
 
         -- P8 compaction
@@ -361,9 +367,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_module VARCHAR2(30);
     BEGIN
         title('PURGE RESULTS (clearing modules count non-empty LOB values)');
-        put('  ' || l('Table', 40) || l('Action', 7) || r('Eligible', 13) || r('Processed', 13) || r('Residual', 10)
+        put('  ' || l('Table', 46) || l('Action', 7) || r('Eligible', 13) || r('Processed', 13) || r('Residual', 10)
             || r('Rows before', 13) || r('Rows after', 13) || r('Kept before', 13) || r('Kept after', 13)
-            || r('Held', 8) || r('Orphans', 9));
+            || r('Held', 10) || r('Orphans', 12));
         FOR t IN (SELECT m.module_code, m.display_order, e.owner, e.table_name, bf.action,
                          CASE WHEN bf.action = 'CLEAR' THEN bf.nonempty_lob_rows ELSE bf.eligible_rows END AS eligible,
                          a.processed_rows AS processed,
@@ -382,9 +388,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 put('  ' || t.module_code);
                 l_module := t.module_code;
             END IF;
-            put('   ' || l(t.owner || '.' || t.table_name, 39) || l(LOWER(t.action), 7) || r(n(t.eligible), 13)
+            put('   ' || l(t.owner || '.' || t.table_name, 45) || l(LOWER(t.action), 7) || r(n(t.eligible), 13)
                 || r(n(t.processed), 13) || r(n(t.residual), 10) || r(n(t.rows_before), 13) || r(n(t.rows_after), 13)
-                || r(n(t.kept_before), 13) || r(n(t.kept_after), 13) || r(n(t.held), 8) || r(n(t.orphans), 9));
+                || r(n(t.kept_before), 13) || r(n(t.kept_after), 13) || r(n(t.held), 10) || r(n(t.orphans), 12));
         END LOOP;
         IF l_module IS NULL THEN
             put('  No table counts recorded for this run.');
@@ -411,11 +417,12 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_m_bef   NUMBER;
         l_m_aft   NUMBER;
         l_m_now   NUMBER;
+        l_lob_est NUMBER;
 
         PROCEDURE module_total IS
         BEGIN
             IF l_module IS NOT NULL THEN
-                put('   ' || l('Total ' || l_module, 39) || r(b(l_m_alloc), 13) || r(b(l_m_bef), 13)
+                put('   ' || l('Total ' || l_module, 45) || r(b(l_m_alloc), 13) || r(b(l_m_bef), 13)
                     || r(b(l_m_aft), 13) || r(b(l_m_bef - l_m_aft), 13) || r(b(l_m_now), 13));
             END IF;
         END module_total;
@@ -431,7 +438,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
 
         title('SPACE INSIDE SEGMENTS (table, indexes and LOB segments of each table; allocated now: '
               || l_last || ')');
-        put('  ' || l('Table', 40) || r('Allocated', 13) || r('Used before', 13) || r('Used after', 13)
+        put('  ' || l('Table', 46) || r('Allocated', 13) || r('Used before', 13) || r('Used after', 13)
             || r('Freed', 13) || r('Alloc. now', 13));
         FOR t IN (SELECT x.module_code, x.parent_owner, x.parent_table,
                          MAX(CASE WHEN x.phase = 'BASELINE' THEN x.alloc END) AS alloc_before,
@@ -467,12 +474,20 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             l_m_bef   := l_m_bef + NVL(t.used_before, 0);
             l_m_aft   := l_m_aft + NVL(t.used_after, t.used_before);
             l_m_now   := l_m_now + NVL(t.alloc_now, 0);
-            put('   ' || l(t.parent_owner || '.' || t.parent_table, 39) || r(b(t.alloc_before), 13)
+            put('   ' || l(t.parent_owner || '.' || t.parent_table, 45) || r(b(t.alloc_before), 13)
                 || r(b(t.used_before), 13) || r(b(t.used_after), 13)
                 || r(CASE WHEN t.used_after IS NOT NULL THEN b(t.used_before - t.used_after) END, 13)
                 || r(b(t.alloc_now), 13));
         END LOOP;
         module_total;
+        SELECT COUNT(*) INTO l_lob_est
+          FROM epf_space_usage
+         WHERE run_id = g_run.run_id AND method = 'BASICFILE_EST';
+        IF l_lob_est > 0 THEN
+            put('  Used after includes ' || l_lob_est || ' BASICFILE LOB segments estimated from the baseline and the '
+                || 'rows kept: Oracle reports the space of deleted LOB values as used until new values of the same '
+                || 'column reuse it.');
+        END IF;
 
         title('DATAFILES');
         put('  ' || l('File', 60) || l('Phase', 14) || r('Size', 12) || r('HWM', 12) || r('Free', 12));
@@ -495,7 +510,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    WHERE ev.run_id = g_run.run_id AND ev.event_code IN ('TREE_REDO', 'TREE_UNDO')
                    GROUP BY e.module_code, ev.object_owner, ev.object_name
                    ORDER BY 1, 2) LOOP
-            put('  ' || l(t.module_code, 18) || l(t.root_table, 40) || 'redo ' || r(b(t.redo), 10) || ', undo '
+            put('  ' || l(t.module_code, 18) || l(t.root_table, 46) || 'redo ' || r(b(t.redo), 10) || ', undo '
                 || r(b(t.undo), 10) || ' for ' || n(t.roots) || ' roots ('
                 || b(t.redo / NULLIF(t.roots, 0)) || ' redo per root)');
         END LOOP;
@@ -567,6 +582,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
          WHERE run_id = p_run_id AND event_code = 'REDO_SUMMARY';
         put('EPF_ADVICE|BATCH_SIZE|' || l_batch);
         put('EPF_ADVICE|REDO_WARN|' || CASE WHEN l_severity = 'WARN' THEN 'Y' ELSE 'N' END);
+        SELECT MAX(bytes) INTO l_count
+          FROM epf_event
+         WHERE run_id = p_run_id AND event_code = 'REDO_ESTIMATE' AND bytes > 0;
+        put('EPF_ADVICE|REDO_PER_ROOT|' || ROUND(l_count));
         SELECT COUNT(*) INTO l_count
           FROM epf_event
          WHERE run_id = p_run_id AND event_code = 'UNDO_ESTIMATE' AND severity = 'WARN';
@@ -618,7 +637,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                            ORDER BY event_id DESC)
                    WHERE ROWNUM <= 10
                    ORDER BY event_id) LOOP
-            put('    ' || TO_CHAR(e.ts, 'HH24:MI:SS') || ' ' || l(e.severity, 8) || l(e.event_code, 22) || e.message);
+            put('    ' || TO_CHAR(e.ts, 'HH24:MI:SS') || ' ' || l(e.severity, 9) || l(e.event_code, 24) || e.message);
         END LOOP;
         FOR t IN (SELECT ti.index_name, ti.table_owner, ti.table_name, ti.run_id
                     FROM epf_temp_index ti

@@ -25,6 +25,8 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
 --   P6  Temporary indexes of the run all dropped. PASS; still present FAIL.
 --   P7  Space measured inside segments before and after the purge. PASS;
 --       estimated or unsupported segments WARN; phase missing WARN.
+--       BASICFILE LOB segments scaled by the rows kept (epf_space) are named
+--       in the value, not a warning.
 --   P8  Compaction (when requested): every candidate compacted PASS; skipped
 --       or failed tables WARN.
 -- Dry runs and runs without a purge: P1-P4, P6, P8 SKIP.
@@ -56,6 +58,8 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     -- for the wizard:
     --   EPF_ADVICE|BATCH_SIZE|<n>          recommended batch size (REDO_SUMMARY)
     --   EPF_ADVICE|REDO_WARN|Y|N           a batch exceeds a whole online log
+    --   EPF_ADVICE|REDO_PER_ROOT|<bytes>   largest redo per root of the trees
+    --                                      with eligible roots
     --   EPF_ADVICE|UNDO_WARN|Y|N           the undo tablespace would grow
     --   EPF_ADVICE|UNDO_ACTIVE|Y|N         undo tuning currently applied
     --   EPF_ADVICE|ERRORS|<n> and WARNINGS|<n>
