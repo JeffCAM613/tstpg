@@ -9,7 +9,7 @@
 -- Effects : None (reads only). Does not exit; errors are printed and the
 --           session continues.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMOUT ON
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMOUT ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR CONTINUE

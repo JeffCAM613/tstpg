@@ -14,7 +14,7 @@
 --           the tablespace; otherwise the tablespace is kept and the remaining
 --           references are counted in the output.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 WHENEVER SQLERROR EXIT FAILURE ROLLBACK
 

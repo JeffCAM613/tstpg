@@ -19,7 +19,7 @@
 --           settings, grants privileges, compiles the packages and stops with
 --           an error if any EPFPG object is invalid. Safe to re-run.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET SQLBLANKLINES ON
 SET DEFINE ON

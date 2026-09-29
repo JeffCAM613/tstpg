@@ -8,13 +8,14 @@
 --             <run_id>  bind to a run created by start_run.sql and attached by
 --                       the caller's monitor session
 --             NEW       create, attach and finish a standalone PREFLIGHT run in
---                       this session with default purge parameters (manual use)
+--                       this session with default purge parameters (manual use);
+--                       the run is ended with the report's verdict
 -- Requires: EPFPG (or SYS).
--- Effects : Writes events and steps of the run; changes nothing else.
---           Exit code 0 without findings, 2 with warnings only, 1 when a
---           check failed.
+-- Effects : Writes events and steps of the run (and, with NEW, its checks);
+--           changes nothing else. Exit code 0 without findings, 2 with
+--           warnings only, 1 when a check failed.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR EXIT FAILURE ROLLBACK
@@ -43,12 +44,11 @@ BEGIN
     :rc := CASE WHEN l_errors > 0 THEN 1 WHEN l_warnings > 0 THEN 2 ELSE 0 END;
 
     IF UPPER('&run_arg') = 'NEW' THEN
-        epfpg.epf_control.finish(
-            p_run_id    => :run_id,
-            p_status    => CASE WHEN l_errors > 0 THEN 'FAILED'
-                                WHEN l_warnings > 0 THEN 'WARNING'
-                                ELSE 'SUCCESS' END,
-            p_exit_code => :rc);
+        epfpg.epf_report.close_run(:run_id,
+                                   CASE WHEN l_errors > 0 THEN 'FAILED'
+                                        WHEN l_warnings > 0 THEN 'WARNING'
+                                        ELSE 'SUCCESS' END,
+                                   :rc);
         epfpg.epf_log.print_events(:run_id);
     END IF;
 END;

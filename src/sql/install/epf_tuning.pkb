@@ -5,7 +5,7 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
 
     PROCEDURE say(p_severity IN VARCHAR2, p_code IN VARCHAR2, p_message IN VARCHAR2) IS
     BEGIN
-        DBMS_OUTPUT.PUT_LINE('  ' || RPAD(p_code, 22) || ' ' || p_message);
+        DBMS_OUTPUT.PUT_LINE('  ' || RPAD(p_code, GREATEST(22, LENGTH(p_code))) || ' ' || p_message);
         IF epfpg.epf_log.current_run IS NOT NULL THEN
             epfpg.epf_log.event(p_severity, p_code, p_message);
         END IF;

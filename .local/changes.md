@@ -2,6 +2,31 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-29 - First end-to-end run on EPFPG783; fixes (0.4.2)
+
+Results (EPFPG783, fresh copy of the same data as EPFPG782; RETENTION_DAYS=365; log `logs/tests/2026-09-29_193038_EPFPG783/test.log`)
+- 10 passed, 9 failed. Install through the wrapper (new tablespace, user, 23 tables) and again with `install.sql`, undo restore, wrapper basics, usage errors (exit 4, no run created), `preflight.sql NEW`, reports, `status.sql`, final state: as expected.
+- T08, T10-T16: every run through the wrapper failed at `begin_run.sql`: PLS-00103, the variable `l_run_id` was declared after the local function `arg` (PL/SQL requires variables before subprograms, also in anonymous blocks). `start_run.sql` had the same order. Run scripts are compiled only when they run, so neither install nor the stand-in for sqlplus could show it. No purge ran; the data of EPFPG783 is unchanged.
+- T12 failed as a consequence (no stopped run); T18 skipped `advice.sql` (no preflight run from T08).
+- T04 failed on the test itself: the installer prints `present  tablespace` (two spaces).
+- Preflight on the fresh data (T09): all modules eligible (138,296 bulk payments, 1.7 M audit trail rows, 198,890 bank statement files); redo WARN with 3 x 150 MB logs (recommended batch 100); undo estimated 58.7 GB for PAYMENTS but no warning, because nothing was measured on this database yet (no rate).
+- Output: sqlplus replaced runs of spaces with tabs (`SET TAB` defaults to ON); `UNDO_NOTHING_TO_RESTORE` was cut to 22 characters; `status` showed verdict `-` for a `preflight.sql NEW` run.
+- Every sqlplus connection from the test machine took 13-15 s.
+
+Changes
+- `run/begin_run.sql`, `run/start_run.sql`: variable declared before the local function.
+- Every entry script, `install.sql`, `uninstall.sql`, `environment.sql`: `SET TAB OFF`.
+- `epf_purge` preflight: without a measured undo rate (first purge of a tree on the database) the undo kept by retention can be up to the undo of all eligible roots; UNDO_ESTIMATE warns ("may grow") when that exceeds the undo tablespace and undo tuning is not applied, so the wizard offers undo tuning on a first purge too.
+- `run/preflight.sql NEW`: the run is ended with `epf_report.close_run` (checks and verdict recorded, as for wrapper runs).
+- `epf_tuning`: event codes are padded, never cut.
+- Wrapper: a run that cannot be created exits 1 unless the database refused it with one of the tool's own errors (ORA-20xxx: parameters, another active run), which stays 4.
+- Test suite T04: pattern `present\s+tablespace`.
+- Tool version 0.4.2.
+
+How to test
+1. `git pull`, then `src\tests\e2e\run_tests.bat` again on EPFPG783 (T03 upgrades it to 0.4.2; its data is untouched).
+2. Return the new `test.log`.
+
 ## 2026-09-29 - End-to-end test suite; UTF-8 console fix
 
 Changes

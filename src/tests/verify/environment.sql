@@ -11,7 +11,7 @@
 -- Requires: SYS AS SYSDBA (or a user with SELECT ANY DICTIONARY).
 -- Effects : None. Only SELECT statements.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF TRIMSPOOL ON PAGESIZE 200 LINESIZE 250
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF TRIMSPOOL ON PAGESIZE 200 LINESIZE 250
 SET HEADING ON TAB OFF
 COLUMN name              FORMAT A40
 COLUMN value             FORMAT A80

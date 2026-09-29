@@ -15,17 +15,18 @@
 --           EPF_RUN_ID=<run_id>. Invalid parameters end with ORA-2012x and
 --           exit code 1.
 -- ============================================================================
-SET ECHO OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
+SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR EXIT FAILURE ROLLBACK
 
 DECLARE
+    l_run_id NUMBER;
+
     FUNCTION arg(p_value IN VARCHAR2) RETURN VARCHAR2 IS
     BEGIN
         RETURN CASE WHEN TRIM(p_value) = '-' THEN NULL ELSE TRIM(p_value) END;
     END arg;
-    l_run_id NUMBER;
 BEGIN
     l_run_id := epfpg.epf_control.start_run(
         p_action         => arg('&1'),

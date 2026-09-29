@@ -493,7 +493,7 @@ function Invoke-Suite {
                         -CommandDisplay @((Get-ScriptLine $path @('"********"'))) -TimeoutMin 30
         Assert-Exit $r @(0)
         Assert-Match $r 'present\s+table EPF_CHECK'
-        Assert-Match $r 'present tablespace EPFPG_DATA'
+        Assert-Match $r 'present\s+tablespace EPFPG_DATA'
         Assert-Match $r ('EPFPG objects valid, tool version ' + [regex]::Escape($script:Version))
     }
 

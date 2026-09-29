@@ -2030,9 +2030,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- root comes from the latest measurement of the tree (TREE_UNDO), else it
     -- is estimated as 45% of the redo estimate. With a measured rate, the undo
     -- kept for undo_retention is estimated as rate x undo_retention, at most
-    -- the undo of all eligible roots: when that exceeds the current size, the
-    -- undo tablespace grows during the purge unless undo tuning is applied.
-    -- Trees without eligible roots are not estimated.
+    -- the undo of all eligible roots; without one (first purge of the tree on
+    -- this database) it can be up to the undo of all eligible roots. When that
+    -- exceeds the current size, the undo tablespace grows during the purge
+    -- unless undo tuning is applied. Trees without eligible roots are not
+    -- estimated.
     PROCEDURE check_undo IS
         l_ts        VARCHAR2(128);
         l_retention NUMBER;
@@ -2105,8 +2107,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
             l_batch := l_per_root * batch_roots(r.table_id);
             l_total := l_per_root * l_eligible;
-            -- Retention cannot keep more undo than the purge writes.
-            l_kept  := LEAST(l_rate * l_retention, NVL(l_total, l_rate * l_retention));
+            IF l_rate IS NOT NULL THEN
+                -- Retention cannot keep more undo than the purge writes.
+                l_kept := LEAST(l_rate * l_retention, NVL(l_total, l_rate * l_retention));
+            ELSE
+                -- No measured rate (first purge of the tree on this database):
+                -- retention can keep up to all the undo the purge writes.
+                l_kept := l_total;
+            END IF;
             l_warn  := l_batch > 0.5 * l_max OR (l_tuning IS NULL AND l_kept > l_size);
             IF l_warn THEN
                 g_warnings := g_warnings + 1;
@@ -2118,15 +2126,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                  ', ' || epf_util.fmt_bytes(l_total) || ' for the ' || epf_util.fmt_int(l_eligible)
                                  || ' eligible roots'
                              END
-                          || CASE WHEN l_kept IS NOT NULL THEN
+                          || CASE WHEN l_rate IS NOT NULL AND l_kept IS NOT NULL THEN
                                  '; at ' || epf_util.fmt_bytes(l_rate) || '/s, undo_retention ' || l_retention
                                  || ' s keeps about ' || epf_util.fmt_bytes(l_kept)
+                                 WHEN l_kept IS NOT NULL THEN
+                                 '; no measured rate yet: undo_retention ' || l_retention || ' s can keep up to '
+                                 || epf_util.fmt_bytes(l_kept)
                              END
                           || CASE WHEN l_batch > 0.5 * l_max THEN
                                  '; a batch needs more than half of what ' || l_ts || ' can hold: lower the batch size'
                              END
                           || CASE WHEN l_tuning IS NULL AND l_kept > l_size THEN
-                                 '; ' || l_ts || ' grows during the purge (up to ' || epf_util.fmt_bytes(l_max)
+                                 '; ' || l_ts || CASE WHEN l_rate IS NULL THEN ' may grow' ELSE ' grows' END
+                                 || ' during the purge (up to ' || epf_util.fmt_bytes(l_max)
                                  || ') unless undo tuning is applied (undo.sql APPLY as SYS)'
                              END,
                           p_object_owner => l_owner, p_object_name => l_table, p_bytes => l_per_root);

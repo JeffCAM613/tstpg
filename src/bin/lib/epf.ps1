@@ -740,7 +740,11 @@ function Invoke-ToolRun {
     if ($state.RunId -eq 0) {
         Show-Lines ($lines -join "`n") -Indent
         Close-Monitor $state.Monitor
-        Exit-Tool $script:ExitUsage 'The run could not be created (see the messages above).'
+        # The tool's own refusals (ORA-20xxx: parameters, another active run)
+        # are usage errors; anything else is a failure.
+        $code = $script:ExitFail
+        if (($lines -join "`n") -match 'ORA-20\d{3}') { $code = $script:ExitUsage }
+        Exit-Tool $code 'The run could not be created (see the messages above).'
     }
     $label = Get-RunLabel $state.RunId
     $state.Folder = New-RunFolder $state.RunId
