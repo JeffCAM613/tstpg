@@ -1,0 +1,36 @@
+# ============================================================================
+# EPF Data Purge - End-to-end test configuration
+# ============================================================================
+# Copy to src\tests\e2e\test.conf (git-ignored) and fill in. One KEY=VALUE per
+# line; lines starting with # are comments.
+# ============================================================================
+
+# TNS alias of the test database (from your tnsnames.ora).
+TNS=EPFPG783
+
+# Name of that database (v$database.name). The tests refuse to run when the
+# database behind TNS has another name.
+EXPECTED_DB=EPFPG783
+
+# The tests purge every module of the test database (rows older than
+# RETENTION_DAYS), clear LOB values, compact tables, enlarge the online redo
+# logs to 4 x 1 GB (permanent) and change undo_retention for the purges.
+# Set to YES to confirm that this database may be changed that way.
+DESTRUCTIVE_OK=NO
+
+# Passwords. Leave empty to be asked (masked) when the tests start. Values
+# written here stay in this file on your machine only (the file is
+# git-ignored); they must not contain quotes. EPFPG_PASSWORD is set on EPFPG
+# by the install test and used for every later step.
+SYS_PASSWORD=
+EPFPG_PASSWORD=
+
+# Retention of every purge in the tests.
+RETENTION_DAYS=30
+
+# The PAYMENTS purge of T11 is stopped after this many BATCH_PROGRESS lines.
+STOP_AFTER_BATCHES=3
+
+# Batch size of the PAYMENTS purge of T13 when T11 did not run in the same
+# session (T13 otherwise uses T11's batch size). Empty: the tool's default.
+PAYMENTS_BATCH_SIZE=

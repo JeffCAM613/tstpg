@@ -39,6 +39,18 @@ $script:ExitUsage   = 4
 $script:Modes = @('FULL', 'CLOB', 'LOGS', 'CLOB_N_LOGS')
 $script:Width = 80
 
+# sqlplus sessions read their standard input in the console code page. With a
+# UTF-8 console (code page 65001) .NET would begin every session's input with
+# a byte order mark, and sqlplus would reject the CONNECT line; the encoding
+# is kept, without the mark.
+try {
+    if ([Console]::InputEncoding.CodePage -eq 65001 -and [Console]::InputEncoding.GetPreamble().Length -gt 0) {
+        [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
+} catch {
+    # No console attached: sessions then use the ANSI code page, which has no mark.
+}
+
 # ----------------------------------------------------------------------------
 # Output
 # ----------------------------------------------------------------------------

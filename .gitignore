@@ -2,3 +2,4 @@ logs/
 src/config/epf_purge.conf
 epf_environment.txt
 *.lst
+src/tests/e2e/test.conf

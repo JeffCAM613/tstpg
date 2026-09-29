@@ -233,6 +233,7 @@ src/sql/
     fk_coverage.sql          FK graph vs registry (coverage gaps)
     run_history.sql          last N runs with status and verdict
 src/tests/
+  e2e/                       end-to-end test suite (run_tests.bat / run_tests.ps1, test.conf.example; 12.5)
   verify/                    read-only verification queries for the target database
   fixtures/                  synthetic scope schema + data generator for a test database
   scenarios/                 reclaim layouts and fault-injection scripts (section 12)
@@ -821,6 +822,28 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 | Largest purge tables: DIRECTORY_DISPATCHING 10.6 GB (3.8 M rows), FILE_DISPATCHING 4.4 GB, PAYMENT_ADDITIONAL_INFO 3.8 GB (56.8 M rows), TRANSMISSION_EXECUTION_AUDIT 2.3 GB, PAYMENT 2.1 GB, PAYMENT_AUDIT 1.5 GB (25.3 M rows) | Index coverage of the PAYMENT_ID children decides purge speed; listed by the phase 2 preflight. |
 | Optimizer statistics of most purge tables date from 2024 | Counts always come from the key snapshot, never from statistics. |
 | OPPAYMENTS owns application packages named `EPF_*` (EPF_BIND, EPF_CONTEXT, EPF_CST, EPF_MIGRATION_133, EPF_SQLBINDING, EPF_UTILS) | Objects of the previous tool are identified by exact name only (section 14). |
+
+### 12.5 End-to-end suite (`src/tests/e2e`)
+
+One command runs every current test against one refreshed test database and writes a single log to review: `src\tests\e2e\run_tests.bat` (Windows PowerShell 5.1, the sqlplus client and tnsnames of the tester's machine). Configuration in `src/tests/e2e/test.conf` (git-ignored; from `test.conf.example`): TNS alias, expected database name (the suite refuses any other database), `DESTRUCTIVE_OK=YES`, passwords (or asked, masked, at start), retention, stop point.
+
+| Test | Covers |
+|------|--------|
+| T01 | Precheck and safety gate: database name, non-CDB, single instance, log mode, redo logs, undo, statistics of the root tables |
+| T02 | Environment survey, appended to the log |
+| T03, T04 | Install through the wrapper, then again with `install.sql` (idempotent upgrade) |
+| T05 | Undo tuning left from earlier work restored; nothing active |
+| T06, T07 | Wrapper basics (help, status, stop without a run) and usage errors (exit 4, no run created) |
+| T08, T09 | Preflight through the wrapper and `preflight.sql NEW` |
+| T10 | Dry run of all modules: P1-P4, P6, P8 SKIP |
+| T11, T12 | PAYMENTS through the wizard (piped answers) with redo log sizing, undo tuning and the batch size for 1 GB logs; graceful stop with the `stop` action after a few batches (exit 3, undo restored, nothing pending) |
+| T13 | PAYMENTS to the end, non-interactive, undo tuning |
+| T14 | LOGS with compaction |
+| T15, T16 | BANK_STATEMENTS LOB clearing (mode CLOB), then FULL through the menu wizard (redo sizing idempotent, BASICFILE estimate) |
+| T17, T18 | Reports (latest, stopped run) through the wrapper; `report.sql`, `status.sql`, `advice.sql` |
+| T19 | Final state: redo logs, undo_retention as before, no active undo change, no temporary index left, no run left RUNNING |
+
+Every step records the command (passwords masked), its full output, exit code and the manifest of each run it created; checks compare exit codes, output patterns and manifest values, and any SP2-/PLS-/compile or missing-object error fails the step. Ctrl+C itself is not scripted (the console is redirected); the stop action exercises the same graceful stop. `--only`, `--from` re-run parts; T01 always runs.
 
 ---
 

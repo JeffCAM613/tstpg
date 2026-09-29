@@ -2,6 +2,17 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-29 - End-to-end test suite; UTF-8 console fix
+
+Changes
+- `src/tests/e2e/run_tests.bat` + `run_tests.ps1` (new): runs tests T01-T19 (plan 12.5) against one test database without further input and writes `logs\tests\<timestamp>_<db>\test.log` with every command, output, exit code, run manifest, check and a summary. Safety: refuses to start unless `DESTRUCTIVE_OK=YES`, and T01 stops everything when the database name is not `EXPECTED_DB`, when it is a CDB or has more than one instance. `test.conf.example` documents the settings; `test.conf` is git-ignored.
+- Wrapper (fix): with a UTF-8 console (code page 65001) .NET began the standard input of every sqlplus session with a byte order mark, so sqlplus would have rejected the CONNECT line of every session (not visible in the earlier checks because the stand-in for sqlplus ignored it). The wrapper now keeps UTF-8 input without the mark. Found by the suite: piped wizard answers arrived as `?30`.
+- Checked locally: the whole suite against a stand-in for sqlplus that rejects a byte order mark, answers the precheck queries and keeps run state (stop, dry run, clearing and compaction events); all steps behave as intended, and no password appears in any output file.
+
+How to test
+1. Refresh a test database (not yet purged at 30 days), set `src\tests\e2e\test.conf`, run `src\tests\e2e\run_tests.bat`.
+2. Return `test.log` from the session folder.
+
 ## 2026-09-29 - Phase 3 test results (EPFPG782), fixes (0.4.1)
 
 Results (EPFPG782, 0.4.0)
