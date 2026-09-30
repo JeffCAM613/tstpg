@@ -19,8 +19,9 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
     -- the same phase:
     --   EPF_SEGMENT_SNAP  every segment of the active registry tables: table,
     --                     indexes, LOB segments and LOB indexes, partitions
-    --   EPF_FILE_SNAP     every datafile of the tablespaces holding them
-    --                     (size, high-water mark, free space, autoextend)
+    --   EPF_FILE_SNAP     every datafile of the tablespaces holding them, and
+    --                     of the undo tablespace (size, high-water mark, free
+    --                     space, autoextend)
     --   EPF_SPACE_USAGE   space used inside each segment except LOB indexes:
     --                       ASSM        DBMS_SPACE.SPACE_USAGE, block fullness
     --                                   (table and BASICFILE LOB blocks count at
@@ -30,9 +31,10 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
     --                                   purge: the chunks of deleted or cleared
     --                                   values stay "used" for DBMS_SPACE until
     --                                   new values reuse them, so the use is
-    --                                   the BASELINE measurement scaled by the
-    --                                   share of rows the purge did not process
-    --                                   (the measured value when lower)
+    --                                   the BASELINE measurement times the share
+    --                                   of the LOB data the purge left (rows not
+    --                                   deleted; for clearing, the values not
+    --                                   cleared); the measured value when lower
     --                       SECUREFILE  DBMS_SPACE.SPACE_USAGE, used bytes
     --                       ESTIMATE    manual segment space management tables:
     --                                   num_rows x avg_row_len from statistics

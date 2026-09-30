@@ -2,6 +2,34 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-30 - Second end-to-end run on EPFPG783: 19/19 passed; review fixes (0.4.3)
+
+Results (EPFPG783, 0.4.2, RETENTION_DAYS=365; log `logs/tests/2026-09-29_205549_EPFPG783/`, 01:06:04)
+- All 19 tests passed: install (wrapper and install.sql), wrapper basics and usage errors, preflights, dry run, PAYMENTS through the wizard with redo sizing (3 x 150 MB -> 4 x 1 GB), undo tuning and a graceful stop after batch 9 (R-000025, exit 3, 12 temporary indexes dropped, undo restored), PAYMENTS to the end (R-000026: 87,309,042 rows in 00:27:07, 53,662 rows/s, 67.6 GB redo, 33.2 GB undo, used inside segments 31.2 -> 16.0 GB), LOGS with compaction (R-000027: 1.66 M rows in 00:00:43, 1.2 GB returned, verdict PASS), BANK_STATEMENTS clearing (R-000028: 2,426,081 LOB values) and full purge through the menu wizard (R-000030: 3,980,655 rows, verdict PASS), reports, final state clean.
+- Live view: heartbeat lines showed wait events, blocking background processes (CKPT, LGWR, DBWn) and longops progress; pre-existing orphans are INFO.
+
+Findings
+- Undo: with undo tuning (undo_retention 60 s) UNDOTBS1 still grew 450 MB -> 2.1 GB (dry run: 5.5 M work keys) -> 5.2 GB (stopped run) -> 27.6 GB (PAYMENTS), and an autoextended datafile does not shrink. With autoextensible undo Oracle tunes retention to the longest running statement, and the purge is one PL/SQL call of about 30 minutes, so lowering undo_retention alone does not stop the growth. On EPFPG782 the 0.2.2 tuning also capped the datafile growth (8 GB) and the file stayed at 8 GB. Open decision (growth cap).
+- BASICFILE estimate for clearing runs: DIRECTORY_DISPATCHING read 3.9 GB used after all its non-empty LOB values were cleared: the estimate scaled by rows, and 1.55 M of its 3.78 M rows had no LOB value.
+- Measurements reused across kinds of purge: the wizard offered batch 30,000 for the BANK_STATEMENTS full purge from the redo measured by the clearing run.
+- A stopped run logged a WARN TABLE_RESULT for every table with residual rows (17 in R-000025), counted in P5 although P1 and P2 already report the residual.
+- Console clocks: section headers showed this machine's time (21:00), events the database time (15:00).
+- A full purge after a clearing run of the same rows counts the cleared BASICFILE LOB space again (its baseline reads it as used); only when both run on the same rows.
+
+Changes
+- `epf_space`: BASICFILE estimate for clearing runs uses the values cleared out of the non-empty values of the eligible rows (R-000028 would read about 0 GB of LOB data left instead of 3.3 GB).
+- `epf_purge`: redo and undo per root are taken only from earlier purges that did the same (deleting or clearing); TABLE_RESULT is a WARN for residual rows only when the module processed every batch (INFO after a stop or a failure).
+- Wrapper: section headers use the database clock (the connection test reads it); the run header shows the offset when the clocks differ.
+- Report: the BASICFILE note names the share of LOB data left.
+- `EPF_WORK_KEY` becomes a global temporary table (ON COMMIT PRESERVE ROWS) and the purge session sets `temp_undo_enabled`: the key snapshot (5.5 M keys for PAYMENTS) writes no redo and no longer grows the undo tablespace, also in dry runs; it uses the temporary tablespace instead. Install replaces a permanent EPF_WORK_KEY (transient data only). Decided 2026-09-30.
+- Undo tuning limits undo growth again (D18 revised, decided 2026-09-30, 4 GB): `epf_tuning.undo_apply(run_id, preflight_run_id)` also sets the growth limit (MAXSIZE) of the autoextensible undo datafiles to `undo_cap`: the largest of the undo tablespace's current size, setting `undo_cap_mb` (4096, new) and 4 x the undo of one batch; the limit is recorded in EPF_INSTANCE_CHANGE (UNDO_DATAFILE) before it is set and `undo_restore` puts it back. No file is resized. `run/undo.sql APPLY [run_id [preflight_run_id]]` (optional arguments). `EPF_RUN.with_undo_tuning` (new column; `start_run` parameter; `begin_run.sql` 9th argument, passed by the wrapper): the preflight of such a run reports the limit (`UNDO_CAP`) instead of a growth warning. The undo tablespace's datafiles are part of the report's DATAFILES section (size before and after), and the report shows the undo tuning the purge ran with.
+- Test suite: T05 records the undo datafiles' growth limits; T12, T13 and T19 check they are back; T11 and T13 check the limit was applied; T13 checks the undo tablespace stayed within the larger of its size and 4 GB; any `Enter value for` prompt fails a step.
+- Tool version 0.4.3.
+
+How to test (a refreshed test database with unpurged data)
+1. `src\tests\e2e\run_tests.bat`.
+2. In the log: T11/T13 `UNDO_CAP` and `UNDO_GROWTH_LIMITED` in the undo tuning section, `UNDO_GROWTH_RESTORED` in the restore; T13 check "undo tablespace ... within ... MB"; T12/T13/T19 "original growth limit"; the purge report's DATAFILES section with the undo datafile; the dry run (T10) without undo growth (work keys in TEMP).
+
 ## 2026-09-29 - First end-to-end run on EPFPG783; fixes (0.4.2)
 
 Results (EPFPG783, fresh copy of the same data as EPFPG782; RETENTION_DAYS=365; log `logs/tests/2026-09-29_193038_EPFPG783/test.log`)

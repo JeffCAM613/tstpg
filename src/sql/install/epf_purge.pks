@@ -18,7 +18,8 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --              tree are left for a later run. Repeated until no reference
 --              remains. Applies to deleting modules.
 --
--- Key snapshot (EPF_WORK_KEY)
+-- Key snapshot (EPF_WORK_KEY, a global temporary table private to the
+-- purging session: no redo; its undo goes to the temporary tablespace)
 --   Root keys are taken once, then the keys of every link source below the
 --   root are derived with the root they belong to. Roots are numbered into
 --   batches of batch_size in key order; roots whose trees reference each

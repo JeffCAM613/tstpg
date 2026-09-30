@@ -23,17 +23,19 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
 
     -- Creates a run. Purge parameters are validated and normalised for
     -- actions PURGE and PREFLIGHT; missing values take their setting default.
-    -- Before inserting, stale runs are marked ABANDONED and history older
-    -- than history_retention_days is removed.
+    -- p_with_undo_tuning: the caller applies undo tuning for the purge (PURGE,
+    -- not a dry run). Before inserting, stale runs are marked ABANDONED and
+    -- history older than history_retention_days is removed.
     FUNCTION start_run(
-        p_action         IN VARCHAR2,
-        p_retention_days IN NUMBER   DEFAULT NULL,
-        p_depth          IN VARCHAR2 DEFAULT NULL,
-        p_mode           IN VARCHAR2 DEFAULT NULL,
-        p_batch_size     IN NUMBER   DEFAULT NULL,
-        p_dry_run        IN VARCHAR2 DEFAULT 'N',
-        p_with_reclaim   IN VARCHAR2 DEFAULT 'N',
-        p_with_compact   IN VARCHAR2 DEFAULT 'N'
+        p_action           IN VARCHAR2,
+        p_retention_days   IN NUMBER   DEFAULT NULL,
+        p_depth            IN VARCHAR2 DEFAULT NULL,
+        p_mode             IN VARCHAR2 DEFAULT NULL,
+        p_batch_size       IN NUMBER   DEFAULT NULL,
+        p_dry_run          IN VARCHAR2 DEFAULT 'N',
+        p_with_reclaim     IN VARCHAR2 DEFAULT 'N',
+        p_with_compact     IN VARCHAR2 DEFAULT 'N',
+        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N'
     ) RETURN NUMBER;
 
     -- Takes the run lock in this session, sets the run RUNNING and binds the

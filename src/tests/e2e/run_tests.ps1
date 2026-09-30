@@ -55,7 +55,7 @@ $script:Current     = $null
 $script:Results     = New-Object 'System.Collections.Generic.List[object]'
 $script:Aborted     = $false
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
-                         StopSent = $false; InPurge = $false }
+                         StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0 }
 
 # Child processes read their standard input in the console code page. With a
 # UTF-8 console .NET would begin every child's input with a byte order mark
@@ -71,7 +71,7 @@ try {
 
 # Output that must never appear in any step.
 $script:Forbidden = @('SP2-\d{4}', 'PLS-\d{5}', 'ORA-06550', 'ORA-00904', 'ORA-00942', 'ORA-01031', 'ORA-04063',
-                      'ORA-06508', 'compilation errors', '(?m)^ Error: ')
+                      'ORA-06508', 'compilation errors', '(?m)^ Error: ', 'Enter value for')
 
 # ----------------------------------------------------------------------------
 # Log
@@ -302,6 +302,32 @@ function Get-ScriptLine {
     return ('@"' + $Path + '" ' + ($Arguments -join ' ')).TrimEnd()
 }
 
+# Datafiles of the undo tablespace (SYS): id, autoextend, growth limit, size.
+function Get-UndoFiles {
+    $r = Invoke-Sql 'SYS' @(
+        'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
+        "SELECT 'UNDOFILE|' || file_id || '|' || autoextensible || '|' || maxbytes || '|' || bytes FROM dba_data_files WHERE tablespace_name = (SELECT UPPER(value) FROM v`$parameter WHERE name = 'undo_tablespace') ORDER BY file_id;",
+        'EXIT')
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in ($r.Output -split "`n")) {
+        if ($line -match '^UNDOFILE\|(\d+)\|([A-Z]+)\|(\d+)\|(\d+)') {
+            $files.Add([pscustomobject]@{ Id = $Matches[1]; Auto = $Matches[2]; Max = [decimal]$Matches[3]; Bytes = [decimal]$Matches[4] })
+        }
+    }
+    return ,$files.ToArray()
+}
+
+# Every undo datafile has the growth limit it had before the tests.
+function Assert-UndoLimits {
+    if ($script:State.UndoFiles.Count -eq 0) { return }
+    $now = Get-UndoFiles
+    foreach ($base in $script:State.UndoFiles) {
+        $match = @($now | Where-Object { $_.Id -eq $base.Id -and $_.Auto -eq $base.Auto -and $_.Max -eq $base.Max })
+        Add-Check ($match.Count -eq 1) ('undo datafile ' + $base.Id + ' has its original growth limit (autoextend ' +
+                                        $base.Auto + ', max ' + [Math]::Round($base.Max / 1MB) + ' MB)')
+    }
+}
+
 # ----------------------------------------------------------------------------
 # Tests and checks
 # ----------------------------------------------------------------------------
@@ -414,7 +440,7 @@ $script:TestList = @(
     'T02  Environment survey (src/tests/verify/environment.sql)',
     'T03  Install through the wrapper (install action)',
     'T04  Install again with install.sql (idempotent upgrade path)',
-    'T05  Undo tuning left from earlier work restored; nothing active',
+    'T05  Undo tuning left from earlier work restored; undo datafile limits recorded',
     'T06  Wrapper basics: --help, status, stop without an active run',
     'T07  Usage errors: exit 4, nothing changed',
     'T08  Preflight through the wrapper',
@@ -497,7 +523,7 @@ function Invoke-Suite {
         Assert-Match $r ('EPFPG objects valid, tool version ' + [regex]::Escape($script:Version))
     }
 
-    Invoke-Test 'T05' 'Undo tuning left from earlier work restored; nothing active' {
+    Invoke-Test 'T05' 'Undo tuning left from earlier work restored; undo datafile limits recorded' {
         $undo = Join-Path $script:RunSqlDir 'undo.sql'
         $r = Invoke-Sql 'SYS' @((Get-ScriptLine $undo @('RESTORE')))
         Assert-Exit $r @(0)
@@ -506,6 +532,14 @@ function Invoke-Suite {
         Assert-NoMatch $r 'active change'
         foreach ($line in ($r.Output -split "`n")) {
             if ($line -match 'undo_retention (\d+) s') { $script:State.UndoRetention = $Matches[1] }
+        }
+        # Baseline of the undo datafiles: growth limits restored after every run.
+        $script:State.UndoFiles = Get-UndoFiles
+        $script:State.UndoBaseBytes = ($script:State.UndoFiles | Measure-Object -Property Bytes -Sum).Sum
+        Add-Check ($script:State.UndoFiles.Count -gt 0) 'undo datafiles recorded'
+        foreach ($f in $script:State.UndoFiles) {
+            Write-TestLog ('  undo datafile ' + $f.Id + ': ' + [Math]::Round($f.Bytes / 1MB) + ' MB, autoextend ' + $f.Auto +
+                           ', max ' + [Math]::Round($f.Max / 1MB) + ' MB')
         }
     }
 
@@ -589,6 +623,9 @@ function Invoke-Suite {
         Assert-Match $r 'STOP_HONORED'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
         Assert-Match $r 'UNDO_RETENTION_RESTORED'
+        Assert-Match $r 'UNDO_CAP'
+        Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
+        Write-Note $r 'UNDO_GROWTH_RESTORED' 'undo growth limit restored'
         $null = Get-Run $r 'PREFLIGHT'
         $run = Get-Run $r 'PURGE'
         Assert-Manifest $run 'status' '^STOPPED$'
@@ -610,6 +647,7 @@ function Invoke-Suite {
         Assert-Exit $r @(0)
         Assert-NoMatch $r 'active change'
         if ($script:State.UndoRetention -ne '') { Assert-Match $r ('undo_retention ' + $script:State.UndoRetention + ' s') }
+        Assert-UndoLimits
         $r = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $r @(0)
         Assert-Match $r 'status STOPPED'
@@ -624,7 +662,19 @@ function Invoke-Suite {
         $r = Invoke-Wrapper $list -TimeoutMin 240 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'PREFLIGHT'
+        Assert-Match $r 'undo tuning planned for this purge'
+        Assert-Match $r 'UNDO_CAP'
+        Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
+        Write-Note $r 'UNDO_GROWTH_RESTORED' 'undo growth limit restored'
+        # The undo tablespace stayed within the growth limit: the larger of its
+        # size before the tests and undo_cap_mb (4 GB), plus rounding.
+        $files = Get-UndoFiles
+        $bytes = ($files | Measure-Object -Property Bytes -Sum).Sum
+        $limit = [Math]::Max([double]$script:State.UndoBaseBytes, 4GB) + 64MB
+        Add-Check ($bytes -le $limit) ('undo tablespace ' + [Math]::Round($bytes / 1MB) + ' MB after the purge, within ' +
+                                        [Math]::Round($limit / 1MB) + ' MB')
+        Assert-UndoLimits
         $run = Get-Run $r 'PURGE'
         Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
         foreach ($check in @('P1', 'P3', 'P6', 'P7')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
@@ -709,6 +759,7 @@ function Invoke-Suite {
         Assert-Match $r 'TEMP_INDEX_LEFT\|0'
         Assert-NoMatch $r 'RUN\|[^\n]*\|(RUNNING|CREATED)\|'
         if ($script:State.UndoRetention -ne '') { Assert-Match $r ('undo_retention=' + $script:State.UndoRetention) }
+        Assert-UndoLimits
     }
 }
 

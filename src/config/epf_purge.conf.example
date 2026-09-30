@@ -26,7 +26,8 @@ DRY_RUN=N
 COMPACT=N
 # Enlarge the online redo logs to 4 x 1 GB before the purge (SYS, permanent).
 REDO_LOGS=N
-# Lower undo_retention for the purge and restore it at the end (SYS).
+# Lower undo_retention and limit the growth of the undo tablespace (4 GB by
+# default, setting undo_cap_mb) for the purge; both restored at the end (SYS).
 UNDO_TUNING=N
 
 # Output.

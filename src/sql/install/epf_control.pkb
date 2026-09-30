@@ -100,14 +100,15 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
     END prune_history;
 
     FUNCTION start_run(
-        p_action         IN VARCHAR2,
-        p_retention_days IN NUMBER   DEFAULT NULL,
-        p_depth          IN VARCHAR2 DEFAULT NULL,
-        p_mode           IN VARCHAR2 DEFAULT NULL,
-        p_batch_size     IN NUMBER   DEFAULT NULL,
-        p_dry_run        IN VARCHAR2 DEFAULT 'N',
-        p_with_reclaim   IN VARCHAR2 DEFAULT 'N',
-        p_with_compact   IN VARCHAR2 DEFAULT 'N'
+        p_action           IN VARCHAR2,
+        p_retention_days   IN NUMBER   DEFAULT NULL,
+        p_depth            IN VARCHAR2 DEFAULT NULL,
+        p_mode             IN VARCHAR2 DEFAULT NULL,
+        p_batch_size       IN NUMBER   DEFAULT NULL,
+        p_dry_run          IN VARCHAR2 DEFAULT 'N',
+        p_with_reclaim     IN VARCHAR2 DEFAULT 'N',
+        p_with_compact     IN VARCHAR2 DEFAULT 'N',
+        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N'
     ) RETURN NUMBER IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_action    VARCHAR2(30) := UPPER(TRIM(p_action));
@@ -119,6 +120,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_dry_run   VARCHAR2(1)  := yes_no(p_dry_run, 'dry_run');
         l_reclaim   VARCHAR2(1)  := yes_no(p_with_reclaim, 'with_reclaim');
         l_compact   VARCHAR2(1)  := yes_no(p_with_compact, 'with_compact');
+        l_undo      VARCHAR2(1)  := yes_no(p_with_undo_tuning, 'with_undo_tuning');
         l_run_id    NUMBER;
     BEGIN
         IF l_action IS NULL OR l_action NOT IN ('PURGE', 'RECLAIM', 'PREFLIGHT') THEN
@@ -128,6 +130,10 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         IF l_compact = 'Y' AND (l_action <> 'PURGE' OR l_dry_run = 'Y' OR l_reclaim = 'Y') THEN
             RAISE_APPLICATION_ERROR(-20127, 'Compaction (with_compact=Y) applies to purge runs that are not dry runs '
                                             || 'and do not reclaim.');
+        END IF;
+        IF l_undo = 'Y' AND (l_action <> 'PURGE' OR l_dry_run = 'Y') THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Undo tuning (with_undo_tuning=Y) applies to purge runs that are not '
+                                            || 'dry runs.');
         END IF;
         IF NOT lock_is_free THEN
             RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '
@@ -171,11 +177,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
 
         INSERT INTO epf_run (
             action, status, retention_days, cutoff_date, depth, purge_mode, batch_size,
-            dry_run, with_reclaim, with_compact, created_at,
+            dry_run, with_reclaim, with_compact, with_undo_tuning, created_at,
             db_name, container_name, client_host, os_user, tool_version
         ) VALUES (
             l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch,
-            l_dry_run, l_reclaim, l_compact, epf_util.now_ts,
+            l_dry_run, l_reclaim, l_compact, l_undo, epf_util.now_ts,
             SYS_CONTEXT('USERENV', 'DB_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME'),
             SYS_CONTEXT('USERENV', 'HOST'), SYS_CONTEXT('USERENV', 'OS_USER'),
             epf_util.setting('tool_version')
@@ -231,6 +237,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                    || ' batch=' || l_run.batch_size || ' dry_run=' || l_run.dry_run
                END
             || ' reclaim=' || l_run.with_reclaim || ' compact=' || l_run.with_compact
+            || ' undo_tuning=' || l_run.with_undo_tuning
             || ' db=' || l_run.db_name || ' container=' || l_run.container_name
             || ' version=' || l_run.tool_version);
     END attach;

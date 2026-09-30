@@ -261,13 +261,83 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END LOOP;
     END undo_status;
 
-    PROCEDURE undo_apply IS
+    FUNCTION undo_cap(p_batch_undo IN NUMBER) RETURN NUMBER IS
+        l_ts   VARCHAR2(128) := undo_tablespace;
+        l_size NUMBER;
+    BEGIN
+        SELECT NVL(SUM(bytes), 0) INTO l_size FROM dba_data_files WHERE tablespace_name = l_ts;
+        RETURN GREATEST(l_size, epfpg.epf_util.setting_num('undo_cap_mb') * 1048576, 4 * NVL(p_batch_undo, 0));
+    END undo_cap;
+
+    -- Undo of one batch of run p_run_id: its batch size times the largest undo
+    -- per root estimated by the preflight run p_preflight_run_id (UNDO_ESTIMATE
+    -- events). NULL without a run.
+    FUNCTION batch_undo(p_run_id IN NUMBER, p_preflight_run_id IN NUMBER) RETURN NUMBER IS
+        l_batch    NUMBER;
+        l_per_root NUMBER;
+    BEGIN
+        IF p_run_id IS NULL THEN
+            RETURN NULL;
+        END IF;
+        SELECT MAX(batch_size) INTO l_batch FROM epfpg.epf_run WHERE run_id = p_run_id;
+        SELECT MAX(bytes)
+          INTO l_per_root
+          FROM epfpg.epf_event
+         WHERE run_id = NVL(p_preflight_run_id, p_run_id) AND event_code = 'UNDO_ESTIMATE' AND bytes > 0;
+        RETURN l_batch * l_per_root;
+    END batch_undo;
+
+    -- Limits the growth of the autoextensible undo datafiles so the undo
+    -- tablespace stays within p_cap bytes (never below the current size of a
+    -- file: nothing is shrunk). The room left under the cap is shared evenly
+    -- between the files. Each change is recorded before it is made.
+    PROCEDURE limit_undo_growth(p_ts IN VARCHAR2, p_cap IN NUMBER, p_run_id IN NUMBER) IS
+        l_total NUMBER;
+        l_files NUMBER;
+        l_room  NUMBER;
+        l_max   NUMBER;
+    BEGIN
+        SELECT NVL(SUM(bytes), 0), COUNT(CASE WHEN autoextensible = 'YES' THEN 1 END)
+          INTO l_total, l_files
+          FROM dba_data_files
+         WHERE tablespace_name = p_ts;
+        IF l_files = 0 THEN
+            say('INFO', 'UNDO_GROWTH_NONE', p_ts || ' has no autoextensible datafile: it cannot grow');
+            RETURN;
+        END IF;
+        l_room := GREATEST(p_cap - l_total, 0);
+        FOR f IN (SELECT d.file_id, d.file_name, d.bytes, d.maxbytes, d.increment_by * t.block_size AS increment
+                    FROM dba_data_files d
+                    JOIN dba_tablespaces t ON t.tablespace_name = d.tablespace_name
+                   WHERE d.tablespace_name = p_ts AND d.autoextensible = 'YES'
+                   ORDER BY d.file_id) LOOP
+            l_max := CEIL((f.bytes + l_room / l_files) / 1048576) * 1048576;
+            IF l_max < f.maxbytes THEN
+                INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_autoextend, original_maxbytes,
+                                                       original_increment, applied_value, applied_at, applied_run_id)
+                VALUES ('UNDO_DATAFILE', f.file_name, f.file_id, 'YES', f.maxbytes, f.increment, l_max,
+                        CAST(SYSTIMESTAMP AS TIMESTAMP), p_run_id);
+                COMMIT;
+                EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || f.file_id || ' AUTOEXTEND ON NEXT '
+                                  || f.increment / 1024 || 'K MAXSIZE ' || l_max / 1024 || 'K';
+                say('OK', 'UNDO_GROWTH_LIMITED', f.file_name || ': may grow to ' || ROUND(l_max / 1048576)
+                                                 || ' MB (was ' || ROUND(f.maxbytes / 1048576) || ' MB)');
+            ELSE
+                say('INFO', 'UNDO_GROWTH_KEPT', f.file_name || ': growth limit ' || ROUND(f.maxbytes / 1048576)
+                                                || ' MB is already within the cap');
+            END IF;
+        END LOOP;
+    END limit_undo_growth;
+
+    PROCEDURE undo_apply(p_run_id IN NUMBER DEFAULT NULL, p_preflight_run_id IN NUMBER DEFAULT NULL) IS
         l_retention NUMBER := epfpg.epf_util.setting_num('undo_retention_s');
         l_ts        VARCHAR2(128);
         l_guarantee VARCHAR2(11);
         l_current   NUMBER;
         l_active    NUMBER;
-        l_run       NUMBER := epfpg.epf_log.current_run;
+        l_run       NUMBER := NVL(p_run_id, epfpg.epf_log.current_run);
+        l_batch     NUMBER;
+        l_cap       NUMBER;
     BEGIN
         check_instance;
         SELECT COUNT(*) INTO l_active
@@ -298,6 +368,15 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         ELSE
             say('INFO', 'UNDO_RETENTION_KEPT', 'undo_retention is already ' || l_current || ' s');
         END IF;
+
+        l_batch := batch_undo(p_run_id, p_preflight_run_id);
+        l_cap := undo_cap(l_batch);
+        say('INFO', 'UNDO_CAP', l_ts || ' limited to ' || ROUND(l_cap / 1048576) || ' MB: the largest of its size, '
+                                || 'undo_cap_mb (' || epfpg.epf_util.setting('undo_cap_mb') || ' MB)'
+                                || CASE WHEN l_batch IS NOT NULL THEN
+                                        ' and 4 x the undo of one batch (' || ROUND(l_batch / 1048576) || ' MB)'
+                                   END);
+        limit_undo_growth(l_ts, l_cap, l_run);
         say('WARN', 'UNDO_APPLIED', 'Undo tuning is active until undo_restore: long queries of other sessions may fail '
                                     || 'with ORA-01555 meanwhile');
     END undo_apply;

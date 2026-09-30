@@ -868,8 +868,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_total;
     END count_sum;
 
+    -- Counts every table of the module into EPF_TABLE_STAT (phase BEFORE or
+    -- AFTER). p_complete: the module processed every batch; residual rows are
+    -- then a warning, after a stop or a failure they are expected (checks P1
+    -- and P2 report them).
     PROCEDURE count_tables(p_module IN VARCHAR2, p_action IN VARCHAR2, p_phase IN VARCHAR2,
-                           p_processed IN t_numbers) IS
+                           p_processed IN t_numbers, p_complete IN BOOLEAN DEFAULT TRUE) IS
         l_total     NUMBER;
         l_eligible  NUMBER;
         l_lob       NUMBER;
@@ -941,7 +945,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                               p_rows => NVL(l_lob, l_eligible));
             ELSE
                 l_residual := CASE WHEN p_action = c_delete THEN l_eligible ELSE l_lob END;
-                epf_log.event(CASE WHEN NVL(l_residual, 0) = 0 THEN epf_log.c_ok ELSE epf_log.c_warn END,
+                epf_log.event(CASE WHEN NVL(l_residual, 0) = 0 THEN epf_log.c_ok
+                                   WHEN p_complete THEN epf_log.c_warn
+                                   ELSE epf_log.c_info END,
                               'TABLE_RESULT',
                               CASE WHEN p_action = c_delete
                                    THEN 'deleted ' || epf_util.fmt_int(l_processed) || ', residual eligible '
@@ -1537,7 +1543,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             BEGIN
                 epf_log.step_start('COUNT_AFTER', p_module);
-                count_tables(p_module, l_action, 'AFTER', l_processed);
+                count_tables(p_module, l_action, 'AFTER', l_processed,
+                             p_complete => NOT l_failed AND l_batch_res = 'DONE');
                 count_orphans(p_module, 'AFTER');
                 epf_log.step_end('DONE');
             EXCEPTION
@@ -1850,11 +1857,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     END row_redo_estimate;
 
     -- Redo per root of a tree: measured by the latest purge of the tree on
-    -- this database (TREE_REDO events), otherwise estimated from optimizer
-    -- statistics (rows per root of each table x row_redo_estimate).
+    -- this database that did the same (deleting or clearing LOB values:
+    -- TREE_REDO events), otherwise estimated from optimizer statistics (rows
+    -- per root of each table x row_redo_estimate).
     PROCEDURE tree_redo(p_root_id IN NUMBER, p_per_root OUT NUMBER, p_source OUT VARCHAR2) IS
         l_owner     VARCHAR2(128) := g_tables(p_root_id).owner;
         l_table     VARCHAR2(128) := g_tables(p_root_id).table_name;
+        l_module    VARCHAR2(30)  := g_tables(p_root_id).module_code;
+        l_action    VARCHAR2(10)  := module_action(g_tables(p_root_id).module_code);
         l_ids       SYS.ODCINUMBERLIST := tree_tables(p_root_id);
         l_run       NUMBER;
         l_root_rows NUMBER;
@@ -1862,13 +1872,17 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_t_owner   VARCHAR2(128);
         l_t_table   VARCHAR2(128);
     BEGIN
-        SELECT MAX(bytes / rows_affected) KEEP (DENSE_RANK LAST ORDER BY event_id),
-               MAX(run_id) KEEP (DENSE_RANK LAST ORDER BY event_id)
+        SELECT MAX(ev.bytes / ev.rows_affected) KEEP (DENSE_RANK LAST ORDER BY ev.event_id),
+               MAX(ev.run_id) KEEP (DENSE_RANK LAST ORDER BY ev.event_id)
           INTO p_per_root, l_run
-          FROM epf_event
-         WHERE event_code = 'TREE_REDO'
-           AND object_owner = l_owner AND object_name = l_table
-           AND rows_affected > 0 AND bytes > 0;
+          FROM epf_event ev
+          JOIN epf_run rn ON rn.run_id = ev.run_id
+         WHERE ev.event_code = 'TREE_REDO'
+           AND ev.object_owner = l_owner AND ev.object_name = l_table
+           AND ev.rows_affected > 0 AND ev.bytes > 0
+           AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                         OR (rn.purge_mode = 'CLOB_N_LOGS' AND l_module = c_logs_module)
+                    THEN c_delete ELSE c_clear END = l_action;
         IF p_per_root IS NOT NULL THEN
             p_source := 'measured by ' || epf_util.run_label(l_run);
             RETURN;
@@ -2033,8 +2047,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- the undo of all eligible roots; without one (first purge of the tree on
     -- this database) it can be up to the undo of all eligible roots. When that
     -- exceeds the current size, the undo tablespace grows during the purge
-    -- unless undo tuning is applied. Trees without eligible roots are not
-    -- estimated.
+    -- unless undo tuning is applied or planned for the run (with_undo_tuning):
+    -- undo tuning limits the growth to epf_tuning.undo_cap (UNDO_CAP event).
+    -- A batch needing more than half of what the tablespace can hold is a
+    -- warning. Trees without eligible roots are not estimated.
     PROCEDURE check_undo IS
         l_ts        VARCHAR2(128);
         l_retention NUMBER;
@@ -2045,6 +2061,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_tuning    VARCHAR2(4000) := undo_tuning_text;
         l_owner     VARCHAR2(128);
         l_table     VARCHAR2(128);
+        l_module    VARCHAR2(30);
+        l_action    VARCHAR2(10);
         l_per_root  NUMBER;
         l_rate      NUMBER;
         l_run       NUMBER;
@@ -2055,6 +2073,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_total     NUMBER;
         l_kept      NUMBER;
         l_warn      BOOLEAN;
+        l_limited   BOOLEAN := l_tuning IS NOT NULL OR g_run.with_undo_tuning = 'Y';
+        l_largest   NUMBER := 0;
+        l_cap       NUMBER;
     BEGIN
         SELECT UPPER(value) INTO l_ts FROM v$parameter WHERE name = 'undo_tablespace';
         SELECT TO_NUMBER(value) INTO l_retention FROM v$parameter WHERE name = 'undo_retention';
@@ -2069,6 +2090,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       || '; undo_retention ' || l_retention || ' s (tuned up to ' || NVL(TO_CHAR(l_tuned), '-')
                       || ' s in the last 24 hours), retention ' || LOWER(l_guarantee)
                       || CASE WHEN l_tuning IS NOT NULL THEN '; undo tuning active: ' || l_tuning
+                              WHEN g_run.with_undo_tuning = 'Y' THEN '; undo tuning planned for this purge'
                               ELSE '; undo tuning not applied' END,
                       p_bytes => l_size);
 
@@ -2088,14 +2110,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                               p_object_owner => l_owner, p_object_name => l_table);
                 CONTINUE;
             END IF;
-            SELECT MAX(bytes / rows_affected) KEEP (DENSE_RANK LAST ORDER BY event_id),
-                   MAX(bytes / GREATEST(elapsed_s, 1)) KEEP (DENSE_RANK LAST ORDER BY event_id),
-                   MAX(run_id) KEEP (DENSE_RANK LAST ORDER BY event_id)
+            -- Measured only by purges that did the same (deleting or clearing).
+            l_module := g_tables(r.table_id).module_code;
+            l_action := module_action(l_module);
+            SELECT MAX(ev.bytes / ev.rows_affected) KEEP (DENSE_RANK LAST ORDER BY ev.event_id),
+                   MAX(ev.bytes / GREATEST(ev.elapsed_s, 1)) KEEP (DENSE_RANK LAST ORDER BY ev.event_id),
+                   MAX(ev.run_id) KEEP (DENSE_RANK LAST ORDER BY ev.event_id)
               INTO l_per_root, l_rate, l_run
-              FROM epf_event
-             WHERE event_code = 'TREE_UNDO'
-               AND object_owner = l_owner AND object_name = l_table
-               AND rows_affected > 0 AND bytes > 0;
+              FROM epf_event ev
+              JOIN epf_run rn ON rn.run_id = ev.run_id
+             WHERE ev.event_code = 'TREE_UNDO'
+               AND ev.object_owner = l_owner AND ev.object_name = l_table
+               AND ev.rows_affected > 0 AND ev.bytes > 0
+               AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                             OR (rn.purge_mode = 'CLOB_N_LOGS' AND l_module = c_logs_module)
+                        THEN c_delete ELSE c_clear END = l_action;
             IF l_per_root IS NOT NULL THEN
                 l_source := 'measured by ' || epf_util.run_label(l_run);
             ELSE
@@ -2106,6 +2135,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 l_rate     := NULL;
             END IF;
             l_batch := l_per_root * batch_roots(r.table_id);
+            l_largest := GREATEST(l_largest, l_batch);
             l_total := l_per_root * l_eligible;
             IF l_rate IS NOT NULL THEN
                 -- Retention cannot keep more undo than the purge writes.
@@ -2115,7 +2145,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 -- retention can keep up to all the undo the purge writes.
                 l_kept := l_total;
             END IF;
-            l_warn  := l_batch > 0.5 * l_max OR (l_tuning IS NULL AND l_kept > l_size);
+            l_warn  := l_batch > 0.5 * l_max OR (NOT l_limited AND l_kept > l_size);
             IF l_warn THEN
                 g_warnings := g_warnings + 1;
             END IF;
@@ -2136,13 +2166,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                           || CASE WHEN l_batch > 0.5 * l_max THEN
                                  '; a batch needs more than half of what ' || l_ts || ' can hold: lower the batch size'
                              END
-                          || CASE WHEN l_tuning IS NULL AND l_kept > l_size THEN
+                          || CASE WHEN NOT l_limited AND l_kept > l_size THEN
                                  '; ' || l_ts || CASE WHEN l_rate IS NULL THEN ' may grow' ELSE ' grows' END
                                  || ' during the purge (up to ' || epf_util.fmt_bytes(l_max)
                                  || ') unless undo tuning is applied (undo.sql APPLY as SYS)'
                              END,
                           p_object_owner => l_owner, p_object_name => l_table, p_bytes => l_per_root);
         END LOOP;
+
+        IF l_tuning IS NULL AND g_run.with_undo_tuning = 'Y' AND l_largest > 0 THEN
+            l_cap := epf_tuning.undo_cap(l_largest);
+            epf_log.event(epf_log.c_info, 'UNDO_CAP',
+                          'Undo tuning for this purge limits ' || l_ts || ' to about ' || epf_util.fmt_bytes(l_cap)
+                          || ' (the largest of its size, undo_cap_mb and 4 x the undo of one batch, '
+                          || epf_util.fmt_bytes(l_largest) || '); committed undo is reused instead of growing it',
+                          p_bytes => l_cap);
+        END IF;
     END check_undo;
 
     PROCEDURE check_roots IS
@@ -2217,6 +2256,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         epf_log.set_phase('PURGE');
         EXECUTE IMMEDIATE 'ALTER SESSION SET ddl_lock_timeout = '
                           || TO_CHAR(TRUNC(epf_util.setting_num('ddl_lock_timeout_s')));
+        -- The work keys (temporary table EPF_WORK_KEY) keep their undo in the
+        -- temporary tablespace: no redo, no undo tablespace growth for them.
+        -- Effective when set before the session's first use of a temporary table.
+        EXECUTE IMMEDIATE 'ALTER SESSION SET temp_undo_enabled = TRUE';
         plan_steps;
         scope_event;
         l_tuning := undo_tuning_text;

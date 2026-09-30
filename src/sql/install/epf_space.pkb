@@ -47,23 +47,32 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
           JOIN dba_tablespaces t ON t.tablespace_name = f.tablespace_name
          WHERE f.tablespace_name IN (SELECT DISTINCT ss.tablespace_name
                                        FROM epf_segment_snap ss
-                                      WHERE ss.run_id = p_run_id AND ss.phase = p_phase);
+                                      WHERE ss.run_id = p_run_id AND ss.phase = p_phase
+                                     UNION
+                                     SELECT UPPER(p.value) FROM v$parameter p WHERE p.name = 'undo_tablespace');
     END capture_files;
 
     -- A BASICFILE LOB segment keeps the chunks of deleted or cleared values as
     -- used blocks: they are reused by new values of the same LOB column after
     -- the LOB retention, but DBMS_SPACE reports them as used. After a purge the
-    -- use of such a segment is estimated from its BASELINE measurement, scaled
-    -- by the share of rows of the owning table that the purge did not process
-    -- (deleted rows, or rows whose LOB values were cleared). A lower measured
-    -- value (after a shrink) is kept. Without a baseline or purge counts the
+    -- use of such a segment is estimated from its BASELINE measurement times
+    -- the share of the LOB data the purge left:
+    --   deleting  rows not deleted / rows before
+    --   clearing  1 - (values cleared / non-empty values of the eligible rows)
+    --                 x (eligible rows / rows before)
+    -- (LOB data assumed evenly spread over the rows). A lower measured value
+    -- (after a shrink) is kept. Without a baseline or purge counts the
     -- measured value stands.
     PROCEDURE basicfile_estimate(p_run_id IN NUMBER, p_owner IN VARCHAR2, p_segment IN VARCHAR2,
                                  p_partition IN VARCHAR2, p_used IN OUT NUMBER, p_method IN OUT VARCHAR2) IS
         l_table     VARCHAR2(128);
         l_baseline  NUMBER;
         l_total     NUMBER;
+        l_eligible  NUMBER;
+        l_nonempty  NUMBER;
         l_processed NUMBER;
+        l_action    VARCHAR2(10);
+        l_left      NUMBER;
     BEGIN
         SELECT MAX(table_name) INTO l_table FROM dba_lobs WHERE owner = p_owner AND segment_name = p_segment;
         SELECT MAX(used_bytes)
@@ -72,15 +81,26 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
          WHERE run_id = p_run_id AND phase = c_baseline AND owner = p_owner AND segment_name = p_segment
            AND NVL(partition_name, '-') = NVL(p_partition, '-');
         SELECT MAX(CASE WHEN st.phase = 'BEFORE' THEN st.total_rows END),
-               MAX(CASE WHEN st.phase = 'AFTER' THEN st.processed_rows END)
-          INTO l_total, l_processed
+               MAX(CASE WHEN st.phase = 'BEFORE' THEN st.eligible_rows END),
+               MAX(CASE WHEN st.phase = 'BEFORE' THEN st.nonempty_lob_rows END),
+               MAX(CASE WHEN st.phase = 'AFTER' THEN st.processed_rows END),
+               MAX(st.action)
+          INTO l_total, l_eligible, l_nonempty, l_processed, l_action
           FROM epf_table_stat st
           JOIN epf_table e ON e.table_id = st.table_id
          WHERE st.run_id = p_run_id AND e.owner = p_owner AND e.table_name = l_table;
         IF l_baseline IS NULL OR l_processed IS NULL OR NVL(l_total, 0) = 0 THEN
             RETURN;
         END IF;
-        p_used   := LEAST(p_used, l_baseline * GREATEST(0, 1 - l_processed / l_total));
+        IF l_action = 'CLEAR' THEN
+            IF NVL(l_nonempty, 0) = 0 THEN
+                RETURN;
+            END IF;
+            l_left := 1 - LEAST(l_processed / l_nonempty, 1) * NVL(l_eligible, 0) / l_total;
+        ELSE
+            l_left := 1 - l_processed / l_total;
+        END IF;
+        p_used   := LEAST(p_used, l_baseline * GREATEST(0, l_left));
         p_method := 'BASICFILE_EST';
     END basicfile_estimate;
 

@@ -10,6 +10,8 @@
 -- ============================================================================
 
 DECLARE
+    l_temporary VARCHAR2(1);
+
     PROCEDURE create_table(p_name IN VARCHAR2, p_ddl IN VARCHAR2) IS
         l_count PLS_INTEGER;
     BEGIN
@@ -131,6 +133,7 @@ BEGIN
             dry_run         CHAR(1)        DEFAULT 'N' NOT NULL,
             with_reclaim    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_compact    CHAR(1)        DEFAULT 'N' NOT NULL,
+            with_undo_tuning CHAR(1)       DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N')),
             stop_requested  CHAR(1)        DEFAULT 'N' NOT NULL,
             created_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
             started_at      TIMESTAMP,
@@ -148,6 +151,9 @@ BEGIN
                                                 AND with_compact IN ('Y', 'N')
                                                 AND stop_requested IN ('Y', 'N'))
         )]');
+    -- with_undo_tuning: undo tuning (epf_tuning.undo_apply) is applied for the
+    -- purge by the caller; the preflight then assumes its growth limit.
+    add_column('EPF_RUN', 'WITH_UNDO_TUNING', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N'))]');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -205,8 +211,21 @@ BEGIN
     --                  root_key they derive from; batch_no = 0 (their batch is
     --                  the batch of root_key). A key derived from several
     --                  roots has one row per root.
+    -- A global temporary table: the keys belong to the purging session only,
+    -- they write no redo, and with temp_undo_enabled (set by epf_purge) their
+    -- undo goes to the temporary tablespace. A permanent EPF_WORK_KEY is
+    -- replaced; its rows are transient work data of finished runs.
+    SELECT MAX(temporary)
+      INTO l_temporary
+      FROM all_tables
+     WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+       AND table_name = 'EPF_WORK_KEY';
+    IF l_temporary = 'N' THEN
+        EXECUTE IMMEDIATE 'DROP TABLE epf_work_key PURGE';
+        DBMS_OUTPUT.PUT_LINE('  dropped  table EPF_WORK_KEY (permanent; replaced by a temporary table)');
+    END IF;
     create_table('EPF_WORK_KEY', q'[
-        CREATE TABLE epf_work_key (
+        CREATE GLOBAL TEMPORARY TABLE epf_work_key (
             run_id     NUMBER  NOT NULL,
             table_id   NUMBER  NOT NULL,
             batch_no   NUMBER  NOT NULL,
@@ -214,9 +233,7 @@ BEGIN
             key_rowid  UROWID,
             root_key   NUMBER,
             group_key  NUMBER
-        )]');
-    add_column('EPF_WORK_KEY', 'ROOT_KEY', 'NUMBER');
-    add_column('EPF_WORK_KEY', 'GROUP_KEY', 'NUMBER');
+        ) ON COMMIT PRESERVE ROWS]');
     create_index('EPF_WORK_KEY_IX',
         'CREATE INDEX epf_work_key_ix ON epf_work_key (run_id, table_id, batch_no)');
     create_index('EPF_WORK_KEY_ROOT_IX',

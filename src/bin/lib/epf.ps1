@@ -29,6 +29,7 @@ $script:SqlPlus     = $null
 $script:Cli         = $null
 $script:Config      = @{}
 $script:Database    = $null
+$script:ClockOffset = [TimeSpan]::Zero
 
 $script:ExitPass    = 0
 $script:ExitFail    = 1
@@ -77,9 +78,10 @@ function Write-Out {
     if (-not $NoLog) { Write-Log $Text }
 }
 
+# Section header with the database clock (the clock of the event times).
 function Write-Section {
     param([string]$Title)
-    $clock = Get-Date -Format 'HH:mm:ss'
+    $clock = (Get-Date).Add($script:ClockOffset).ToString('HH:mm:ss')
     Write-Out ''
     Write-Out (' ' + $Title.PadRight($script:Width - $clock.Length - 1) + $clock) 'White'
 }
@@ -141,8 +143,8 @@ Options
   --compact            shrink the purged tables afterwards (purge only)
   --redo-logs          enlarge the online redo logs first (4 x 1 GB,
                        permanent; SYS)
-  --undo-tuning        lower undo_retention for the purge and restore it at
-                       the end (SYS)
+  --undo-tuning        lower undo_retention and limit undo growth (4 GB by
+                       default) for the purge; restored at the end (SYS)
   --run ID             run for report (default LATEST) and stop (default:
                        the active run); 124 or R-000124
   --yes                skip the final confirmation (required with
@@ -437,9 +439,9 @@ function Test-DbConnection {
     $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
     $in.WriteLine((Get-ConnectLine $Login))
     if ($WithVersion) {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value FROM epfpg.epf_setting WHERE name = 'tool_version';")
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
     } else {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' FROM dual;")
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
     }
     $in.WriteLine('EXIT')
     $in.Close()
@@ -447,12 +449,28 @@ function Test-DbConnection {
     $err = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
     $text = $out.Result + $err.Result
+    $received = Get-Date
     foreach ($line in ($text -split "`r?`n")) {
-        if ($line -match '^EPF_CONNECTED\|([^|]*)\|(.*)$') {
-            return [pscustomobject]@{ Ok = $true; Container = $Matches[1]; Version = $Matches[2].Trim(); Output = $text }
+        if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
+            $container = $Matches[1]
+            $version = $Matches[2].Trim()
+            $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            # Database clock minus this machine's clock, to the minute.
+            $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
+            return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text }
         }
     }
     return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text }
+}
+
+# "+06:00" for a clock offset; empty when the clocks agree.
+function Format-Offset {
+    param([TimeSpan]$Offset)
+    if ([Math]::Abs($Offset.TotalMinutes) -lt 1) { return '' }
+    $sign = '+'
+    if ($Offset.TotalMinutes -lt 0) { $sign = '-' }
+    $abs = $Offset.Duration()
+    return ($sign + ('{0:00}:{1:00}' -f [Math]::Floor($abs.TotalHours), $abs.Minutes))
 }
 
 # Runs one entry script in its own sqlplus session and waits for it. With a
@@ -731,8 +749,11 @@ function Invoke-ToolRun {
         $batchArg = $Ctx.BatchSize
     }
 
+    $undo = 'N'
+    if ($Ctx.UndoTuning -and $Action -eq 'PURGE' -and -not $Ctx.DryRun) { $undo = 'Y' }
+
     $state.Monitor = Open-Monitor $Ctx.Cred
-    $begin = @($Action, $Ctx.Retention, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact)
+    $begin = @($Action, $Ctx.Retention, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact, $undo)
     $lines = Invoke-MonitorCommand $state.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $begin) 120000
     foreach ($line in $lines) {
         if ($line -match '^EPF_RUN_ID=(\d+)$') { $state.RunId = [long]$Matches[1] }
@@ -754,6 +775,10 @@ function Invoke-ToolRun {
     Write-Out (' ' + ('-' * ($script:Width - 1)))
     Write-Out (' Database   ' + $script:Database.Container + ', tool version ' + $script:Database.Version +
                ', ' + $Ctx.Cred.Tns)
+    $offset = Format-Offset $script:ClockOffset
+    if ($offset -ne '') {
+        Write-Out (' Times      database clock (' + $offset + ' from this machine)')
+    }
     Write-Out (' Run folder ' + $state.Folder)
     if ($Action -eq 'PURGE') {
         Write-Out (' Purge      mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', retention ' + $Ctx.Retention +
@@ -799,7 +824,13 @@ function Invoke-ToolRun {
                 if ($Ctx.UndoTuning) {
                     Write-Section 'UNDO TUNING (SYS)'
                     $undoApplied = $true
-                    $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') @('APPLY') $state 'sqlplus_undo_apply.log'
+                    # The growth limit is sized from this run's batch size and the
+                    # undo per root estimated by its preflight (this run, or the
+                    # wizard's preflight run).
+                    $preflightId = [string]$state.RunId
+                    if ($Ctx.PreflightRun -ne '') { $preflightId = $Ctx.PreflightRun -replace '^R-0*', '' }
+                    $applyArgs = @('APPLY', [string]$state.RunId, $preflightId)
+                    $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') $applyArgs $state 'sqlplus_undo_apply.log'
                     Show-Lines $result.Output -Indent
                     if ($result.ExitCode -ne 0) { throw 'Undo tuning could not be applied; the purge was not started.' }
                 }
@@ -1043,7 +1074,7 @@ function Show-Review {
         Write-Out '  Dry run       no'
         Write-Out ('  Compact       ' + (Get-YN $Ctx.Compact))
         Write-Out ('  Redo logs     ' + (Get-YN $Ctx.RedoLogs) + '   (enlarge to 4 x 1 GB before the purge; permanent)')
-        Write-Out ('  Undo tuning   ' + (Get-YN $Ctx.UndoTuning) + '   (undo_retention lowered for the purge, restored at the end)')
+        Write-Out ('  Undo tuning   ' + (Get-YN $Ctx.UndoTuning) + '   (undo_retention lowered and undo growth limited for the purge, restored at the end)')
     }
     if ($Ctx.PreflightRun -ne '') { Write-Out ('  Preflight     ' + $Ctx.PreflightRun) }
 }
@@ -1074,7 +1105,7 @@ function Invoke-PurgeAction {
                 $ctx.UndoTuning = Read-YesNo 'Keep it for this purge and restore it at the end (SYS)' $true
             } elseif ($advice.UNDO_WARN -eq 'Y' -and -not $ctx.UndoTuning) {
                 Write-Out ' The undo tablespace is expected to grow during the purge (UNDO_ESTIMATE above).' 'Yellow'
-                $ctx.UndoTuning = Read-YesNo 'Lower undo_retention for the purge and restore it at the end (SYS)' $true
+                $ctx.UndoTuning = Read-YesNo 'Lower undo_retention and limit undo growth for the purge, restored at the end (SYS)' $true
             }
         }
         if ($ctx.BatchSize -eq '') {

@@ -485,8 +485,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
          WHERE run_id = g_run.run_id AND method = 'BASICFILE_EST';
         IF l_lob_est > 0 THEN
             put('  Used after includes ' || l_lob_est || ' BASICFILE LOB segments estimated from the baseline and the '
-                || 'rows kept: Oracle reports the space of deleted LOB values as used until new values of the same '
-                || 'column reuse it.');
+                || 'share of LOB data the purge left: Oracle reports the space of deleted or cleared LOB values as '
+                || 'used until new values of the same column reuse it.');
         END IF;
 
         title('DATAFILES');
@@ -513,6 +513,15 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             put('  ' || l(t.module_code, 18) || l(t.root_table, 46) || 'redo ' || r(b(t.redo), 10) || ', undo '
                 || r(b(t.undo), 10) || ' for ' || n(t.roots) || ' roots ('
                 || b(t.redo / NULLIF(t.roots, 0)) || ' redo per root)');
+        END LOOP;
+        -- Undo tuning as the purge found it at its start (undo tablespace size
+        -- before and after: DATAFILES).
+        FOR u IN (SELECT message
+                    FROM epf_event
+                   WHERE run_id = g_run.run_id AND event_code = 'UNDO_TUNING'
+                   ORDER BY event_id
+                   FETCH FIRST 1 ROWS ONLY) LOOP
+            put('  ' || u.message);
         END LOOP;
     END print_space;
 
