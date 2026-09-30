@@ -30,6 +30,7 @@ $script:Cli         = $null
 $script:Config      = @{}
 $script:Database    = $null
 $script:ClockOffset = [TimeSpan]::Zero
+$script:Children    = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
 
 $script:ExitPass    = 0
 $script:ExitFail    = 1
@@ -415,7 +416,24 @@ function Start-SqlProcess {
     $info.RedirectStandardError = $true
     $info.CreateNoWindow = $true
     $info.WorkingDirectory = $script:RepoDir
-    return [System.Diagnostics.Process]::Start($info)
+    $process = [System.Diagnostics.Process]::Start($info)
+    $script:Children.Add($process)
+    return $process
+}
+
+# Ends every sqlplus session this wrapper started that is still running, so
+# none outlives the wrapper (on any exit path).
+function Stop-Children {
+    foreach ($child in $script:Children) {
+        try {
+            if (-not $child.HasExited) {
+                $child.Kill()
+                Write-Out (' Ended a sqlplus session left running (PID ' + $child.Id + ').') 'Yellow'
+            }
+        } catch {
+            Write-Out (' A sqlplus session could not be ended (PID ' + $child.Id + '): ' + $_.Exception.Message) 'Yellow'
+        }
+    }
 }
 
 function Get-ScriptLine {
@@ -531,6 +549,9 @@ function Invoke-MonitorCommand {
         $left = [int]($deadline - (Get-Date)).TotalMilliseconds
         if ($left -le 0 -or -not $Monitor.Pending.Wait($left)) {
             $message = 'The monitor session did not answer within ' + [int]($TimeoutMs / 1000) + ' s.'
+            if ($lines.Count -gt 0) {
+                $message = $message + ' It printed: ' + (@($lines | Select-Object -Last 10) -join ' | ')
+            }
             throw (New-Object System.TimeoutException($message))
         }
         $line = $Monitor.Pending.Result
@@ -754,7 +775,18 @@ function Invoke-ToolRun {
 
     $state.Monitor = Open-Monitor $Ctx.Cred
     $begin = @($Action, $Ctx.Retention, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact, $undo)
-    $lines = Invoke-MonitorCommand $state.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $begin) 120000
+    try {
+        $lines = Invoke-MonitorCommand $state.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $begin) 120000
+    } catch {
+        # No run was created (or none is known): end the session, then show
+        # the tool's sessions and runs as the database sees them.
+        Write-Out (' ' + $_.Exception.Message) 'Red'
+        try { $state.Monitor.Process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
+        Write-Out ' State of the tool in the database (status):' 'Yellow'
+        $diagnosis = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'status.sql') @()
+        Show-Lines $diagnosis.Output -Indent
+        Exit-Tool $script:ExitFail 'The run could not be created: the monitor session did not answer.'
+    }
     foreach ($line in $lines) {
         if ($line -match '^EPF_RUN_ID=(\d+)$') { $state.RunId = [long]$Matches[1] }
     }
@@ -1245,4 +1277,6 @@ try {
 } catch {
     Write-Out (' Error: ' + $_.Exception.Message) 'Red'
     exit $script:ExitAborted
+} finally {
+    Stop-Children
 }

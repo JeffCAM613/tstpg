@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-30 - End-to-end run on EPFPG781 (0.4.3): undo apply error, hang at T16; fixes (0.4.4)
+
+Results (EPFPG781, fresh copy, RETENTION_DAYS=365; partial log `logs/tests/2026-09-30_143658_EPFPG781/`)
+- T01-T10, T14, T15 passed (install, redo logs 3 x 150 MB -> 4 x 1 GB, preflights with UNDO_CAP for the planned undo tuning, dry run, LOGS with compaction, BANK_STATEMENTS clearing).
+- T11, T13: `undo.sql APPLY` failed with ORA-00923 in `epf_tuning` (line 309): the new growth-limit query used the reserved word INCREMENT as a column alias; the SQL of an invoker-rights package is checked when it runs, not at install. The failure path worked: no datafile had been changed, the purge was not started, undo_retention was restored, the runs ended FAILED with their reports. T12 failed as a consequence (no stopped run). PAYMENTS was not purged.
+- T16: after the wizard's preflight (R-000009) and the confirmation, the new monitor session did not answer `begin_run.sql` within 120 s (cause not visible in the log: the session's output and database state were not captured). The wrapper stopped with an error but left that sqlplus running; it held the output pipe of the wrapper, so the test suite waited indefinitely.
+
+Changes
+- `epf_tuning`: alias `incr_bytes` (all SQL searched for reserved words used as aliases; this was the only one).
+- Wrapper: every sqlplus it starts is registered and ended when the wrapper exits, on every exit path; when `begin_run` does not answer, the monitor session is ended, the message includes what the session printed, `status` is shown, and the exit code is 1.
+- `epf_report.print_status` (`status`): lists the other sessions of the tool schema with status, wait event, seconds, blocking session (user, machine, program) and SQL_ID, so a stuck monitor or worker shows why.
+- Test suite: once a process has exited its output is read for 15 more seconds at most; sqlplus processes left behind by a step (parent ended) are ended and fail the step ("no sqlplus session left running by the wrapper"); only T01 runs whatever the selection (T03 no longer runs with `--only`); T14 checks that the COMPACT step ran (nothing to compact on data an earlier run compacted).
+- Checked locally: a `begin_run` that never answers (stand-in for sqlplus) now ends in 2 minutes with the diagnosis, exit 1, no sqlplus left, and the suite continues.
+- Tool version 0.4.4.
+
+How to test
+1. EPFPG781 as it is (PAYMENTS untouched, LOGS purged, BANK_STATEMENTS LOB values cleared) or a fresh copy: `git pull`, `src\tests\e2e\run_tests.bat`.
+
 ## 2026-09-30 - Second end-to-end run on EPFPG783: 19/19 passed; review fixes (0.4.3)
 
 Results (EPFPG783, 0.4.2, RETENTION_DAYS=365; log `logs/tests/2026-09-29_205549_EPFPG783/`, 01:06:04)

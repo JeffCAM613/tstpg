@@ -168,9 +168,28 @@ function Format-Duration {
     return ('{0:00}:{1:00}:{2:00}' -f [Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds)
 }
 
+# Ends sqlplus processes started since $Since whose parent process has ended
+# (left behind by a wrapper that exited). They would also keep the wrapper's
+# output pipe open. Returns how many were ended.
+function Stop-Orphans {
+    param([datetime]$Since)
+    $count = 0
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name = 'sqlplus.exe'")) {
+        if ($p.CreationDate -lt $Since) { continue }
+        if ($null -ne (Get-Process -Id $p.ParentProcessId -ErrorAction SilentlyContinue)) { continue }
+        Write-TestLog ('---- sqlplus left running (PID ' + $p.ProcessId + ', started ' +
+                       $p.CreationDate.ToString('HH:mm:ss') + '): ended') 'Yellow'
+        Stop-Tree ([int]$p.ProcessId)
+        $count++
+    }
+    return $count
+}
+
 # Starts a process with the given standard input, writes every output line to
 # the log as it arrives, calls $OnLine for each line, and ends it after the
 # timeout (with $OnTimeout called first, and 15 more minutes, when given).
+# Once the process has exited, its output is read for 15 more seconds at
+# most: a process it left running can keep the pipe open.
 function Invoke-Process {
     param([string]$File, [string]$Arguments, [string]$Display, [string[]]$InputLines = @(),
           [string[]]$InputDisplay = @(), [int]$TimeoutMin = 15, [scriptblock]$OnLine = $null,
@@ -197,6 +216,8 @@ function Invoke-Process {
     $timedOut = $false
     $graceUsed = $false
     $pending = $null
+    $exitedAt = $null
+    $orphans = 0
     while ($true) {
         if ($null -eq $pending) { $pending = $process.StandardOutput.ReadLineAsync() }
         $left = [int]($deadline - (Get-Date)).TotalMilliseconds
@@ -213,7 +234,18 @@ function Invoke-Process {
             Stop-Tree $process.Id
             break
         }
-        if (-not $pending.Wait([Math]::Min($left, 5000))) { continue }
+        if (-not $pending.Wait([Math]::Min($left, 5000))) {
+            if ($process.HasExited) {
+                if ($null -eq $exitedAt) {
+                    $exitedAt = Get-Date
+                } elseif (((Get-Date) - $exitedAt).TotalSeconds -ge 15) {
+                    Write-TestLog '---- the process has exited but its output is still open'
+                    $orphans = $orphans + (Stop-Orphans $started)
+                    break
+                }
+            }
+            continue
+        }
         $line = $pending.Result
         $pending = $null
         if ($null -eq $line) { break }
@@ -223,7 +255,8 @@ function Invoke-Process {
     }
     if (-not $process.WaitForExit(120000)) { Stop-Tree $process.Id }
     $process.WaitForExit()
-    $errText = $errors.Result
+    $errText = ''
+    if ($errors.Wait(15000)) { $errText = $errors.Result }
     if (-not [string]::IsNullOrWhiteSpace($errText)) {
         foreach ($l in ($errText -split "`r?`n")) { if ($l -ne '') { $lines.Add($l); Write-TestLog ('stderr: ' + $l) } }
     }
@@ -231,7 +264,9 @@ function Invoke-Process {
     if ($timedOut) { $code = -1 }
     $seconds = [int]((Get-Date) - $started).TotalSeconds
     Write-TestLog ('exit ' + $code + ' (' + (Format-Duration $seconds) + ')')
-    return [pscustomobject]@{ ExitCode = $code; Output = ($lines -join "`n"); TimedOut = $timedOut; Runs = @() }
+    $orphans = $orphans + (Stop-Orphans $started)
+    return [pscustomobject]@{ ExitCode = $code; Output = ($lines -join "`n"); TimedOut = $timedOut; Runs = @();
+                              Orphans = $orphans }
 }
 
 function Get-RunFolders {
@@ -273,6 +308,7 @@ function Invoke-Wrapper {
     }
     $result.Runs = $runs.ToArray()
     Test-Clean $result
+    Add-Check ($result.Orphans -eq 0) ('no sqlplus session left running by the wrapper (' + $result.Orphans + ' ended)')
     return $result
 }
 
@@ -401,9 +437,11 @@ function Test-Selected {
     return $true
 }
 
+# -Always: runs whatever the selection (the safety precheck). -Required: when
+# it fails, the remaining tests are skipped.
 function Invoke-Test {
-    param([string]$Id, [string]$Title, [scriptblock]$Body, [switch]$Required)
-    if (-not $Required -and -not (Test-Selected $Id)) { return }
+    param([string]$Id, [string]$Title, [scriptblock]$Body, [switch]$Required, [switch]$Always)
+    if (-not $Always -and -not (Test-Selected $Id)) { return }
     if ($script:Aborted) {
         $script:Results.Add([pscustomobject]@{ Id = $Id; Title = $Title; Status = 'SKIPPED'; Seconds = 0; Failures = @() })
         return
@@ -458,7 +496,7 @@ $script:TestList = @(
 )
 
 function Invoke-Suite {
-    Invoke-Test 'T01' 'Precheck: database identity, non-CDB, redo logs, undo (SYS; safety gate)' -Required {
+    Invoke-Test 'T01' 'Precheck: database identity, non-CDB, redo logs, undo (SYS; safety gate)' -Required -Always {
         $r = Invoke-Sql 'SYS' @(
             'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
             "SELECT 'DB|' || name || '|' || cdb || '|' || log_mode || '|' || open_mode || '|' || database_role FROM v`$database;",
@@ -686,7 +724,8 @@ function Invoke-Suite {
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS',
                               '--compact') -TimeoutMin 90 -StopOnTimeout
         Assert-Exit $r @(0, 2)
-        Assert-Match $r 'COMPACTED|COMPACT_SKIPPED'
+        Assert-Match $r 'PURGE COMPACT DONE'
+        Write-Note $r 'COMPACTED' 'tables compacted (none when an earlier run already compacted them)'
         $run = Get-Run $r 'PURGE'
         foreach ($check in @('P1', 'P3', 'P6')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Assert-Manifest $run 'check.P8' '^(PASS|WARN)'

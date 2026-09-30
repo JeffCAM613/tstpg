@@ -306,7 +306,7 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
             RETURN;
         END IF;
         l_room := GREATEST(p_cap - l_total, 0);
-        FOR f IN (SELECT d.file_id, d.file_name, d.bytes, d.maxbytes, d.increment_by * t.block_size AS increment
+        FOR f IN (SELECT d.file_id, d.file_name, d.bytes, d.maxbytes, d.increment_by * t.block_size AS incr_bytes
                     FROM dba_data_files d
                     JOIN dba_tablespaces t ON t.tablespace_name = d.tablespace_name
                    WHERE d.tablespace_name = p_ts AND d.autoextensible = 'YES'
@@ -315,11 +315,11 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
             IF l_max < f.maxbytes THEN
                 INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_autoextend, original_maxbytes,
                                                        original_increment, applied_value, applied_at, applied_run_id)
-                VALUES ('UNDO_DATAFILE', f.file_name, f.file_id, 'YES', f.maxbytes, f.increment, l_max,
+                VALUES ('UNDO_DATAFILE', f.file_name, f.file_id, 'YES', f.maxbytes, f.incr_bytes, l_max,
                         CAST(SYSTIMESTAMP AS TIMESTAMP), p_run_id);
                 COMMIT;
                 EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || f.file_id || ' AUTOEXTEND ON NEXT '
-                                  || f.increment / 1024 || 'K MAXSIZE ' || l_max / 1024 || 'K';
+                                  || f.incr_bytes / 1024 || 'K MAXSIZE ' || l_max / 1024 || 'K';
                 say('OK', 'UNDO_GROWTH_LIMITED', f.file_name || ': may grow to ' || ROUND(l_max / 1048576)
                                                  || ' MB (was ' || ROUND(f.maxbytes / 1048576) || ' MB)');
             ELSE

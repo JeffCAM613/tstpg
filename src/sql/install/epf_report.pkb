@@ -620,6 +620,26 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_run_id NUMBER := NVL(l_active, epf_control.latest_run_id);
         l_count  NUMBER := 0;
     BEGIN
+        -- Other sessions of the tool schema: monitor and worker sessions, with
+        -- what they wait on and who blocks them.
+        FOR s IN (SELECT w.sid, w.serial#, w.status, w.event, w.seconds_in_wait, w.blocking_session, w.sql_id,
+                         w.action, w.client_identifier, TO_CHAR(w.logon_time, 'HH24:MI:SS') AS logon,
+                         (SELECT b.username || '@' || b.machine || ' ' || b.program
+                            FROM v$session b
+                           WHERE b.sid = w.blocking_session AND ROWNUM = 1) AS blocker
+                    FROM v$session w
+                   WHERE w.username = $$PLSQL_UNIT_OWNER
+                     AND w.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
+                   ORDER BY w.logon_time) LOOP
+            put('session ' || s.sid || ',' || s.serial# || ' ' || s.status || ' since ' || s.logon
+                || CASE WHEN s.client_identifier IS NOT NULL THEN ' ' || s.client_identifier END
+                || CASE WHEN s.action IS NOT NULL THEN ' ' || s.action END
+                || ': ' || s.event || ' ' || s.seconds_in_wait || ' s'
+                || CASE WHEN s.blocking_session IS NOT NULL THEN
+                        ', blocked by session ' || s.blocking_session || ' (' || s.blocker || ')'
+                   END
+                || CASE WHEN s.sql_id IS NOT NULL THEN ', sql_id ' || s.sql_id END);
+        END LOOP;
         IF l_run_id IS NULL THEN
             put('No run recorded.');
             RETURN;

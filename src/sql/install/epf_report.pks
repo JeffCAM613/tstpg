@@ -66,9 +66,10 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   EPF_ADVICE|ROOTS|<owner.table>|<eligible rows>   per root table
     PROCEDURE print_advice(p_run_id IN NUMBER);
 
-    -- Prints the state of the active run (or the latest one): status, steps
-    -- not DONE, the last events, temporary indexes still present, active
-    -- undo tuning, accounts still locked by a reclaim.
+    -- Prints the other sessions of the tool schema (wait event, blocker,
+    -- SQL_ID), then the state of the active run (or the latest one): status,
+    -- steps not DONE, the last events, temporary indexes still present,
+    -- active undo tuning, accounts still locked by a reclaim.
     PROCEDURE print_status;
 
 END epf_report;
