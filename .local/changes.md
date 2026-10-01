@@ -2,6 +2,34 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-01 - Parity check against the previous tool
+
+Closes the open exit criterion of phase 2 (parity with the previous tool), row by row, on two copies of the same database (plan 12.6).
+
+- `src/tests/parity/parity.sql` (SYS, read-only; steps in `parity_step.sql`): for the 27 tables of the previous tool, every row is classed by four flags and counted with a checksum of its key (primary key, otherwise unique key, otherwise every column that is not a LOB or LONG) per class:
+  - D: the previous tool deletes it. Its rules, transcribed from `legacy/sql/03_epf_purge_pkg_body.sql`: bulk payments by value date and their 20 dependent tables (payment_audit by bulk payment and by payment), file_integration by integration date, audit_trail by timestamp with the audit_archive rows it references, spec_trt_log by date, file_dispatching by reception date only when it has directory rows, with those rows.
+  - X: deleted through an ON DELETE CASCADE foreign key from a D row (NOTIFICATION_EXECUTION.IMPORT_AUDIT_FK).
+  - N: this tool selects it (registry links, before holding back).
+  - C: the previous tool clears its LOB values in CLOB_ONLY and CLOB_N_LOGS (payment_audit by bulk payment only).
+  - Scope CLOB also records the non-empty LOB values per column and class.
+- The snapshot also records every enabled foreign key into the 27 tables. When kept rows reference D rows, the count is reported: the previous tool's delete fails with ORA-02292 there, and the module stops.
+- It records the last runs of both tools as well: `OPPAYMENTS.EPF_PURGE_LOG` with its errors, and `EPFPG.EPF_RUN` with the held rows.
+- `src/tests/parity/compare.ps1` reads the four snapshots. It checks:
+  - both copies started identical (every class, count and checksum), and both purges used the snapshot cutoff;
+  - the previous tool deleted or cleared exactly what its rules select, or the rows it left are listed with its errors;
+  - this tool kept every row it does not select.
+
+  Every difference between the two results is classified: D8, D16 (held back, cascade rows of kept roots), PAYMENT_AUDIT (LOB clearing through the payment). Anything else fails.
+- `compare.ps1 -Before` reads only the two BEFORE snapshots, before any purge is started. It checks that both copies start identical and lists, per table, what each tool will change. It also lists the expected differences, the rule differences and the foreign keys that will stop the previous tool. Exit 0 READY, 1 INVALID or rule differences.
+- Checked locally with synthetic snapshots: identical results (exit 0), explained differences (exit 2), a kept row deleted (exit 1), different starting data (exit 1), LOB clearing with the PAYMENT_AUDIT and D8 differences (exit 2), CLOB mode on snapshots without LOB values (refused). The SQL has not run on a database yet.
+
+How to test (EPFPG783 for the previous tool, EPFPG782 for this tool, both refreshed from the same source; both purges on the same day with the same retention, so cutoff = that day minus the retention)
+1. In the tool folder: `sqlplus -L "sys@EPFPG783 AS SYSDBA" @src\tests\parity\parity.sql LEGACY_BEFORE <cutoff>` and `sqlplus -L "sys@EPFPG782 AS SYSDBA" @src\tests\parity\parity.sql NEW_BEFORE <cutoff>` (two windows can run at once). Do not run the end-to-end suite on these copies: it purges them.
+1b. `powershell -NoProfile -ExecutionPolicy Bypass -File src\tests\parity\compare.ps1 -Mode FULL -Before`: purge only on RESULT READY; send `logs\parity\parity_before_report.txt`.
+2. Previous tool on EPFPG783: `legacy\bin\epf_purge.bat --tns EPFPG783 --user oppayments --retention <days> --depth ALL --mode FULL`, without reclaim. This tool on EPFPG782: `src\bin\epf_purge.bat install --tns EPFPG782`, then `src\bin\epf_purge.bat purge --tns EPFPG782 --retention <days> --depth ALL --mode FULL --redo-logs --undo-tuning`.
+3. `parity.sql LEGACY_AFTER <cutoff>` on EPFPG783 and `parity.sql NEW_AFTER <cutoff>` on EPFPG782.
+4. `powershell -NoProfile -ExecutionPolicy Bypass -File src\tests\parity\compare.ps1 -Mode FULL`; send `logs\parity\parity_report.txt`.
+
 ## 2026-09-30 - End-to-end run on EPFPG781 (0.4.4): 19/19 passed
 
 Results (EPFPG781 as the 0.4.3 run left it: PAYMENTS untouched, LOGS purged, BANK_STATEMENTS LOB values cleared; RETENTION_DAYS=365; 01:01:21; log kept on the test machine only, `logs/tests/2026-09-30_172149_EPFPG781/`)

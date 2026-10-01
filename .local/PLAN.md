@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft 3 - decisions D1-D16 applied; phase 1 delivered and tested; phase 2 (purge engine) delivered, not yet run. Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied; phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity check against the previous tool (phase 2 exit criterion) written, not yet run. Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -845,6 +845,14 @@ One command runs every current test against one refreshed test database and writ
 | T19 | Final state: redo logs, undo_retention as before, no active undo change, no temporary index left, no run left RUNNING |
 
 Every step records the command (passwords masked), its full output, exit code and the manifest of each run it created; checks compare exit codes, output patterns and manifest values, and any SP2-/PLS-/compile or missing-object error fails the step. Ctrl+C itself is not scripted (the console is redirected); the stop action exercises the same graceful stop. `--only`, `--from` re-run parts; T01 always runs.
+
+### 12.6 Parity check (`src/tests/parity`)
+
+The purge parity of 12.2, row by row, on two copies of the same database: one purged by the previous tool (`legacy/`), one by this tool, same cutoff, mode and depth.
+
+- `parity.sql <label> <cutoff> [FULL|CLOB]` (SYS, read-only) is run on each copy before and after its purge (labels `LEGACY_BEFORE`, `LEGACY_AFTER`, `NEW_BEFORE`, `NEW_AFTER`; files in `logs/parity`). For the 27 tables of the previous tool it classes every row with four flags and records the row count and a checksum of the keys per class: D the previous tool deletes it (its rules, transcribed from `epf_purge_pkg`), X it is deleted through an ON DELETE CASCADE key from a D row, N this tool selects it (registry links, before holding back), C the previous tool clears its LOB values. Scope CLOB also records the non-empty LOB values per column and class. It also records the foreign keys into the tables (rows of kept trees referencing D rows: ORA-02292 for the previous tool) and the runs both tools logged.
+- `compare.ps1 -Mode <mode> [-Depth <depth>]` checks that both copies started identical, that each tool changed exactly the rows its rules select, and classifies every difference: D8 (bank statement files without directory rows), D16 (rows held back, including rows the previous tool deletes through ON DELETE CASCADE), PAYMENT_AUDIT in LOB clearing (the previous tool clears it by bulk payment only). Anything else fails. Exit 0 identical, 2 explained differences only, 1 fail or unusable snapshots. With `-Before` it reads only the two BEFORE snapshots: identical start, what each tool will change, rule differences; the purges start only on READY.
+- Covered: FULL, CLOB_ONLY, CLOB_N_LOGS (the previous tool adds LOGS to the depth) on all three modules. Not covered: the previous tool's reclaim, shrink, redo sizing and index scripts, which change no rows.
 
 ---
 
