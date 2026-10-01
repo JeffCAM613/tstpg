@@ -2,6 +2,16 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-09-30 - End-to-end run on EPFPG781 (0.4.4): 19/19 passed
+
+Results (EPFPG781 as the 0.4.3 run left it: PAYMENTS untouched, LOGS purged, BANK_STATEMENTS LOB values cleared; RETENTION_DAYS=365; 01:01:21; log kept on the test machine only, `logs/tests/2026-09-30_172149_EPFPG781/`)
+- All 19 tests passed, no check failed. Every wrapper step ended with no sqlplus session left running (0 ended); T16 completed in 00:04:08.
+- Undo growth cap: at T05 UNDOTBS1 was 3,435 MB with a growth limit of 32,768 MB. T11 and T13 set the cap to 4,096 MB (setting `undo_cap_mb`; 4 x the undo of one batch was 920 MB and 540 MB) and limited the datafile 32,768 -> 4,096 MB. The PAYMENTS purge to the end (R-000015: 87,309,042 rows, 275/275 batches in 00:26:44, 67.6 GB redo, 33.2 GB undo, verdict PASS) completed within the cap: UNDOTBS1 3,435 -> 4,096 MB (27.6 GB on EPFPG783 without the cap, 00:27:07). T16 (BANK_STATEMENTS full purge, R-000019: 3,980,655 rows, 1.6 GB undo) ran with the cap at the current size (4,096 MB, no growth left) and completed. After every run the growth limit was back at 32,768 MB (T12, T13, T19) and undo_retention at 900 s.
+- The stopped run (R-000014, after batch 9 of 284, 1.2 GB undo) and the dry run (T10, work keys in TEMP) did not grow the undo tablespace.
+- Undo per batch: the preflight before any measured purge estimated 230 MB (measured: 1.2 GB / 9 batches, about 136 MB); after that run 135 MB (measured in R-000015: 33.2 GB / 275, about 124 MB).
+- T14 (LOGS) and T15 (BANK_STATEMENTS clearing) had nothing to process (0 rows; 0 LOB values in 199 batches): the 0.4.3 run had purged them (1,659,623 rows; 2,426,081 LOB values), and their code is unchanged in 0.4.4.
+- Space used inside segments: PAYMENTS 28.9 -> 13.7 GB, BANK_STATEMENTS 15.5 -> 3.2 GB.
+
 ## 2026-09-30 - End-to-end run on EPFPG781 (0.4.3): undo apply error, hang at T16; fixes (0.4.4)
 
 Results (EPFPG781, fresh copy, RETENTION_DAYS=365; partial log `logs/tests/2026-09-30_143658_EPFPG781/`)
