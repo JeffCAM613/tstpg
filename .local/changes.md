@@ -2,6 +2,32 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-01 - Parity check: running the previous tool without its wrapper
+
+Results (EPFPG782 previous tool, EPFPG781 this tool, cutoff 2025-10-01)
+- `compare.ps1 -Before`: READY. Both copies start identical, and both tools select the same rows in every table except the D8 files (5,422 FILE_DISPATCHING rows without directory rows). No rows go through ON DELETE CASCADE, and no foreign key will stop the previous tool.
+- The snapshot ran without errors on both copies, about 4 minutes each.
+- `legacy/bin/epf_purge.bat` cannot run a purge:
+  - The block that asks for the TNS name, password and retention is missing. The mode, depth and batch prompts sit inside the reclaim-only branch, so a purge run asks for nothing and connects as `oppayments/@<tns>` with an empty password (sqlplus prints its usage).
+  - A config file is read only with `--config <path>`.
+  - `wmic` no longer exists on recent Windows 11, so the timestamp is empty and the log file name contains a colon.
+
+Changes
+- `src/tests/parity/legacy_purge.sql <retention> [mode [depth [batch]]]` (as OPPAYMENTS): runs the previous tool's purge the way its wrapper does, without the wrapper. It installs `legacy/sql` 01-03 (statement errors do not stop it, as in the wrapper), stops if `EPF_PURGE_PKG` has compilation errors, calls `run_purge` with the wrapper's arguments and prints the elapsed time and the errors the run logged. Output in `logs/parity/legacy_purge.txt`.
+- The wrapper's optional steps around the purge end with EXIT, so they run as separate commands in the wrapper's order:
+  - as SYS: `06_optimize_db.sql` (redo logs 4 x 1 GB, OPPAYMENTS statistics), then `utility/08_undo_tune.sql` (undo_retention 60 s, undo datafiles limited to 8 GB, not reverted by the wrapper);
+  - as OPPAYMENTS: `06b_create_purge_indexes.sql` (temporary FK indexes), the purge, then `06c_drop_purge_indexes.sql`;
+  - as SYS: `ALTER SYSTEM SET undo_retention = 900`.
+- `legacy/` is left as it is (reference).
+
+How to test (EPFPG782, previous tool; from the top folder)
+1. `sqlplus -L "sys@EPFPG782 AS SYSDBA" @legacy\sql\06_optimize_db.sql`, then `exit` once it prints "Database optimization complete".
+2. `sqlplus -L "sys@EPFPG782 AS SYSDBA" @legacy\sql\utility\08_undo_tune.sql`
+3. `sqlplus -L "oppayments@EPFPG782" @legacy\sql\06b_create_purge_indexes.sql`
+4. `sqlplus -L "oppayments@EPFPG782" @src\tests\parity\legacy_purge.sql 365`
+5. `sqlplus -L "oppayments@EPFPG782" @legacy\sql\06c_drop_purge_indexes.sql`
+6. `sqlplus -L "sys@EPFPG782 AS SYSDBA"`, then `ALTER SYSTEM SET undo_retention = 900;` and `exit`.
+
 ## 2026-10-01 - Parity check against the previous tool
 
 Closes the open exit criterion of phase 2 (parity with the previous tool), row by row, on two copies of the same database (plan 12.6).
