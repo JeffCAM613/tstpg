@@ -6,7 +6,12 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
 
 Results (FULL, depth ALL, cutoff 2025-10-01; copies refreshed from the same source)
 - Previous tool on EPFPG782 (`legacy_purge.sql 366`, after `06_optimize_db.sql`, `08_undo_tune.sql`, `06b_create_purge_indexes.sql`): 29:04, no errors, 96,157,615 rows.
-- This tool on EPFPG781 (R-000002, `--redo-logs --undo-tuning`): verdict PASS, 96,163,037 rows. PAYMENTS took 29:22 for 284 batches; the previous tool took 26:51 for 139 batches of 1,000 bulk payments.
+- This tool on EPFPG781 (R-000002, `--redo-logs --undo-tuning`, batch 530): verdict PASS, 96,163,037 rows, 30.2 GB freed inside segments (31.6 -> 1.4 GB).
+- Timing, this tool against the previous tool:
+  - batch loops: PAYMENTS 29:22 against 26:52, LOGS 1:00 against 0:37, BANK_STATEMENTS 1:23 against 1:33;
+  - all steps: 35:11 against 29:03 for `run_purge`, without each tool's preparation;
+  - about 3.5 minutes of the difference is measurement: key snapshot 1:47, counts before and after 1:20, space 0:13;
+  - about 2.5 minutes is the batch size: 530 bulk payments per batch (284 batches) against 1,000 (139). The first purge on the database estimated about 1 MB of redo per root; 531 KB were measured, so the next recommendation for 1 GB logs is about 980.
 - `compare.ps1 -Mode FULL`: starting data identical. The remaining rows are the same, count and key checksum, in 26 of the 27 tables. FILE_DISPATCHING differs by the 5,422 files without directory rows that this tool deletes and the previous tool keeps (D8). No row held back (D16), no row deleted through ON DELETE CASCADE, no foreign key blocking the previous tool. Both tools used cutoff 2025-10-01.
 - The class counts before the purge matched the previous tool's own per-table counts exactly, including PAYMENT_AUDIT by bulk payment (15,368,660) and by payment (10,784,182). The snapshot models its rules.
 - Previous tool, findings for the record:
