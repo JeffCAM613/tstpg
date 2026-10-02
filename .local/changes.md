@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - 0.5.0 test round: end-to-end suite on EPFPG781 (set A), 21/21 passed
+
+- 21 passed, 0 failed, in 1:22:52.
+- T10B: the purge R-000004 was refused (NOT READY: UNDO, BACKUP). It ended FAILED with REQUIREMENTS_NOT_MET, and no batch ran.
+- T11:
+  - the wizard's preflight, with `--undo-tuning --backup none`, was READY except REDO_LOGS (slower only);
+  - after the redo log sizing, the purge's own preflight was READY 6 of 6;
+  - the root counts were reused, and the stop was honoured.
+- T13 against the dry run R-000007 (T12B). The redo and undo per root were measured by the three batches of T11:
+  - rows: exact;
+  - redo: 68.7 GB forecast, 67.6 GB actual (+1.6%);
+  - undo: 33.3 GB forecast, 33.2 GB actual (+0.2%);
+  - deleting time: 34:49 forecast, 28:22 actual (+22.7%). The rate came from the three batches of T11 only;
+  - space freed inside the tables: 16.2 GB forecast, 15.2 GB actual (+6.7%).
+- T14 (`--confirm UNDO`), T15 and T16 passed. Undo growth limits were restored after every run.
+
 ## 2026-10-02 - 0.5.0 test round: install check on EPFPG783 (S1, S2)
 
 - S1: the 0.5.0 install compiled; the wrapper connects and reports tool version 0.5.0.
