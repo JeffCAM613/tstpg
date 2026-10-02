@@ -2,6 +2,84 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - Requirements, simulation, forecast against result (D19, D20 round 1; 0.5.0)
+
+Why: a purge must not fill the archive destination or the undo tablespace part way (plan 6.10), and the dry run must say what the purge will do, so its accuracy can be checked against real purges.
+
+Requirements (preflight step REQUIREMENTS, report section REQUIREMENTS)
+- Six requirements, each with its reason, what was measured, the ways to meet it, and which one meets it now: ARCHIVE, UNDO, TEMP, INDEX_SPACE, REDO_LOGS, BACKUP. ARCHIVE, UNDO, TEMP and BACKUP are blocking. The section ends with RESULT READY or NOT READY.
+- A purge that deletes does not start while a blocking requirement of its own preflight is not met:
+  - the wrapper names the requirements;
+  - the purge step records REQUIREMENTS_NOT_MET;
+  - the run ends FAILED (exit 1) and nothing is changed.
+- Choices, on the command line or in the configuration file:
+  - `--backup confirmed|none` (BACKUP), for when no RMAN database backup newer than `backup_max_age_h` (24) is found;
+  - `--confirm ARCHIVE,UNDO,TEMP` (CONFIRM): the DBA confirms these are handled although the preflight finds them not met, for example an archive directory whose free space the database cannot read;
+  - `--undo-tuning` now also works with `preflight` and `--dry-run`: the requirements are checked as if undo tuning were applied, and nothing is changed;
+  - `--cutoff YYYY-MM-DD` (CUTOFF) instead of `--retention`, so a purge on a later day keeps the cutoff of its dry run.
+- Wizard, after its preflight:
+  - the backup question when no recent backup is found (stop, made another way, or none);
+  - for ARCHIVE, UNDO or TEMP not met: stop here, or the DBA confirms;
+  - the batch size offered is capped so that the undo tablespace holds 4 batches.
+- Every purge runs its own preflight with its choices, also after the wizard. After the wizard it reuses the root counts of the wizard's preflight (same cutoff, mode and depth, within `preflight_valid_h`, 8 hours), so the root tables are not scanned twice.
+- Undo tuning is sized from the purge run's own preflight.
+
+Simulation and forecast
+- Dry run report:
+  - SIMULATION per module: exact rows, roots, batches, redo, undo, deleting time, space freed;
+  - held-back roots, enabled triggers, application sessions now;
+  - RETENTION OPTIONS: the requested retention and 1.5, 2 and 3 times it, each with roots, rows, redo, archive space needed, space freed, and whether it fits;
+  - REQUIREMENTS;
+  - EXPECTED: WOULD COMPLETE (time, space), WOULD FAIL (where and why, for example the batch at which the archive space runs out), or MAY FAIL.
+- Preflight report: an ESTIMATE per module, RETENTION OPTIONS and REQUIREMENTS.
+- Purge report, FORECAST AND RESULT per module:
+  - it compares the forecast with the actual rows, redo, undo, deleting time and space freed, with the error in percent;
+  - the forecast comes from the latest dry run with the same cutoff and mode and no purge of the module since, otherwise from the purge's own preflight.
+- Deleting time uses the redo rate measured by the latest purge on the database (else `redo_rate_mb_s`, 30).
+
+Other
+- New settings:
+  - `archive_margin_pct` 20;
+  - `backup_max_age_h` 24;
+  - `redo_rate_mb_s` 30;
+  - `preflight_valid_h` 8.
+- New grants:
+  - V$ARCHIVE_DEST, V$RECOVERY_FILE_DEST, V$ASM_DISKGROUP, V$RMAN_BACKUP_JOB_DETAILS;
+  - DBA_TEMP_FREE_SPACE, DBA_TEMP_FILES, DBA_TRIGGERS.
+- New tables: EPF_TREE_EST, EPF_ROOT_MONTH, EPF_RETENTION_OPTION, EPF_REQUIREMENT, EPF_REQ_OPTION, EPF_FORECAST.
+- New EPF_RUN columns: BACKUP_CHOICE, CONFIRMED_REQS.
+- manifest.txt gains these keys:
+  - `cutoff`, `backup`, `confirmed`;
+  - `req.<requirement>`, `requirements_ready`;
+  - `expected`, `forecast.<module>.<measure>`.
+- Advice lines: READY, REQ, UNDO_MAX_BATCH.
+- Not in this round (round 2): the plan of smaller runs, choices stored with the preflight, plan lifecycle and menu.
+
+End-to-end suite (21 tests)
+- T07: new usage errors (retention with cutoff, bad cutoff date, bad backup choice, `--confirm BACKUP`).
+- T08 and T10: requirements, estimate, retention options, simulation, expected outcome.
+- T10B, new: with `backup_max_age_h` set to 0 for the test, a LOGS purge without `--backup` is refused (exit 1, REQUIREMENTS_NOT_MET, no batch). The setting is put back afterwards.
+- T11 and T16: `--backup none`. T11 also checks that the purge reused the wizard's root counts.
+- T12B, new: a PAYMENTS dry run with T13's batch size.
+- T13 compares its result with that dry run:
+  - rows must match exactly (check);
+  - redo, undo, deleting time and space freed are logged as `forecast accuracy` lines with their error.
+- T14: `--backup none --confirm UNDO` (no undo tuning).
+- T15: `--backup none`.
+- T18: the READY and REQ advice lines.
+
+Not yet run: written without a database. The new PL/SQL compiles for the first time at install (T03 and T04 would show compile errors).
+
+How to test
+1. Refresh EPFPG781, pull, and run `run_tests.bat`. T03 installs 0.5.0.
+2. Send the digest. These PowerShell commands write `logs\review.txt` from the latest test session and copy it to the clipboard:
+   ```
+   $log = Get-ChildItem logs\tests -Directory | Sort-Object Name | Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName 'test.log' }
+   Select-String -Path $log -Pattern '^====|^----|FAILED|forecast accuracy|  note |^ RESULT' | ForEach-Object { $_.Line } | Set-Content logs\review.txt
+   Get-Content logs\review.txt | Set-Clipboard
+   ```
+3. Optional: run `epf_purge.bat preflight --retention 366` and read REQUIREMENTS and RETENTION OPTIONS in the report.
+
 ## 2026-10-02 - Parity with the previous tool: EXPLAINED (D8 only)
 
 Results (FULL, depth ALL, cutoff 2025-10-01; copies refreshed from the same source)

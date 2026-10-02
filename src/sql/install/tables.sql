@@ -134,6 +134,8 @@ BEGIN
             with_reclaim    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_compact    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_undo_tuning CHAR(1)       DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N')),
+            backup_choice   VARCHAR2(10)   CHECK (backup_choice IN ('CONFIRMED', 'NONE')),
+            confirmed_reqs  VARCHAR2(100),
             stop_requested  CHAR(1)        DEFAULT 'N' NOT NULL,
             created_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
             started_at      TIMESTAMP,
@@ -154,6 +156,15 @@ BEGIN
     -- with_undo_tuning: undo tuning (epf_tuning.undo_apply) is applied for the
     -- purge by the caller; the preflight then assumes its growth limit.
     add_column('EPF_RUN', 'WITH_UNDO_TUNING', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N'))]');
+    -- backup_choice: how the operator meets the BACKUP requirement when no
+    -- recent RMAN backup is found: CONFIRMED (a backup made another way) or
+    -- NONE (purge without a backup); NULL when not given.
+    add_column('EPF_RUN', 'BACKUP_CHOICE', q'[VARCHAR2(10) CHECK (backup_choice IN ('CONFIRMED', 'NONE'))]');
+    -- confirmed_reqs: blocking requirements the operator confirms are handled
+    -- although the preflight finds them not met (ARCHIVE, UNDO, TEMP;
+    -- separated by commas), for example an archive directory whose free
+    -- space the database cannot read.
+    add_column('EPF_RUN', 'CONFIRMED_REQS', 'VARCHAR2(100)');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -487,6 +498,102 @@ BEGIN
             applied_run_id       NUMBER,
             CONSTRAINT epf_instance_change_pk PRIMARY KEY (change_id),
             CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE'))
+        )]');
+
+    -- Per root tree of a preflight: eligible roots and the redo and undo per
+    -- root with their basis (measured by an earlier purge, or estimated).
+    create_table('EPF_TREE_EST', q'[
+        CREATE TABLE epf_tree_est (
+            run_id      NUMBER          NOT NULL,
+            table_id    NUMBER          NOT NULL,
+            action      VARCHAR2(10)    NOT NULL,
+            roots       NUMBER,
+            redo_root   NUMBER,
+            redo_basis  VARCHAR2(400),
+            undo_root   NUMBER,
+            undo_basis  VARCHAR2(400),
+            undo_rate   NUMBER,
+            CONSTRAINT epf_tree_est_pk PRIMARY KEY (run_id, table_id)
+        )]');
+
+    -- Roots before the cutoff of a preflight per month of their date (the
+    -- largest purge that fits the archive space, smaller runs).
+    create_table('EPF_ROOT_MONTH', q'[
+        CREATE TABLE epf_root_month (
+            run_id       NUMBER   NOT NULL,
+            table_id     NUMBER   NOT NULL,
+            month_start  DATE     NOT NULL,
+            roots        NUMBER   NOT NULL,
+            CONSTRAINT epf_root_month_pk PRIMARY KEY (run_id, table_id, month_start)
+        )]');
+
+    -- Roots before the cutoff of each retention option of a preflight (the
+    -- requested retention and longer ones: retention table).
+    create_table('EPF_RETENTION_OPTION', q'[
+        CREATE TABLE epf_retention_option (
+            run_id          NUMBER   NOT NULL,
+            retention_days  NUMBER   NOT NULL,
+            table_id        NUMBER   NOT NULL,
+            cutoff_date     DATE     NOT NULL,
+            roots           NUMBER   NOT NULL,
+            CONSTRAINT epf_retention_option_pk PRIMARY KEY (run_id, retention_days, table_id)
+        )]');
+
+    -- Requirements of a purge measured by its preflight. status MET, NOT_MET
+    -- or NOT_APPLICABLE; blocking Y when a purge cannot be expected to finish
+    -- without it (N: it only slows the purge or leaves no way back).
+    create_table('EPF_REQUIREMENT', q'[
+        CREATE TABLE epf_requirement (
+            run_id        NUMBER          NOT NULL,
+            req_code      VARCHAR2(20)    NOT NULL,
+            seq           NUMBER          NOT NULL,
+            status        VARCHAR2(20)    NOT NULL,
+            blocking      CHAR(1)         NOT NULL,
+            title         VARCHAR2(200)   NOT NULL,
+            why           VARCHAR2(1000),
+            measured      VARCHAR2(2000),
+            needed_bytes  NUMBER,
+            room_bytes    NUMBER,
+            met_by        VARCHAR2(30),
+            CONSTRAINT epf_requirement_pk PRIMARY KEY (run_id, req_code),
+            CONSTRAINT epf_requirement_ck CHECK (status IN ('MET', 'NOT_MET', 'NOT_APPLICABLE')
+                                                 AND blocking IN ('Y', 'N'))
+        )]');
+
+    -- Ways to meet a requirement; met Y when the option meets it now.
+    create_table('EPF_REQ_OPTION', q'[
+        CREATE TABLE epf_req_option (
+            run_id       NUMBER          NOT NULL,
+            req_code     VARCHAR2(20)    NOT NULL,
+            option_code  VARCHAR2(30)    NOT NULL,
+            seq          NUMBER          NOT NULL,
+            met          CHAR(1)         NOT NULL,
+            title        VARCHAR2(200)   NOT NULL,
+            detail       VARCHAR2(2000),
+            CONSTRAINT epf_req_option_pk PRIMARY KEY (run_id, req_code, option_code),
+            CONSTRAINT epf_req_option_ck CHECK (met IN ('Y', 'N'))
+        )]');
+
+    -- Forecast per module: by the preflight (eligible roots, estimates) and
+    -- by a dry run (exact rows and roots after holding back, space freed).
+    -- A purge report compares its result with the latest forecast.
+    create_table('EPF_FORECAST', q'[
+        CREATE TABLE epf_forecast (
+            run_id          NUMBER          NOT NULL,
+            origin          VARCHAR2(10)    NOT NULL,
+            module_code     VARCHAR2(30)    NOT NULL,
+            action          VARCHAR2(10),
+            roots           NUMBER,
+            row_count       NUMBER,
+            batches         NUMBER,
+            redo_bytes      NUMBER,
+            undo_bytes      NUMBER,
+            delete_seconds  NUMBER,
+            freed_bytes     NUMBER,
+            redo_basis      VARCHAR2(400),
+            time_basis      VARCHAR2(400),
+            CONSTRAINT epf_forecast_pk PRIMARY KEY (run_id, origin, module_code),
+            CONSTRAINT epf_forecast_ck CHECK (origin IN ('PREFLIGHT', 'DRY_RUN'))
         )]');
 
     -- Accounts locked and sessions disconnected for the reclaim window.

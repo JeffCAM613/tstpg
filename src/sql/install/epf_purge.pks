@@ -73,7 +73,41 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   STOP_HONORED, TREE_REDO, TREE_UNDO, TABLE_RESULT, LINK_ORPHANS, COMPACTED,
 --   COMPACT_SKIPPED, COMPACT_FAILED, ROW_MOVEMENT_KEPT, MODULE_END, STEP_FAILED,
 --   IDX_MISSING, IDX_SUMMARY, ROOTS_ELIGIBLE, REDO_LOGS, REDO_ESTIMATE,
---   REDO_SUMMARY, UNDO, UNDO_ESTIMATE, UNDO_TUNING, PURGE_END.
+--   REDO_SUMMARY, UNDO, UNDO_ESTIMATE, UNDO_TUNING, REQUIREMENTS, FORECAST,
+--   ROOTS_RECOUNTED, REQUIREMENTS_NOT_MET, PURGE_END.
+--
+-- Requirements (preflight step REQUIREMENTS; EPF_REQUIREMENT, EPF_REQ_OPTION)
+--   Six conditions for a purge to run to its end, each with the ways to meet
+--   it and which of them meets it now:
+--     ARCHIVE      archived logs fit the archive destination (ARCHIVELOG):
+--                  redo estimate + archive_margin_pct against the free space
+--                  of the recovery area or ASM disk group; a directory cannot
+--                  be measured from the database
+--     UNDO         the undo tablespace holds 4 batches and the undo kept for
+--                  undo_retention, or undo tuning limits it
+--     TEMP         TEMP holds the work keys
+--     INDEX_SPACE  the tool's tablespace holds the temporary indexes
+--     REDO_LOGS    one batch fits an online log (otherwise only slower)
+--     BACKUP       an RMAN database backup newer than backup_max_age_h, or
+--                  the run's backup_choice (CONFIRMED, NONE)
+--   ARCHIVE, UNDO, TEMP and BACKUP are blocking. The operator can confirm
+--   ARCHIVE, UNDO and TEMP as handled (EPF_RUN.confirmed_reqs), for example
+--   an archive directory whose free space the database cannot read. A purge
+--   that deletes does not start while a blocking requirement of its
+--   preflight is not met (REQUIREMENTS_NOT_MET, status FAILED). Root counts
+--   are kept per month (EPF_ROOT_MONTH: the largest purge that fits the
+--   archive space) and for 1.5, 2 and 3 times the retention
+--   (EPF_RETENTION_OPTION). A purge's preflight reuses the root counts of
+--   the wizard's preflight run (same cutoff, mode and depth, within
+--   preflight_valid_h) instead of counting again.
+--
+-- Forecast (EPF_FORECAST, per module)
+--   The preflight forecasts roots, batches, redo, undo (estimates per root,
+--   EPF_TREE_EST) and the deleting time at the redo rate measured by the
+--   latest purge on the database (else redo_rate_mb_s). A dry run ends with
+--   step FORECAST: exact rows and roots after holding back, its batches, and
+--   the space freed inside the segments (used space x eligible share). The
+--   report of a purge compares its result with the latest forecast.
 --
 -- Redo
 --   The redo written by each root tree is measured (V$MYSTAT) and recorded
@@ -98,13 +132,16 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
     -- Read-only checks for run p_run_id (action PURGE or PREFLIGHT) in the
     -- session bound to it: registry validation (step REGISTRY), supporting
     -- indexes (SUPPORTING_INDEXES), eligible roots (ELIGIBLE_ROOTS), online
-    -- redo logs with the recommended batch size (REDO_LOGS) and undo (UNDO)
-    -- of the modules in scope.
-    PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER);
+    -- redo logs with the recommended batch size (REDO_LOGS), undo (UNDO),
+    -- the requirements (REQUIREMENTS) and the forecast (FORECAST) of the
+    -- modules in scope. p_reuse_run: a PREFLIGHT run whose root counts are
+    -- reused when still valid. Writes only the tool's own tables.
+    PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER,
+                        p_reuse_run IN NUMBER DEFAULT NULL);
 
     -- Runs the purge phase of run p_run_id (action PURGE) in the session bound
     -- to it (epf_control.attach / enter). p_status returns SUCCESS, WARNING,
-    -- FAILED or STOPPED. A dry run stops after the counts.
+    -- FAILED or STOPPED. A dry run stops after the counts and its forecast.
     PROCEDURE run(p_run_id IN NUMBER, p_status OUT VARCHAR2);
 
 END epf_purge;

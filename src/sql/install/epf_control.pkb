@@ -108,7 +108,10 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         p_dry_run          IN VARCHAR2 DEFAULT 'N',
         p_with_reclaim     IN VARCHAR2 DEFAULT 'N',
         p_with_compact     IN VARCHAR2 DEFAULT 'N',
-        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N'
+        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N',
+        p_backup_choice    IN VARCHAR2 DEFAULT NULL,
+        p_cutoff_date      IN DATE     DEFAULT NULL,
+        p_confirm          IN VARCHAR2 DEFAULT NULL
     ) RETURN NUMBER IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_action    VARCHAR2(30) := UPPER(TRIM(p_action));
@@ -121,8 +124,28 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_reclaim   VARCHAR2(1)  := yes_no(p_with_reclaim, 'with_reclaim');
         l_compact   VARCHAR2(1)  := yes_no(p_with_compact, 'with_compact');
         l_undo      VARCHAR2(1)  := yes_no(p_with_undo_tuning, 'with_undo_tuning');
+        l_backup    VARCHAR2(10) := UPPER(TRIM(p_backup_choice));
+        l_confirm   VARCHAR2(100);
+        l_codes     SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST('ARCHIVE', 'UNDO', 'TEMP');
         l_run_id    NUMBER;
     BEGIN
+        IF l_backup IS NOT NULL AND l_backup NOT IN ('CONFIRMED', 'NONE') THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Backup choice must be CONFIRMED or NONE, got: ' || p_backup_choice);
+        END IF;
+        -- Confirmed requirements: ARCHIVE, UNDO, TEMP, in that order.
+        IF TRIM(p_confirm) IS NOT NULL THEN
+            FOR i IN 1 .. REGEXP_COUNT(p_confirm, '[^,]+') LOOP
+                IF UPPER(TRIM(REGEXP_SUBSTR(p_confirm, '[^,]+', 1, i))) NOT IN ('ARCHIVE', 'UNDO', 'TEMP') THEN
+                    RAISE_APPLICATION_ERROR(-20127, 'Requirements to confirm: ARCHIVE, UNDO, TEMP separated by '
+                                                    || 'commas, got: ' || p_confirm);
+                END IF;
+            END LOOP;
+            FOR k IN 1 .. l_codes.COUNT LOOP
+                IF INSTR(',' || REPLACE(UPPER(p_confirm), ' ') || ',', ',' || l_codes(k) || ',') > 0 THEN
+                    l_confirm := l_confirm || CASE WHEN l_confirm IS NOT NULL THEN ',' END || l_codes(k);
+                END IF;
+            END LOOP;
+        END IF;
         IF l_action IS NULL OR l_action NOT IN ('PURGE', 'RECLAIM', 'PREFLIGHT') THEN
             RAISE_APPLICATION_ERROR(-20121, 'Unknown action: ' || p_action
                                             || '. Valid values: PURGE, RECLAIM, PREFLIGHT');
@@ -131,9 +154,8 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
             RAISE_APPLICATION_ERROR(-20127, 'Compaction (with_compact=Y) applies to purge runs that are not dry runs '
                                             || 'and do not reclaim.');
         END IF;
-        IF l_undo = 'Y' AND (l_action <> 'PURGE' OR l_dry_run = 'Y') THEN
-            RAISE_APPLICATION_ERROR(-20127, 'Undo tuning (with_undo_tuning=Y) applies to purge runs that are not '
-                                            || 'dry runs.');
+        IF l_undo = 'Y' AND l_action NOT IN ('PURGE', 'PREFLIGHT') THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Undo tuning (with_undo_tuning=Y) applies to purge and preflight runs.');
         END IF;
         IF NOT lock_is_free THEN
             RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '
@@ -150,12 +172,22 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                 l_depth := normalize_depth(l_depth || ',LOGS');
             END IF;
 
-            l_retention := NVL(p_retention_days, epf_util.setting_num('retention_days_default'));
+            IF p_cutoff_date IS NOT NULL AND p_retention_days IS NOT NULL THEN
+                RAISE_APPLICATION_ERROR(-20127, 'Give the retention or the cutoff date, not both.');
+            END IF;
+            IF p_cutoff_date IS NOT NULL THEN
+                l_retention := TRUNC(SYSDATE) - TRUNC(p_cutoff_date);
+            ELSE
+                l_retention := NVL(p_retention_days, epf_util.setting_num('retention_days_default'));
+            END IF;
             IF l_retention <> TRUNC(l_retention)
                OR l_retention < epf_util.setting_num('retention_days_min') THEN
                 RAISE_APPLICATION_ERROR(-20127, 'Retention must be a whole number of days >= '
                                                 || epf_util.setting('retention_days_min')
-                                                || ', got: ' || p_retention_days);
+                                                || CASE WHEN p_cutoff_date IS NOT NULL
+                                                        THEN ' (cutoff ' || TO_CHAR(p_cutoff_date, 'YYYY-MM-DD')
+                                                             || ' is ' || l_retention || ' days ago)'
+                                                        ELSE ', got: ' || p_retention_days END);
             END IF;
             l_cutoff := TRUNC(SYSDATE) - l_retention;
 
@@ -177,11 +209,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
 
         INSERT INTO epf_run (
             action, status, retention_days, cutoff_date, depth, purge_mode, batch_size,
-            dry_run, with_reclaim, with_compact, with_undo_tuning, created_at,
+            dry_run, with_reclaim, with_compact, with_undo_tuning, backup_choice, confirmed_reqs, created_at,
             db_name, container_name, client_host, os_user, tool_version
         ) VALUES (
             l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch,
-            l_dry_run, l_reclaim, l_compact, l_undo, epf_util.now_ts,
+            l_dry_run, l_reclaim, l_compact, l_undo, l_backup, l_confirm, epf_util.now_ts,
             SYS_CONTEXT('USERENV', 'DB_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME'),
             SYS_CONTEXT('USERENV', 'HOST'), SYS_CONTEXT('USERENV', 'OS_USER'),
             epf_util.setting('tool_version')
@@ -238,6 +270,8 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                END
             || ' reclaim=' || l_run.with_reclaim || ' compact=' || l_run.with_compact
             || ' undo_tuning=' || l_run.with_undo_tuning
+            || CASE WHEN l_run.backup_choice IS NOT NULL THEN ' backup=' || l_run.backup_choice END
+            || CASE WHEN l_run.confirmed_reqs IS NOT NULL THEN ' confirmed=' || l_run.confirmed_reqs END
             || ' db=' || l_run.db_name || ' container=' || l_run.container_name
             || ' version=' || l_run.tool_version);
     END attach;

@@ -12,6 +12,9 @@ TNS=localhost:1521/EPFPDB
 
 # Purge parameters.
 RETENTION_DAYS=30
+# Or a cutoff date instead of the retention: rows dated before this day.
+# Used only when no --retention is given.
+#CUTOFF=2025-10-01
 # FULL | CLOB | LOGS | CLOB_N_LOGS
 MODE=FULL
 # ALL, or modules separated by commas: PAYMENTS,LOGS,BANK_STATEMENTS
@@ -28,7 +31,16 @@ COMPACT=N
 REDO_LOGS=N
 # Lower undo_retention and limit the growth of the undo tablespace (4 GB by
 # default, setting undo_cap_mb) for the purge; both restored at the end (SYS).
+# With a preflight or a dry run it is checked as planned; nothing is applied.
 UNDO_TUNING=N
+
+# Requirements (checked by the preflight before every purge).
+# When no RMAN database backup newer than 24 hours is found: CONFIRMED (a
+# backup was made another way) or NONE (purge without a backup).
+#BACKUP=CONFIRMED
+# Requirements the DBA confirms are handled although the preflight finds them
+# not met: ARCHIVE, UNDO, TEMP separated by commas.
+#CONFIRM=ARCHIVE
 
 # Output.
 #LOG_DIR=D:\epf\logs

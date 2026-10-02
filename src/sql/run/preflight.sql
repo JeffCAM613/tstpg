@@ -3,13 +3,18 @@
 -- ============================================================================
 -- Purpose : Read-only checks before a run: registry validation against the
 --           live database, supporting indexes of the link columns, eligible
---           roots per root table (epf_purge.preflight).
--- Usage   : sqlplus -L -S "epfpg@<service>" @src/sql/run/preflight.sql <run_id|NEW>
---             <run_id>  bind to a run created by start_run.sql and attached by
---                       the caller's monitor session
---             NEW       create, attach and finish a standalone PREFLIGHT run in
---                       this session with default purge parameters (manual use);
---                       the run is ended with the report's verdict
+--           roots per root table, redo, undo, the requirements of a purge and
+--           its forecast (epf_purge.preflight).
+-- Usage   : sqlplus -L -S "epfpg@<service>" @src/sql/run/preflight.sql <run_id|NEW> [<reuse_run>]
+--             <run_id>     bind to a run created by start_run.sql and attached
+--                          by the caller's monitor session
+--             NEW          create, attach and finish a standalone PREFLIGHT run
+--                          in this session with default purge parameters
+--                          (manual use); the run is ended with the report's
+--                          verdict
+--             <reuse_run>  a PREFLIGHT run whose root counts are reused when
+--                          it has the same cutoff, mode and depth and is
+--                          recent (preflight_valid_h); - or omitted: count
 -- Requires: EPFPG (or SYS).
 -- Effects : Writes events and steps of the run (and, with NEW, its checks);
 --           changes nothing else. Exit code 0 without findings, 2 with
@@ -20,7 +25,12 @@ SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 SET DEFINE ON
 WHENEVER SQLERROR EXIT FAILURE ROLLBACK
 
+-- Optional second argument: defined as - when not given.
+COLUMN 2 NEW_VALUE 2 NOPRINT
+SELECT '-' AS "2" FROM dual WHERE 1 = 0;
+
 DEFINE run_arg = "&1"
+DEFINE reuse_arg = "&2"
 
 VARIABLE run_id NUMBER
 VARIABLE rc     NUMBER
@@ -40,7 +50,9 @@ DECLARE
     l_errors   PLS_INTEGER;
     l_warnings PLS_INTEGER;
 BEGIN
-    epfpg.epf_purge.preflight(:run_id, l_errors, l_warnings);
+    epfpg.epf_purge.preflight(:run_id, l_errors, l_warnings,
+                              p_reuse_run => CASE WHEN TRIM('&reuse_arg') IN ('-', '') THEN NULL
+                                                  ELSE TO_NUMBER('&reuse_arg') END);
     :rc := CASE WHEN l_errors > 0 THEN 1 WHEN l_warnings > 0 THEN 2 ELSE 0 END;
 
     IF UPPER('&run_arg') = 'NEW' THEN

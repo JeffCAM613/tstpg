@@ -560,6 +560,445 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         put('EPF_VERDICT|' || l_label || '|' || p_verdict || '|exit=' || p_exit);
     END print_checks;
 
+    -- ------------------------------------------------------------------
+    -- Requirements, forecast, simulation
+    -- ------------------------------------------------------------------
+
+    -- Signed error of a forecast against the actual value, in percent.
+    FUNCTION pct_error(p_forecast IN NUMBER, p_actual IN NUMBER) RETURN VARCHAR2 IS
+        l_pct NUMBER;
+    BEGIN
+        IF p_forecast IS NULL OR p_actual IS NULL OR p_actual = 0 THEN
+            RETURN '-';
+        END IF;
+        l_pct := ROUND(100 * (p_forecast - p_actual) / p_actual, 1);
+        RETURN CASE WHEN l_pct > 0 THEN '+' END || TO_CHAR(l_pct, 'FM999999990.0') || '%';
+    END pct_error;
+
+    FUNCTION dur(p_seconds IN NUMBER) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN CASE WHEN p_seconds IS NULL THEN '-' ELSE epf_util.fmt_duration(p_seconds) END;
+    END dur;
+
+    -- Requirements measured by the run's preflight, with the ways to meet the
+    -- ones not met, and whether a purge can start (READY).
+    PROCEDURE print_requirements IS
+        l_run   NUMBER := g_run.run_id;
+        l_label VARCHAR2(20) := epf_util.run_label(g_run.run_id);
+        l_count NUMBER;
+        l_met   NUMBER;
+        l_block NUMBER;
+        l_unmet VARCHAR2(400);
+        l_slow  VARCHAR2(400);
+    BEGIN
+        SELECT COUNT(*),
+               COUNT(CASE WHEN status <> 'NOT_MET' THEN 1 END),
+               COUNT(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN 1 END),
+               LISTAGG(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN req_code END, ', ') WITHIN GROUP (ORDER BY seq),
+               LISTAGG(CASE WHEN status = 'NOT_MET' AND blocking = 'N' THEN req_code END, ', ') WITHIN GROUP (ORDER BY seq)
+          INTO l_count, l_met, l_block, l_unmet, l_slow
+          FROM epf_requirement
+         WHERE run_id = l_run;
+        IF l_count = 0 THEN
+            RETURN;
+        END IF;
+        title('REQUIREMENTS' || CASE WHEN g_run.action = 'PURGE' AND g_run.dry_run = 'N'
+                                     THEN ' (checked when the purge started)' END);
+        FOR q IN (SELECT req_code, status, blocking, title, why, measured, met_by
+                    FROM epf_requirement
+                   WHERE run_id = l_run
+                   ORDER BY seq) LOOP
+            put('  ' || l(q.req_code, 12) || RPAD(q.title || ' ', 40, '.') || ' '
+                || CASE q.status WHEN 'MET' THEN 'MET' WHEN 'NOT_MET' THEN 'NOT MET' ELSE 'NOT MEASURED' END
+                || CASE WHEN q.status = 'NOT_MET' AND q.blocking = 'N' THEN ' (slower only)' END);
+            IF q.status = 'NOT_MET' THEN
+                put('      Why: ' || q.why);
+            END IF;
+            put('      ' || q.measured);
+            IF q.status = 'NOT_MET' THEN
+                FOR o IN (SELECT met, title, detail
+                            FROM epf_req_option
+                           WHERE run_id = l_run AND req_code = q.req_code
+                           ORDER BY seq) LOOP
+                    put('      [' || CASE o.met WHEN 'Y' THEN 'x' ELSE ' ' END || '] ' || l(o.title, 52) || o.detail);
+                END LOOP;
+            ELSE
+                FOR o IN (SELECT title FROM epf_req_option
+                           WHERE run_id = l_run AND req_code = q.req_code AND met = 'Y'
+                           ORDER BY seq) LOOP
+                    put('      [x] ' || o.title);
+                END LOOP;
+            END IF;
+        END LOOP;
+        put(' ' || RPAD('-', c_width - 1, '-'));
+        put(' RESULT  ' || CASE WHEN l_block > 0 THEN 'NOT READY: ' || l_block || ' blocking requirement'
+                                                    || CASE WHEN l_block > 1 THEN 's' END || ' not met (' || l_unmet || ')'
+                                ELSE 'READY: ' || l_met || ' of ' || l_count || ' met' END
+            || CASE WHEN l_slow IS NOT NULL THEN '; slower only: ' || l_slow END);
+        FOR q IN (SELECT req_code, status, blocking, met_by FROM epf_requirement WHERE run_id = l_run ORDER BY seq) LOOP
+            put('EPF_REQ|' || l_label || '|' || q.req_code || '|' || q.status || '|' || q.blocking || '|' || q.met_by);
+        END LOOP;
+    END print_requirements;
+
+    -- Forecast per module of the run: SIMULATION for a dry run (exact rows),
+    -- ESTIMATE for a preflight (eligible roots, estimates).
+    PROCEDURE print_forecast_table(p_origin IN VARCHAR2) IS
+        l_run   NUMBER := g_run.run_id;
+        l_count NUMBER;
+        l_rows  NUMBER := 0;
+        l_roots NUMBER := 0;
+        l_batch NUMBER := 0;
+        l_redo  NUMBER := 0;
+        l_undo  NUMBER := 0;
+        l_secs  NUMBER := 0;
+        l_freed NUMBER := 0;
+    BEGIN
+        SELECT COUNT(*) INTO l_count FROM epf_forecast WHERE run_id = l_run AND origin = p_origin;
+        IF l_count = 0 THEN
+            RETURN;
+        END IF;
+        title(CASE p_origin WHEN 'DRY_RUN' THEN 'SIMULATION (dry run: nothing was changed)'
+                            ELSE 'ESTIMATE (rows before the cutoff are counted exactly by a dry run)' END);
+        put('  ' || l('Module', 18) || r('Rows', 14) || r('Roots', 12) || r('Batches', 9) || r('Redo', 11)
+            || r('Undo', 11) || r('Deleting', 10) || r('Space freed', 13));
+        FOR x IN (SELECT f.module_code, f.row_count, f.roots, f.batches, f.redo_bytes, f.undo_bytes,
+                         f.delete_seconds, f.freed_bytes
+                    FROM epf_forecast f
+                    JOIN epf_module m ON m.module_code = f.module_code
+                   WHERE f.run_id = l_run AND f.origin = p_origin
+                   ORDER BY m.display_order) LOOP
+            put('  ' || l(x.module_code, 18) || r(n(x.row_count), 14) || r(n(x.roots), 12) || r(n(x.batches), 9)
+                || r(b(x.redo_bytes), 11) || r(b(x.undo_bytes), 11) || r(dur(x.delete_seconds), 10)
+                || r(b(x.freed_bytes), 13));
+            l_rows  := l_rows + NVL(x.row_count, 0);
+            l_roots := l_roots + NVL(x.roots, 0);
+            l_batch := l_batch + NVL(x.batches, 0);
+            l_redo  := l_redo + NVL(x.redo_bytes, 0);
+            l_undo  := l_undo + NVL(x.undo_bytes, 0);
+            l_secs  := l_secs + NVL(x.delete_seconds, 0);
+            l_freed := l_freed + NVL(x.freed_bytes, 0);
+        END LOOP;
+        IF l_count > 1 THEN
+            put('  ' || l('Total', 18) || r(CASE WHEN p_origin = 'DRY_RUN' THEN n(l_rows) ELSE '-' END, 14)
+                || r(n(l_roots), 12) || r(n(l_batch), 9) || r(b(l_redo), 11) || r(b(l_undo), 11) || r(dur(l_secs), 10)
+                || r(CASE WHEN p_origin = 'DRY_RUN' THEN b(l_freed) ELSE '-' END, 13));
+        END IF;
+        FOR x IN (SELECT DISTINCT redo_basis FROM epf_forecast
+                   WHERE run_id = l_run AND origin = p_origin AND redo_basis IS NOT NULL) LOOP
+            put('  Redo and undo per root: ' || x.redo_basis);
+        END LOOP;
+        FOR x IN (SELECT DISTINCT time_basis FROM epf_forecast
+                   WHERE run_id = l_run AND origin = p_origin AND time_basis IS NOT NULL) LOOP
+            put('  Deleting time: ' || x.time_basis);
+        END LOOP;
+    END print_forecast_table;
+
+    -- Roots held back, triggers that would fire, and application sessions now
+    -- (dry run).
+    PROCEDURE print_simulation_notes IS
+        l_run   NUMBER := g_run.run_id;
+        l_held  NUMBER;
+        l_trig  VARCHAR2(4000);
+        l_count NUMBER := 0;
+        l_apps  SYS.ODCIVARCHAR2LIST := epf_util.split_list(epf_util.setting('app_schemas'));
+        l_sess  NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO l_held FROM epf_held_root WHERE run_id = l_run;
+        put('  Held back       ' || CASE WHEN l_held = 0 THEN 'none (no kept row references a row to purge)'
+                                         ELSE n(l_held) || ' roots, still referenced by rows that are kept (PURGE RESULTS)' END);
+        FOR t IN (SELECT tr.owner, tr.trigger_name, tr.table_owner, tr.table_name, tr.triggering_event, e.module_code
+                    FROM dba_triggers tr
+                    JOIN epf_table e ON e.owner = tr.table_owner AND e.table_name = tr.table_name AND e.active = 'Y'
+                   WHERE tr.status = 'ENABLED'
+                     AND (tr.triggering_event LIKE '%DELETE%' OR tr.triggering_event LIKE '%UPDATE%')
+                   ORDER BY tr.table_owner, tr.table_name, tr.trigger_name) LOOP
+            CONTINUE WHEN NOT in_depth(t.module_code);
+            l_count := l_count + 1;
+            IF l_count <= 5 THEN
+                l_trig := l_trig || CASE WHEN l_count > 1 THEN '; ' END || t.owner || '.' || t.trigger_name || ' on '
+                          || t.table_owner || '.' || t.table_name || ' (' || LOWER(t.triggering_event) || ')';
+            END IF;
+        END LOOP;
+        put('  Triggers        ' || CASE WHEN l_count = 0 THEN 'none enabled on the tables of the run'
+                                         ELSE l_count || ' enabled, they fire for every row: ' || l_trig END);
+        SELECT COUNT(*) INTO l_sess
+          FROM v$session
+         WHERE username IN (SELECT column_value FROM TABLE(l_apps));
+        put('  Activity now    ' || l_sess || ' sessions of ' || epf_util.setting('app_schemas')
+            || CASE WHEN l_sess > 0 THEN ': rows they lock make batches wait' END);
+    END print_simulation_notes;
+
+    -- Rows, redo, archive space and space freed for the requested retention
+    -- and longer ones (a longer retention purges less).
+    PROCEDURE print_retention_options IS
+        l_run    NUMBER := g_run.run_id;
+        l_count  NUMBER;
+        l_margin NUMBER := 1 + epf_util.setting_num('archive_margin_pct') / 100;
+        l_room   NUMBER;
+        l_noarch NUMBER;
+        l_rows   NUMBER;
+        l_freed  NUMBER;
+        l_fits   VARCHAR2(10);
+        l_days   NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO l_count FROM epf_retention_option WHERE run_id = l_run;
+        IF l_count = 0 THEN
+            RETURN;
+        END IF;
+        SELECT MAX(room_bytes), COUNT(CASE WHEN met_by = 'NOARCHIVELOG' THEN 1 END)
+          INTO l_room, l_noarch
+          FROM epf_requirement
+         WHERE run_id = l_run AND req_code = 'ARCHIVE';
+        title('RETENTION OPTIONS (a longer retention purges less'
+              || CASE WHEN l_noarch > 0 THEN '; NOARCHIVELOG: no archive space needed'
+                      WHEN l_room IS NOT NULL THEN '; free archive space ' || b(l_room) END || ')');
+        put('  ' || l('Retention', 11) || l('Cutoff', 12) || r('Roots', 12) || r('Rows', 14) || r('Redo', 11)
+            || r('Archive need', 14) || r('Space freed', 13) || r('Fits', 6));
+        FOR o IN (SELECT ro.retention_days, MIN(ro.cutoff_date) AS cutoff_date, SUM(ro.roots) AS roots,
+                         SUM(ro.roots * te.redo_root) AS redo_bytes,
+                         COUNT(CASE WHEN ro.roots > 0 AND te.redo_root IS NULL THEN 1 END) AS unknown
+                    FROM epf_retention_option ro
+                    LEFT JOIN epf_tree_est te ON te.run_id = ro.run_id AND te.table_id = ro.table_id
+                   WHERE ro.run_id = l_run
+                   GROUP BY ro.retention_days
+                   ORDER BY ro.retention_days DESC) LOOP
+            l_days := o.retention_days;
+            SELECT SUM(x.roots * f.row_count / NULLIF(f.roots, 0)), SUM(x.roots * f.freed_bytes / NULLIF(f.roots, 0))
+              INTO l_rows, l_freed
+              FROM (SELECT t.module_code, SUM(ro.roots) AS roots
+                      FROM epf_retention_option ro
+                      JOIN epf_table t ON t.table_id = ro.table_id
+                     WHERE ro.run_id = l_run AND ro.retention_days = l_days
+                     GROUP BY t.module_code) x
+              JOIN epf_forecast f ON f.run_id = l_run AND f.origin = 'DRY_RUN' AND f.module_code = x.module_code;
+            l_fits := CASE WHEN l_noarch > 0 THEN 'n/a'
+                           WHEN l_room IS NULL OR o.unknown > 0 THEN '?'
+                           WHEN NVL(o.redo_bytes, 0) * l_margin <= l_room THEN 'yes' ELSE 'no' END;
+            put('  ' || l(o.retention_days, 11) || l(TO_CHAR(o.cutoff_date, 'YYYY-MM-DD'), 12) || r(n(o.roots), 12)
+                || r(n(l_rows), 14)
+                || r(CASE WHEN o.unknown > 0 THEN '-' ELSE b(NVL(o.redo_bytes, 0)) END, 11)
+                || r(CASE WHEN o.unknown > 0 OR l_noarch > 0 THEN '-' ELSE b(NVL(o.redo_bytes, 0) * l_margin) END, 14)
+                || r(b(l_freed), 13) || r(l_fits, 6)
+                || CASE WHEN o.retention_days = g_run.retention_days THEN '  (requested)' END);
+        END LOOP;
+        FOR x IN (SELECT detail FROM epf_req_option
+                   WHERE run_id = l_run AND req_code = 'ARCHIVE' AND option_code = 'SMALLER_RUNS') LOOP
+            put('  Smaller runs: ' || x.detail);
+        END LOOP;
+    END print_retention_options;
+
+    -- Predicted outcome of a dry run: the first blocking requirement not met
+    -- decides where it would fail; otherwise it would complete.
+    PROCEDURE print_expected IS
+        l_run     NUMBER := g_run.run_id;
+        l_label   VARCHAR2(20) := epf_util.run_label(g_run.run_id);
+        l_code    VARCHAR2(20);
+        l_text    VARCHAR2(4000);
+        l_notes   VARCHAR2(4000);
+        l_cum     NUMBER := 0;
+        l_batch   NUMBER;
+        l_secs    NUMBER;
+        l_freed   NUMBER;
+        l_redo    NUMBER;
+
+        PROCEDURE note(p_text IN VARCHAR2) IS
+        BEGIN
+            l_notes := l_notes || CASE WHEN l_notes IS NOT NULL THEN '; ' END || p_text;
+        END note;
+    BEGIN
+        FOR q IN (SELECT req_code, blocking, needed_bytes, room_bytes
+                    FROM epf_requirement
+                   WHERE run_id = l_run AND status = 'NOT_MET'
+                   ORDER BY seq) LOOP
+            CASE q.req_code
+                WHEN 'ARCHIVE' THEN
+                    IF l_code IS NULL AND q.room_bytes IS NULL THEN
+                        l_code := 'MAY_FAIL';
+                        l_text := 'archived logs need about ' || b(q.needed_bytes)
+                                  || ' and the free space of the archive destination cannot be measured';
+                    ELSIF l_code IS NULL THEN
+                        FOR f IN (SELECT f.module_code, f.redo_bytes, f.batches
+                                    FROM epf_forecast f
+                                    JOIN epf_module m ON m.module_code = f.module_code
+                                   WHERE f.run_id = l_run AND f.origin = 'DRY_RUN'
+                                   ORDER BY m.display_order) LOOP
+                            IF f.redo_bytes IS NOT NULL AND f.batches > 0 AND l_cum + f.redo_bytes > q.room_bytes THEN
+                                l_batch := GREATEST(1, CEIL((q.room_bytes - l_cum) / (f.redo_bytes / f.batches)));
+                                l_code  := 'FAIL';
+                                l_text  := 'the archive destination would be full at about batch ' || n(l_batch)
+                                           || ' of ' || n(f.batches) || ' in ' || f.module_code || ' ('
+                                           || b(q.room_bytes) || ' of archived logs); from then on the whole database '
+                                           || 'waits (ORA-00257)';
+                                EXIT;
+                            END IF;
+                            l_cum := l_cum + NVL(f.redo_bytes, 0);
+                        END LOOP;
+                        IF l_code IS NULL THEN
+                            l_code := 'MAY_FAIL';
+                            l_text := 'archived logs need about ' || b(q.needed_bytes) || ' with the margin, '
+                                      || b(q.room_bytes) || ' free';
+                        END IF;
+                    END IF;
+                WHEN 'UNDO' THEN
+                    IF l_code IS NULL AND q.needed_bytes > q.room_bytes THEN
+                        l_code := 'FAIL';
+                        l_text := 'the first batch would fail: one batch needs ' || b(q.needed_bytes)
+                                  || ' of undo, the undo tablespace can hold ' || b(q.room_bytes) || ' (ORA-30036)';
+                    ELSIF l_code IS NULL AND 4 * q.needed_bytes > q.room_bytes THEN
+                        l_code := 'MAY_FAIL';
+                        l_text := 'one batch needs ' || b(q.needed_bytes) || ' of undo; the undo tablespace can hold '
+                                  || b(q.room_bytes);
+                    ELSE
+                        note('the undo tablespace would grow during the purge (no undo tuning)');
+                    END IF;
+                WHEN 'TEMP' THEN
+                    IF l_code IS NULL THEN
+                        l_code := 'FAIL';
+                        l_text := 'recording the keys would fail: TEMP needs about ' || b(q.needed_bytes) || ', '
+                                  || b(q.room_bytes) || ' free (ORA-01652); nothing would be deleted';
+                    END IF;
+                WHEN 'BACKUP' THEN
+                    note('no backup to go back to');
+                WHEN 'REDO_LOGS' THEN
+                    note('slower: one batch writes more redo than an online log holds');
+                WHEN 'INDEX_SPACE' THEN
+                    note('slower: not every temporary index fits');
+                ELSE
+                    NULL;
+            END CASE;
+        END LOOP;
+        SELECT SUM(delete_seconds), SUM(freed_bytes), SUM(redo_bytes)
+          INTO l_secs, l_freed, l_redo
+          FROM epf_forecast
+         WHERE run_id = l_run AND origin = 'DRY_RUN';
+        IF l_code IS NULL THEN
+            l_code := 'COMPLETE';
+            l_text := 'in about ' || dur(l_secs) || ' of deleting'
+                      || CASE WHEN l_freed IS NOT NULL THEN ', about ' || b(l_freed) || ' freed inside the tables' END;
+        END IF;
+        put;
+        put(' EXPECTED  ' || CASE l_code WHEN 'COMPLETE' THEN 'WOULD COMPLETE ' WHEN 'FAIL' THEN 'WOULD FAIL: '
+                                         ELSE 'MAY FAIL: ' END || l_text);
+        IF l_notes IS NOT NULL THEN
+            put('           ' || l_notes);
+        END IF;
+        put('EPF_EXPECTED|' || l_label || '|' || l_code || '|' || ROUND(l_secs) || '|' || ROUND(l_freed) || '|'
+            || ROUND(l_redo));
+    END print_expected;
+
+    -- Result of a purge against the latest forecast with the same cutoff and
+    -- mode, per module: the latest dry run, otherwise the latest preflight
+    -- (the purge's own), made before this purge and after the last purge of
+    -- the module.
+    PROCEDURE print_forecast_result IS
+        l_run      NUMBER := g_run.run_id;
+        l_label    VARCHAR2(20) := epf_util.run_label(g_run.run_id);
+        l_cutoff   DATE := g_run.cutoff_date;
+        l_mode     VARCHAR2(30) := g_run.purge_mode;
+        l_created  TIMESTAMP := g_run.created_at;
+        l_status   VARCHAR2(20) := g_run.status;
+        l_module   VARCHAR2(30);
+        l_shown    BOOLEAN := FALSE;
+        l_fc_run   NUMBER;
+        l_origin   VARCHAR2(10);
+        l_f_rows   NUMBER;
+        l_f_redo   NUMBER;
+        l_f_undo   NUMBER;
+        l_f_secs   NUMBER;
+        l_f_freed  NUMBER;
+        l_rows     NUMBER;
+        l_redo     NUMBER;
+        l_undo     NUMBER;
+        l_secs     NUMBER;
+        l_freed    NUMBER;
+
+        PROCEDURE line(p_measure IN VARCHAR2, p_code IN VARCHAR2, p_forecast IN NUMBER, p_actual IN NUMBER,
+                       p_text_f IN VARCHAR2, p_text_a IN VARCHAR2) IS
+        BEGIN
+            put('  ' || l(CASE WHEN p_code = 'ROWS' THEN l_module END, 18) || l(p_measure, 16)
+                || r(p_text_f, 16) || r(p_text_a, 16) || r(pct_error(p_forecast, p_actual), 10));
+            put('EPF_FORECAST|' || l_label || '|' || l_module || '|' || p_code || '|' || ROUND(p_forecast) || '|'
+                || ROUND(p_actual) || '|' || epf_util.run_label(l_fc_run) || '|' || l_origin);
+        END line;
+    BEGIN
+        FOR m IN (SELECT DISTINCT t.module_code, md.display_order
+                    FROM epf_table_stat s
+                    JOIN epf_table t ON t.table_id = s.table_id
+                    JOIN epf_module md ON md.module_code = t.module_code
+                   WHERE s.run_id = l_run AND s.phase = 'AFTER'
+                   ORDER BY md.display_order) LOOP
+            l_module := m.module_code;
+            l_fc_run := NULL;
+            l_origin := NULL;
+            FOR f IN (SELECT f.run_id, f.origin, f.row_count, f.redo_bytes, f.undo_bytes, f.delete_seconds, f.freed_bytes
+                        FROM epf_forecast f
+                        JOIN epf_run fr ON fr.run_id = f.run_id
+                       WHERE f.module_code = l_module
+                         AND fr.cutoff_date = l_cutoff AND fr.purge_mode = l_mode
+                         AND fr.created_at <= l_created
+                         AND (fr.run_id = l_run OR fr.status IN ('SUCCESS', 'WARNING', 'RUNNING'))
+                         AND NOT EXISTS (SELECT 1
+                                           FROM epf_run p
+                                           JOIN epf_table_stat ps ON ps.run_id = p.run_id AND ps.phase = 'AFTER'
+                                           JOIN epf_table pt ON pt.table_id = ps.table_id
+                                          WHERE p.action = 'PURGE' AND p.dry_run = 'N' AND p.run_id <> l_run
+                                            AND p.created_at > fr.created_at AND p.created_at < l_created
+                                            AND pt.module_code = l_module AND ps.processed_rows > 0)
+                       ORDER BY CASE f.origin WHEN 'DRY_RUN' THEN 0 ELSE 1 END, f.run_id DESC
+                       FETCH FIRST 1 ROWS ONLY) LOOP
+                l_fc_run  := f.run_id;
+                l_origin  := f.origin;
+                l_f_rows  := f.row_count;
+                l_f_redo  := f.redo_bytes;
+                l_f_undo  := f.undo_bytes;
+                l_f_secs  := f.delete_seconds;
+                l_f_freed := f.freed_bytes;
+            END LOOP;
+            IF NOT l_shown THEN
+                title('FORECAST AND RESULT (error = forecast against actual)');
+                put('  ' || l('Module', 18) || l('Measure', 16) || r('Forecast', 16) || r('Actual', 16) || r('Error', 10));
+                l_shown := TRUE;
+            END IF;
+            IF l_fc_run IS NULL THEN
+                put('  ' || l(l_module, 18) || 'no forecast with the same cutoff before this purge (a dry run makes one)');
+                CONTINUE;
+            END IF;
+            SELECT SUM(s.processed_rows)
+              INTO l_rows
+              FROM epf_table_stat s
+              JOIN epf_table t ON t.table_id = s.table_id
+             WHERE s.run_id = l_run AND s.phase = 'AFTER' AND t.module_code = l_module;
+            SELECT SUM(CASE WHEN ev.event_code = 'TREE_REDO' THEN ev.bytes END),
+                   SUM(CASE WHEN ev.event_code = 'TREE_UNDO' THEN ev.bytes END)
+              INTO l_redo, l_undo
+              FROM epf_event ev
+              JOIN epf_table t ON t.owner = ev.object_owner AND t.table_name = ev.object_name
+             WHERE ev.run_id = l_run AND ev.event_code IN ('TREE_REDO', 'TREE_UNDO') AND t.module_code = l_module;
+            SELECT MAX(epf_util.elapsed_s(started_at, ended_at))
+              INTO l_secs
+              FROM epf_step
+             WHERE run_id = l_run AND step_code = 'PROCESS_BATCHES' AND scope = l_module;
+            SELECT SUM(CASE WHEN su.phase = 'BASELINE' THEN su.used_bytes END)
+                   - SUM(CASE WHEN su.phase = 'POST_PURGE' THEN su.used_bytes END)
+              INTO l_freed
+              FROM epf_segment_snap ss
+              JOIN epf_space_usage su
+                ON su.run_id = ss.run_id AND su.phase = ss.phase AND su.owner = ss.owner
+               AND su.segment_name = ss.segment_name AND NVL(su.partition_name, '-') = NVL(ss.partition_name, '-')
+             WHERE ss.run_id = l_run AND ss.phase IN ('BASELINE', 'POST_PURGE') AND ss.module_code = l_module;
+            put('  ' || l(l_module, 18) || 'forecast of ' || epf_util.run_label(l_fc_run)
+                || CASE l_origin WHEN 'DRY_RUN' THEN ' (dry run)' ELSE ' (preflight, estimated)' END);
+            line('rows', 'ROWS', l_f_rows, l_rows, n(l_f_rows), n(l_rows));
+            line('redo', 'REDO', l_f_redo, l_redo, b(l_f_redo), b(l_redo));
+            line('undo', 'UNDO', l_f_undo, l_undo, b(l_f_undo), b(l_undo));
+            line('deleting time', 'SECONDS', l_f_secs, l_secs, dur(l_f_secs), dur(l_secs));
+            line('space freed', 'FREED', l_f_freed, l_freed, b(l_f_freed), b(l_freed));
+        END LOOP;
+        IF l_shown AND l_status IN ('STOPPED', 'FAILED') THEN
+            put('  The purge ended ' || l_status || ': the actual values cover only what it did.');
+        END IF;
+    END print_forecast_result;
+
     PROCEDURE print_report(p_run_id IN NUMBER) IS
         l_verdict VARCHAR2(30);
         l_exit    NUMBER;
@@ -572,7 +1011,21 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         print_steps;
         IF g_run.action = 'PURGE' THEN
             print_results;
+            IF g_run.dry_run = 'Y' THEN
+                print_forecast_table('DRY_RUN');
+                print_simulation_notes;
+                print_retention_options;
+                print_requirements;
+                print_expected;
+            ELSE
+                print_forecast_result;
+                print_requirements;
+            END IF;
             print_space;
+        ELSIF g_run.action = 'PREFLIGHT' THEN
+            print_forecast_table('PREFLIGHT');
+            print_retention_options;
+            print_requirements;
         END IF;
         print_checks(l_verdict, l_exit);
     END print_report;
@@ -612,6 +1065,22 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    WHERE run_id = p_run_id AND event_code = 'ROOTS_ELIGIBLE'
                    ORDER BY event_id) LOOP
             put('EPF_ADVICE|ROOTS|' || e.root_table || '|' || e.rows_affected);
+        END LOOP;
+        SELECT COUNT(*), COUNT(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN 1 END)
+          INTO l_count, l_errors
+          FROM epf_requirement
+         WHERE run_id = p_run_id;
+        put('EPF_ADVICE|READY|' || CASE WHEN l_count = 0 THEN '-' WHEN l_errors = 0 THEN 'Y' ELSE 'N' END);
+        FOR q IN (SELECT req_code, status, blocking, met_by FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
+            put('EPF_ADVICE|REQ|' || q.req_code || '|' || q.status || '|' || q.blocking || '|' || q.met_by);
+        END LOOP;
+        -- Largest batch whose undo the undo tablespace holds 4 times (UNDO).
+        FOR u IN (SELECT rq.needed_bytes, rq.room_bytes, rn.batch_size
+                    FROM epf_requirement rq
+                    JOIN epf_run rn ON rn.run_id = rq.run_id
+                   WHERE rq.run_id = p_run_id AND rq.req_code = 'UNDO' AND rq.needed_bytes > 0
+                     AND rq.room_bytes > 0) LOOP
+            put('EPF_ADVICE|UNDO_MAX_BATCH|' || FLOOR(u.room_bytes / 4 / (u.needed_bytes / u.batch_size)));
         END LOOP;
     END print_advice;
 

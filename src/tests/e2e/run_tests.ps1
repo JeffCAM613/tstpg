@@ -55,7 +55,8 @@ $script:Current     = $null
 $script:Results     = New-Object 'System.Collections.Generic.List[object]'
 $script:Aborted     = $false
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
-                         StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0 }
+                         StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0;
+                         DryRun = ''; DryRunExpected = '' }
 
 # Child processes read their standard input in the console code page. With a
 # UTF-8 console .NET would begin every child's input with a byte order mark
@@ -483,11 +484,13 @@ $script:TestList = @(
     'T07  Usage errors: exit 4, nothing changed',
     'T08  Preflight through the wrapper',
     'T09  preflight.sql NEW',
-    'T10  Dry run of all modules through the wrapper',
+    'T10  Dry run of all modules through the wrapper: simulation and expected outcome',
+    'T10B Requirements gate: a purge without a recent backup or a backup choice does not start',
     'T11  PAYMENTS purge through the wizard with redo log sizing and undo tuning; graceful stop',
     'T12  State after the stop: undo restored, nothing pending',
-    'T13  PAYMENTS purge to the end, non-interactive, undo tuning',
-    'T14  LOGS purge with compaction, non-interactive',
+    'T12B PAYMENTS dry run: the simulation T13 is compared with',
+    'T13  PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result',
+    'T14  LOGS purge with compaction, non-interactive, undo growth confirmed',
     'T15  BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive',
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
     'T17  Reports through the wrapper: latest, and the stopped run',
@@ -596,6 +599,10 @@ function Invoke-Suite {
         foreach ($case in @(@('purge', '--bogus'), @('reclaim'), @('preflight', '--non-interactive', '--compact'),
                             @('purge', '--non-interactive', '--dry-run', '--compact'),
                             @('purge', '--non-interactive', '--batch-size', '50'),
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--cutoff', '2025-01-01'),
+                            @('purge', '--non-interactive', '--cutoff', '2025-13-01'),
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--backup', 'maybe'),
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--confirm', 'BACKUP'),
                             @('purge', '--non-interactive', '--retention', $script:Retention))) {
             $r = Invoke-Wrapper $case
             Assert-Exit $r @(4)
@@ -610,8 +617,17 @@ function Invoke-Suite {
         Assert-Match $r 'ROOTS_ELIGIBLE'
         Assert-Match $r 'REDO_LOGS'
         Assert-Match $r 'UNDO_ESTIMATE|No rows before the cutoff'
+        Assert-Match $r 'ESTIMATE \(rows before the cutoff'
+        Assert-Match $r 'RETENTION OPTIONS'
+        Assert-Match $r 'REQUIREMENTS'
+        Assert-Match $r ' RESULT  (READY|NOT READY)'
+        Assert-Match $r 'EPF_REQ\|'
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
+        Assert-Manifest $run 'requirements_ready' '^(Y|N)$'
+        foreach ($code in @('ARCHIVE', 'UNDO', 'TEMP', 'INDEX_SPACE', 'REDO_LOGS', 'BACKUP')) {
+            Assert-Manifest $run ('req.' + $code) '^(MET|NOT_MET|NOT_APPLICABLE)\|[YN]\|'
+        }
         if ($null -ne $run) { $script:State.PreflightRun = $run['run'] }
     }
 
@@ -621,13 +637,51 @@ function Invoke-Suite {
         Assert-Match $r 'RUN_END'
     }
 
-    Invoke-Test 'T10' 'Dry run of all modules through the wrapper' {
+    Invoke-Test 'T10' 'Dry run of all modules through the wrapper: simulation and expected outcome' {
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--retention', $script:Retention, '--dry-run') -TimeoutMin 60
         Assert-Exit $r @(0, 2)
+        Assert-Match $r 'SIMULATION \(dry run'
+        Assert-Match $r 'RETENTION OPTIONS'
+        Assert-Match $r 'REQUIREMENTS'
+        Assert-Match $r 'EXPECTED  (WOULD COMPLETE|WOULD FAIL|MAY FAIL)'
+        Assert-Match $r 'Held back'
         $run = Get-Run $r 'PURGE'
         Assert-Manifest $run 'dry_run' '^Y$'
+        Assert-Manifest $run 'step.PURGE.FORECAST.-' '^DONE'
+        Assert-Manifest $run 'expected' '^(COMPLETE|FAIL|MAY_FAIL)\|'
         foreach ($check in @('P1', 'P2', 'P3', 'P4', 'P6', 'P8')) { Assert-Manifest $run ('check.' + $check) '^SKIP' }
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
+    }
+
+    Invoke-Test 'T10B' 'Requirements gate: a purge without a recent backup or a backup choice does not start' {
+        # With backup_max_age_h 0 no RMAN backup counts as recent; the
+        # original value is put back whatever happens.
+        $setting = ''
+        $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                                  "SELECT 'SETTING|' || value FROM epf_setting WHERE name = 'backup_max_age_h';",
+                                  "UPDATE epf_setting SET value = '0' WHERE name = 'backup_max_age_h';", 'COMMIT;', 'EXIT')
+        Assert-Exit $r @(0)
+        foreach ($line in ($r.Output -split "`n")) {
+            if ($line -match '^SETTING\|(\d+)') { $setting = $Matches[1] }
+        }
+        Add-Check ($setting -ne '') ('backup_max_age_h read (' + $setting + ')')
+        if ($setting -eq '') { $setting = '24' }
+        try {
+            $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS') -TimeoutMin 30
+            Assert-Exit $r @(1)
+            Assert-Match $r 'Blocking requirements not met: [A-Z_, ]*BACKUP'
+            Assert-Match $r 'REQUIREMENTS_NOT_MET'
+            Assert-Match $r 'NOT READY'
+            Assert-NoMatch $r 'BATCH_PROGRESS'
+            $run = Get-Run $r 'PURGE'
+            Assert-Manifest $run 'status' '^FAILED$'
+            Assert-Manifest $run 'req.BACKUP' '^NOT_MET\|Y\|'
+            Assert-Manifest $run 'requirements_ready' '^N$'
+            Assert-Manifest $run 'step.PURGE.PREPARE.-' '^SKIPPED'
+        } finally {
+            $r = Invoke-Sql 'EPFPG' @("UPDATE epf_setting SET value = '" + $setting + "' WHERE name = 'backup_max_age_h';", 'COMMIT;', 'EXIT')
+            Assert-Exit $r @(0)
+        }
     }
 
     Invoke-Test 'T11' 'PAYMENTS purge through the wizard with redo log sizing and undo tuning; graceful stop' {
@@ -648,14 +702,19 @@ function Invoke-Suite {
             }
         }
         # Wizard answers: retention, mode, dry run, compact, batch size (Enter: the
-        # recommendation for 1 GB logs), final confirmation.
+        # recommendation for 1 GB logs), final confirmation. --backup none: no
+        # backup question (requirement BACKUP met by the choice).
         $answers = @($script:Retention, 'FULL', 'N', 'N', '', 'yes')
-        $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--undo-tuning') -Answers $answers `
+        $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
         Assert-Exit $r @(3)
         Assert-Match $r 'CHECKING THE DATABASE'
         Assert-Match $r 'Recommended batch size with 1 GB online logs'
+        # The purge checks the requirements again with the wizard's choices,
+        # reusing the root counts of the wizard's preflight.
+        Assert-Match $r 'PREFLIGHT  with the choices above; root counts of R-\d+'
+        Assert-Match $r 'counted by R-\d+'
         Assert-Match $r 'REDO LOGS \(SYS\)'
         Assert-Match $r 'UNDO TUNING \(SYS\)'
         Assert-Match $r 'STOP_HONORED'
@@ -670,6 +729,8 @@ function Invoke-Suite {
         Assert-Manifest $run 'exit_code' '^3$'
         Assert-Manifest $run 'redo_logs' '^Y$'
         Assert-Manifest $run 'undo_tuning' '^Y$'
+        Assert-Manifest $run 'backup' '^NONE$'
+        Assert-Manifest $run 'requirements_ready' '^Y$'
         Assert-Manifest $run 'preflight_run' '^R-\d+$'
         Assert-Manifest $run 'check.P3' '^PASS'
         Assert-Manifest $run 'check.P4' '^(PASS|WARN)'
@@ -692,15 +753,39 @@ function Invoke-Suite {
         Assert-Match $r 'no temporary index, undo tuning or locked account pending'
     }
 
-    Invoke-Test 'T13' 'PAYMENTS purge to the end, non-interactive, undo tuning' {
+    Invoke-Test 'T12B' 'PAYMENTS dry run: the simulation T13 is compared with' {
         $batch = $script:State.StopBatch
         if ($batch -eq '' -or $batch -eq '-') { $batch = $script:PayBatch }
-        $list = @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--depth', 'PAYMENTS', '--undo-tuning')
+        $list = @('purge', '--non-interactive', '--retention', $script:Retention, '--depth', 'PAYMENTS', '--dry-run',
+                  '--undo-tuning', '--backup', 'none')
+        if ($batch -ne '') { $list += @('--batch-size', $batch) }
+        $r = Invoke-Wrapper $list -TimeoutMin 120 -StopOnTimeout
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r 'SIMULATION \(dry run'
+        Assert-Match $r 'EXPECTED  '
+        Write-Note $r 'EXPECTED  WOULD COMPLETE' 'the simulation expects the purge to complete'
+        Assert-NoMatch $r 'UNDO TUNING \(SYS\)'
+        $run = Get-Run $r 'PURGE'
+        Assert-Manifest $run 'dry_run' '^Y$'
+        Assert-Manifest $run 'undo_tuning' '^Y$'
+        Assert-Manifest $run 'expected' '^(COMPLETE|FAIL|MAY_FAIL)\|'
+        if ($null -ne $run) {
+            $script:State.DryRun = $run['run']
+            if ($run.ContainsKey('expected')) { $script:State.DryRunExpected = ([string]$run['expected']).Split('|')[0] }
+        }
+    }
+
+    Invoke-Test 'T13' 'PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result' {
+        $batch = $script:State.StopBatch
+        if ($batch -eq '' -or $batch -eq '-') { $batch = $script:PayBatch }
+        $list = @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--depth', 'PAYMENTS', '--undo-tuning',
+                  '--backup', 'none')
         if ($batch -ne '') { $list += @('--batch-size', $batch) }
         $r = Invoke-Wrapper $list -TimeoutMin 240 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'PREFLIGHT'
         Assert-Match $r 'undo tuning planned for this purge'
+        Assert-Match $r 'FORECAST AND RESULT'
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
@@ -718,11 +803,40 @@ function Invoke-Suite {
         foreach ($check in @('P1', 'P3', 'P6', 'P7')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Assert-Manifest $run 'check.P2' '^(PASS|WARN)'
         Assert-Manifest $run 'check.P4' '^(PASS|WARN)'
+        # Forecast against result: rows exactly as the dry run counted them;
+        # redo, undo, deleting time and space freed logged with their error.
+        if ($null -ne $run) {
+            Add-Check ($run.ContainsKey('forecast.PAYMENTS.ROWS')) 'manifest has forecast.PAYMENTS.ROWS'
+            if ($script:State.DryRun -ne '') {
+                Assert-Manifest $run 'forecast.PAYMENTS.ROWS' ('\|' + [regex]::Escape($script:State.DryRun) + '\|DRY_RUN$')
+            }
+            foreach ($measure in @('ROWS', 'REDO', 'UNDO', 'SECONDS', 'FREED')) {
+                $key = 'forecast.PAYMENTS.' + $measure
+                if (-not $run.ContainsKey($key)) { continue }
+                $parts = ([string]$run[$key]).Split('|')
+                if ($parts.Count -lt 4) { continue }
+                $forecast = [double]0
+                $actual = [double]0
+                $text = $measure + ': forecast ' + $parts[0] + ', actual ' + $parts[1] + ' (' + $parts[3] + ' ' + $parts[2] + ')'
+                if ([double]::TryParse($parts[0], [ref]$forecast) -and [double]::TryParse($parts[1], [ref]$actual) -and $actual -ne 0) {
+                    $text = $text + ', error ' + [Math]::Round(100 * ($forecast - $actual) / $actual, 1) + '%'
+                }
+                if ($measure -eq 'ROWS') {
+                    Add-Check ($parts[0] -ne '' -and $parts[0] -eq $parts[1]) ('rows forecast = rows deleted: ' + $text)
+                } else {
+                    Write-TestLog ('  forecast accuracy ' + $text)
+                }
+            }
+        }
+        if ($script:State.DryRunExpected -ne '') {
+            Add-Check ($script:State.DryRunExpected -ne 'FAIL') ('the dry run did not predict a failure (' + $script:State.DryRunExpected + ')')
+        }
     }
 
-    Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive' {
+    Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive, undo growth confirmed' {
+        # --confirm UNDO: no undo tuning (no SYS); the undo tablespace may grow.
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS',
-                              '--compact') -TimeoutMin 90 -StopOnTimeout
+                              '--compact', '--backup', 'none', '--confirm', 'UNDO') -TimeoutMin 90 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'PURGE COMPACT DONE'
         Write-Note $r 'COMPACTED' 'tables compacted (none when an earlier run already compacted them)'
@@ -730,11 +844,13 @@ function Invoke-Suite {
         foreach ($check in @('P1', 'P3', 'P6')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Assert-Manifest $run 'check.P8' '^(PASS|WARN)'
         Assert-Manifest $run 'compact' '^Y$'
+        Assert-Manifest $run 'confirmed' '^UNDO$'
+        Assert-Manifest $run 'req.UNDO' '^MET\|Y\|(ROOM|CONFIRMED)$'
     }
 
     Invoke-Test 'T15' 'BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive' {
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'CLOB',
-                              '--depth', 'BANK_STATEMENTS') -TimeoutMin 120 -StopOnTimeout
+                              '--depth', 'BANK_STATEMENTS', '--backup', 'none') -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'LOB values cleared'
         $run = Get-Run $r 'PURGE'
@@ -745,7 +861,7 @@ function Invoke-Suite {
     Invoke-Test 'T16' 'BANK_STATEMENTS purge through the menu wizard (redo sizing already done)' {
         # Menu answers: 1 Purge, retention, mode, dry run, compact, batch size, confirmation.
         $answers = @('1', $script:Retention, 'FULL', 'N', 'N', '', 'yes')
-        $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--undo-tuning') -Answers $answers `
+        $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'REDO_UNCHANGED|REDO_ENLARGED'
@@ -781,6 +897,8 @@ function Invoke-Suite {
             Assert-Exit $r @(0)
             Assert-Match $r 'EPF_ADVICE\|BATCH_SIZE'
             Assert-Match $r 'EPF_ADVICE\|REDO_PER_ROOT'
+            Assert-Match $r 'EPF_ADVICE\|READY\|[YN]'
+            Assert-Match $r 'EPF_ADVICE\|REQ\|BACKUP\|'
         }
     }
 

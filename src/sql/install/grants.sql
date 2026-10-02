@@ -56,7 +56,9 @@ BEGIN
                          'V_$SESSION', 'V_$SESSION_LONGOPS', 'V_$TRANSACTION', 'V_$LOCKED_OBJECT',
                          'V_$DATABASE', 'V_$INSTANCE', 'V_$VERSION', 'V_$PARAMETER',
                          'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME',
-                         'V_$UNDOSTAT'))) LOOP
+                         'V_$UNDOSTAT', 'V_$ARCHIVE_DEST', 'V_$RECOVERY_FILE_DEST', 'V_$ASM_DISKGROUP',
+                         'V_$RMAN_BACKUP_JOB_DETAILS', 'DBA_TEMP_FREE_SPACE', 'DBA_TEMP_FILES',
+                         'DBA_TRIGGERS'))) LOOP
         run_grant('GRANT SELECT ON sys.' || v.view_name || ' TO epfpg');
     END LOOP;
 

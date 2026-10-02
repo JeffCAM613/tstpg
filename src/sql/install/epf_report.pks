@@ -46,11 +46,19 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     PROCEDURE close_run(p_run_id IN NUMBER, p_status IN VARCHAR2, p_exit_code OUT NUMBER);
 
     -- Prints the report of run p_run_id through DBMS_OUTPUT: run header,
-    -- steps, purge results per module and table, held roots, space inside
-    -- segments, datafiles, redo and undo, checks, verdict, and the
-    -- machine-readable lines. Evaluates first.
+    -- steps, purge results per module and table, held roots, then
+    --   dry run   SIMULATION (forecast per module), held roots, triggers and
+    --             sessions, RETENTION OPTIONS, REQUIREMENTS, EXPECTED outcome
+    --   purge     FORECAST AND RESULT (the latest forecast with the same
+    --             cutoff against the result, per module), REQUIREMENTS
+    --   preflight ESTIMATE, RETENTION OPTIONS, REQUIREMENTS
+    -- space inside segments, datafiles, redo and undo, checks, verdict, and
+    -- the machine-readable lines. Evaluates first.
     --   EPF_CHECK|<run>|<check_id>|<status>|<value>|<title>
     --   EPF_STEP|<run>|<phase>|<step>|<scope>|<status>|<elapsed seconds>
+    --   EPF_REQ|<run>|<requirement>|<MET|NOT_MET|NOT_APPLICABLE>|<blocking Y|N>|<met by>
+    --   EPF_EXPECTED|<run>|<COMPLETE|FAIL|MAY_FAIL>|<deleting seconds>|<bytes freed>|<redo bytes>
+    --   EPF_FORECAST|<run>|<module>|<ROWS|REDO|UNDO|SECONDS|FREED>|<forecast>|<actual>|<forecast run>|<origin>
     --   EPF_VERDICT|<run>|<verdict>|exit=<n>
     PROCEDURE print_report(p_run_id IN NUMBER);
 
@@ -64,6 +72,11 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   EPF_ADVICE|UNDO_ACTIVE|Y|N         undo tuning currently applied
     --   EPF_ADVICE|ERRORS|<n> and WARNINGS|<n>
     --   EPF_ADVICE|ROOTS|<owner.table>|<eligible rows>   per root table
+    --   EPF_ADVICE|READY|Y|N|-             every blocking requirement met
+    --                                      (- when none was measured)
+    --   EPF_ADVICE|REQ|<requirement>|<status>|<blocking>|<met by>
+    --   EPF_ADVICE|UNDO_MAX_BATCH|<n>      largest batch whose undo the undo
+    --                                      tablespace holds 4 times
     PROCEDURE print_advice(p_run_id IN NUMBER);
 
     -- Prints the other sessions of the tool schema (wait event, blocker,

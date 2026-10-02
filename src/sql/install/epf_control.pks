@@ -23,8 +23,16 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
 
     -- Creates a run. Purge parameters are validated and normalised for
     -- actions PURGE and PREFLIGHT; missing values take their setting default.
-    -- p_with_undo_tuning: the caller applies undo tuning for the purge (PURGE,
-    -- not a dry run). Before inserting, stale runs are marked ABANDONED and
+    -- The cutoff is TRUNC(SYSDATE) - p_retention_days, or p_cutoff_date when
+    -- given (the retention is then the days between them; giving both is an
+    -- error), so a purge run on a later day can keep the cutoff of its
+    -- preflight. p_with_undo_tuning: undo tuning is planned for the purge
+    -- (PURGE: the caller applies it unless dry run; PREFLIGHT and dry runs
+    -- check the requirements as if it were applied). p_backup_choice: CONFIRMED or NONE, how the
+    -- operator meets the BACKUP requirement without a recent RMAN backup.
+    -- p_confirm: blocking requirements (ARCHIVE, UNDO, TEMP, separated by
+    -- commas) the operator confirms are handled although the preflight finds
+    -- them not met. Before inserting, stale runs are marked ABANDONED and
     -- history older than history_retention_days is removed.
     FUNCTION start_run(
         p_action           IN VARCHAR2,
@@ -35,7 +43,10 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
         p_dry_run          IN VARCHAR2 DEFAULT 'N',
         p_with_reclaim     IN VARCHAR2 DEFAULT 'N',
         p_with_compact     IN VARCHAR2 DEFAULT 'N',
-        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N'
+        p_with_undo_tuning IN VARCHAR2 DEFAULT 'N',
+        p_backup_choice    IN VARCHAR2 DEFAULT NULL,
+        p_cutoff_date      IN DATE     DEFAULT NULL,
+        p_confirm          IN VARCHAR2 DEFAULT NULL
     ) RETURN NUMBER;
 
     -- Takes the run lock in this session, sets the run RUNNING and binds the

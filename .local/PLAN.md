@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Decisions D1-D18 applied, D19-D20 decided (not built); phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied; D19-D20 round 1 built (0.5.0: requirements, gate, simulation, forecast against result; not yet run), round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -398,12 +398,12 @@ The preflight decides whether a purge can run to the end on this database and pr
 
   | Requirement | Why | Met by |
   |---|---|---|
-  | ARCHIVE (ARCHIVELOG only) | Every deleted row is written to redo. Archived logs stay until backed up, and a full archive destination stops the database (ORA-00257). | NOARCHIVELOG (detected; the tool never changes the log mode) · room in the archive destination of at least the redo estimate + 20% (recovery area: limit - used + reclaimable; ASM: disk group free; a directory: not measurable, the DBA frees space and confirms) · smaller runs (the plan) |
-  | UNDO | A batch's undo must fit until its commit. | Undo tuning (D18) · the undo tablespace holds 4 batches |
-  | TEMP | The work keys (temporary table) need room in TEMP. | Room in TEMP |
-  | INDEX_SPACE | Temporary indexes on unindexed link columns need room in the table's tablespace. | Room (free + autoextend) · indexes already present |
-  | REDO_LOGS | Small online logs slow the purge (not a failure). | Logs of at least 1 GB · redo log sizing at purge start (D17) · smaller batch |
-  | BACKUP | A purge cannot be undone. | RMAN full backup newer than 24 h (`v$rman_backup_job_details`) · backup made another way (confirmed) · purge without a backup (confirmed) |
+  | ARCHIVE (ARCHIVELOG only) | Every deleted row is written to redo. Archived logs stay until backed up, and a full archive destination stops the database (ORA-00257). | NOARCHIVELOG (detected; the tool never changes the log mode); room in the archive destination of at least the redo estimate + 20% (recovery area: limit - used + reclaimable; ASM: disk group free; a directory: not measurable, the DBA frees space and confirms); smaller runs (the plan) |
+  | UNDO | A batch's undo must fit until its commit; without undo tuning the undo tablespace grows. | Undo tuning (D18); the undo tablespace holds 4 batches and the undo kept for undo_retention without growing; smaller batch; the DBA accepts the growth (`--confirm UNDO`) |
+  | TEMP | The work keys (temporary table) need room in TEMP. | Room in TEMP; the DBA confirms (`--confirm TEMP`) |
+  | INDEX_SPACE | Temporary indexes on unindexed link columns need room in the table's tablespace. | Room (free + autoextend); indexes already present |
+  | REDO_LOGS | Small online logs slow the purge (not a failure). | Logs of at least 1 GB; redo log sizing at purge start (D17); smaller batch |
+  | BACKUP | A purge cannot be undone. | RMAN full backup newer than 24 h (`v$rman_backup_job_details`); backup made another way (confirmed); purge without a backup (confirmed) |
 
 - **Choices.** For a requirement that is not met, the wizard offers the options the tool can apply and records the choice:
   - smaller runs: the plan below;
@@ -432,6 +432,17 @@ The preflight decides whether a purge can run to the end on this database and pr
   - a retention table: rows, redo, archive space needed and space freed for the requested retention and longer ones, and the smallest retention that fits the archive room now.
 
   A dry run counts as a preflight for the purge.
+
+- **Built in round 1 (0.5.0).**
+  - The requirements, with the confirmations `--backup` and `--confirm`.
+  - The gate: a purge that deletes refuses to start while a blocking requirement of its own preflight is not met.
+  - The wizard's questions.
+  - Root counts reused from the wizard's preflight.
+  - The simulation, with the retention table and the expected outcome.
+  - FORECAST AND RESULT in every purge report.
+  - `--cutoff`.
+
+  Round 2: the plan of smaller runs, choices stored with the preflight, the plan lifecycle and the menu.
 
 ---
 

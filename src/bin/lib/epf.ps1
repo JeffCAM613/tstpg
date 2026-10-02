@@ -135,17 +135,27 @@ Options
                        command line values override file values
   --tns NAME           TNS alias or EZConnect string (PDB service in multitenant)
   --retention DAYS     default 30
+  --cutoff YYYY-MM-DD  purge rows dated before this day, instead of --retention
+                       (keeps the cutoff of an earlier preflight or dry run)
   --depth LIST         ALL, or modules separated by commas
                        (PAYMENTS,LOGS,BANK_STATEMENTS); not used in LOGS mode
   --mode MODE          FULL | CLOB | LOGS | CLOB_N_LOGS
   --batch-size N       root rows per transaction, 100-100000; the wizard
                        offers the preflight's recommendation
-  --dry-run            snapshot and counts only
+  --dry-run            simulation: exact counts, forecast and expected outcome;
+                       nothing is deleted
+  --backup CHOICE      when no recent RMAN backup is found: confirmed (a backup
+                       was made another way) or none (purge without a backup)
+  --confirm LIST       requirements the DBA confirms are handled although the
+                       preflight finds them not met: ARCHIVE, UNDO, TEMP
+                       separated by commas
   --compact            shrink the purged tables afterwards (purge only)
   --redo-logs          enlarge the online redo logs first (4 x 1 GB,
                        permanent; SYS)
   --undo-tuning        lower undo_retention and limit undo growth (4 GB by
-                       default) for the purge; restored at the end (SYS)
+                       default) for the purge; restored at the end (SYS).
+                       With preflight or --dry-run: checked as planned, nothing
+                       is applied
   --run ID             run for report (default LATEST) and stop (default:
                        the active run); 124 or R-000124
   --yes                skip the final confirmation (required with
@@ -155,6 +165,13 @@ Options
   --log-dir DIR        run folders (default: logs in the tool folder)
   --no-color           plain output
   --help
+
+Requirements
+  Before a purge the preflight checks six requirements: archive space, undo,
+  TEMP, index space, redo logs and backup. The report lists each one with the
+  ways to meet it. A purge does not start while a blocking one (archive, undo,
+  TEMP, backup) is not met: meet it and run again, or use --backup, --confirm
+  or --undo-tuning. A dry run simulates the purge and predicts its outcome.
 
 Environment
   EPF_PASSWORD         EPFPG password
@@ -177,8 +194,8 @@ Exit codes: 0 PASS, 1 FAIL, 2 PASS WITH WARNINGS, 3 aborted or stopped,
 function Read-Arguments {
     param([object[]]$List)
     $result = @{ Action = $null; Options = @{}; Flags = @{} }
-    $valueOptions = @('config', 'tns', 'retention', 'depth', 'mode', 'batch-size', 'log-dir', 'run',
-                      'tablespaces', 'long-conversion')
+    $valueOptions = @('config', 'tns', 'retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup', 'confirm',
+                      'log-dir', 'run', 'tablespaces', 'long-conversion')
     $flagOptions = @('dry-run', 'compact', 'redo-logs', 'undo-tuning', 'yes', 'non-interactive', 'no-color',
                      'help', 'reclaim', 'resume')
     $i = 0
@@ -770,11 +787,24 @@ function Invoke-ToolRun {
         $batchArg = $Ctx.BatchSize
     }
 
+    # Undo tuning is planned for the run (the preflight checks the
+    # requirements with it); only a purge that deletes applies it.
     $undo = 'N'
-    if ($Ctx.UndoTuning -and $Action -eq 'PURGE' -and -not $Ctx.DryRun) { $undo = 'Y' }
+    if ($Ctx.UndoTuning) { $undo = 'Y' }
+    $retentionArg = $Ctx.Retention
+    $cutoffArg = '-'
+    if ($Ctx.Cutoff -ne '') {
+        $retentionArg = '-'
+        $cutoffArg = $Ctx.Cutoff
+    }
+    $backupArg = '-'
+    if ($Ctx.Backup -ne '') { $backupArg = $Ctx.Backup }
+    $confirmArg = '-'
+    if ($Ctx.Confirm -ne '') { $confirmArg = $Ctx.Confirm }
 
     $state.Monitor = Open-Monitor $Ctx.Cred
-    $begin = @($Action, $Ctx.Retention, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact, $undo)
+    $begin = @($Action, $retentionArg, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact, $undo, $backupArg,
+               $cutoffArg, $confirmArg)
     try {
         $lines = Invoke-MonitorCommand $state.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $begin) 120000
     } catch {
@@ -812,10 +842,19 @@ function Invoke-ToolRun {
         Write-Out (' Times      database clock (' + $offset + ' from this machine)')
     }
     Write-Out (' Run folder ' + $state.Folder)
+    $period = 'retention ' + $Ctx.Retention + ' days'
+    if ($Ctx.Cutoff -ne '') { $period = 'cutoff ' + $Ctx.Cutoff }
     if ($Action -eq 'PURGE') {
-        Write-Out (' Purge      mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', retention ' + $Ctx.Retention +
-                   ' days, batch ' + $batch + ', dry run ' + $dry + ', compact ' + $compact)
+        Write-Out (' Purge      mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', ' + $period +
+                   ', batch ' + $batch + ', dry run ' + $dry + ', compact ' + $compact)
+    } else {
+        Write-Out (' Preflight  mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', ' + $period + ', batch ' + $batch)
     }
+    $choices = @()
+    if ($Ctx.UndoTuning) { $choices += 'undo tuning' }
+    if ($Ctx.Backup -ne '') { $choices += ('backup ' + $Ctx.Backup.ToLower()) }
+    if ($Ctx.Confirm -ne '') { $choices += ('confirmed ' + $Ctx.Confirm) }
+    if ($choices.Count -gt 0) { Write-Out (' Choices    ' + ($choices -join ', ')) }
 
     $status = 'FAILED'
     $undoApplied = $false
@@ -830,38 +869,57 @@ function Invoke-ToolRun {
             if ($result.ExitCode -ne 0) { throw 'Redo log sizing failed; the purge was not started.' }
         }
 
+        # Every run checks the requirements with its own choices. After the
+        # wizard's preflight run, its root counts are reused (no second scan).
         $preflightOk = $true
+        $reuse = '-'
+        $title = 'PREFLIGHT'
         if ($Ctx.PreflightRun -ne '') {
-            Write-Section ('PREFLIGHT  done in ' + $Ctx.PreflightRun)
+            $reuse = $Ctx.PreflightRun -replace '^R-0*', ''
+            $title = 'PREFLIGHT  with the choices above; root counts of ' + $Ctx.PreflightRun
+        }
+        Write-Section $title
+        $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'preflight.sql') @([string]$state.RunId, $reuse) $state 'sqlplus_preflight.log'
+        Update-LiveView $state
+        if ($result.ExitCode -eq 0) {
+            $status = 'SUCCESS'
+        } elseif ($result.ExitCode -eq 2) {
+            $status = 'WARNING'
         } else {
-            Write-Section 'PREFLIGHT'
-            $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'preflight.sql') @([string]$state.RunId) $state 'sqlplus_preflight.log'
-            Update-LiveView $state
-            if ($result.ExitCode -eq 0) {
-                $status = 'SUCCESS'
-            } elseif ($result.ExitCode -eq 2) {
-                $status = 'WARNING'
-            } else {
-                $preflightOk = $false
-                $status = 'FAILED'
-                if (Test-SessionFailure $result.Output) { Show-Lines $result.Output -Indent }
-                Write-Out ' The preflight found errors; nothing was changed.' 'Red'
-            }
+            $preflightOk = $false
+            $status = 'FAILED'
+            if (Test-SessionFailure $result.Output) { Show-Lines $result.Output -Indent }
+            Write-Out ' The preflight found errors; nothing was changed.' 'Red'
         }
 
         if ($Action -eq 'PURGE' -and $preflightOk) {
+            # A purge that deletes starts only when every blocking requirement
+            # is met; otherwise the purge step records the refusal
+            # (REQUIREMENTS_NOT_MET) and changes nothing.
+            $ready = $true
+            if (-not $Ctx.DryRun) {
+                $unmet = Get-Unmet (Read-Advice $Ctx.Cred $state.RunId)
+                if ($unmet.Count -gt 0) {
+                    $ready = $false
+                    Write-Out (' Blocking requirements not met: ' + ($unmet -join ', ') + '. The purge does not start;') 'Red'
+                    Write-Out ' REQUIREMENTS in the report lists the ways to meet them.' 'Red'
+                }
+            }
             if ($state.StopRequested) {
                 $status = 'STOPPED'
+            } elseif (-not $ready) {
+                Write-Section 'PURGE  not started (requirements)'
+                $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'purge.sql') @([string]$state.RunId, '-', '-', '-', '-', '-', '-') $state 'sqlplus_purge.log'
+                Update-LiveView $state
+                if ($result.Output -match 'ORA-\d{5}|SP2-\d{4}') { Show-Lines $result.Output -Indent }
+                $status = 'FAILED'
             } else {
-                if ($Ctx.UndoTuning) {
+                if ($Ctx.UndoTuning -and -not $Ctx.DryRun) {
                     Write-Section 'UNDO TUNING (SYS)'
                     $undoApplied = $true
                     # The growth limit is sized from this run's batch size and the
-                    # undo per root estimated by its preflight (this run, or the
-                    # wizard's preflight run).
-                    $preflightId = [string]$state.RunId
-                    if ($Ctx.PreflightRun -ne '') { $preflightId = $Ctx.PreflightRun -replace '^R-0*', '' }
-                    $applyArgs = @('APPLY', [string]$state.RunId, $preflightId)
+                    # undo per root estimated by its own preflight.
+                    $applyArgs = @('APPLY', [string]$state.RunId, [string]$state.RunId)
                     $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') $applyArgs $state 'sqlplus_undo_apply.log'
                     Show-Lines $result.Output -Indent
                     if ($result.ExitCode -ne 0) { throw 'Undo tuning could not be applied; the purge was not started.' }
@@ -945,6 +1003,7 @@ function Write-Manifest {
     $lines.Add('tool_version=' + $script:Database.Version)
     $lines.Add('tns=' + $Ctx.Cred.Tns)
     $lines.Add('retention_days=' + $Ctx.Retention)
+    if ($Ctx.Cutoff -ne '') { $lines.Add('cutoff=' + $Ctx.Cutoff) }
     $lines.Add('depth=' + $Ctx.Depth)
     $lines.Add('mode=' + $Ctx.Mode)
     $lines.Add('batch_size=' + $Ctx.BatchSize)
@@ -952,9 +1011,12 @@ function Write-Manifest {
     $lines.Add('compact=' + (Get-YN $Ctx.Compact))
     $lines.Add('redo_logs=' + (Get-YN $Ctx.RedoLogs))
     $lines.Add('undo_tuning=' + (Get-YN $Ctx.UndoTuning))
+    $lines.Add('backup=' + $Ctx.Backup)
+    $lines.Add('confirmed=' + $Ctx.Confirm)
     if ($Ctx.PreflightRun -ne '') { $lines.Add('preflight_run=' + $Ctx.PreflightRun) }
     $lines.Add('stop_requested=' + (Get-YN $State.StopRequested))
     $lines.Add('status=' + $Status)
+    $ready = '-'
     foreach ($line in ($Report -split "`r?`n")) {
         if ($line -match '^EPF_STEP\|[^|]*\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$') {
             $lines.Add('step.' + $Matches[1] + '.' + $Matches[2] + '.' + $Matches[3] + '=' + $Matches[4] + '|' + $Matches[5])
@@ -962,8 +1024,20 @@ function Write-Manifest {
             $lines.Add('check.' + $Matches[1] + '=' + $Matches[2] + '|' + $Matches[3])
         } elseif ($line -match '^EPF_VERDICT\|[^|]*\|([^|]*)\|') {
             $verdict = $Matches[1]
+        } elseif ($line -match '^EPF_REQ\|[^|]*\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$') {
+            # req.<requirement>=<status>|<blocking>|<met by>
+            $lines.Add('req.' + $Matches[1] + '=' + $Matches[2] + '|' + $Matches[3] + '|' + $Matches[4].Trim())
+            if ($ready -eq '-') { $ready = 'Y' }
+            if ($Matches[2] -eq 'NOT_MET' -and $Matches[3] -eq 'Y') { $ready = 'N' }
+        } elseif ($line -match '^EPF_EXPECTED\|[^|]*\|(.*)$') {
+            # expected=<COMPLETE|FAIL|MAY_FAIL>|<deleting s>|<bytes freed>|<redo bytes>
+            $lines.Add('expected=' + $Matches[1].Trim())
+        } elseif ($line -match '^EPF_FORECAST\|[^|]*\|([^|]*)\|([^|]*)\|(.*)$') {
+            # forecast.<module>.<measure>=<forecast>|<actual>|<forecast run>|<origin>
+            $lines.Add('forecast.' + $Matches[1] + '.' + $Matches[2] + '=' + $Matches[3].Trim())
         }
     }
+    $lines.Add('requirements_ready=' + $ready)
     $lines.Add('verdict=' + $verdict)
     $lines.Add('exit_code=' + $ExitCode)
     [System.IO.File]::WriteAllLines((Join-Path $State.Folder 'manifest.txt'), $lines.ToArray(), [System.Text.Encoding]::ASCII)
@@ -1023,15 +1097,50 @@ function Connect-Sys {
 function Get-PurgeContext {
     param($Login, [string]$Action)
     $ctx = [pscustomobject]@{
-        Cred = $Login; SysCred = $null; Retention = ''; Depth = ''; Mode = ''; BatchSize = '';
-        DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $false; PreflightRun = ''
+        Cred = $Login; SysCred = $null; Retention = ''; Cutoff = ''; Depth = ''; Mode = ''; BatchSize = '';
+        DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $false; Backup = ''; Confirm = '';
+        PreflightRun = ''
     }
     if ($Action -ne 'PURGE') {
-        foreach ($name in @('dry-run', 'compact', 'redo-logs', 'undo-tuning')) {
+        foreach ($name in @('dry-run', 'compact', 'redo-logs')) {
             if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge only.') }
         }
     }
-    $ctx.Retention = Get-Input -Name 'retention' -Key 'RETENTION_DAYS' -Prompt 'Retention in days' -Default '30' -Min 1
+    # A cutoff date instead of the retention: a purge on a later day keeps the
+    # cutoff of its preflight or dry run. Retention then shows the days to it.
+    if ($script:Cli.Options.ContainsKey('cutoff') -and $script:Cli.Options.ContainsKey('retention')) {
+        Exit-Tool $script:ExitUsage 'Give --retention or --cutoff, not both.'
+    }
+    $cutoff = ''
+    if (-not $script:Cli.Options.ContainsKey('retention')) { $cutoff = Get-Option 'cutoff' 'CUTOFF' '' }
+    if ($cutoff -ne '') {
+        $day = [datetime]::MinValue
+        $today = (Get-Date).Add($script:ClockOffset).Date
+        if (-not [datetime]::TryParseExact($cutoff.Trim(), 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
+                                           [Globalization.DateTimeStyles]::None, [ref]$day)) {
+            Exit-Tool $script:ExitUsage ('--cutoff: a date as YYYY-MM-DD, got ' + $cutoff + '.')
+        }
+        if ($day -ge $today) { Exit-Tool $script:ExitUsage ('--cutoff: a day before today, got ' + $cutoff + '.') }
+        $ctx.Cutoff = $day.ToString('yyyy-MM-dd')
+        $ctx.Retention = [string][int]($today - $day).TotalDays
+    } else {
+        $ctx.Retention = Get-Input -Name 'retention' -Key 'RETENTION_DAYS' -Prompt 'Retention in days' -Default '30' -Min 1
+    }
+    $backup = Get-Option 'backup' 'BACKUP' ''
+    if ($backup -ne '') {
+        $ctx.Backup = Test-Value $backup -Allowed @('CONFIRMED', 'NONE')
+        if ($null -eq $ctx.Backup) { Exit-Tool $script:ExitUsage ('--backup: confirmed or none, got ' + $backup + '.') }
+    }
+    $confirmList = Get-Option 'confirm' 'CONFIRM' ''
+    if ($confirmList -ne '') {
+        $codes = @($confirmList.ToUpper().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        foreach ($code in $codes) {
+            if (@('ARCHIVE', 'UNDO', 'TEMP') -notcontains $code) {
+                Exit-Tool $script:ExitUsage ('--confirm: ARCHIVE, UNDO, TEMP separated by commas, got ' + $confirmList + '.')
+            }
+        }
+        $ctx.Confirm = (@($codes | Select-Object -Unique) -join ',')
+    }
     $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
     if ($ctx.Mode -eq 'LOGS') {
         $ctx.Depth = 'LOGS'
@@ -1046,18 +1155,20 @@ function Get-PurgeContext {
     }
     if ($Action -eq 'PURGE') {
         $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('dry-run')
-        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (snapshot and counts only, nothing is deleted)' -Ask:$ask
+        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask
         if ($ctx.DryRun) {
-            foreach ($name in @('compact', 'redo-logs', 'undo-tuning')) {
+            foreach ($name in @('compact', 'redo-logs')) {
                 if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' does not apply to a dry run.') }
             }
         } else {
             $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('compact')
             $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask
             $ctx.RedoLogs = Get-Choice 'redo-logs' 'REDO_LOGS' ''
-            $ctx.UndoTuning = Get-Choice 'undo-tuning' 'UNDO_TUNING' ''
         }
     }
+    # Applied by a purge that deletes; a preflight or dry run checks the
+    # requirements as if it were applied.
+    $ctx.UndoTuning = Get-Choice 'undo-tuning' 'UNDO_TUNING' ''
     return $ctx
 }
 
@@ -1069,13 +1180,75 @@ function Get-Advice {
     param($Ctx)
     $run = Invoke-ToolRun $Ctx 'PREFLIGHT'
     $script:LogFile = $null
-    $advice = @{ BATCH_SIZE = ''; REDO_PER_ROOT = ''; REDO_WARN = 'N'; UNDO_WARN = 'N'; UNDO_ACTIVE = 'N'; ERRORS = '0'; WARNINGS = '0' }
-    $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'advice.sql') @([string]$run.RunId)
-    foreach ($line in ($result.Output -split "`r?`n")) {
-        if ($line -match '^EPF_ADVICE\|([A-Z_]+)\|([^|]*)$') { $advice[$Matches[1]] = $Matches[2].Trim() }
-    }
+    $advice = Read-Advice $Ctx.Cred $run.RunId
     $advice['Run'] = $run
     return $advice
+}
+
+# EPF_ADVICE lines of a run (advice.sql): single values by name, and the
+# requirements in Req (code -> Status, Blocking, MetBy).
+function Read-Advice {
+    param($Cred, [long]$RunId)
+    $advice = @{ BATCH_SIZE = ''; REDO_PER_ROOT = ''; REDO_WARN = 'N'; UNDO_WARN = 'N'; UNDO_ACTIVE = 'N'; ERRORS = '0';
+                 WARNINGS = '0'; READY = '-'; UNDO_MAX_BATCH = '' }
+    $requirements = [ordered]@{}
+    $result = Invoke-SqlScript $Cred (Join-Path $script:RunSqlDir 'advice.sql') @([string]$RunId)
+    foreach ($line in ($result.Output -split "`r?`n")) {
+        if ($line -match '^EPF_ADVICE\|REQ\|([A-Z_]+)\|([A-Z_]+)\|([YN])\|(.*)$') {
+            $requirements[$Matches[1]] = [pscustomobject]@{ Status = $Matches[2]; Blocking = $Matches[3]; MetBy = $Matches[4].Trim() }
+        } elseif ($line -match '^EPF_ADVICE\|([A-Z_]+)\|([^|]*)$') {
+            $advice[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+    $advice['Req'] = $requirements
+    return $advice
+}
+
+# Blocking requirements not met, in the preflight's order.
+function Get-Unmet {
+    param($Advice)
+    $codes = @()
+    foreach ($code in $Advice.Req.Keys) {
+        $item = $Advice.Req[$code]
+        if ($item.Status -eq 'NOT_MET' -and $item.Blocking -eq 'Y') { $codes += $code }
+    }
+    return ,$codes
+}
+
+# Wizard, after the preflight: the blocking requirements it found not met.
+# BACKUP: a backup made another way, or none. ARCHIVE, UNDO, TEMP: the DBA
+# confirms them as handled, or the wizard stops so they can be met first (a
+# new preflight then checks them again). UNDO is left to the purge's own
+# preflight when undo tuning was chosen.
+function Resolve-Requirements {
+    param($Ctx, $Advice)
+    $requirements = $Advice.Req
+    if ($requirements.Count -eq 0) { return }
+    if ($requirements.Contains('BACKUP') -and $requirements['BACKUP'].Status -eq 'NOT_MET' -and $Ctx.Backup -eq '') {
+        Write-Out ''
+        Write-Out ' No recent database backup was found (BACKUP above). A purge cannot be undone.' 'Yellow'
+        Write-Out '   1  Stop here: take a backup, then run the purge again'
+        Write-Out '   2  A backup was made another way (storage snapshot, export)'
+        Write-Out '   3  Purge without a backup'
+        $answer = Read-Value -Prompt 'Backup' -Default '1' -Allowed @('1', '2', '3')
+        switch ($answer) {
+            '1' { Exit-Tool $script:ExitAborted 'Stopped: take a backup, then run the purge again.' }
+            '2' { $Ctx.Backup = 'CONFIRMED' }
+            '3' { $Ctx.Backup = 'NONE' }
+        }
+    }
+    foreach ($code in @('ARCHIVE', 'UNDO', 'TEMP')) {
+        if (-not $requirements.Contains($code) -or $requirements[$code].Status -ne 'NOT_MET') { continue }
+        if ($code -eq 'UNDO' -and $Ctx.UndoTuning) { continue }
+        if ((',' + $Ctx.Confirm + ',').Contains(',' + $code + ',')) { continue }
+        Write-Out ''
+        Write-Out (' Requirement ' + $code + ' is not met: REQUIREMENTS above shows why and the ways to meet it.') 'Yellow'
+        Write-Out '   1  Stop here: meet it, then run the purge again (its preflight checks again)'
+        Write-Out '   2  The DBA confirms it is handled: purge anyway'
+        $answer = Read-Value -Prompt $code -Default '1' -Allowed @('1', '2')
+        if ($answer -eq '1') { Exit-Tool $script:ExitAborted ('Stopped: meet ' + $code + ', then run the purge again.') }
+        if ($Ctx.Confirm -eq '') { $Ctx.Confirm = $code } else { $Ctx.Confirm = $Ctx.Confirm + ',' + $code }
+    }
 }
 
 # Batch size that keeps one batch within half of an online log of $LogBytes
@@ -1092,23 +1265,30 @@ function Get-BatchForLog {
 function Show-Review {
     param($Ctx, [string]$Action)
     Write-Section 'REVIEW'
-    $cutoff = (Get-Date).Date.AddDays(-1 * [int]$Ctx.Retention).ToString('yyyy-MM-dd')
+    $cutoff = $Ctx.Cutoff
+    if ($cutoff -eq '') { $cutoff = (Get-Date).Add($script:ClockOffset).Date.AddDays(-1 * [int]$Ctx.Retention).ToString('yyyy-MM-dd') }
     $batch = $Ctx.BatchSize
     if ($batch -eq '') { $batch = 'default setting' }
+    $backupText = 'a recent RMAN backup (checked by the preflight)'
+    if ($Ctx.Backup -eq 'CONFIRMED') { $backupText = 'made another way (confirmed)' }
+    if ($Ctx.Backup -eq 'NONE') { $backupText = 'none (purge without a backup)' }
     Write-Out ('  Action        ' + $Action)
     Write-Out ('  Database      ' + $script:Database.Container + ' (' + $Ctx.Cred.Tns + ')')
     Write-Out ('  Retention     ' + $Ctx.Retention + ' days (rows before ' + $cutoff + ')')
     Write-Out ('  Mode, depth   ' + $Ctx.Mode + ', ' + $Ctx.Depth)
     Write-Out ('  Batch size    ' + $batch)
     if ($Ctx.DryRun) {
-        Write-Out '  Dry run       yes (nothing is deleted)'
+        Write-Out '  Dry run       yes (simulation: nothing is deleted)'
+        if ($Ctx.UndoTuning) { Write-Out '  Undo tuning   planned (checked as applied, nothing is changed)' }
     } else {
         Write-Out '  Dry run       no'
         Write-Out ('  Compact       ' + (Get-YN $Ctx.Compact))
         Write-Out ('  Redo logs     ' + (Get-YN $Ctx.RedoLogs) + '   (enlarge to 4 x 1 GB before the purge; permanent)')
         Write-Out ('  Undo tuning   ' + (Get-YN $Ctx.UndoTuning) + '   (undo_retention lowered and undo growth limited for the purge, restored at the end)')
+        Write-Out ('  Backup        ' + $backupText)
+        if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the preflight finds them not met)') }
     }
-    if ($Ctx.PreflightRun -ne '') { Write-Out ('  Preflight     ' + $Ctx.PreflightRun) }
+    if ($Ctx.PreflightRun -ne '') { Write-Out ('  Preflight     ' + $Ctx.PreflightRun + ' (the purge checks the requirements again with these choices)') }
 }
 
 # ----------------------------------------------------------------------------
@@ -1139,6 +1319,7 @@ function Invoke-PurgeAction {
                 Write-Out ' The undo tablespace is expected to grow during the purge (UNDO_ESTIMATE above).' 'Yellow'
                 $ctx.UndoTuning = Read-YesNo 'Lower undo_retention and limit undo growth for the purge, restored at the end (SYS)' $true
             }
+            Resolve-Requirements $ctx $advice
         }
         if ($ctx.BatchSize -eq '') {
             $default = 1000
@@ -1151,11 +1332,19 @@ function Invoke-PurgeAction {
                 $default = [Math]::Min(100000, [Math]::Max(100, $recommended))
                 Write-Out (' Recommended batch size: ' + $default + ' root rows (REDO_SUMMARY above).')
             }
+            # Requirement UNDO: the undo tablespace holds 4 batches.
+            $undoMax = 0
+            if ([int]::TryParse($advice.UNDO_MAX_BATCH, [ref]$undoMax) -and $undoMax -gt 0 -and $undoMax -lt $default) {
+                $default = [Math]::Max(100, [int]([Math]::Floor($undoMax / 100) * 100))
+                Write-Out (' Batch size limited to ' + $default + ' root rows: the undo tablespace holds 4 batches of that size (UNDO above).')
+            }
             $ctx.BatchSize = Read-Value -Prompt 'Batch size (root rows per transaction)' -Default ([string]$default) -Min 100 -Max 100000
         }
     }
 
-    if ($ctx.RedoLogs -or $ctx.UndoTuning) { $ctx.SysCred = Connect-Sys $login.Tns }
+    if ($Action -eq 'PURGE' -and -not $ctx.DryRun -and ($ctx.RedoLogs -or $ctx.UndoTuning)) {
+        $ctx.SysCred = Connect-Sys $login.Tns
+    }
     if ($Action -eq 'PURGE') {
         Show-Review $ctx $Action
         if (-not $ctx.DryRun) {
