@@ -416,8 +416,15 @@ The preflight decides whether a purge can run to the end on this database and pr
 - **Stored in the database.** Requirements, choices and plan belong to the preflight run, with who confirmed what. The run folder gets `requirements.txt` and `plan.txt`. Each preflight shows what changed since the previous one for the same scope.
 - **Purge.** `purge` without scope options takes the latest preflight for this database not older than `preflight_valid_h` (8). It runs the next step of the plan with its choices: depth, retention, batch size, redo log sizing and undo tuning.
   - At start it measures ARCHIVE, UNDO, TEMP and INDEX_SPACE again. If one is not met it refuses (non-interactive) or asks to type yes (wizard).
-  - Options that differ from the plan are refused, with a pointer to run the preflight again.
+  - Options that differ from the plan: the wizard asks to continue the plan, start over with those options, or cancel. Non-interactive runs stop with exit 4 ("a plan is in progress; add --new to start over").
+  - A plan older than `preflight_valid_h` is not refused: the purge re-checks the requirements with the saved choices, shows the result and asks to continue.
   - The report ends with the next step and what to do before it.
+- **Plan lifecycle.** One plan per database at a time; the latest preflight decides.
+  - States: READY (no step run), IN PROGRESS (step n of m done; a stopped or failed step is offered again and continues with what is left), DONE, CLOSED (started over or closed).
+  - Starting over closes the plan. Completed steps stay done (purged rows cannot come back), and the new preflight measures what is left; choices and confirmations are asked again.
+  - Checking again (`preflight` while a plan is open) offers the saved choices as one question: use them? [Y/n].
+  - The wizard's main menu shows the plan (who, when, steps done, next step) and offers: continue the plan, check again, rehearse (dry run), start over. Without a plan it offers the preflight first.
+  - Commands: `purge` (continue), `preflight` (check again, or start a plan), `preflight --new` (start over), `plan` (show), `plan --close`.
 - **Dry run = simulation (D20).** The full rehearsal of the plan without changing anything:
   - exact rows per table and module (key snapshot), rows held back, references that would block, enabled triggers on the tables, current sessions of the application;
   - batches, redo, undo, time (measured rates, otherwise estimated), space freed, and the requirements;

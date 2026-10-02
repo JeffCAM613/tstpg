@@ -13,7 +13,8 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
   - the backup requirement can be met by a detected RMAN backup, a confirmed backup made another way, or a confirmed purge without a backup;
   - the dry run becomes a simulation with a retention table and a predicted outcome;
   - no option based on archived logs being removed while the purge runs;
-  - the tool never changes the log mode.
+  - the tool never changes the log mode;
+  - plan lifecycle: one plan per database; the latest preflight decides; start over at any time (completed steps stay done, the new preflight measures what is left); check again with the saved choices in one question; an expired plan is re-checked rather than refused; the main menu shows the plan and offers continue, check again, rehearse, start over.
 
 ## 2026-10-02 - Parity check: runner fix
 
