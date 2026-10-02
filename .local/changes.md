@@ -2,6 +2,11 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - Parity check: runner fix
+
+- `legacy_purge.sql`, first run on EPFPG782: SQL*Plus did not find `@@../../../legacy/sql/0x_*.sql`, so nothing was installed. The check still reported the package valid, because it only looked for compilation errors. `run_purge` then failed with PLS-00201, and nothing was purged.
+- The install scripts are now called relative to the top folder (`@legacy/sql/...`), where the runner is started from (as the spool path already required). The check requires both the package and the package body, and both VALID.
+
 ## 2026-10-01 - Parity check: running the previous tool without its wrapper
 
 Results (EPFPG782 previous tool, EPFPG781 this tool, cutoff 2025-10-01)

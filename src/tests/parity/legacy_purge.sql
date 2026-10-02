@@ -67,26 +67,26 @@ SPOOL logs\parity\legacy_purge.txt
 PROMPT == Previous tool: install (legacy/sql 01, 02, 03)
 WHENEVER SQLERROR CONTINUE
 SET FEEDBACK ON DEFINE OFF
-@@../../../legacy/sql/01_create_purge_log_table.sql
-@@../../../legacy/sql/02_epf_purge_pkg_spec.sql
-@@../../../legacy/sql/03_epf_purge_pkg_body.sql
+@legacy/sql/01_create_purge_log_table.sql
+@legacy/sql/02_epf_purge_pkg_spec.sql
+@legacy/sql/03_epf_purge_pkg_body.sql
 SET FEEDBACK OFF DEFINE ON
 SET ECHO OFF TAB OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON TRIMOUT ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
 
 WHENEVER SQLERROR EXIT FAILURE
 DECLARE
-    l_errors  NUMBER;
-    l_invalid NUMBER;
+    l_errors NUMBER;
+    l_valid  NUMBER;
 BEGIN
     SELECT COUNT(*) INTO l_errors FROM user_errors WHERE name = 'EPF_PURGE_PKG';
-    SELECT COUNT(*) INTO l_invalid FROM user_objects
-     WHERE object_name = 'EPF_PURGE_PKG' AND object_type IN ('PACKAGE', 'PACKAGE BODY') AND status <> 'VALID';
+    SELECT COUNT(*) INTO l_valid FROM user_objects
+     WHERE object_name = 'EPF_PURGE_PKG' AND object_type IN ('PACKAGE', 'PACKAGE BODY') AND status = 'VALID';
     FOR e IN (SELECT type, line, text FROM user_errors WHERE name = 'EPF_PURGE_PKG' ORDER BY type, sequence) LOOP
         DBMS_OUTPUT.PUT_LINE('  ' || e.type || ' line ' || e.line || ': ' || e.text);
     END LOOP;
-    IF l_errors > 0 OR l_invalid > 0 THEN
-        RAISE_APPLICATION_ERROR(-20197, 'The package of the previous tool did not compile: nothing was purged.');
+    IF l_errors > 0 OR l_valid < 2 THEN
+        RAISE_APPLICATION_ERROR(-20197, 'The package of the previous tool is missing or did not compile: nothing was purged.');
     END IF;
     DBMS_OUTPUT.PUT_LINE('  package OPPAYMENTS.EPF_PURGE_PKG valid');
 END;
