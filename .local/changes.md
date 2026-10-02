@@ -12,7 +12,8 @@ Results (FULL, depth ALL, cutoff 2025-10-01; copies refreshed from the same sour
 - Previous tool, findings for the record:
   - its run summary reports 96,114,901 rows: it counts FILE_INTEGRATION, SPEC_TRT_LOG and the bulk payment batches twice and leaves out FILE_DISPATCHING; its per-table lines are right;
   - its space snapshot falls back to `user_segments` without the DBA view grants its wrapper gives when it has the SYS password.
-- Phase 2 exit criterion (parity with the previous tool) met for FULL. CLOB_ONLY and CLOB_N_LOGS not run. Expected differences there: PAYMENT_AUDIT values reached through the payment only (10.8 M rows, cleared by this tool only) and D8.
+- Phase 2 exit criterion (parity with the previous tool) met for FULL. CLOB_ONLY and CLOB_N_LOGS not run; the expected difference there is D8.
+- PAYMENT_AUDIT in LOB clearing: the previous tool clears it by bulk payment only, while it deletes it by bulk payment and by payment. The 10.8 M rows reached through the payment only would keep their LOB values with it. No reason for the asymmetry in its code; this tool treats both links the same in both modes. PAYMENT_AUDIT has no LOB column (`dba_lobs`, EPFPG782), so the difference cannot occur on this schema.
 
 ## 2026-10-02 - Plan: requirements, purge plan and simulation (D19, D20)
 
