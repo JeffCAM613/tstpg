@@ -3,7 +3,8 @@
 -- ============================================================================
 -- Purpose : Prints the preflight findings of a run as EPF_ADVICE lines for the
 --           wizard (epf_report.print_advice): recommended batch size, redo
---           and undo warnings, eligible roots.
+--           and undo warnings, eligible roots, and the requirements with the
+--           texts of the wizard's questions.
 -- Usage   : sqlplus -L -S "epfpg@<service>" @src/sql/run/advice.sql <run_id>
 -- Requires: EPFPG.
 -- Effects : None (reads only).

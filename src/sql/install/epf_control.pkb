@@ -82,6 +82,60 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         RETURN l_mode;
     END normalize_mode;
 
+    -- Depth of a run in mode p_mode: LOGS mode purges the LOGS module only;
+    -- CLOB_N_LOGS always includes it.
+    FUNCTION scope_depth(p_mode IN VARCHAR2, p_depth IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        IF p_mode = 'LOGS' THEN
+            RETURN 'LOGS';
+        ELSIF p_mode = 'CLOB_N_LOGS' AND p_depth <> 'ALL' AND INSTR(',' || p_depth || ',', ',LOGS,') = 0 THEN
+            RETURN normalize_depth(p_depth || ',LOGS');
+        END IF;
+        RETURN p_depth;
+    END scope_depth;
+
+    -- Backup choice: CONFIRMED, NONE or NULL.
+    FUNCTION norm_backup(p_value IN VARCHAR2) RETURN VARCHAR2 IS
+        l_value VARCHAR2(100) := UPPER(TRIM(p_value));
+    BEGIN
+        IF l_value IS NOT NULL AND l_value NOT IN ('CONFIRMED', 'NONE') THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Backup choice must be CONFIRMED or NONE, got: ' || p_value);
+        END IF;
+        RETURN l_value;
+    END norm_backup;
+
+    -- Confirmed requirements: ARCHIVE, UNDO, TEMP, in that order, or NULL.
+    FUNCTION norm_confirm(p_value IN VARCHAR2) RETURN VARCHAR2 IS
+        l_codes  SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST('ARCHIVE', 'UNDO', 'TEMP');
+        l_result VARCHAR2(100);
+    BEGIN
+        IF TRIM(p_value) IS NULL THEN
+            RETURN NULL;
+        END IF;
+        FOR i IN 1 .. REGEXP_COUNT(p_value, '[^,]+') LOOP
+            IF UPPER(TRIM(REGEXP_SUBSTR(p_value, '[^,]+', 1, i))) NOT IN ('ARCHIVE', 'UNDO', 'TEMP') THEN
+                RAISE_APPLICATION_ERROR(-20127, 'Requirements to confirm: ARCHIVE, UNDO, TEMP separated by '
+                                                || 'commas, got: ' || p_value);
+            END IF;
+        END LOOP;
+        FOR k IN 1 .. l_codes.COUNT LOOP
+            IF INSTR(',' || REPLACE(UPPER(p_value), ' ') || ',', ',' || l_codes(k) || ',') > 0 THEN
+                l_result := l_result || CASE WHEN l_result IS NOT NULL THEN ',' END || l_codes(k);
+            END IF;
+        END LOOP;
+        RETURN l_result;
+    END norm_confirm;
+
+    FUNCTION norm_batch(p_value IN NUMBER) RETURN NUMBER IS
+        l_batch NUMBER := NVL(p_value, epf_util.setting_num('batch_size_default'));
+    BEGIN
+        IF l_batch <> TRUNC(l_batch) OR l_batch NOT BETWEEN 100 AND 100000 THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Batch size must be a whole number between 100 and 100000, got: '
+                                            || p_value);
+        END IF;
+        RETURN l_batch;
+    END norm_batch;
+
     PROCEDURE prune_history IS
         l_cutoff TIMESTAMP := epf_util.now_ts
                               - NUMTODSINTERVAL(epf_util.setting_num('history_retention_days'), 'DAY');
@@ -111,7 +165,8 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         p_with_undo_tuning IN VARCHAR2 DEFAULT 'N',
         p_backup_choice    IN VARCHAR2 DEFAULT NULL,
         p_cutoff_date      IN DATE     DEFAULT NULL,
-        p_confirm          IN VARCHAR2 DEFAULT NULL
+        p_confirm          IN VARCHAR2 DEFAULT NULL,
+        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N'
     ) RETURN NUMBER IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_action    VARCHAR2(30) := UPPER(TRIM(p_action));
@@ -124,28 +179,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_reclaim   VARCHAR2(1)  := yes_no(p_with_reclaim, 'with_reclaim');
         l_compact   VARCHAR2(1)  := yes_no(p_with_compact, 'with_compact');
         l_undo      VARCHAR2(1)  := yes_no(p_with_undo_tuning, 'with_undo_tuning');
-        l_backup    VARCHAR2(10) := UPPER(TRIM(p_backup_choice));
-        l_confirm   VARCHAR2(100);
-        l_codes     SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST('ARCHIVE', 'UNDO', 'TEMP');
+        l_redo      VARCHAR2(1)  := yes_no(p_with_redo_logs, 'with_redo_logs');
+        l_backup    VARCHAR2(10) := norm_backup(p_backup_choice);
+        l_confirm   VARCHAR2(100) := norm_confirm(p_confirm);
         l_run_id    NUMBER;
     BEGIN
-        IF l_backup IS NOT NULL AND l_backup NOT IN ('CONFIRMED', 'NONE') THEN
-            RAISE_APPLICATION_ERROR(-20127, 'Backup choice must be CONFIRMED or NONE, got: ' || p_backup_choice);
-        END IF;
-        -- Confirmed requirements: ARCHIVE, UNDO, TEMP, in that order.
-        IF TRIM(p_confirm) IS NOT NULL THEN
-            FOR i IN 1 .. REGEXP_COUNT(p_confirm, '[^,]+') LOOP
-                IF UPPER(TRIM(REGEXP_SUBSTR(p_confirm, '[^,]+', 1, i))) NOT IN ('ARCHIVE', 'UNDO', 'TEMP') THEN
-                    RAISE_APPLICATION_ERROR(-20127, 'Requirements to confirm: ARCHIVE, UNDO, TEMP separated by '
-                                                    || 'commas, got: ' || p_confirm);
-                END IF;
-            END LOOP;
-            FOR k IN 1 .. l_codes.COUNT LOOP
-                IF INSTR(',' || REPLACE(UPPER(p_confirm), ' ') || ',', ',' || l_codes(k) || ',') > 0 THEN
-                    l_confirm := l_confirm || CASE WHEN l_confirm IS NOT NULL THEN ',' END || l_codes(k);
-                END IF;
-            END LOOP;
-        END IF;
         IF l_action IS NULL OR l_action NOT IN ('PURGE', 'RECLAIM', 'PREFLIGHT') THEN
             RAISE_APPLICATION_ERROR(-20121, 'Unknown action: ' || p_action
                                             || '. Valid values: PURGE, RECLAIM, PREFLIGHT');
@@ -157,6 +195,9 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         IF l_undo = 'Y' AND l_action NOT IN ('PURGE', 'PREFLIGHT') THEN
             RAISE_APPLICATION_ERROR(-20127, 'Undo tuning (with_undo_tuning=Y) applies to purge and preflight runs.');
         END IF;
+        IF l_redo = 'Y' AND l_action NOT IN ('PURGE', 'PREFLIGHT') THEN
+            RAISE_APPLICATION_ERROR(-20127, 'Redo log sizing (with_redo_logs=Y) applies to purge and preflight runs.');
+        END IF;
         IF NOT lock_is_free THEN
             RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '
                                             || NVL(epf_util.run_label(active_run_id), 'unknown run'));
@@ -164,13 +205,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
 
         IF l_action IN ('PURGE', 'PREFLIGHT') THEN
             l_mode  := normalize_mode(NVL(p_mode, 'FULL'));
-            l_depth := normalize_depth(NVL(p_depth, 'ALL'));
-            IF l_mode = 'LOGS' THEN
-                l_depth := 'LOGS';
-            ELSIF l_mode = 'CLOB_N_LOGS' AND l_depth <> 'ALL'
-                  AND INSTR(',' || l_depth || ',', ',LOGS,') = 0 THEN
-                l_depth := normalize_depth(l_depth || ',LOGS');
-            END IF;
+            l_depth := scope_depth(l_mode, normalize_depth(NVL(p_depth, 'ALL')));
 
             IF p_cutoff_date IS NOT NULL AND p_retention_days IS NOT NULL THEN
                 RAISE_APPLICATION_ERROR(-20127, 'Give the retention or the cutoff date, not both.');
@@ -190,12 +225,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                                                         ELSE ', got: ' || p_retention_days END);
             END IF;
             l_cutoff := TRUNC(SYSDATE) - l_retention;
-
-            l_batch := NVL(p_batch_size, epf_util.setting_num('batch_size_default'));
-            IF l_batch <> TRUNC(l_batch) OR l_batch NOT BETWEEN 100 AND 100000 THEN
-                RAISE_APPLICATION_ERROR(-20127, 'Batch size must be a whole number between 100 and 100000, got: '
-                                                || p_batch_size);
-            END IF;
+            l_batch  := norm_batch(p_batch_size);
         END IF;
 
         UPDATE epf_run
@@ -209,11 +239,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
 
         INSERT INTO epf_run (
             action, status, retention_days, cutoff_date, depth, purge_mode, batch_size,
-            dry_run, with_reclaim, with_compact, with_undo_tuning, backup_choice, confirmed_reqs, created_at,
-            db_name, container_name, client_host, os_user, tool_version
+            dry_run, with_reclaim, with_compact, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs,
+            created_at, db_name, container_name, client_host, os_user, tool_version
         ) VALUES (
             l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch,
-            l_dry_run, l_reclaim, l_compact, l_undo, l_backup, l_confirm, epf_util.now_ts,
+            l_dry_run, l_reclaim, l_compact, l_undo, l_redo, l_backup, l_confirm, epf_util.now_ts,
             SYS_CONTEXT('USERENV', 'DB_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME'),
             SYS_CONTEXT('USERENV', 'HOST'), SYS_CONTEXT('USERENV', 'OS_USER'),
             epf_util.setting('tool_version')
@@ -269,7 +299,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                    || ' batch=' || l_run.batch_size || ' dry_run=' || l_run.dry_run
                END
             || ' reclaim=' || l_run.with_reclaim || ' compact=' || l_run.with_compact
-            || ' undo_tuning=' || l_run.with_undo_tuning
+            || ' undo_tuning=' || l_run.with_undo_tuning || ' redo_logs=' || l_run.with_redo_logs
             || CASE WHEN l_run.backup_choice IS NOT NULL THEN ' backup=' || l_run.backup_choice END
             || CASE WHEN l_run.confirmed_reqs IS NOT NULL THEN ' confirmed=' || l_run.confirmed_reqs END
             || ' db=' || l_run.db_name || ' container=' || l_run.container_name
@@ -379,6 +409,75 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         SELECT MAX(run_id) INTO l_run_id FROM epf_run WHERE status IN ('CREATED', 'RUNNING');
         RETURN l_run_id;
     END active_run_id;
+
+    PROCEDURE set_choices(
+        p_run_id           IN NUMBER,
+        p_batch_size       IN NUMBER,
+        p_with_undo_tuning IN VARCHAR2,
+        p_with_redo_logs   IN VARCHAR2,
+        p_backup_choice    IN VARCHAR2,
+        p_confirm          IN VARCHAR2
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        l_batch   NUMBER        := norm_batch(p_batch_size);
+        l_undo    VARCHAR2(1)   := yes_no(p_with_undo_tuning, 'with_undo_tuning');
+        l_redo    VARCHAR2(1)   := yes_no(p_with_redo_logs, 'with_redo_logs');
+        l_backup  VARCHAR2(10)  := norm_backup(p_backup_choice);
+        l_confirm VARCHAR2(100) := norm_confirm(p_confirm);
+    BEGIN
+        UPDATE epf_run
+           SET batch_size       = l_batch,
+               with_undo_tuning = l_undo,
+               with_redo_logs   = l_redo,
+               backup_choice    = l_backup,
+               confirmed_reqs   = l_confirm
+         WHERE run_id = p_run_id
+           AND action IN ('PURGE', 'PREFLIGHT')
+           AND status = 'RUNNING';
+        IF SQL%ROWCOUNT = 0 THEN
+            ROLLBACK;
+            RAISE_APPLICATION_ERROR(-20124, 'Run ' || epf_util.run_label(p_run_id)
+                                            || ' is not a running purge or preflight run.');
+        END IF;
+        COMMIT;
+    END set_choices;
+
+    PROCEDURE print_saved_choices(
+        p_retention_days IN NUMBER,
+        p_cutoff_date    IN DATE,
+        p_mode           IN VARCHAR2,
+        p_depth          IN VARCHAR2
+    ) IS
+        l_mode   VARCHAR2(30)   := normalize_mode(NVL(p_mode, 'FULL'));
+        l_depth  VARCHAR2(4000) := scope_depth(l_mode, normalize_depth(NVL(p_depth, 'ALL')));
+        l_cutoff DATE           := NVL(TRUNC(p_cutoff_date),
+                                       TRUNC(SYSDATE) - NVL(p_retention_days,
+                                                            epf_util.setting_num('retention_days_default')));
+        l_hours  NUMBER         := epf_util.setting_num('preflight_valid_h');
+        l_since  TIMESTAMP      := epf_util.now_ts - NUMTODSINTERVAL(l_hours, 'HOUR');
+        l_ready  VARCHAR2(1);
+    BEGIN
+        FOR r IN (SELECT run_id, batch_size, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs,
+                         created_at
+                    FROM epf_run
+                   WHERE action = 'PREFLIGHT' AND status IN ('SUCCESS', 'WARNING')
+                     AND cutoff_date = l_cutoff AND purge_mode = l_mode AND depth = l_depth
+                     AND created_at >= l_since
+                   ORDER BY run_id DESC
+                   FETCH FIRST 1 ROWS ONLY) LOOP
+            SELECT CASE WHEN COUNT(*) = 0 THEN '-'
+                        WHEN COUNT(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN 1 END) = 0 THEN 'Y'
+                        ELSE 'N' END
+              INTO l_ready
+              FROM epf_requirement
+             WHERE run_id = r.run_id;
+            DBMS_OUTPUT.PUT_LINE('EPF_SAVED|' || epf_util.run_label(r.run_id) || '|' || r.run_id || '|' || r.batch_size
+                                 || '|' || r.with_undo_tuning || '|' || r.with_redo_logs
+                                 || '|' || NVL(r.backup_choice, '-') || '|' || NVL(r.confirmed_reqs, '-')
+                                 || '|' || l_ready || '|' || TO_CHAR(r.created_at, 'HH24:MI')
+                                 || '|' || TO_CHAR(r.created_at + NUMTODSINTERVAL(l_hours, 'HOUR'), 'YYYY-MM-DD HH24:MI'));
+        END LOOP;
+    END print_saved_choices;
 
 END epf_control;
 /

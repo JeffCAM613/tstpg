@@ -483,9 +483,10 @@ $script:TestList = @(
     'T06  Wrapper basics: --help, status, stop without an active run',
     'T07  Usage errors: exit 4, nothing changed',
     'T08  Preflight through the wrapper',
+    'T08B Preflight with questions: choices saved, a dry run follows them',
     'T09  preflight.sql NEW',
     'T10  Dry run of all modules through the wrapper: simulation and expected outcome',
-    'T10B Requirements gate: a purge without a recent backup or a backup choice does not start',
+    'T10B Requirements gate: a purge without a backup choice does not start; S stops the preflight questions',
     'T11  PAYMENTS purge through the wizard with redo log sizing and undo tuning; graceful stop',
     'T12  State after the stop: undo restored, nothing pending',
     'T12B PAYMENTS dry run: the simulation T13 is compared with',
@@ -616,12 +617,13 @@ function Invoke-Suite {
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'ROOTS_ELIGIBLE'
         Assert-Match $r 'REDO_LOGS'
-        Assert-Match $r 'UNDO_ESTIMATE|No rows before the cutoff'
+        Assert-Match $r 'PREFLIGHT UNDO DONE'
         Assert-Match $r 'ESTIMATE \(rows before the cutoff'
         Assert-Match $r 'RETENTION OPTIONS'
         Assert-Match $r 'REQUIREMENTS'
         Assert-Match $r ' RESULT  (READY|NOT READY)'
-        Assert-Match $r 'EPF_REQ\|'
+        Assert-NoMatch $r '(?m)^EPF_REQ\|'
+        Assert-NoMatch $r ' CHOICES '
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
         Assert-Manifest $run 'requirements_ready' '^(Y|N)$'
@@ -629,6 +631,39 @@ function Invoke-Suite {
             Assert-Manifest $run ('req.' + $code) '^(MET|NOT_MET|NOT_APPLICABLE)\|[YN]\|'
         }
         if ($null -ne $run) { $script:State.PreflightRun = $run['run'] }
+    }
+
+    Invoke-Test 'T08B' 'Preflight with questions: choices saved, a dry run follows them' {
+        # One day more than the suite's retention: no other purge of the
+        # suite has this scope, so none follows these choices.
+        $retention = [string]([int]$script:Retention + 1)
+        # With these options every requirement is met: the only question is
+        # the batch size.
+        $r = Invoke-Wrapper @('preflight', '--retention', $retention, '--mode', 'LOGS', '--undo-tuning', '--redo-logs',
+                              '--backup', 'none') -Answers @('200') -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r ' CHOICES '
+        Assert-Match $r 'READY with these choices'
+        Assert-Match $r 'Next    epf_purge.bat purge'
+        $saved = ''
+        $run = Get-Run $r 'PREFLIGHT'
+        Assert-Manifest $run 'batch_size' '^200$'
+        Assert-Manifest $run 'requirements_ready' '^Y$'
+        Assert-Manifest $run 'step.PREFLIGHT.CHOICES.-' '^DONE'
+        if ($null -ne $run) { $saved = $run['run'] }
+        $r = Invoke-Wrapper @('purge', '--non-interactive', '--retention', $retention, '--mode', 'LOGS', '--dry-run') -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r ('Choices saved with the preflight ' + [regex]::Escape($saved))
+        Assert-Match $r 'counted by R-\d+'
+        Assert-NoMatch $r 'REDO LOGS \(SYS\)'
+        $run = Get-Run $r 'PURGE'
+        Assert-Manifest $run 'dry_run' '^Y$'
+        Assert-Manifest $run 'batch_size' '^200$'
+        Assert-Manifest $run 'backup' '^NONE$'
+        Assert-Manifest $run 'undo_tuning' '^Y$'
+        Assert-Manifest $run 'redo_logs' '^Y$'
+        Assert-Manifest $run 'preflight_run' ('^' + [regex]::Escape($saved) + '$')
+        Assert-Manifest $run 'requirements_ready' '^Y$'
     }
 
     Invoke-Test 'T09' 'preflight.sql NEW' {
@@ -653,7 +688,7 @@ function Invoke-Suite {
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
     }
 
-    Invoke-Test 'T10B' 'Requirements gate: a purge without a recent backup or a backup choice does not start' {
+    Invoke-Test 'T10B' 'Requirements gate: a purge without a backup choice does not start; S stops the preflight questions' {
         # With backup_max_age_h 0 no RMAN backup counts as recent; the
         # original value is put back whatever happens.
         $setting = ''
@@ -678,6 +713,13 @@ function Invoke-Suite {
             Assert-Manifest $run 'req.BACKUP' '^NOT_MET\|Y\|'
             Assert-Manifest $run 'requirements_ready' '^N$'
             Assert-Manifest $run 'step.PURGE.PREPARE.-' '^SKIPPED'
+            # The preflight's questions: S at the first one stops; nothing is
+            # saved and the exit code is 3.
+            $r = Invoke-Wrapper @('preflight', '--retention', $script:Retention, '--mode', 'LOGS') -Answers @('S', 'S', 'S') -TimeoutMin 30
+            Assert-Exit $r @(3)
+            Assert-Match $r ' CHOICES '
+            Assert-Match $r 'Stopped: '
+            Assert-NoMatch $r 'Checking again with these choices'
         } finally {
             $r = Invoke-Sql 'EPFPG' @("UPDATE epf_setting SET value = '" + $setting + "' WHERE name = 'backup_max_age_h';", 'COMMIT;', 'EXIT')
             Assert-Exit $r @(0)
@@ -701,15 +743,20 @@ function Invoke-Suite {
                 Assert-Match $s 'Stop requested'
             }
         }
-        # Wizard answers: retention, mode, dry run, compact, batch size (Enter: the
-        # recommendation for 1 GB logs), final confirmation. --backup none: no
-        # backup question (requirement BACKUP met by the choice).
+        # Wizard answers: retention, mode, dry run, compact; in the preflight's
+        # CHOICES the batch size (Enter: the recommendation for 1 GB logs);
+        # final confirmation. --redo-logs, --undo-tuning and --backup none meet
+        # the requirements, so no other question is asked.
         $answers = @($script:Retention, 'FULL', 'N', 'N', '', 'yes')
         $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
         Assert-Exit $r @(3)
         Assert-Match $r 'CHECKING THE DATABASE'
+        # The wizard's preflight asks its questions (here only the batch size)
+        # and checks again with the answers.
+        Assert-Match $r ' CHOICES '
+        Assert-Match $r 'READY with these choices'
         Assert-Match $r 'Recommended batch size with 1 GB online logs'
         # The purge checks the requirements again with the wizard's choices,
         # reusing the root counts of the wizard's preflight.
@@ -859,7 +906,8 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T16' 'BANK_STATEMENTS purge through the menu wizard (redo sizing already done)' {
-        # Menu answers: 1 Purge, retention, mode, dry run, compact, batch size, confirmation.
+        # Menu answers: 1 Purge, retention, mode, dry run, compact, batch size (in
+        # the preflight's CHOICES), confirmation.
         $answers = @('1', $script:Retention, 'FULL', 'N', 'N', '', 'yes')
         $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout

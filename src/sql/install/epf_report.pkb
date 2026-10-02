@@ -1074,6 +1074,19 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         FOR q IN (SELECT req_code, status, blocking, met_by FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
             put('EPF_ADVICE|REQ|' || q.req_code || '|' || q.status || '|' || q.blocking || '|' || q.met_by);
         END LOOP;
+        -- Texts for the wizard's questions: title and measurement of each
+        -- requirement, and the details of its ways to meet it.
+        FOR q IN (SELECT req_code, title, measured FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
+            put('EPF_ADVICE|REQTEXT|' || q.req_code || '|' || REPLACE(q.title, '|', '/') || '|'
+                || REPLACE(q.measured, '|', '/'));
+        END LOOP;
+        FOR o IN (SELECT req_code, option_code, met, detail FROM epf_req_option WHERE run_id = p_run_id
+                   ORDER BY req_code, seq) LOOP
+            put('EPF_ADVICE|OPT|' || o.req_code || '|' || o.option_code || '|' || o.met || '|'
+                || REPLACE(o.detail, '|', '/'));
+        END LOOP;
+        SELECT MAX(batch_size) INTO l_count FROM epf_run WHERE run_id = p_run_id;
+        put('EPF_ADVICE|RUN_BATCH|' || l_count);
         -- Largest batch whose undo the undo tablespace holds 4 times (UNDO).
         FOR u IN (SELECT rq.needed_bytes, rq.room_bytes, rn.batch_size
                     FROM epf_requirement rq

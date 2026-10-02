@@ -2,6 +2,38 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - Preflight asks for the choices and saves them; the purge follows them (0.5.1)
+
+Why: the preflight only reported the requirements. The operator expected it to ask how to meet each one, and the purge to follow the answers (plan 6.10).
+
+Preflight
+- Without `--non-interactive`, after the checks, the preflight asks one question per requirement not met. Blocking requirements come first, then the ones that only slow the purge. Each question shows what was measured:
+  - ARCHIVE: the DBA confirms the room; purge older data first (stops with the `--cutoff` that fits); or stop;
+  - UNDO: undo tuning (default); accept the growth (the DBA confirms); or stop;
+  - TEMP: the DBA confirms; or stop (default);
+  - BACKUP: made another way; purge without a backup; or stop (default);
+  - INDEX_SPACE: continue (slower); or stop;
+  - REDO_LOGS: enlarge to 4 x 1 GB when the purge starts (default); or leave them.
+- Then it asks the batch size: the recommendation for 1 GB logs when they will be enlarged, capped by undo.
+- The answers are saved with the preflight run (`epf_control.set_choices`). The requirements and the forecast are checked again without a table scan (`epf_purge.recheck`, step and event CHOICES). If something is still not met, it offers to answer again.
+- `S` stops at any question: nothing is saved, exit code 3.
+- At the end: the saved choices, and the next command (`purge` of the same scope, or `--dry-run` first).
+
+Purge
+- A purge or dry run looks up the latest preflight of its scope (same mode, depth and cutoff, within `preflight_valid_h`, 8 h) (`saved.sql`).
+- If that preflight is READY, the purge follows its choices. The wizard asks once, "Use the choices saved with R-...?", instead of running a new preflight; a run without prompts uses them and says so.
+- Command-line values win over saved ones. Undo tuning, redo log sizing and confirmations add up.
+- The purge's own preflight reuses that preflight's root counts unless a purge has processed batches since; then it counts again.
+- The wizard without saved choices runs the preflight with its questions, then the purge. The old separate redo, undo, backup and batch questions are gone.
+- `--redo-logs` now also works with `preflight` and `--dry-run`, as planned (EPF_RUN.WITH_REDO_LOGS). The requirement REDO_LOGS then counts 1 GB logs.
+
+Output
+- The console no longer shows the EPF_ machine lines of the report, or the INFO detail events: IDX_MISSING, REDO_ESTIMATE, UNDO_ESTIMATE, TABLE_ELIGIBLE, TEMP_INDEX_CREATED, TEMP_INDEX_DROPPED. `console.log` and `report.txt` keep everything.
+
+Tests (22): T08B, new, is an interactive preflight with options (the only question is the batch size, answered 200), then a dry run that follows the saved choices. T10B also checks that `S` stops the preflight's questions with exit code 3. T11 checks the wizard's CHOICES section. T08 checks that no machine lines reach the console.
+
+Not yet run: written without a database.
+
 ## 2026-10-02 - 0.5.0 test round: end-to-end suite on EPFPG781 (set A), 21/21 passed
 
 - 21 passed, 0 failed, in 1:22:52.

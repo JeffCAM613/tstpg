@@ -134,6 +134,7 @@ BEGIN
             with_reclaim    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_compact    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_undo_tuning CHAR(1)       DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N')),
+            with_redo_logs  CHAR(1)        DEFAULT 'N' NOT NULL CHECK (with_redo_logs IN ('Y', 'N')),
             backup_choice   VARCHAR2(10)   CHECK (backup_choice IN ('CONFIRMED', 'NONE')),
             confirmed_reqs  VARCHAR2(100),
             stop_requested  CHAR(1)        DEFAULT 'N' NOT NULL,
@@ -156,6 +157,9 @@ BEGIN
     -- with_undo_tuning: undo tuning (epf_tuning.undo_apply) is applied for the
     -- purge by the caller; the preflight then assumes its growth limit.
     add_column('EPF_RUN', 'WITH_UNDO_TUNING', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (with_undo_tuning IN ('Y', 'N'))]');
+    -- with_redo_logs: the online redo logs are enlarged (redo_logs.sql) when
+    -- the purge starts; a preflight checks the requirements as if they were.
+    add_column('EPF_RUN', 'WITH_REDO_LOGS', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (with_redo_logs IN ('Y', 'N'))]');
     -- backup_choice: how the operator meets the BACKUP requirement when no
     -- recent RMAN backup is found: CONFIRMED (a backup made another way) or
     -- NONE (purge without a backup); NULL when not given.

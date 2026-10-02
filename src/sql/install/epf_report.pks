@@ -75,6 +75,9 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   EPF_ADVICE|READY|Y|N|-             every blocking requirement met
     --                                      (- when none was measured)
     --   EPF_ADVICE|REQ|<requirement>|<status>|<blocking>|<met by>
+    --   EPF_ADVICE|REQTEXT|<requirement>|<title>|<measured>
+    --   EPF_ADVICE|OPT|<requirement>|<option>|<met Y|N>|<detail>
+    --   EPF_ADVICE|RUN_BATCH|<n>           batch size of the run
     --   EPF_ADVICE|UNDO_MAX_BATCH|<n>      largest batch whose undo the undo
     --                                      tablespace holds 4 times
     PROCEDURE print_advice(p_run_id IN NUMBER);

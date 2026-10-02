@@ -3,7 +3,7 @@
 -- ============================================================================
 -- Purpose : Creates a run and attaches this session to it, so this session
 --           holds the run lock for the whole run (the wrapper's monitor).
--- Usage   : @src/sql/run/begin_run.sql <action> <retention_days> <depth> <mode> <batch_size> <dry_run> <reclaim> <compact> <undo_tuning> <backup> <cutoff> <confirm>
+-- Usage   : @src/sql/run/begin_run.sql <action> <retention_days> <depth> <mode> <batch_size> <dry_run> <reclaim> <compact> <undo_tuning> <backup> <cutoff> <confirm> <redo_logs>
 --           in a connected, persistent sqlplus session (EPFPG); the
 --           arguments of start_run.sql ('-' for a default), plus
 --           undo_tuning Y when the caller applies undo tuning for the purge,
@@ -11,8 +11,9 @@
 --           without a recent RMAN backup), cutoff YYYY-MM-DD instead of
 --           the retention (retention_days is then -), and confirm: blocking
 --           requirements the operator confirms are handled (ARCHIVE, UNDO,
---           TEMP separated by commas). Every argument is given ('-' when not
---           used): a missing one would be prompted for.
+--           TEMP separated by commas), and redo_logs Y when the caller
+--           enlarges the online redo logs for the purge. Every argument is
+--           given ('-' when not used): a missing one would be prompted for.
 -- Requires: EPFPG.
 -- Effects : Inserts and attaches the run; prints EPF_RUN_ID=<run_id>. Does not
 --           exit, so the session stays connected; errors are printed and the
@@ -43,7 +44,8 @@ BEGIN
         p_with_undo_tuning => NVL(arg('&9'), 'N'),
         p_backup_choice    => arg('&10'),
         p_cutoff_date      => TO_DATE(arg('&11'), 'YYYY-MM-DD'),
-        p_confirm          => arg('&12'));
+        p_confirm          => arg('&12'),
+        p_with_redo_logs   => NVL(arg('&13'), 'N'));
     epfpg.epf_control.attach(l_run_id);
     DBMS_OUTPUT.PUT_LINE('EPF_RUN_ID=' || l_run_id);
 END;

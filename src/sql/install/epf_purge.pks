@@ -74,7 +74,7 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   COMPACT_SKIPPED, COMPACT_FAILED, ROW_MOVEMENT_KEPT, MODULE_END, STEP_FAILED,
 --   IDX_MISSING, IDX_SUMMARY, ROOTS_ELIGIBLE, REDO_LOGS, REDO_ESTIMATE,
 --   REDO_SUMMARY, UNDO, UNDO_ESTIMATE, UNDO_TUNING, REQUIREMENTS, FORECAST,
---   ROOTS_RECOUNTED, REQUIREMENTS_NOT_MET, PURGE_END.
+--   ROOTS_RECOUNTED, REQUIREMENTS_NOT_MET, CHOICES, PURGE_END.
 --
 -- Requirements (preflight step REQUIREMENTS; EPF_REQUIREMENT, EPF_REQ_OPTION)
 --   Six conditions for a purge to run to its end, each with the ways to meet
@@ -98,8 +98,12 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   are kept per month (EPF_ROOT_MONTH: the largest purge that fits the
 --   archive space) and for 1.5, 2 and 3 times the retention
 --   (EPF_RETENTION_OPTION). A purge's preflight reuses the root counts of
---   the wizard's preflight run (same cutoff, mode and depth, within
---   preflight_valid_h) instead of counting again.
+--   the preflight run whose choices it follows (same cutoff, mode and depth,
+--   within preflight_valid_h, no purge since) instead of counting again.
+--   The operator's choices (batch size, undo tuning, redo log sizing,
+--   backup, confirmations) are kept with the run; recheck evaluates the
+--   requirements again with them. Redo log sizing planned counts as 1 GB
+--   online logs.
 --
 -- Forecast (EPF_FORECAST, per module)
 --   The preflight forecasts roots, batches, redo, undo (estimates per root,
@@ -138,6 +142,13 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
     -- reused when still valid. Writes only the tool's own tables.
     PROCEDURE preflight(p_run_id IN NUMBER, p_errors OUT PLS_INTEGER, p_warnings OUT PLS_INTEGER,
                         p_reuse_run IN NUMBER DEFAULT NULL);
+
+    -- After the operator's choices are saved with run p_run_id
+    -- (epf_control.set_choices), checks the redo logs, undo and requirements
+    -- again and redoes the forecast, from the root counts its preflight kept
+    -- (step CHOICES, event CHOICES; no table is scanned). In the session
+    -- bound to the run.
+    PROCEDURE recheck(p_run_id IN NUMBER, p_warnings OUT PLS_INTEGER);
 
     -- Runs the purge phase of run p_run_id (action PURGE) in the session bound
     -- to it (epf_control.attach / enter). p_status returns SUCCESS, WARNING,

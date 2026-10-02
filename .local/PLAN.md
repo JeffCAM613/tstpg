@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Decisions D1-D18 applied; D19-D20 round 1 built (0.5.0: requirements, gate, simulation, forecast against result; not yet run), round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied; D19-D20 round 1 built and tested (0.5.0: requirements, gate, simulation, forecast against result; end-to-end 21/21 on EPFPG781), choices asked by the preflight and followed by the purge built (0.5.1, not yet run), round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered; parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -441,8 +441,11 @@ The preflight decides whether a purge can run to the end on this database and pr
   - The simulation, with the retention table and the expected outcome.
   - FORECAST AND RESULT in every purge report.
   - `--cutoff`.
+- **Built in 0.5.1.**
+  - The preflight asks for the choices, saves them with its run and checks again.
+  - A purge or dry run of the same scope follows the latest READY preflight for `preflight_valid_h`; the wizard asks once.
 
-  Round 2: the plan of smaller runs, choices stored with the preflight, the plan lifecycle and the menu.
+  Round 2: the plan of smaller runs, the plan lifecycle (start over, check again with the saved choices) and the menu.
 
 ---
 

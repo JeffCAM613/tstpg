@@ -98,6 +98,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     g_undo_limit BOOLEAN := FALSE;
     -- Preflight run whose root counts this preflight reuses (reusable_run).
     g_reuse_run  NUMBER;
+    -- TRUE while recheck runs the redo and undo checks again (no events).
+    g_silent     BOOLEAN := FALSE;
 
     -- ------------------------------------------------------------------
     -- Names and SQL fragments
@@ -495,6 +497,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END IF;
         g_warnings := 0;
         g_eligible.DELETE;
+        g_undo_batch := 0;
+        g_undo_kept  := 0;
+        g_undo_cap   := NULL;
+        g_reuse_run  := NULL;
+        g_silent     := FALSE;
         load_registry;
         SELECT module_code BULK COLLECT INTO g_modules
           FROM epf_module
@@ -1967,6 +1974,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         COMMIT;
     END save_tree_undo;
 
+    -- Events of the redo and undo checks. None while the requirements are
+    -- checked again with the operator's choices (recheck): the first check
+    -- already reported them.
+    PROCEDURE note(p_severity IN VARCHAR2, p_event_code IN VARCHAR2, p_message IN VARCHAR2,
+                   p_object_owner IN VARCHAR2 DEFAULT NULL, p_object_name IN VARCHAR2 DEFAULT NULL,
+                   p_rows IN NUMBER DEFAULT NULL, p_bytes IN NUMBER DEFAULT NULL) IS
+    BEGIN
+        IF NOT g_silent THEN
+            epf_log.event(p_severity, p_event_code, p_message, p_object_owner => p_object_owner,
+                          p_object_name => p_object_name, p_rows => p_rows, p_bytes => p_bytes);
+        END IF;
+    END note;
+
     -- Online redo logs against the redo a batch writes. The recommended batch
     -- size keeps one batch within half of the smallest online log, so a batch
     -- causes at most one log switch. A batch larger than a whole log is a
@@ -1996,11 +2016,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                   FROM v$log_history
                  WHERE first_time > SYSDATE - 1
                  GROUP BY TRUNC(first_time, 'HH24'));
-        epf_log.event(epf_log.c_info, 'REDO_LOGS',
-                      l_groups || ' online redo log groups, smallest ' || epf_util.fmt_bytes(l_min_log)
-                      || ' (' || l_log_mode || '); ' || l_switches || ' log switches in the last 24 hours, at most '
-                      || l_peak || ' in one hour',
-                      p_bytes => l_min_log);
+        note(epf_log.c_info, 'REDO_LOGS',
+             l_groups || ' online redo log groups, smallest ' || epf_util.fmt_bytes(l_min_log)
+             || ' (' || l_log_mode || '); ' || l_switches || ' log switches in the last 24 hours, at most '
+             || l_peak || ' in one hour',
+             p_bytes => l_min_log);
 
         FOR r IN (SELECT e.table_id
                     FROM epf_table e
@@ -2011,9 +2031,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                           OR NOT g_tables(r.table_id).reachable;
             IF eligible_roots(r.table_id) = 0 THEN
                 IF module_action(g_tables(r.table_id).module_code) = c_delete THEN
-                    epf_log.event(epf_log.c_info, 'REDO_ESTIMATE', 'No rows before the cutoff: no redo',
-                                  p_object_owner => g_tables(r.table_id).owner,
-                                  p_object_name => g_tables(r.table_id).table_name);
+                    note(epf_log.c_info, 'REDO_ESTIMATE', 'No rows before the cutoff: no redo',
+                         p_object_owner => g_tables(r.table_id).owner,
+                         p_object_name => g_tables(r.table_id).table_name);
                 END IF;
                 CONTINUE;
             END IF;
@@ -2030,9 +2050,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
             save_tree_redo(r.table_id, l_per_root, l_source);
             IF l_per_root IS NULL THEN
-                epf_log.event(epf_log.c_info, 'REDO_ESTIMATE', 'No redo estimate: ' || l_source,
-                              p_object_owner => g_tables(r.table_id).owner,
-                              p_object_name => g_tables(r.table_id).table_name);
+                note(epf_log.c_info, 'REDO_ESTIMATE', 'No redo estimate: ' || l_source,
+                     p_object_owner => g_tables(r.table_id).owner,
+                     p_object_name => g_tables(r.table_id).table_name);
                 CONTINUE;
             END IF;
             l_batch_redo := l_per_root * batch_roots(r.table_id);
@@ -2041,32 +2061,32 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             IF l_batch_redo > l_min_log THEN
                 l_over := TRUE;
             END IF;
-            epf_log.event(CASE WHEN l_batch_redo > l_min_log THEN epf_log.c_warn ELSE epf_log.c_info END,
-                          'REDO_ESTIMATE',
-                          'about ' || epf_util.fmt_bytes(l_per_root) || ' redo per root (' || l_source || '): '
-                          || epf_util.fmt_bytes(l_batch_redo) || ' per batch of '
-                          || epf_util.fmt_int(batch_roots(r.table_id))
-                          || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_min_log, 1), 'FM999990.0')
-                          || ' online logs; recommended batch size ' || epf_util.fmt_int(l_recommend),
-                          p_object_owner => g_tables(r.table_id).owner,
-                          p_object_name => g_tables(r.table_id).table_name,
-                          p_rows => l_recommend, p_bytes => l_per_root);
+            note(CASE WHEN l_batch_redo > l_min_log THEN epf_log.c_warn ELSE epf_log.c_info END,
+                 'REDO_ESTIMATE',
+                 'about ' || epf_util.fmt_bytes(l_per_root) || ' redo per root (' || l_source || '): '
+                 || epf_util.fmt_bytes(l_batch_redo) || ' per batch of '
+                 || epf_util.fmt_int(batch_roots(r.table_id))
+                 || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_min_log, 1), 'FM999990.0')
+                 || ' online logs; recommended batch size ' || epf_util.fmt_int(l_recommend),
+                 p_object_owner => g_tables(r.table_id).owner,
+                 p_object_name => g_tables(r.table_id).table_name,
+                 p_rows => l_recommend, p_bytes => l_per_root);
         END LOOP;
 
         IF l_overall IS NOT NULL THEN
             IF l_over THEN
                 g_warnings := g_warnings + 1;
             END IF;
-            epf_log.event(CASE WHEN l_over THEN epf_log.c_warn ELSE epf_log.c_ok END, 'REDO_SUMMARY',
-                          'Recommended batch size: ' || epf_util.fmt_int(l_overall)
-                          || ' (one batch within half of a ' || epf_util.fmt_bytes(l_min_log) || ' online log)'
-                          || CASE WHEN l_over THEN
-                                 '. With batch ' || epf_util.fmt_int(g_run.batch_size)
-                                 || ' a batch fills more than one online log: expect ''log file switch (checkpoint '
-                                 || 'incomplete)'' waits. Larger online redo logs remove them (run/redo_logs.sql as '
-                                 || 'SYS); a smaller batch only spreads the switches.'
-                             END,
-                          p_rows => l_overall);
+            note(CASE WHEN l_over THEN epf_log.c_warn ELSE epf_log.c_ok END, 'REDO_SUMMARY',
+                 'Recommended batch size: ' || epf_util.fmt_int(l_overall)
+                 || ' (one batch within half of a ' || epf_util.fmt_bytes(l_min_log) || ' online log)'
+                 || CASE WHEN l_over THEN
+                        '. With batch ' || epf_util.fmt_int(g_run.batch_size)
+                        || ' a batch fills more than one online log: expect ''log file switch (checkpoint '
+                        || 'incomplete)'' waits. Larger online redo logs remove them (run/redo_logs.sql as '
+                        || 'SYS); a smaller batch only spreads the switches.'
+                    END,
+                 p_rows => l_overall);
         END IF;
     END check_redo;
 
@@ -2138,14 +2158,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         g_undo_size  := l_size;
         g_undo_max   := l_max;
         g_undo_limit := l_limited;
-        epf_log.event(epf_log.c_info, 'UNDO',
-                      l_ts || ' ' || epf_util.fmt_bytes(l_size) || ', can grow to ' || epf_util.fmt_bytes(l_max)
-                      || '; undo_retention ' || l_retention || ' s (tuned up to ' || NVL(TO_CHAR(l_tuned), '-')
-                      || ' s in the last 24 hours), retention ' || LOWER(l_guarantee)
-                      || CASE WHEN l_tuning IS NOT NULL THEN '; undo tuning active: ' || l_tuning
-                              WHEN g_run.with_undo_tuning = 'Y' THEN '; undo tuning planned for this purge'
-                              ELSE '; undo tuning not applied' END,
-                      p_bytes => l_size);
+        note(epf_log.c_info, 'UNDO',
+             l_ts || ' ' || epf_util.fmt_bytes(l_size) || ', can grow to ' || epf_util.fmt_bytes(l_max)
+             || '; undo_retention ' || l_retention || ' s (tuned up to ' || NVL(TO_CHAR(l_tuned), '-')
+             || ' s in the last 24 hours), retention ' || LOWER(l_guarantee)
+             || CASE WHEN l_tuning IS NOT NULL THEN '; undo tuning active: ' || l_tuning
+                     WHEN g_run.with_undo_tuning = 'Y' THEN '; undo tuning planned for this purge'
+                     ELSE '; undo tuning not applied' END,
+             p_bytes => l_size);
 
         FOR r IN (SELECT e.table_id
                     FROM epf_table e
@@ -2159,8 +2179,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_table := g_tables(r.table_id).table_name;
             l_eligible := eligible_roots(r.table_id);
             IF l_eligible = 0 THEN
-                epf_log.event(epf_log.c_info, 'UNDO_ESTIMATE', 'No rows before the cutoff: no undo',
-                              p_object_owner => l_owner, p_object_name => l_table);
+                note(epf_log.c_info, 'UNDO_ESTIMATE', 'No rows before the cutoff: no undo',
+                     p_object_owner => l_owner, p_object_name => l_table);
                 CONTINUE;
             END IF;
             -- Measured only by purges that did the same (deleting or clearing).
@@ -2204,38 +2224,38 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             IF l_warn THEN
                 g_warnings := g_warnings + 1;
             END IF;
-            epf_log.event(CASE WHEN l_warn THEN epf_log.c_warn ELSE epf_log.c_info END, 'UNDO_ESTIMATE',
-                          'about ' || epf_util.fmt_bytes(l_per_root) || ' undo per root (' || l_source || '): '
-                          || epf_util.fmt_bytes(l_batch) || ' per batch of ' || epf_util.fmt_int(batch_roots(r.table_id))
-                          || CASE WHEN l_total IS NOT NULL THEN
-                                 ', ' || epf_util.fmt_bytes(l_total) || ' for the ' || epf_util.fmt_int(l_eligible)
-                                 || ' eligible roots'
-                             END
-                          || CASE WHEN l_rate IS NOT NULL AND l_kept IS NOT NULL THEN
-                                 '; at ' || epf_util.fmt_bytes(l_rate) || '/s, undo_retention ' || l_retention
-                                 || ' s keeps about ' || epf_util.fmt_bytes(l_kept)
-                                 WHEN l_kept IS NOT NULL THEN
-                                 '; no measured rate yet: undo_retention ' || l_retention || ' s can keep up to '
-                                 || epf_util.fmt_bytes(l_kept)
-                             END
-                          || CASE WHEN l_batch > 0.5 * l_max THEN
-                                 '; a batch needs more than half of what ' || l_ts || ' can hold: lower the batch size'
-                             END
-                          || CASE WHEN NOT l_limited AND l_kept > l_size THEN
-                                 '; ' || l_ts || CASE WHEN l_rate IS NULL THEN ' may grow' ELSE ' grows' END
-                                 || ' during the purge (up to ' || epf_util.fmt_bytes(l_max)
-                                 || ') unless undo tuning is applied (undo.sql APPLY as SYS)'
-                             END,
-                          p_object_owner => l_owner, p_object_name => l_table, p_bytes => l_per_root);
+            note(CASE WHEN l_warn THEN epf_log.c_warn ELSE epf_log.c_info END, 'UNDO_ESTIMATE',
+                 'about ' || epf_util.fmt_bytes(l_per_root) || ' undo per root (' || l_source || '): '
+                 || epf_util.fmt_bytes(l_batch) || ' per batch of ' || epf_util.fmt_int(batch_roots(r.table_id))
+                 || CASE WHEN l_total IS NOT NULL THEN
+                        ', ' || epf_util.fmt_bytes(l_total) || ' for the ' || epf_util.fmt_int(l_eligible)
+                        || ' eligible roots'
+                    END
+                 || CASE WHEN l_rate IS NOT NULL AND l_kept IS NOT NULL THEN
+                        '; at ' || epf_util.fmt_bytes(l_rate) || '/s, undo_retention ' || l_retention
+                        || ' s keeps about ' || epf_util.fmt_bytes(l_kept)
+                        WHEN l_kept IS NOT NULL THEN
+                        '; no measured rate yet: undo_retention ' || l_retention || ' s can keep up to '
+                        || epf_util.fmt_bytes(l_kept)
+                    END
+                 || CASE WHEN l_batch > 0.5 * l_max THEN
+                        '; a batch needs more than half of what ' || l_ts || ' can hold: lower the batch size'
+                    END
+                 || CASE WHEN NOT l_limited AND l_kept > l_size THEN
+                        '; ' || l_ts || CASE WHEN l_rate IS NULL THEN ' may grow' ELSE ' grows' END
+                        || ' during the purge (up to ' || epf_util.fmt_bytes(l_max)
+                        || ') unless undo tuning is applied (undo.sql APPLY as SYS)'
+                    END,
+                 p_object_owner => l_owner, p_object_name => l_table, p_bytes => l_per_root);
         END LOOP;
 
         IF l_tuning IS NULL AND g_run.with_undo_tuning = 'Y' AND l_largest > 0 THEN
             l_cap := epf_tuning.undo_cap(l_largest);
-            epf_log.event(epf_log.c_info, 'UNDO_CAP',
-                          'Undo tuning for this purge limits ' || l_ts || ' to about ' || epf_util.fmt_bytes(l_cap)
-                          || ' (the largest of its size, undo_cap_mb and 4 x the undo of one batch, '
-                          || epf_util.fmt_bytes(l_largest) || '); committed undo is reused instead of growing it',
-                          p_bytes => l_cap);
+            note(epf_log.c_info, 'UNDO_CAP',
+                 'Undo tuning for this purge limits ' || l_ts || ' to about ' || epf_util.fmt_bytes(l_cap)
+                 || ' (the largest of its size, undo_cap_mb and 4 x the undo of one batch, '
+                 || epf_util.fmt_bytes(l_largest) || '); committed undo is reused instead of growing it',
+                 p_bytes => l_cap);
         END IF;
         g_undo_batch := l_largest;
         g_undo_cap   := l_cap;
@@ -2246,7 +2266,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
     -- p_run when its root counts can stand for this run's: a PREFLIGHT run
     -- ended SUCCESS or WARNING, with the same cutoff, mode and depth, created
-    -- within preflight_valid_h. Otherwise NULL, with the reason (ROOTS_RECOUNTED).
+    -- within preflight_valid_h, and no purge has processed batches since.
+    -- Otherwise NULL, with the reason (ROOTS_RECOUNTED).
     FUNCTION reusable_run(p_run IN NUMBER) RETURN NUMBER IS
         l_cutoff DATE := g_run.cutoff_date;
         l_mode   VARCHAR2(30) := g_run.purge_mode;
@@ -2254,6 +2275,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_hours  NUMBER := epf_util.setting_num('preflight_valid_h');
         l_prev   epf_run%ROWTYPE;
         l_reason VARCHAR2(400);
+        l_purged NUMBER;
     BEGIN
         IF p_run IS NULL THEN
             RETURN NULL;
@@ -2276,6 +2298,18 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                              WHEN l_prev.created_at < epf_util.now_ts - NUMTODSINTERVAL(l_hours, 'HOUR')
                              THEN 'older than ' || l_hours || ' hours (preflight_valid_h)'
                         END;
+        END IF;
+        IF l_reason IS NULL THEN
+            -- A purge that processed batches since then changed the counts.
+            SELECT MAX(p.run_id)
+              INTO l_purged
+              FROM epf_run p
+              JOIN epf_step st ON st.run_id = p.run_id
+             WHERE p.action = 'PURGE' AND p.dry_run = 'N' AND p.run_id > p_run
+               AND st.step_code = 'PROCESS_BATCHES' AND st.started_at IS NOT NULL;
+            IF l_purged IS NOT NULL THEN
+                l_reason := epf_util.run_label(l_purged) || ' purged since';
+            END IF;
         END IF;
         IF l_reason IS NULL THEN
             RETURN p_run;
@@ -2626,6 +2660,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_batch_redo NUMBER := 0;
         l_per_root   NUMBER := 0;
         l_recommend  NUMBER;
+        l_planned    BOOLEAN;
+        l_log        NUMBER;
         l_last_bkp   DATE;
         l_bkp_note   VARCHAR2(400);
         l_recent     BOOLEAN;
@@ -2798,16 +2834,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         IF l_per_root > 0 AND g_min_log > 0 THEN
             l_recommend := round_batch(0.5 * g_min_log / l_per_root);
         END IF;
-        l_met := l_batch_redo <= NVL(g_min_log, 0);
+        -- Redo log sizing planned for the purge (with_redo_logs): 1 GB logs.
+        l_planned := g_run.with_redo_logs = 'Y' AND NVL(g_min_log, 0) < 1073741824;
+        l_log     := CASE WHEN l_planned THEN 1073741824 ELSE NVL(g_min_log, 0) END;
+        l_met     := l_batch_redo <= l_log;
         add_req('REDO_LOGS', 5, l_met, 'N', 'Redo log size', c_why_redo,
-                'smallest online log ' || epf_util.fmt_bytes(g_min_log) || '; one batch writes about '
-                || epf_util.fmt_bytes(l_batch_redo),
-                l_batch_redo, g_min_log, CASE WHEN g_min_log >= 1073741824 THEN 'LOGS_1GB' ELSE 'BATCH' END);
+                'smallest online log ' || epf_util.fmt_bytes(g_min_log)
+                || CASE WHEN l_planned THEN ', 4 x 1 GB when the purge starts' END
+                || '; one batch writes about ' || epf_util.fmt_bytes(l_batch_redo),
+                l_batch_redo, l_log,
+                CASE WHEN g_min_log >= 1073741824 THEN 'LOGS_1GB' WHEN l_planned THEN 'REDO_LOGS' ELSE 'BATCH' END);
         add_opt('REDO_LOGS', 'LOGS_1GB', 1, g_min_log >= 1073741824, 'Online logs of at least 1 GB',
                 'smallest now ' || epf_util.fmt_bytes(g_min_log));
-        add_opt('REDO_LOGS', 'REDO_LOGS', 2, FALSE, 'Enlarge the logs when the purge starts (--redo-logs)',
+        add_opt('REDO_LOGS', 'REDO_LOGS', 2, l_planned AND l_met, 'Enlarge the logs when the purge starts (--redo-logs)',
                 'replaces them with 4 x 1 GB (permanent; SYS)');
-        add_opt('REDO_LOGS', 'SMALLER_BATCH', 3, l_met AND g_min_log < 1073741824, 'Smaller batch (--batch-size)',
+        add_opt('REDO_LOGS', 'SMALLER_BATCH', 3, l_met AND NOT l_planned AND g_min_log < 1073741824,
+                'Smaller batch (--batch-size)',
                 CASE WHEN l_recommend IS NOT NULL THEN 'batch ' || epf_util.fmt_int(l_recommend)
                                                        || ' keeps one batch within half an online log'
                      ELSE 'no redo estimate' END);
@@ -3019,6 +3061,38 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END IF;
         p_warnings := l_warnings + g_warnings;
     END preflight;
+
+    PROCEDURE recheck(p_run_id IN NUMBER, p_warnings OUT PLS_INTEGER) IS
+    BEGIN
+        init(p_run_id, 'PURGE,PREFLIGHT');
+        FOR t IN (SELECT table_id, roots FROM epf_tree_est WHERE run_id = p_run_id) LOOP
+            g_eligible(t.table_id) := t.roots;
+        END LOOP;
+        epf_log.step_start('CHOICES');
+        epf_log.event(epf_log.c_info, 'CHOICES',
+                      'Batch ' || epf_util.fmt_int(g_run.batch_size)
+                      || '; undo tuning ' || CASE g_run.with_undo_tuning WHEN 'Y' THEN 'planned' ELSE 'no' END
+                      || '; redo logs ' || CASE g_run.with_redo_logs WHEN 'Y' THEN 'enlarged when the purge starts'
+                                                                      ELSE 'as they are' END
+                      || '; backup ' || NVL(LOWER(g_run.backup_choice), 'RMAN')
+                      || CASE WHEN g_run.confirmed_reqs IS NOT NULL
+                              THEN '; confirmed by the DBA: ' || g_run.confirmed_reqs END,
+                      p_rows => g_run.batch_size);
+        g_silent := TRUE;
+        BEGIN
+            check_redo;
+            check_undo;
+        EXCEPTION
+            WHEN OTHERS THEN
+                g_silent := FALSE;
+                RAISE;
+        END;
+        g_silent := FALSE;
+        check_requirements;
+        forecast_preflight;
+        epf_log.step_end('DONE');
+        p_warnings := g_warnings;
+    END recheck;
 
     PROCEDURE run(p_run_id IN NUMBER, p_status OUT VARCHAR2) IS
         l_errors   PLS_INTEGER;

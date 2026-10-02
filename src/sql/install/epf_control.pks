@@ -32,8 +32,10 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- operator meets the BACKUP requirement without a recent RMAN backup.
     -- p_confirm: blocking requirements (ARCHIVE, UNDO, TEMP, separated by
     -- commas) the operator confirms are handled although the preflight finds
-    -- them not met. Before inserting, stale runs are marked ABANDONED and
-    -- history older than history_retention_days is removed.
+    -- them not met. p_with_redo_logs: the online redo logs are enlarged when
+    -- the purge starts (the caller does it unless dry run; PREFLIGHT and dry
+    -- runs check as if it were done). Before inserting, stale runs are marked
+    -- ABANDONED and history older than history_retention_days is removed.
     FUNCTION start_run(
         p_action           IN VARCHAR2,
         p_retention_days   IN NUMBER   DEFAULT NULL,
@@ -46,7 +48,8 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
         p_with_undo_tuning IN VARCHAR2 DEFAULT 'N',
         p_backup_choice    IN VARCHAR2 DEFAULT NULL,
         p_cutoff_date      IN DATE     DEFAULT NULL,
-        p_confirm          IN VARCHAR2 DEFAULT NULL
+        p_confirm          IN VARCHAR2 DEFAULT NULL,
+        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N'
     ) RETURN NUMBER;
 
     -- Takes the run lock in this session, sets the run RUNNING and binds the
@@ -79,6 +82,32 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
 
     -- Normalised mode: FULL, CLOB, LOGS or CLOB_N_LOGS.
     FUNCTION normalize_mode(p_mode IN VARCHAR2) RETURN VARCHAR2;
+
+    -- The operator's choices for a running PURGE or PREFLIGHT run, validated
+    -- as in start_run: batch size, undo tuning and redo log sizing planned,
+    -- backup choice and confirmed requirements. A preflight keeps them as the
+    -- choices a later purge with the same scope follows.
+    PROCEDURE set_choices(
+        p_run_id           IN NUMBER,
+        p_batch_size       IN NUMBER,
+        p_with_undo_tuning IN VARCHAR2,
+        p_with_redo_logs   IN VARCHAR2,
+        p_backup_choice    IN VARCHAR2,
+        p_confirm          IN VARCHAR2
+    );
+
+    -- The choices saved with the latest PREFLIGHT run of the scope (cutoff
+    -- from p_cutoff_date or p_retention_days, mode, depth), ended SUCCESS or
+    -- WARNING within preflight_valid_h, through DBMS_OUTPUT:
+    --   EPF_SAVED|<run>|<run_id>|<batch>|<undo Y|N>|<redo logs Y|N>|<backup|->
+    --            |<confirmed|->|<ready Y|N|->|<created HH24:MI>|<valid until>
+    -- Nothing is printed when there is no such run.
+    PROCEDURE print_saved_choices(
+        p_retention_days IN NUMBER,
+        p_cutoff_date    IN DATE,
+        p_mode           IN VARCHAR2,
+        p_depth          IN VARCHAR2
+    );
 
 END epf_control;
 /
