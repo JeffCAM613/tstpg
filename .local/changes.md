@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - 0.5.0 test round: install check on EPFPG783 (S1, S2)
+
+- S1: the 0.5.0 install compiled; the wrapper connects and reports tool version 0.5.0.
+- S2: preflight with `--cutoff 2025-10-01` (R-000001, 56 s, PASS WITH WARNINGS, exit 2):
+  - ESTIMATE, RETENTION OPTIONS and REQUIREMENTS are in the report;
+  - RESULT NOT READY: UNDO and BACKUP are blocking, REDO_LOGS is slower only;
+  - ARCHIVE is met by NOARCHIVELOG; TEMP and INDEX_SPACE are met.
+- EPFPG783 after its refresh: 3 online logs of 150 MB, UNDOTBS1 620 MB (can grow to 32 GB), no RMAN backup recorded, empty tool schema (first run R-000001).
+- The first-purge estimates (optimizer statistics), against what R-000002 measured on the same data in the parity run:
+  - redo per bulk payment 988.6 KB against 531 KB (+86%); PAYMENTS redo 130.4 GB against 70.1 GB;
+  - undo per bulk payment 444.9 KB against about 261 KB (34.4 GB over 138,295) (+71%);
+  - PAYMENTS deleting time 1:14:11 at the assumed 30 MB/s against 29:22 measured (the parity run wrote about 40 MB/s).
+
+  The statistics-based estimate and the `redo_rate_mb_s` default are to be calibrated after set B, which compares a first purge with a measured one.
+
 ## 2026-10-02 - Requirements, simulation, forecast against result (D19, D20 round 1; 0.5.0)
 
 Why: a purge must not fill the archive destination or the undo tablespace part way (plan 6.10), and the dry run must say what the purge will do, so its accuracy can be checked against real purges.
