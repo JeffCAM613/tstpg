@@ -2,6 +2,18 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - Parity with the previous tool: EXPLAINED (D8 only)
+
+Results (FULL, depth ALL, cutoff 2025-10-01; copies refreshed from the same source)
+- Previous tool on EPFPG782 (`legacy_purge.sql 366`, after `06_optimize_db.sql`, `08_undo_tune.sql`, `06b_create_purge_indexes.sql`): 29:04, no errors, 96,157,615 rows.
+- This tool on EPFPG781 (R-000002, `--redo-logs --undo-tuning`): verdict PASS, 96,163,037 rows. PAYMENTS took 29:22 for 284 batches; the previous tool took 26:51 for 139 batches of 1,000 bulk payments.
+- `compare.ps1 -Mode FULL`: starting data identical. The remaining rows are the same, count and key checksum, in 26 of the 27 tables. FILE_DISPATCHING differs by the 5,422 files without directory rows that this tool deletes and the previous tool keeps (D8). No row held back (D16), no row deleted through ON DELETE CASCADE, no foreign key blocking the previous tool. Both tools used cutoff 2025-10-01.
+- The class counts before the purge matched the previous tool's own per-table counts exactly, including PAYMENT_AUDIT by bulk payment (15,368,660) and by payment (10,784,182). The snapshot models its rules.
+- Previous tool, findings for the record:
+  - its run summary reports 96,114,901 rows: it counts FILE_INTEGRATION, SPEC_TRT_LOG and the bulk payment batches twice and leaves out FILE_DISPATCHING; its per-table lines are right;
+  - its space snapshot falls back to `user_segments` without the DBA view grants its wrapper gives when it has the SYS password.
+- Phase 2 exit criterion (parity with the previous tool) met for FULL. CLOB_ONLY and CLOB_N_LOGS not run. Expected differences there: PAYMENT_AUDIT values reached through the payment only (10.8 M rows, cleared by this tool only) and D8.
+
 ## 2026-10-02 - Plan: requirements, purge plan and simulation (D19, D20)
 
 - Design only (plan 6.10, D19, D20); to be built after the parity results are reviewed.

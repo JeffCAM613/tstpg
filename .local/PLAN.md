@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Decisions D1-D18 applied; phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity check against the previous tool (phase 2 exit criterion) written, not yet run. Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied, D19-D20 decided (not built); phases 1-4 delivered, end-to-end suite 19/19 on EPFPG783 and EPFPG781 (0.4.4); parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
