@@ -390,6 +390,42 @@ A DELETE writes undo (about half of its redo, 400-450 MB per batch of 1,000 bulk
 - **Opt-in tuning (`run/undo.sql APPLY [run_id [preflight_run_id]]|RESTORE|STATUS`, SYS):** APPLY records, then sets `undo_retention` to `undo_retention_s` (60, SCOPE=MEMORY, so a restart also restores it) and limits the growth (MAXSIZE) of the autoextensible undo datafiles to `epf_tuning.undo_cap`: the largest of the undo tablespace's current size, `undo_cap_mb` (4096) and 4 x the undo of one batch (batch size of the run x the largest undo per root of its preflight). The room under the cap is shared between the files; no file is resized or limited below its current size. Why both: with autoextensible undo datafiles Oracle keeps undo for the longest running statement, and a purge is one long call, so a lower `undo_retention` alone did not stop the growth (EPFPG783, 0.4.2: UNDOTBS1 450 MB -> 27.6 GB during a PAYMENTS purge); with a growth limit Oracle reuses committed undo instead (EPFPG782, 0.2.2 with an 8 GB limit: the file stayed at 8 GB). Only the running batch needs undo that cannot be reused (120-250 MB per batch at the recommended batch sizes), so the limit holds on larger databases too; a batch that still hits it fails with ORA-30036, rolls back alone, and the run ends FAILED with nothing half-deleted. The run records the plan (`EPF_RUN.with_undo_tuning`, `begin_run.sql` 9th argument), so its preflight reports the limit (`UNDO_CAP`) instead of a growth warning. Refused with RETENTION GUARANTEE. RESTORE puts back every recorded original value. `EPF_INSTANCE_CHANGE` keeps the records outside history pruning; uninstall refuses while a change is active. A purge reports at start and end whether undo tuning is active.
 - **Wizard (phase 4):** offered when the preflight expects the undo tablespace to grow (SYS password; `--undo-tuning` or `UNDO_TUNING=Y` without the wizard); applied after the preflight, just before the purge worker starts, and restored in a `finally` block on every exit path of the wrapper. When tuning from an earlier run is still active, the wizard offers to keep it for this purge and restore it at the end; `status` lists active tuning.
 
+### 6.10 Requirements, purge plan and simulation (D19, D20)
+
+The preflight decides whether a purge can run to the end on this database and prepares how it runs; the purge follows what the preflight prepared. The user runs the preflight again after every action until it reports READY.
+
+- **Requirements.** Each is shown with a one-line reason, its measured status and the ways to meet it.
+
+  | Requirement | Why | Met by |
+  |---|---|---|
+  | ARCHIVE (ARCHIVELOG only) | Every deleted row is written to redo. Archived logs stay until backed up, and a full archive destination stops the database (ORA-00257). | NOARCHIVELOG (detected; the tool never changes the log mode) · room in the archive destination of at least the redo estimate + 20% (recovery area: limit - used + reclaimable; ASM: disk group free; a directory: not measurable, the DBA frees space and confirms) · smaller runs (the plan) |
+  | UNDO | A batch's undo must fit until its commit. | Undo tuning (D18) · the undo tablespace holds 4 batches |
+  | TEMP | The work keys (temporary table) need room in TEMP. | Room in TEMP |
+  | INDEX_SPACE | Temporary indexes on unindexed link columns need room in the table's tablespace. | Room (free + autoextend) · indexes already present |
+  | REDO_LOGS | Small online logs slow the purge (not a failure). | Logs of at least 1 GB · redo log sizing at purge start (D17) · smaller batch |
+  | BACKUP | A purge cannot be undone. | RMAN full backup newer than 24 h (`v$rman_backup_job_details`) · backup made another way (confirmed) · purge without a backup (confirmed) |
+
+- **Choices.** For a requirement that is not met, the wizard offers the options the tool can apply and records the choice:
+  - smaller runs: the plan below;
+  - smaller batch: the batch size the purge then uses;
+  - redo log sizing and undo tuning: applied by the purge;
+  - the backup choice.
+
+  Options outside the tool (free space, take a backup) are listed with what to do, and the preflight is run again after them.
+- **Plan (smaller runs).** The preflight estimates the redo for any cutoff from the root dates (redo per root x roots before the date, per module). It proposes the fewest runs that each fit the archive room: older data first (a higher retention purges less), and modules that fit together share a run. The last run uses the requested retention. Each step shows rows, redo, archive space needed and space freed; the user accepts the plan or sets the steps. Between steps the DBA backs up and deletes the archived logs.
+- **Stored in the database.** Requirements, choices and plan belong to the preflight run, with who confirmed what. The run folder gets `requirements.txt` and `plan.txt`. Each preflight shows what changed since the previous one for the same scope.
+- **Purge.** `purge` without scope options takes the latest preflight for this database not older than `preflight_valid_h` (8). It runs the next step of the plan with its choices: depth, retention, batch size, redo log sizing and undo tuning.
+  - At start it measures ARCHIVE, UNDO, TEMP and INDEX_SPACE again. If one is not met it refuses (non-interactive) or asks to type yes (wizard).
+  - Options that differ from the plan are refused, with a pointer to run the preflight again.
+  - The report ends with the next step and what to do before it.
+- **Dry run = simulation (D20).** The full rehearsal of the plan without changing anything:
+  - exact rows per table and module (key snapshot), rows held back, references that would block, enabled triggers on the tables, current sessions of the application;
+  - batches, redo, undo, time (measured rates, otherwise estimated), space freed, and the requirements;
+  - a predicted outcome: WOULD COMPLETE (time, space) or WOULD FAIL (where and why, for example the batch at which the archive space runs out);
+  - a retention table: rows, redo, archive space needed and space freed for the requested retention and longer ones, and the smallest retention that fits the archive room now.
+
+  A dry run counts as a preflight for the purge.
+
 ---
 
 ## 7. Space reclaim engine design (deep dive)
@@ -924,6 +960,8 @@ Each phase is one reviewable pull request on this branch lineage.
 | D16 | Kept rows that reference rows being purged (cross-references, ON DELETE CASCADE, shared audit archives) | Hold back: the referenced rows and the whole root they belong to stay until a later run; counted and reported with the referencing table; the run never fails on it and nothing newer than the cutoff is deleted (6.1.1) |
 | D17 | Online redo logs too small for the purge (log file switch (checkpoint incomplete)) | Opt-in: `epf_tuning.enlarge_redo` (SYS, `run/redo_logs.sql`, later a wizard option) replaces undersized groups, default 4 x 1 GB, like the previous tool; permanent, reported, not reverted. Preflight always reports the online logs, the redo per batch (measured by earlier runs, otherwise estimated) and a recommended batch size (6.8) |
 | D18 | Undo growth during a purge | Opt-in: `epf_tuning.undo_apply` (SYS, `run/undo.sql APPLY`) lowers `undo_retention` to 60 s (SCOPE=MEMORY) and limits the growth of the undo datafiles to the largest of their current size, 4 GB (`undo_cap_mb`) and 4 x the undo of one batch, for the purge; nothing is shrunk (revised 2026-09-30 after retention alone let UNDOTBS1 grow to 27.6 GB). `undo_restore` puts back the recorded original values (`EPF_INSTANCE_CHANGE`), on every exit path of the wrapper; the end-to-end suite checks the original growth limits after every run. Preflight reports undo size, undo per batch and the undo kept by retention at the measured rate (6.9). Side effect while applied: long queries of other sessions can hit ORA-01555 |
+| D19 | Requirements before a purge, and how the purge follows the preflight | The preflight measures six requirements (ARCHIVE, UNDO, TEMP, INDEX_SPACE, REDO_LOGS, BACKUP), each with its reason and the ways to meet it. The user's choices and a purge plan (smaller runs by retention steps and modules) are stored with the preflight run in the database. `purge` runs the next step of the latest valid preflight (8 h) with its choices, and measures the space requirements again at start. The tool never changes the log mode. Backup can be met by a detected RMAN backup, a confirmed backup made another way, or a confirmed purge without a backup (6.10). Decided 2026-10-02 |
+| D20 | Dry run | A simulation of the plan: exact counts, forecasts of time, redo, undo and space, a retention table and a predicted outcome (WOULD COMPLETE, or WOULD FAIL with where and why). It counts as a preflight (6.10). Decided 2026-10-02 |
 
 Also settled:
 

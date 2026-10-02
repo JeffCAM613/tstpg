@@ -2,6 +2,19 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-02 - Plan: requirements, purge plan and simulation (D19, D20)
+
+- Design only (plan 6.10, D19, D20); to be built after the parity results are reviewed.
+- Why: the PAYMENTS purge of EPFPG782 wrote 70.1 GB of redo and 34.4 GB of undo for 90.5 M rows. Without archiving this costs I/O only. A database in ARCHIVELOG mode would keep about that much in archived logs and stop if the archive destination fills (ORA-00257).
+- Decided with the user:
+  - six requirements, each with its reason and ways to meet it;
+  - choices and a plan of smaller runs (retention steps, older data first, and modules), stored with the preflight run in the database;
+  - `purge` follows the latest preflight of the last 8 hours, applies its choices (batch size, redo log sizing, undo tuning) and measures the space requirements again at start;
+  - the backup requirement can be met by a detected RMAN backup, a confirmed backup made another way, or a confirmed purge without a backup;
+  - the dry run becomes a simulation with a retention table and a predicted outcome;
+  - no option based on archived logs being removed while the purge runs;
+  - the tool never changes the log mode.
+
 ## 2026-10-02 - Parity check: runner fix
 
 - `legacy_purge.sql`, first run on EPFPG782: SQL*Plus did not find `@@../../../legacy/sql/0x_*.sql`, so nothing was installed. The check still reported the package valid, because it only looked for compilation errors. `run_purge` then failed with PLS-00201, and nothing was purged.
