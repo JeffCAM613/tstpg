@@ -445,6 +445,9 @@ function Start-SqlProcess {
     $info.RedirectStandardError = $true
     $info.CreateNoWindow = $true
     $info.WorkingDirectory = $script:RepoDir
+    # Passwords reach sqlplus only on standard input: the ones the operator
+    # set in the environment for --non-interactive are not passed on.
+    foreach ($name in @('EPF_PASSWORD', 'EPF_SYS_PASSWORD')) { $info.EnvironmentVariables.Remove($name) }
     $process = [System.Diagnostics.Process]::Start($info)
     $script:Children.Add($process)
     return $process
