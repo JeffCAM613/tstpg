@@ -2736,7 +2736,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         add_req('UNDO', 2, l_met, 'Y', 'Undo fits', c_why_undo,
                 g_undo_ts || ' ' || epf_util.fmt_bytes(g_undo_size) || ', can grow to ' || epf_util.fmt_bytes(g_undo_max)
                 || '; one batch needs about ' || epf_util.fmt_bytes(g_undo_batch)
-                || '; undo_retention keeps about ' || epf_util.fmt_bytes(g_undo_kept),
+                || CASE WHEN g_undo_limit THEN
+                       '; undo tuning keeps undo ' || epf_util.setting('undo_retention_s') || ' s and caps ' || g_undo_ts
+                       || ' at about ' || NVL(epf_util.fmt_bytes(g_undo_cap), epf_util.fmt_bytes(g_undo_size))
+                       || ' (without it undo_retention would keep about ' || epf_util.fmt_bytes(g_undo_kept) || ')'
+                   ELSE '; undo_retention keeps about ' || epf_util.fmt_bytes(g_undo_kept) END,
                 g_undo_batch, g_undo_max, l_met_by);
         add_opt('UNDO', 'UNDO_TUNING', 1, g_undo_limit AND l_ok, 'Undo tuning (--undo-tuning)',
                 'undo kept 60 s and its growth limited'
@@ -3121,6 +3125,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_tuning := undo_tuning_text;
         epf_log.info('UNDO_TUNING',
                      CASE WHEN l_tuning IS NOT NULL THEN 'Undo tuning active: ' || l_tuning
+                          WHEN g_run.dry_run = 'Y' THEN
+                              'Dry run: nothing is deleted, so no undo is written'
+                              || CASE WHEN g_run.with_undo_tuning = 'Y' THEN '; undo tuning is planned for the purge' END
                           ELSE 'Undo tuning not applied: the undo tablespace keeps undo for undo_retention and may '
                                || 'grow during the purge (preflight step UNDO)' END);
 

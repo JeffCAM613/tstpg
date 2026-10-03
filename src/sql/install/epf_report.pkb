@@ -43,6 +43,13 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         put(' ' || RPAD('-', c_width - 1, '-'));
     END title;
 
+    -- The module deletes its rows (modes FULL and LOGS, and the LOGS module
+    -- in CLOB_N_LOGS); otherwise it clears LOB values.
+    FUNCTION module_deletes(p_module IN VARCHAR2) RETURN BOOLEAN IS
+    BEGIN
+        RETURN g_run.purge_mode IN ('FULL', 'LOGS') OR (g_run.purge_mode = 'CLOB_N_LOGS' AND p_module = 'LOGS');
+    END module_deletes;
+
     FUNCTION in_depth(p_module IN VARCHAR2) RETURN BOOLEAN IS
     BEGIN
         RETURN g_run.depth = 'ALL' OR INSTR(',' || g_run.depth || ',', ',' || p_module || ',') > 0;
@@ -419,11 +426,14 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_m_now   NUMBER;
         l_lob_est NUMBER;
 
+        -- Without a phase after the purge (dry run) there is no used after.
         PROCEDURE module_total IS
         BEGIN
             IF l_module IS NOT NULL THEN
                 put('   ' || l('Total ' || l_module, 45) || r(b(l_m_alloc), 13) || r(b(l_m_bef), 13)
-                    || r(b(l_m_aft), 13) || r(b(l_m_bef - l_m_aft), 13) || r(b(l_m_now), 13));
+                    || r(CASE WHEN l_last = 'BASELINE' THEN '-' ELSE b(l_m_aft) END, 13)
+                    || r(CASE WHEN l_last = 'BASELINE' THEN '-' ELSE b(l_m_bef - l_m_aft) END, 13)
+                    || r(b(l_m_now), 13));
             END IF;
         END module_total;
     BEGIN
@@ -706,21 +716,31 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         SELECT COUNT(*) INTO l_held FROM epf_held_root WHERE run_id = l_run;
         put('  Held back       ' || CASE WHEN l_held = 0 THEN 'none (no kept row references a row to purge)'
                                          ELSE n(l_held) || ' roots, still referenced by rows that are kept (PURGE RESULTS)' END);
-        FOR t IN (SELECT tr.owner, tr.trigger_name, tr.table_owner, tr.table_name, tr.triggering_event, e.module_code
+        -- Triggers the purge fires: delete triggers on the tables of a
+        -- deleting module, update triggers on the tables whose LOB values a
+        -- clearing module clears.
+        FOR t IN (SELECT tr.owner, tr.trigger_name, tr.table_owner, tr.table_name, tr.triggering_event, e.module_code,
+                         e.lob_clear
                     FROM dba_triggers tr
                     JOIN epf_table e ON e.owner = tr.table_owner AND e.table_name = tr.table_name AND e.active = 'Y'
                    WHERE tr.status = 'ENABLED'
                      AND (tr.triggering_event LIKE '%DELETE%' OR tr.triggering_event LIKE '%UPDATE%')
                    ORDER BY tr.table_owner, tr.table_name, tr.trigger_name) LOOP
             CONTINUE WHEN NOT in_depth(t.module_code);
+            IF module_deletes(t.module_code) THEN
+                CONTINUE WHEN t.triggering_event NOT LIKE '%DELETE%';
+            ELSE
+                CONTINUE WHEN t.triggering_event NOT LIKE '%UPDATE%' OR NVL(t.lob_clear, 'N') <> 'Y';
+            END IF;
             l_count := l_count + 1;
             IF l_count <= 5 THEN
                 l_trig := l_trig || CASE WHEN l_count > 1 THEN '; ' END || t.owner || '.' || t.trigger_name || ' on '
                           || t.table_owner || '.' || t.table_name || ' (' || LOWER(t.triggering_event) || ')';
             END IF;
         END LOOP;
-        put('  Triggers        ' || CASE WHEN l_count = 0 THEN 'none enabled on the tables of the run'
-                                         ELSE l_count || ' enabled, they fire for every row: ' || l_trig END);
+        put('  Triggers        ' || CASE WHEN l_count = 0 THEN 'none that the purge fires'
+                                         ELSE l_count || ' that fire for every row the purge deletes or clears: ' || l_trig
+                                              || CASE WHEN l_count > 5 THEN ' and ' || (l_count - 5) || ' more' END END);
         SELECT COUNT(*) INTO l_sess
           FROM v$session
          WHERE username IN (SELECT column_value FROM TABLE(l_apps));

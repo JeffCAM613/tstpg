@@ -2,6 +2,35 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-03 - 0.5.1 test round: set C on EPFPG783 passed; report fixes (0.5.2)
+
+Set C (EPFPG783, 0.5.1)
+- C1: the install of 0.5.1 compiled.
+- C2: `S` at the first question stopped the preflight (exit 3).
+- C3 (R-000023, again R-000026):
+  - questions UNDO, BACKUP and REDO_LOGS, then the batch size (530 for 1 GB logs);
+  - the check with the answers took about 1 s, with no table scan; result READY 6 of 6;
+  - the screen kept the steps, the warnings and the report.
+- C4: the wizard offered the choices saved with R-000026, the review showed them, and `no` aborted. No run was created.
+- C5 (R-000027, dry run without prompts):
+  - it followed the choices of R-000026 and reused its root counts (preflight in 1 s);
+  - SIMULATION: 96,163,037 rows, the same as the parity purge R-000002 on the same data; nothing held back; READY; WOULD COMPLETE;
+  - space freed: 31.6 GB forecast against 30.2 GB measured by R-000002 (+4.6%);
+  - first-purge estimates as in S2: redo 140.9 GB, deleting time 1:20:11 at the assumed 30 MB/s.
+- Commands with `--non-interactive` read the passwords from EPF_PASSWORD and EPF_SYS_PASSWORD. The checklist now has a line that sets both from masked prompts, and the wrapper no longer passes these variables on to its sqlplus sessions (a4afeb5).
+
+Fixes (0.5.2)
+- Triggers in the simulation:
+  - for a deleting purge, the simulation notes listed the tables' UPDATE triggers;
+  - they now list the triggers the purge fires: DELETE triggers for deleting modules, and UPDATE triggers on the tables whose LOB values a clearing module clears;
+  - past 5 triggers the line ends with "and N more";
+  - on EPFPG783 a FULL purge fires none.
+- SPACE INSIDE SEGMENTS: in a dry run, the module totals showed used after equal to used before and 0 B freed. They now show `-`, like the table lines.
+- A dry run reported "Undo tuning not applied ... may grow during the purge". It now says that a dry run writes no undo, and whether undo tuning is planned.
+- UNDO requirement with undo tuning planned or active: the line now says undo tuning keeps undo 60 s and caps the tablespace; the undo_retention figure appears as "without it".
+
+Finding: each new sqlplus session takes about 15 s to connect from the test machine. It shows even for the session that only reads the advice, so it is the connection, not the tool's work; a wizard purge opens 6 to 8 such sessions. To measure it, with the password line set: `Measure-Command { src\bin\epf_purge.bat status --tns EPFPG783 --non-interactive }` (two sessions). The tool could later run its short queries in the monitor session, which stays connected.
+
 ## 2026-10-02 - Preflight asks for the choices and saves them; the purge follows them (0.5.1)
 
 Why: the preflight only reported the requirements. The operator expected it to ask how to meet each one, and the purge to follow the answers (plan 6.10).
