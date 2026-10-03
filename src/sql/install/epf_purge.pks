@@ -109,9 +109,14 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   The preflight forecasts roots, batches, redo, undo (estimates per root,
 --   EPF_TREE_EST) and the deleting time at the redo rate measured by the
 --   latest purge on the database (else redo_rate_mb_s). A dry run ends with
---   step FORECAST: exact rows and roots after holding back, its batches, and
---   the space freed inside the segments (used space x eligible share). The
---   report of a purge compares its result with the latest forecast.
+--   step FORECAST: exact rows and roots after holding back, its batches, the
+--   space freed inside the segments (used space x eligible share), and redo
+--   and undo per row: the rows counted in the tables of each tree times the
+--   redo and undo per row measured by the latest purge of the tree, else the
+--   estimate per row from optimizer statistics (roots of different ages
+--   carry very different numbers of rows, so a cost per root does not carry
+--   over). The report of a purge compares its result with the latest
+--   forecast.
 --
 -- Redo
 --   The redo written by each root tree is measured (V$MYSTAT) and recorded

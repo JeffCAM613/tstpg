@@ -2,6 +2,61 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-03 - Set B on EPFPG782: dry-run accuracy; per-row forecast and LOB space fix (0.5.2)
+
+Set B (EPFPG782, 0.5.1, batch 1000, `--redo-logs --undo-tuning --backup none`)
+- Step 1, cutoff 2023-09-28, the first purge on the database:
+  - dry run R-000001 (3:58);
+  - purge R-000002 (48:24): PASS WITH WARNINGS. The only warning is P4: AUDIT_TRAIL orphans that existed before the purge (1,195,572, then 800,823).
+- Step 2, cutoff 2025-10-01: dry run R-000003 (1:24), then purge R-000004 (4:53), PASS.
+- Forecast against result (FORECAST AND RESULT):
+
+  | Step | Module | Rows | Redo | Undo | Deleting time | Space freed |
+  |---|---|---|---|---|---|---|
+  | 1 (statistics) | PAYMENTS | 0.0% | +34.8% | +33.5% | +58.9% | +6.8% |
+  | 1 | LOGS | 0.0% | +37.8% | +45.5% | +112.7% | +1.6% |
+  | 1 | BANK_STATEMENTS | 0.0% | +68.9% | +12.4% | +243.6% | +2.4% |
+  | 2 (measured by step 1) | PAYMENTS | 0.0% | +121.6% | +105.4% | +174.5% | not valid (LOB space) |
+  | 2 | LOGS | 0.0% | -8.9% | -5.4% | +31.2% | +13.3% |
+  | 2 | BANK_STATEMENTS | 0.0% | +40.6% | +39.3% | +78.4% | not valid (LOB space) |
+
+- Expected outcome: WOULD COMPLETE both times, and both purges completed.
+- Why step 2 was further off than step 1:
+  - the cost was measured per bulk payment;
+  - the older bulk payments of step 1 carry 684 rows each, the recent ones of step 2 carry 402;
+  - per row the redo moved much less: 1,098 B against 842 B.
+- Space:
+  - step 2's baseline took Oracle's raw figure for the 6 BASICFILE LOB segments (DIRECTORY_DISPATCHING, FILE_DISPATCHING, TRANSMISSION_EXECUTION_AUDIT), which still counts the space step 1 freed: 16.2 GB used before step 2, against 3.3 GB after step 1;
+  - step 2 reported 14.8 GB freed, about 1.9 GB in reality;
+  - its space forecast matched only because it started from the same inflated figure.
+- Transaction size, redo per row of the BULK_PAYMENT tree:
+  - step 1: 1,098 B, at 683K rows per batch;
+  - step 2: 842 B, at 390K rows per batch;
+  - parity purge (batch 530): 832 B, at 347K rows per batch.
+
+  Time per row was 29.6, 17.9 and 19.5 microseconds. Batches above about 400K rows cost about 30% more redo and 50% more time per row.
+
+Changes (0.5.2, with the set C report fixes)
+- Dry-run forecast per row:
+  - the rows the dry run counts in the tables of each tree, times the redo and undo per row measured by the latest purge of that tree (TREE_REDO and TREE_UNDO over the rows that purge processed);
+  - without a measurement: each table's rows times its estimate per row from optimizer statistics.
+- Recomputed on set B's numbers, step 2 would have been:
+  - PAYMENTS: redo +30.4% (was +121.6%), undo +20.8% (was +105.4%), deleting time +61% (was +175%);
+  - BANK_STATEMENTS: redo -11.0% (was +40.6%), undo -11.8% (was +39.3%);
+  - LOGS: unchanged (one row per root).
+- A dry run's RETENTION OPTIONS scale the dry run's own forecast, redo included, so the requested row matches SIMULATION.
+- BASICFILE LOB space is carried over:
+  - EPF_SPACE_USAGE.RAW_USED_BYTES keeps DBMS_SPACE's figure;
+  - at a BASELINE, a BASICFILE LOB segment whose latest capture by another run was an estimate starts from that estimate, plus the growth of the raw figure since;
+  - the report notes the carried segments, and P7 counts each estimated segment once.
+- Not changed:
+  - the preflight's estimate is still per root, since it has no counts per table;
+  - the statistics estimate for a first purge stays 35-70% high (safe, but stricter than needed for the archive requirement).
+
+Proposal, not built: limit batches by rows (about 400K) as well as by roots. Old, heavy bulk payments would then run in smaller transactions, which costs about 30% less redo and about a third less time.
+
+Not yet run: written without a database.
+
 ## 2026-10-03 - 0.5.1 test round: set C on EPFPG783 passed; report fixes (0.5.2)
 
 Set C (EPFPG783, 0.5.1)

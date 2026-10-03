@@ -34,12 +34,18 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
     --                                   the BASELINE measurement times the share
     --                                   of the LOB data the purge left (rows not
     --                                   deleted; for clearing, the values not
-    --                                   cleared); the measured value when lower
+    --                                   cleared); the measured value when lower.
+    --                                   At a later BASELINE the segment starts
+    --                                   from that estimate plus the growth of
+    --                                   the measurement since, so the freed
+    --                                   chunks are not counted twice
     --                       SECUREFILE  DBMS_SPACE.SPACE_USAGE, used bytes
     --                       ESTIMATE    manual segment space management tables:
     --                                   num_rows x avg_row_len from statistics
     --                       UNSUPPORTED other segments in manual segment space
     --                                   management (used bytes not recorded)
+    --                     raw_used_bytes keeps what DBMS_SPACE reported, also
+    --                     when used_bytes is an estimate
     -- p_failed returns the number of segments that could not be measured;
     -- each is reported as a SPACE_UNMEASURED warning. Emits SPACE_CAPTURED.
     -- ORA-20140 for an unknown phase.

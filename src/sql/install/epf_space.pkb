@@ -104,10 +104,35 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
         p_method := 'BASICFILE_EST';
     END basicfile_estimate;
 
+    -- At a BASELINE, a BASICFILE LOB segment whose latest capture by another
+    -- run is an estimate starts from that estimate plus what DBMS_SPACE
+    -- reports more than then (new LOB data). Otherwise the chunks freed by
+    -- the earlier purge, still reported as used, would count as freed again.
+    -- A lower measured value (after a shrink) is kept.
+    PROCEDURE basicfile_carry(p_run_id IN NUMBER, p_owner IN VARCHAR2, p_segment IN VARCHAR2,
+                              p_partition IN VARCHAR2, p_used IN OUT NUMBER, p_method IN OUT VARCHAR2) IS
+        l_method VARCHAR2(20);
+        l_est    NUMBER;
+        l_raw    NUMBER;
+    BEGIN
+        SELECT MAX(method) KEEP (DENSE_RANK LAST ORDER BY measured_at, run_id),
+               MAX(used_bytes) KEEP (DENSE_RANK LAST ORDER BY measured_at, run_id),
+               MAX(raw_used_bytes) KEEP (DENSE_RANK LAST ORDER BY measured_at, run_id)
+          INTO l_method, l_est, l_raw
+          FROM epf_space_usage
+         WHERE run_id <> p_run_id AND owner = p_owner AND segment_name = p_segment
+           AND NVL(partition_name, '-') = NVL(p_partition, '-');
+        IF l_method = 'BASICFILE_EST' AND l_est IS NOT NULL AND l_raw IS NOT NULL THEN
+            p_used   := LEAST(p_used, l_est + GREATEST(p_used - l_raw, 0));
+            p_method := 'BASICFILE_EST';
+        END IF;
+    END basicfile_carry;
+
     PROCEDURE measure(p_run_id IN NUMBER, p_phase IN VARCHAR2, p_failed IN OUT PLS_INTEGER) IS
         l_type      VARCHAR2(30);
         l_method    VARCHAR2(20);
         l_used      NUMBER;
+        l_raw       NUMBER;
         l_unf_b     NUMBER;
         l_unf       NUMBER;
         l_fs1_b     NUMBER;
@@ -152,6 +177,7 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
                           ELSE s.segment_type
                       END;
             l_used := NULL;
+            l_raw  := NULL;
             BEGIN
                 IF s.ssm = 'AUTO' AND s.securefile = 'YES' THEN
                     DBMS_SPACE.SPACE_USAGE(
@@ -193,7 +219,10 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
                     ELSE
                         l_used := l_full + l_fs1 * 0.875 + l_fs2 * 0.625 + l_fs3 * 0.375 + l_fs4 * 0.125;
                     END IF;
-                    IF s.securefile = 'NO' AND p_phase <> c_baseline THEN
+                    l_raw := l_used;
+                    IF s.securefile = 'NO' AND p_phase = c_baseline THEN
+                        basicfile_carry(p_run_id, s.owner, s.segment_name, s.partition_name, l_used, l_method);
+                    ELSIF s.securefile = 'NO' THEN
                         basicfile_estimate(p_run_id, s.owner, s.segment_name, s.partition_name, l_used, l_method);
                     END IF;
                 ELSIF s.segment_type IN ('TABLE', 'NESTED TABLE') THEN
@@ -208,10 +237,10 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
 
                 INSERT INTO epf_space_usage (
                     run_id, phase, owner, segment_name, partition_name, segment_type,
-                    allocated_bytes, used_bytes, free_bytes, method
+                    allocated_bytes, used_bytes, free_bytes, method, raw_used_bytes
                 ) VALUES (
                     p_run_id, p_phase, s.owner, s.segment_name, s.partition_name, s.segment_type,
-                    s.bytes, ROUND(l_used), s.bytes - ROUND(l_used), l_method
+                    s.bytes, ROUND(l_used), s.bytes - ROUND(l_used), l_method, ROUND(NVL(l_raw, l_used))
                 );
             EXCEPTION
                 WHEN OTHERS THEN
@@ -269,7 +298,9 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
                             || epf_util.fmt_bytes(l_used) || ' used inside; '
                             || l_files || ' datafiles, ' || epf_util.fmt_bytes(l_file_size)
                             || CASE WHEN l_estimated > 0 THEN '; ' || l_estimated || ' segments estimated or unsupported' END
-                            || CASE WHEN l_lob_est > 0 THEN '; ' || l_lob_est || ' BASICFILE LOB segments scaled by rows' END
+                            || CASE WHEN l_lob_est > 0 AND l_phase = c_baseline
+                                    THEN '; ' || l_lob_est || ' BASICFILE LOB segments carried over from an earlier estimate'
+                                    WHEN l_lob_est > 0 THEN '; ' || l_lob_est || ' BASICFILE LOB segments scaled by rows' END
                             || CASE WHEN p_failed > 0 THEN '; ' || p_failed || ' segments not measured' END,
             p_bytes      => l_used,
             p_run_id     => p_run_id);

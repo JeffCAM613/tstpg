@@ -277,7 +277,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         -- P7 space measured
         SELECT COUNT(DISTINCT phase),
                COUNT(CASE WHEN method IN ('ESTIMATE', 'UNSUPPORTED') THEN 1 END),
-               COUNT(CASE WHEN method = 'BASICFILE_EST' THEN 1 END),
+               COUNT(DISTINCT CASE WHEN method = 'BASICFILE_EST'
+                                   THEN owner || '.' || segment_name || '.' || partition_name END),
                SUM(CASE WHEN phase = 'BASELINE' THEN used_bytes END),
                SUM(CASE WHEN phase = 'POST_PURGE' THEN used_bytes END)
           INTO l_phases, l_estimated, l_lob_est, l_before, l_now
@@ -425,6 +426,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_m_aft   NUMBER;
         l_m_now   NUMBER;
         l_lob_est NUMBER;
+        l_lob_carry NUMBER;
 
         -- Without a phase after the purge (dry run) there is no used after.
         PROCEDURE module_total IS
@@ -490,9 +492,14 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || r(b(t.alloc_now), 13));
         END LOOP;
         module_total;
-        SELECT COUNT(*) INTO l_lob_est
+        SELECT COUNT(CASE WHEN phase = 'BASELINE' THEN 1 END), COUNT(CASE WHEN phase <> 'BASELINE' THEN 1 END)
+          INTO l_lob_carry, l_lob_est
           FROM epf_space_usage
          WHERE run_id = g_run.run_id AND method = 'BASICFILE_EST';
+        IF l_lob_carry > 0 THEN
+            put('  Used before includes ' || l_lob_carry || ' BASICFILE LOB segments carried over from the estimate of an '
+                || 'earlier purge: Oracle still reports the space that purge freed as used.');
+        END IF;
         IF l_lob_est > 0 THEN
             put('  Used after includes ' || l_lob_est || ' BASICFILE LOB segments estimated from the baseline and the '
                 || 'share of LOB data the purge left: Oracle reports the space of deleted or cleared LOB values as '
@@ -695,7 +702,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END IF;
         FOR x IN (SELECT DISTINCT redo_basis FROM epf_forecast
                    WHERE run_id = l_run AND origin = p_origin AND redo_basis IS NOT NULL) LOOP
-            put('  Redo and undo per root: ' || x.redo_basis);
+            put('  Redo and undo ' || CASE WHEN x.redo_basis LIKE 'per row%' THEN x.redo_basis
+                                           ELSE 'per root, ' || x.redo_basis END);
         END LOOP;
         FOR x IN (SELECT DISTINCT time_basis FROM epf_forecast
                    WHERE run_id = l_run AND origin = p_origin AND time_basis IS NOT NULL) LOOP
@@ -756,10 +764,12 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_margin NUMBER := 1 + epf_util.setting_num('archive_margin_pct') / 100;
         l_room   NUMBER;
         l_noarch NUMBER;
-        l_rows   NUMBER;
-        l_freed  NUMBER;
-        l_fits   VARCHAR2(10);
-        l_days   NUMBER;
+        l_rows    NUMBER;
+        l_freed   NUMBER;
+        l_redo    NUMBER;
+        l_unknown NUMBER;
+        l_fits    VARCHAR2(10);
+        l_days    NUMBER;
     BEGIN
         SELECT COUNT(*) INTO l_count FROM epf_retention_option WHERE run_id = l_run;
         IF l_count = 0 THEN
@@ -783,21 +793,31 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    GROUP BY ro.retention_days
                    ORDER BY ro.retention_days DESC) LOOP
             l_days := o.retention_days;
-            SELECT SUM(x.roots * f.row_count / NULLIF(f.roots, 0)), SUM(x.roots * f.freed_bytes / NULLIF(f.roots, 0))
-              INTO l_rows, l_freed
+            -- A dry run scales its own forecast per module (redo per row
+            -- included); a preflight has the estimates per root only.
+            SELECT SUM(x.roots * f.row_count / NULLIF(f.roots, 0)), SUM(x.roots * f.freed_bytes / NULLIF(f.roots, 0)),
+                   CASE WHEN COUNT(CASE WHEN f.redo_bytes IS NULL THEN 1 END) = 0
+                        THEN SUM(x.roots * f.redo_bytes / NULLIF(f.roots, 0)) END
+              INTO l_rows, l_freed, l_redo
               FROM (SELECT t.module_code, SUM(ro.roots) AS roots
                       FROM epf_retention_option ro
                       JOIN epf_table t ON t.table_id = ro.table_id
                      WHERE ro.run_id = l_run AND ro.retention_days = l_days
                      GROUP BY t.module_code) x
               JOIN epf_forecast f ON f.run_id = l_run AND f.origin = 'DRY_RUN' AND f.module_code = x.module_code;
+            l_unknown := o.unknown;
+            IF l_redo IS NULL THEN
+                l_redo := o.redo_bytes;
+            ELSE
+                l_unknown := 0;
+            END IF;
             l_fits := CASE WHEN l_noarch > 0 THEN 'n/a'
-                           WHEN l_room IS NULL OR o.unknown > 0 THEN '?'
-                           WHEN NVL(o.redo_bytes, 0) * l_margin <= l_room THEN 'yes' ELSE 'no' END;
+                           WHEN l_room IS NULL OR l_unknown > 0 THEN '?'
+                           WHEN NVL(l_redo, 0) * l_margin <= l_room THEN 'yes' ELSE 'no' END;
             put('  ' || l(o.retention_days, 11) || l(TO_CHAR(o.cutoff_date, 'YYYY-MM-DD'), 12) || r(n(o.roots), 12)
                 || r(n(l_rows), 14)
-                || r(CASE WHEN o.unknown > 0 THEN '-' ELSE b(NVL(o.redo_bytes, 0)) END, 11)
-                || r(CASE WHEN o.unknown > 0 OR l_noarch > 0 THEN '-' ELSE b(NVL(o.redo_bytes, 0) * l_margin) END, 14)
+                || r(CASE WHEN l_unknown > 0 THEN '-' ELSE b(NVL(l_redo, 0)) END, 11)
+                || r(CASE WHEN l_unknown > 0 OR l_noarch > 0 THEN '-' ELSE b(NVL(l_redo, 0) * l_margin) END, 14)
                 || r(b(l_freed), 13) || r(l_fits, 6)
                 || CASE WHEN o.retention_days = g_run.retention_days THEN '  (requested)' END);
         END LOOP;

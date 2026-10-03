@@ -378,8 +378,12 @@ BEGIN
             used_bytes       NUMBER,
             free_bytes       NUMBER,
             method           VARCHAR2(20),
-            measured_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL
+            measured_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+            raw_used_bytes   NUMBER
         )]');
+    -- raw_used_bytes: what DBMS_SPACE reported, also when used_bytes is an
+    -- estimate (BASICFILE_EST), so a later run can carry the estimate over.
+    add_column('EPF_SPACE_USAGE', 'RAW_USED_BYTES', 'NUMBER');
     create_index('EPF_SPACE_USAGE_IX',
         'CREATE INDEX epf_space_usage_ix ON epf_space_usage (run_id, phase)');
 
