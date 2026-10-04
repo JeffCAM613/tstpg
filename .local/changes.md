@@ -2,6 +2,34 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-05 - Set E step 1 on EPFPG783 (0.5.2, batch 530)
+
+- Dry run R-000041 passed, and the purge passed with warnings.
+- FORECAST AND RESULT, first purge on this database (estimates from statistics, per row):
+
+  | Module | Rows | Redo | Undo | Deleting time | Space freed |
+  |---|---|---|---|---|---|
+  | PAYMENTS | 0.0% | +89.5% | +73.7% | +161.8% | +6.8% |
+  | LOGS | 0.0% | +37.2% | +45.2% | +90.0% | +1.6% |
+  | BANK_STATEMENTS | 0.0% | +69.6% | +12.9% | +255.3% | +2.4% |
+
+- Transaction size confirmed. Set B step 1 and set E step 1 purged the same 84,663,379 PAYMENTS rows on copies of the same data:
+
+  | Batch | Redo | Undo | Deleting time |
+  |---|---|---|---|
+  | 1000 (set B) | 86.5 GB | 39.3 GB | 41:46 |
+  | 530 (set E) | 65.5 GB | 32.1 GB | 26:57 |
+
+  Batch 530 used 24% less redo, 18% less undo, and took 35% less time. Per row that is 831 B of redo, the same as the parity purge (832 B) and set B step 2 (842 B).
+- The redo error rose from +35% to +89.5% because the actual redo fell; the estimate barely moved (116.7 GB per root, 124.1 GB per row).
+- Statistics estimate against measured redo per row:
+  - PAYMENTS: 1,574 B against 831 B;
+  - BANK_STATEMENTS: 2,044 B against 1,204 B;
+  - LOGS: 1.84 KB against 1.31 KB.
+
+  The assumed redo rate is 30 MB/s; this purge wrote about 41 MB/s.
+- To do after step 2: calibrate the statistics estimate and the default redo rate on these measurements, and limit batches by rows.
+
 ## 2026-10-03 - Set B on EPFPG782: dry-run accuracy; per-row forecast and LOB space fix (0.5.2)
 
 Set B (EPFPG782, 0.5.1, batch 1000, `--redo-logs --undo-tuning --backup none`)
