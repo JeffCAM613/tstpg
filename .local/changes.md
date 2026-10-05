@@ -57,7 +57,7 @@ Built from the set E measurements (entry below). Not yet run on a database.
   - `EPF_ADVICE|UNDO_MAX_BATCH` comes from the largest undo per root.
 - Faster measuring: the session statistics are read by their statistic number, looked up once.
 
-How to test: set G on EPFPG783 after a refresh. It runs the same two steps as set E, with batch 530, `--redo-logs --undo-tuning --backup none`.
+How to test: set G on EPFPG782, refreshed: the same data as set E's EPFPG783, on the same server. The parity purge on EPFPG781 and set E on EPFPG783 wrote the same redo per row at batch 530 (832 and 831 B), so the instances compare. It runs the same two steps as set E, with batch 530, `--redo-logs --undo-tuning --backup none`. In G2 the dry run must say `estimated from optimizer statistics` (no earlier purge on the copy).
 - G1: pull and install. Pass if `EPFPG objects valid, tool version 0.5.3`.
 - G2, step 1 at 2023-09-28, dry run then purge. Pass if:
   - KEYS_SNAPSHOT shows about 450 PAYMENTS batches of up to 530 roots and about 200,000 rows;
