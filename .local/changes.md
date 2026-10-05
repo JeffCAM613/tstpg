@@ -2,7 +2,7 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
-## 2026-10-05 - Set F: the full suite on EPFPG781 (0.5.4), 21 of 22; T08 assertion fixed
+## 2026-10-05 - Set F: the full suite on EPFPG781 (0.5.4), 21 of 22; T08 assertion fixed, rerun passed
 
 - 21 passed, 1 failed, in 1:16:06. 0.5.4 compiled (T03, T04) and every purge, stop, wizard and report test passed:
   - the graceful stop with batches limited by rows (T11);
@@ -15,6 +15,8 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
 - Fix: the four checks use the section header exactly, case-sensitive: `(?m-i)^ CHOICES +HH:MM:SS` (`$script:ChoicesSection`). Checked against sample lines: it matches the section, not the Choices line or the CHOICES step of the report.
 
 How to test: `.\src\tests\e2e\run_tests.bat --only T08,T08B,T10B` (T01 runs too; about 10 minutes on the purged copy): 4 passed. T11 uses the same check and needs data to purge: the next full run covers it.
+
+Rerun (F4) with the fix: T01, T08, T08B and T10B passed. T08B and T10B found the questions section itself this time.
 
 ## 2026-10-05 - Measuring lighter, no redo log warning when the logs are to be enlarged (0.5.4)
 
