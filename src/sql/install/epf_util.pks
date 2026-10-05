@@ -15,6 +15,9 @@ CREATE OR REPLACE PACKAGE epf_util AUTHID DEFINER AS
     -- Display label of a run: R-000124.
     FUNCTION run_label(p_run_id IN NUMBER) RETURN VARCHAR2;
 
+    -- Plan label: P-000123.
+    FUNCTION plan_label(p_plan_id IN NUMBER) RETURN VARCHAR2;
+
     -- 1234567 -> '1,234,567'.
     FUNCTION fmt_int(p_value IN NUMBER) RETURN VARCHAR2;
 

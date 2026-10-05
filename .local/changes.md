@@ -2,6 +2,52 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-05 - Plan of smaller runs and its lifecycle (0.6.0, D19/D20 round 2)
+
+Why: in ARCHIVELOG a purge whose redo does not fit the archive space cannot run at once. The preflight now plans it in smaller runs, and the purges carry out the plan step by step with the choices of its preflight.
+
+- Every preflight records the plan of its scope (mode, depth, cutoff) in EPF_PLAN and EPF_PLAN_STEP (new step PLAN, after UNDO).
+  - One run, or several when the archive space (ARCHIVELOG, ARCHIVE not confirmed) or the new `--max-redo SIZE` (such as 500M or 20G) cannot take the redo at once.
+  - Steps follow the months of the root dates, older data first, with roots, rows, redo, archive need and deleting time per step. A month alone above the limit is a step of its own (`fits N`); the last step ends at the requested cutoff.
+  - ARCHIVE counts as met (SMALLER_RUNS) when the plan has several runs that each fit.
+- `purge` without `--retention`, `--cutoff`, `--mode` or `--depth` carries out the next step of the open plan with its choices; `--dry-run` rehearses it.
+  - A step is DONE when its purge ends SUCCESS or WARNING with P1 PASS; the plan is DONE after its last step. A stopped or failed step stays to do.
+  - The purge reuses the root counts of the plan's preflight only while they are valid (same cutoff, within `preflight_valid_h`, nothing purged since), so a later step counts again.
+- Lifecycle, at most one open plan (READY or IN_PROGRESS):
+  - a run with other options replaces a READY plan;
+  - while a plan is IN_PROGRESS, a purge with other options is refused: exit 4 non-interactive, the wizard asks (continue, start over, cancel); `start_run` refuses it too (ORA-20128);
+  - `--new` starts over: the open plan is closed, its done steps stay done;
+  - `plan` shows the open plan (or the latest), `plan --close` closes it (`--yes` with `--non-interactive`);
+  - a preflight of the same scope checks the plan again: done steps stay, the rest is planned anew, and CHANGES SINCE lists what moved since the previous check;
+  - a preflight of another scope while a plan is in progress plans nothing and says so (PLAN_KEPT);
+  - a preflight that ends STOPPED or FAILED leaves no plan to follow: the plan it made is closed, and a plan it checked again keeps its previous check;
+  - the run that closes a plan (start over, or a purge or preflight of another scope replacing it) says so in a PLAN event, with how far the plan had got.
+- Wizard: the menu shows the open plan and offers continue, check again, rehearse the next step and start over.
+  - Before a step it checks the plan again (a preflight with the plan's choices, counting anew) when the last check found requirements not met, is older than `preflight_valid_h` (8 h), or `--max-redo` changes.
+  - Without a plan, Purge runs the preflight first; it plans, and the purge carries out step 1.
+  - The wizard connects as EPFPG before the menu, to show the plan. A failed connection still shows the menu (Install).
+- Reports and run folder:
+  - PLAN section in preflight and purge reports: the steps with their estimates and state, and the next command;
+  - machine lines EPF_PLAN, EPF_PLAN_STEP and EPF_PLAN_KEPT;
+  - manifest keys plan, plan_status, plan_steps, plan_done, plan_next, plan_step and max_redo;
+  - `plan.txt` and `requirements.txt`;
+  - `status` shows the open plan.
+- Removed: `saved.sql` and `epf_control.print_saved_choices`. The plan replaces the saved choices, which no longer expire after 8 h.
+- e2e suite:
+  - new T13B: LOGS at twice the suite's retention, the plan split with `--max-redo` at 60% of its redo, step 1, other options refused, a dry run of step 2, `plan`, `plan --close`;
+  - plan checks in T08B, T10B (the stopped preflight's plan is CLOSED), T11, T12B and T13 (the plan is DONE);
+  - usage errors for `--new`, `--close` and `--max-redo` in T07.
+- Checked here: both scripts parse; 41 unit checks of the wrapper's plan helpers pass (sizes, plan lines, scope matching, report sections, choices). The SQL is not compiled here: T03 and T04 compile it.
+
+How to test (set H, on a refreshed copy; see the status page):
+- H1, by hand, LOGS only:
+  - `epf_purge.bat preflight --mode LOGS --retention 400 --backup none --confirm UNDO`: a plan of one step; note its Redo (est.).
+  - The same command with `--max-redo` at about half of that redo (such as 300M): the plan is checked again and split into several steps, `plan.txt` in the run folder.
+  - `epf_purge.bat` (menu): the plan is shown. 3 rehearses step 1; 1 carries it out; `plan` shows 1 step done.
+  - `epf_purge.bat purge --mode FULL`: the question continue, start over, cancel (S).
+  - Menu 4 starts over; `plan --close` closes the new plan.
+- H2: the full suite, `.\src\tests\e2e\run_tests.bat`: 23 tests pass. T13B notes the redo estimate and months of its plan.
+
 ## 2026-10-05 - Set F: the full suite on EPFPG781 (0.5.4), 21 of 22; T08 assertion fixed, rerun passed
 
 - 21 passed, 1 failed, in 1:16:06. 0.5.4 compiled (T03, T04) and every purge, stop, wizard and report test passed:

@@ -2974,6 +2974,190 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_fit;
     END fit_cutoff;
 
+    -- ------------------------------------------------------------------
+    -- Plan of smaller runs
+    -- ------------------------------------------------------------------
+
+    -- The plan of a PREFLIGHT run (EPF_PLAN, EPF_PLAN_STEP). The purge is
+    -- split into steps, older data first, each writing at most the step limit
+    -- of redo: the archive room less archive_margin_pct (ARCHIVELOG with a
+    -- measurable room, ARCHIVE not confirmed by the operator) and the run's
+    -- max_redo_bytes, the smaller of both. Without a limit, or without a redo
+    -- estimate for every tree, the plan has one step. Steps follow the months
+    -- of the root dates (EPF_ROOT_MONTH x redo per root); a month alone above
+    -- the limit is a step of its own (fits N); the last step ends at the
+    -- run's cutoff. The open plan of the same scope (mode, depth, cutoff) is
+    -- checked again: its done steps stay and the rest is planned anew from
+    -- what is left. An open plan of another scope is replaced when no step
+    -- has run yet; a plan in progress is kept and this preflight plans
+    -- nothing (PLAN_KEPT). Emits PLAN.
+    PROCEDURE build_plan IS
+        l_run       NUMBER := g_run.run_id;
+        l_margin    NUMBER := 1 + epf_util.setting_num('archive_margin_pct') / 100;
+        l_room      NUMBER;
+        l_where     VARCHAR2(2000);
+        l_limit     NUMBER;
+        l_basis     VARCHAR2(400);
+        l_plan      NUMBER;
+        l_status    VARCHAR2(20);
+        l_mode      VARCHAR2(30);
+        l_depth     VARCHAR2(200);
+        l_cutoff    DATE;
+        l_done      NUMBER := 0;
+        l_last_done DATE;
+        l_step      NUMBER;
+        l_unknown   NUMBER;
+        l_steps     NUMBER;
+        l_acc_roots NUMBER := 0;
+        l_acc_rows  NUMBER := 0;
+        l_acc_redo  NUMBER := 0;
+        l_replaced  VARCHAR2(400);
+
+        PROCEDURE add_step(p_cutoff IN DATE) IS
+        BEGIN
+            l_step := l_step + 1;
+            INSERT INTO epf_plan_step (plan_id, step_no, cutoff_date, roots, row_count, redo_bytes, fits, status)
+            VALUES (l_plan, l_step, p_cutoff, l_acc_roots, ROUND(l_acc_rows), ROUND(l_acc_redo),
+                    CASE WHEN l_limit IS NULL OR l_acc_redo <= l_limit THEN 'Y' ELSE 'N' END, 'PENDING');
+            l_acc_roots := 0;
+            l_acc_rows  := 0;
+            l_acc_redo  := 0;
+        END add_step;
+    BEGIN
+        SELECT MAX(plan_id) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(status) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(purge_mode) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(depth) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(cutoff_date) KEEP (DENSE_RANK LAST ORDER BY plan_id)
+          INTO l_plan, l_status, l_mode, l_depth, l_cutoff
+          FROM epf_plan
+         WHERE status IN ('READY', 'IN_PROGRESS');
+        IF l_plan IS NOT NULL
+           AND (l_mode <> g_run.purge_mode OR l_depth <> g_run.depth OR l_cutoff <> g_run.cutoff_date) THEN
+            IF l_status = 'IN_PROGRESS' THEN
+                g_warnings := g_warnings + 1;
+                epf_log.event(epf_log.c_warn, 'PLAN_KEPT',
+                              'Plan ' || epf_util.plan_label(l_plan) || ' of another scope is in progress (mode '
+                              || l_mode || ', depth ' || l_depth || ', cutoff ' || TO_CHAR(l_cutoff, 'YYYY-MM-DD')
+                              || '): this preflight plans nothing. Continue that plan, or start over with '
+                              || 'preflight --new.');
+                RETURN;
+            END IF;
+            UPDATE epf_plan
+               SET status = 'CLOSED', closed_at = epf_util.now_ts, closed_by = g_run.os_user,
+                   close_reason = 'replaced by preflight ' || epf_util.run_label(l_run)
+             WHERE plan_id = l_plan;
+            l_replaced := epf_util.plan_label(l_plan) || ' of another scope (mode ' || l_mode || ', depth ' || l_depth
+                          || ', cutoff ' || TO_CHAR(l_cutoff, 'YYYY-MM-DD') || ') closed: replaced by this preflight, '
+                          || 'no step run yet';
+            l_plan := NULL;
+        END IF;
+
+        -- The most redo one step may write.
+        IF NVL(g_log_mode, 'NOARCHIVELOG') <> 'NOARCHIVELOG'
+           AND INSTR(',' || g_run.confirmed_reqs || ',', ',ARCHIVE,') = 0 THEN
+            archive_room(l_room, l_where);
+            IF l_room IS NOT NULL THEN
+                l_limit := GREATEST(l_room / l_margin, 0);
+                l_basis := 'each run within the archive space, ' || epf_util.fmt_bytes(l_room) || ' less '
+                           || epf_util.setting('archive_margin_pct') || '%';
+            END IF;
+        END IF;
+        IF g_run.max_redo_bytes IS NOT NULL AND (l_limit IS NULL OR g_run.max_redo_bytes < l_limit) THEN
+            l_limit := g_run.max_redo_bytes;
+            l_basis := 'each run within ' || epf_util.fmt_bytes(g_run.max_redo_bytes) || ' of redo (--max-redo)';
+        END IF;
+        SELECT COUNT(CASE WHEN te.redo_root IS NULL THEN 1 END)
+          INTO l_unknown
+          FROM epf_root_month rm
+          LEFT JOIN epf_tree_est te ON te.run_id = rm.run_id AND te.table_id = rm.table_id
+         WHERE rm.run_id = l_run AND rm.roots > 0;
+        IF l_limit IS NOT NULL AND l_unknown > 0 THEN
+            l_limit := NULL;
+            l_basis := 'one run: not every tree has a redo estimate (LOB clearing not measured yet)';
+        ELSIF l_limit IS NULL THEN
+            l_basis := 'one run: '
+                       || CASE WHEN NVL(g_log_mode, 'NOARCHIVELOG') = 'NOARCHIVELOG' THEN 'NOARCHIVELOG, no --max-redo'
+                               WHEN INSTR(',' || g_run.confirmed_reqs || ',', ',ARCHIVE,') > 0
+                               THEN 'the archive space is confirmed by the DBA'
+                               ELSE 'the archive space cannot be measured' END;
+        END IF;
+
+        IF l_plan IS NULL THEN
+            INSERT INTO epf_plan (status, purge_mode, depth, cutoff_date, retention_days, created_run_id,
+                                  preflight_run_id, step_limit_bytes, limit_basis, created_by, checked_at)
+            VALUES ('READY', g_run.purge_mode, g_run.depth, g_run.cutoff_date, g_run.retention_days, l_run,
+                    l_run, l_limit, SUBSTR(l_basis, 1, 400), g_run.os_user, epf_util.now_ts)
+            RETURNING plan_id INTO l_plan;
+        ELSE
+            -- Checked again: the steps done stay, the rest is planned anew.
+            DELETE FROM epf_plan_step WHERE plan_id = l_plan AND status = 'PENDING';
+            SELECT COUNT(*), MAX(cutoff_date) INTO l_done, l_last_done FROM epf_plan_step WHERE plan_id = l_plan;
+            UPDATE epf_plan
+               SET preflight_run_id = l_run, step_limit_bytes = l_limit, limit_basis = SUBSTR(l_basis, 1, 400),
+                   checked_at = epf_util.now_ts
+             WHERE plan_id = l_plan;
+        END IF;
+        UPDATE epf_run SET plan_id = l_plan WHERE run_id = l_run;
+        g_run.plan_id := l_plan;
+
+        -- Steps: the months of the root dates, older first.
+        l_step := l_done;
+        FOR m IN (SELECT rm.month_start, SUM(rm.roots) AS roots,
+                         SUM(rm.roots * NVL(te.rows_root, 1)) AS row_est,
+                         SUM(rm.roots * NVL(te.redo_root, 0)) AS redo
+                    FROM epf_root_month rm
+                    LEFT JOIN epf_tree_est te ON te.run_id = rm.run_id AND te.table_id = rm.table_id
+                   WHERE rm.run_id = l_run AND rm.roots > 0
+                   GROUP BY rm.month_start
+                   ORDER BY rm.month_start) LOOP
+            IF l_limit IS NOT NULL AND l_acc_roots > 0 AND l_acc_redo + m.redo > l_limit
+               AND (l_last_done IS NULL OR m.month_start > l_last_done) THEN
+                add_step(m.month_start);
+            END IF;
+            l_acc_roots := l_acc_roots + m.roots;
+            l_acc_rows  := l_acc_rows + m.row_est;
+            l_acc_redo  := l_acc_redo + m.redo;
+        END LOOP;
+        IF l_acc_roots > 0 OR l_step = l_done THEN
+            add_step(g_run.cutoff_date);
+        END IF;
+        COMMIT;
+        IF l_replaced IS NOT NULL THEN
+            epf_log.event(epf_log.c_info, 'PLAN', l_replaced);
+        END IF;
+        l_steps := l_step - l_done;
+        epf_log.event(epf_log.c_info, 'PLAN',
+                      epf_util.plan_label(l_plan) || ': '
+                      || CASE WHEN l_limit IS NULL THEN l_basis
+                              ELSE l_steps || CASE WHEN l_steps = 1 THEN ' run' ELSE ' runs, older data first' END
+                                   || CASE WHEN l_done > 0 THEN ' (' || l_done || ' done before)' END || '; ' || l_basis
+                         END,
+                      p_rows => l_steps, p_bytes => l_limit);
+    END build_plan;
+
+    -- Deleting time of the pending steps of the run's plan: each step's redo
+    -- at the seconds per byte of redo of the run's forecast (all modules).
+    PROCEDURE plan_times IS
+        l_secs NUMBER;
+        l_redo NUMBER;
+        l_plan NUMBER := g_run.plan_id;
+    BEGIN
+        IF l_plan IS NULL OR g_run.action <> 'PREFLIGHT' THEN
+            RETURN;
+        END IF;
+        SELECT SUM(delete_seconds), SUM(redo_bytes)
+          INTO l_secs, l_redo
+          FROM epf_forecast
+         WHERE run_id = g_run.run_id AND origin = 'PREFLIGHT';
+        IF NVL(l_redo, 0) > 0 AND l_secs IS NOT NULL THEN
+            UPDATE epf_plan_step
+               SET delete_seconds = redo_bytes * l_secs / l_redo
+             WHERE plan_id = l_plan AND status = 'PENDING';
+            COMMIT;
+        END IF;
+    END plan_times;
+
     -- Size of an index on p_columns of a table: rows x (key length + row
     -- address) plus block overhead, from optimizer statistics.
     FUNCTION index_bytes_estimate(p_owner IN VARCHAR2, p_table IN VARCHAR2, p_columns IN SYS.ODCIVARCHAR2LIST)
@@ -3083,6 +3267,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_blocking   NUMBER;
         l_unmet      VARCHAR2(400);
         l_confirmed  VARCHAR2(100) := g_run.confirmed_reqs;
+        l_plan_ok    BOOLEAN := FALSE;
+        l_steps      NUMBER := 0;
+        l_over       NUMBER := 0;
 
         -- Last way to meet a blocking requirement: the operator's confirmation.
         PROCEDURE add_confirm(p_code IN VARCHAR2, p_seq IN NUMBER) IS
@@ -3116,11 +3303,24 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_need := l_redo * (1 + l_margin_pct / 100);
             archive_room(l_room, l_where);
             l_met := l_room IS NOT NULL AND l_unknown = 0 AND l_room >= l_need;
+            -- A preflight's plan meets it when it has several runs that each
+            -- fit the archive space.
+            IF NOT l_met AND g_run.action = 'PREFLIGHT' AND g_run.plan_id IS NOT NULL AND l_room IS NOT NULL
+               AND l_unknown = 0 THEN
+                SELECT COUNT(*), COUNT(CASE WHEN fits = 'N' THEN 1 END)
+                  INTO l_steps, l_over
+                  FROM epf_plan_step
+                 WHERE plan_id = g_run.plan_id AND status = 'PENDING';
+                l_plan_ok := l_steps > 1 AND l_over = 0;
+            END IF;
             l_text := 'needs ' || epf_util.fmt_bytes(l_need) || ' (redo estimate ' || epf_util.fmt_bytes(l_redo)
                       || ' + ' || l_margin_pct || '%)'
                       || CASE WHEN l_unknown > 0 THEN ', ' || l_unknown || ' trees without a redo estimate' END
-                      || '; ' || l_where;
-            add_req('ARCHIVE', 1, l_met, 'Y', 'Archived logs fit', c_why_archive, l_text, l_need, l_room, 'ROOM');
+                      || '; ' || l_where
+                      || CASE WHEN l_plan_ok THEN '; the plan ' || epf_util.plan_label(g_run.plan_id) || ' splits it into '
+                                                  || l_steps || ' runs that each fit' END;
+            add_req('ARCHIVE', 1, l_met OR l_plan_ok, 'Y', 'Archived logs fit', c_why_archive, l_text, l_need, l_room,
+                    CASE WHEN l_met THEN 'ROOM' ELSE 'SMALLER_RUNS' END);
             add_opt('ARCHIVE', 'NOARCHIVELOG', 1, FALSE, 'Database in NOARCHIVELOG',
                     'ARCHIVELOG now. Switching needs 2 restarts and a new full backup: the DBA''s decision, '
                     || 'never made by this tool');
@@ -3131,8 +3331,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             IF l_room IS NOT NULL THEN
                 l_fit := fit_cutoff(l_room / (1 + l_margin_pct / 100));
             END IF;
-            add_opt('ARCHIVE', 'SMALLER_RUNS', 3, FALSE, 'Purge in smaller runs, older data first',
-                    CASE WHEN l_room IS NULL THEN 'needs a measurable free space'
+            add_opt('ARCHIVE', 'SMALLER_RUNS', 3, l_plan_ok, 'Purge in smaller runs, older data first',
+                    CASE WHEN l_plan_ok THEN 'the plan ' || epf_util.plan_label(g_run.plan_id) || ': ' || l_steps
+                                             || ' runs, each within the free space; the DBA backs up and deletes '
+                                             || 'archived logs between runs'
+                         WHEN l_room IS NULL THEN 'needs a measurable free space'
                          WHEN l_fit IS NULL THEN 'the oldest month alone does not fit the free space'
                          WHEN l_fit >= g_run.cutoff_date THEN 'the whole purge fits in one run'
                          ELSE 'largest purge that fits now: retention ' || (TRUNC(SYSDATE) - l_fit) || ' days (cutoff '
@@ -3624,11 +3827,17 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             epf_log.step_start('UNDO');
             check_undo;
             epf_log.step_end('DONE');
+            IF g_run.action = 'PREFLIGHT' THEN
+                epf_log.step_start('PLAN');
+                build_plan;
+                epf_log.step_end('DONE');
+            END IF;
             epf_log.step_start('REQUIREMENTS');
             check_requirements;
             epf_log.step_end('DONE');
             epf_log.step_start('FORECAST');
             forecast_preflight;
+            plan_times;
             epf_log.step_end('DONE');
         END IF;
         p_warnings := l_warnings + g_warnings;
@@ -3660,8 +3869,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 RAISE;
         END;
         g_silent := FALSE;
+        IF g_run.action = 'PREFLIGHT' THEN
+            build_plan;
+        END IF;
         check_requirements;
         forecast_preflight;
+        plan_times;
         epf_log.step_end('DONE');
         p_warnings := g_warnings;
     END recheck;

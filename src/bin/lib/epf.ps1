@@ -127,7 +127,10 @@ Usage: epf_purge.bat [action] [options]
 Actions
   (none)       interactive wizard
   purge        purge: preflight, purge, report
-  preflight    read-only checks and estimates; changes nothing
+  preflight    read-only checks and estimates, and the plan of the purge;
+               changes no data
+  plan         the open plan with its steps (or the latest plan)
+               --close closes the open plan
   report       report of a run                          --run <id|LATEST>
   status       state of the active or latest run, pending temporary indexes,
                undo tuning and locked accounts
@@ -162,6 +165,13 @@ Options
                        With preflight or --dry-run, --redo-logs and
                        --undo-tuning are checked as planned; nothing is
                        changed
+  --max-redo SIZE      the most redo one run of the plan may write, such as
+                       500M or 20G (preflight, and the wizard's purge): the
+                       plan splits the purge into runs of at most that much,
+                       older data first
+  --new                start over: close the open plan (preflight: plan
+                       again; purge: run the options given)
+  --close              with plan: close the open plan
   --run ID             run for report (default LATEST) and stop (default:
                        the active run); 124 or R-000124
   --yes                skip the final confirmation (required with
@@ -177,13 +187,24 @@ Requirements and choices
   space, redo logs and backup. Run it without --non-interactive and it asks,
   for each one not met, how to meet it (undo tuning, larger redo logs, the
   backup choice, a confirmation by the DBA, or stop), then the batch size,
-  and checks again. The answers are saved with the preflight: for 8 hours a
-  purge or dry run of the same scope (mode, depth, cutoff) follows them, and
-  the wizard asks once whether to use them. Options on the command line
+  and checks again. The answers are saved with the preflight and its plan:
+  the purges of the plan follow them. Options on the command line
   (--batch-size, --backup, --confirm, --undo-tuning, --redo-logs) are choices
   too. A purge does not start while a blocking requirement (archive, undo,
   TEMP, backup) is not met. A dry run simulates the purge and predicts its
   outcome.
+
+Plan of smaller runs
+  The preflight also plans the purge: one run, or several when the archive
+  space (ARCHIVELOG) or --max-redo cannot take its redo at once, older data
+  first. purge without --retention, --cutoff, --mode or --depth carries out
+  the next step of the open plan with its choices (--dry-run rehearses it);
+  preflight checks the plan again, and the wizard does so first when the
+  last check is older than 8 hours or found requirements not met. A purge
+  with other options is refused while a plan is in progress (the wizard
+  asks); --new starts over. A plan with no step run yet is replaced by a
+  run with other options. Between runs in ARCHIVELOG the DBA backs up and
+  deletes the archived logs.
 
 Environment
   EPF_PASSWORD         EPFPG password
@@ -207,9 +228,9 @@ function Read-Arguments {
     param([object[]]$List)
     $result = @{ Action = $null; Options = @{}; Flags = @{} }
     $valueOptions = @('config', 'tns', 'retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup', 'confirm',
-                      'log-dir', 'run', 'tablespaces', 'long-conversion')
+                      'log-dir', 'run', 'tablespaces', 'long-conversion', 'max-redo')
     $flagOptions = @('dry-run', 'compact', 'redo-logs', 'undo-tuning', 'yes', 'non-interactive', 'no-color',
-                     'help', 'reclaim', 'resume')
+                     'help', 'reclaim', 'resume', 'new', 'close')
     $i = 0
     while ($i -lt $List.Count) {
         $arg = [string]$List[$i]
@@ -827,10 +848,20 @@ function Invoke-ToolRun {
     if ($Ctx.Backup -ne '') { $backupArg = $Ctx.Backup }
     $confirmArg = '-'
     if ($Ctx.Confirm -ne '') { $confirmArg = $Ctx.Confirm }
+    $maxRedoArg = '-'
+    if ($Ctx.MaxRedo -ne '') { $maxRedoArg = $Ctx.MaxRedo }
+    # A purge carries out (a dry run rehearses) the plan step; a preflight
+    # plans, or checks the open plan again.
+    $planIdArg = '-'
+    $planStepArg = '-'
+    if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '') {
+        $planIdArg = $Ctx.PlanId
+        $planStepArg = $Ctx.PlanStep
+    }
 
     $state.Monitor = Open-Monitor $Ctx.Cred
     $begin = @($Action, $retentionArg, $Ctx.Depth, $Ctx.Mode, $batchArg, $dry, 'N', $compact, $undo, $backupArg,
-               $cutoffArg, $confirmArg, $redo)
+               $cutoffArg, $confirmArg, $redo, $maxRedoArg, (Get-YN $Ctx.NewPlan), $planIdArg, $planStepArg)
     try {
         $lines = Invoke-MonitorCommand $state.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $begin) 120000
     } catch {
@@ -878,6 +909,13 @@ function Invoke-ToolRun {
     }
     $choices = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
     if ($choices -ne 'none') { Write-Out (' Choices    ' + $choices) }
+    if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '') {
+        $what = 'step '
+        if ($Ctx.DryRun) { $what = 'rehearsal of step ' }
+        Write-Out (' Plan       ' + $Ctx.PlanLabel + ', ' + $what + $Ctx.PlanStep + ' of ' + $Ctx.Plan.Steps)
+    } elseif ($Action -eq 'PREFLIGHT' -and $Ctx.MaxRedo -ne '') {
+        Write-Out (' Plan       runs of at most ' + (Format-Bytes ([double]$Ctx.MaxRedo)) + ' of redo')
+    }
 
     $status = 'FAILED'
     $undoApplied = $false
@@ -1010,6 +1048,14 @@ function Invoke-ToolRun {
     $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId)
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
     Show-Lines $report.Output -HideMachine
+    # The requirements and the plan of the run, each in its own file.
+    foreach ($part in @(@('REQUIREMENTS', 'requirements.txt'), @('PLAN', 'plan.txt'))) {
+        $text = Get-ReportSection $report.Output $part[0]
+        if ($text -ne '') {
+            [System.IO.File]::WriteAllText((Join-Path $state.Folder $part[1]), $text, [System.Text.Encoding]::ASCII)
+        }
+    }
+    $planAfter = Read-PlanLines $report.Output
 
     $exitCode = $closeCode
     if ($null -eq $exitCode) { $exitCode = $script:ExitFail }
@@ -1026,12 +1072,21 @@ function Invoke-ToolRun {
     if ($Action -eq 'PREFLIGHT' -and -not $FromWizard -and -not $state.Stopped -and $status -ne 'FAILED') {
         Show-PreflightNext $Ctx $state $report.Output
     }
+    if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '' -and -not $Ctx.DryRun -and $null -ne $planAfter) {
+        if ($planAfter.Status -eq 'DONE') {
+            Write-Out (' Plan    ' + $planAfter.Label + ' is done: every step ran.') 'Green'
+        } elseif ($planAfter.NextStep -ne '-') {
+            Write-Out (' Plan    ' + $planAfter.Label + ': ' + $planAfter.Done + ' of ' + $planAfter.Steps +
+                       ' steps done. Next: epf_purge.bat purge (step ' + $planAfter.NextStep + ', rows before ' +
+                       $planAfter.NextCutoff + ')')
+        }
+    }
     return [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
                               Stopped = $state.Stopped }
 }
 
-# After a preflight: whether a purge can start, with the choices a purge of
-# the same scope follows for the next preflight_valid_h hours.
+# After a preflight: whether a purge can start, and how it follows the plan
+# and the choices saved with this preflight.
 function Show-PreflightNext {
     param($Ctx, $State, [string]$Report)
     $unmet = @()
@@ -1040,10 +1095,19 @@ function Show-PreflightNext {
     }
     $scope = '--mode ' + $Ctx.Mode + ' --depth ' + $Ctx.Depth
     if ($Ctx.Cutoff -ne '') { $scope = $scope + ' --cutoff ' + $Ctx.Cutoff } else { $scope = $scope + ' --retention ' + $Ctx.Retention }
+    $plan = Read-PlanLines $Report
     Write-Out (' Choices ' + (Format-Choices $Ctx.BatchSize $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm) +
                ' (saved with ' + (Get-RunLabel $State.RunId) + ')')
-    if ($unmet.Count -gt 0) {
+    if ($Report -match '(?m)^EPF_PLAN_KEPT\|(P-\d+)') {
+        Write-Out (' Next    plan ' + $Matches[1] + ' of another scope is in progress: epf_purge.bat purge continues it;' +
+                   ' preflight --new starts over with these options') 'Yellow'
+    } elseif ($unmet.Count -gt 0) {
         Write-Out (' Next    not ready (' + ($unmet -join ', ') + '): meet them or choose how, then run the preflight again') 'Yellow'
+    } elseif ($null -ne $plan -and $plan.NextStep -ne '-' -and $plan.Steps -gt 1) {
+        Write-Out (' Next    epf_purge.bat purge carries out step ' + $plan.NextStep + ' of ' + $plan.Steps + ' of plan ' +
+                   $plan.Label + ' (rows before ' + $plan.NextCutoff + '); add --dry-run to rehearse it') 'Green'
+    } elseif ($null -ne $plan) {
+        Write-Out (' Next    epf_purge.bat purge follows these choices (plan ' + $plan.Label + '); add --dry-run to simulate it first') 'Green'
     } else {
         Write-Out (' Next    epf_purge.bat purge ' + $scope + ' follows these choices; add --dry-run to simulate it first') 'Green'
     }
@@ -1072,6 +1136,17 @@ function Write-Manifest {
     $lines.Add('backup=' + $Ctx.Backup)
     $lines.Add('confirmed=' + $Ctx.Confirm)
     if ($Ctx.PreflightRun -ne '') { $lines.Add('preflight_run=' + $Ctx.PreflightRun) }
+    if ($Ctx.MaxRedo -ne '') { $lines.Add('max_redo=' + $Ctx.MaxRedo) }
+    if ($Ctx.PlanId -ne '' -and $Action -eq 'PURGE') { $lines.Add('plan_step=' + $Ctx.PlanStep) }
+    $plan = Read-PlanLines $Report
+    if ($null -ne $plan) {
+        # plan=<plan> and its state as the report shows it after the run
+        $lines.Add('plan=' + $plan.Label)
+        $lines.Add('plan_status=' + $plan.Status)
+        $lines.Add('plan_steps=' + $plan.Steps)
+        $lines.Add('plan_done=' + $plan.Done)
+        $lines.Add('plan_next=' + $plan.NextStep)
+    }
     $lines.Add('stop_requested=' + (Get-YN $State.StopRequested))
     $lines.Add('status=' + $Status)
     $ready = '-'
@@ -1117,13 +1192,20 @@ function Get-Tns {
     return (Get-Input -Name 'tns' -Key 'TNS' -Prompt 'TNS alias or EZConnect (PDB service)' -Hint 'a TNS alias or host:port/service')
 }
 
+# Connection as EPFPG. -Soft (the wizard's menu): a failed connection
+# returns $null instead of ending the tool.
 function Connect-Tool {
+    param([switch]$Soft)
     $tns = Get-Tns
     $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
     $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
     $test = Test-DbConnection $login -WithVersion
     if (-not $test.Ok) {
         Show-Lines $test.Output -Indent
+        if ($Soft) {
+            Write-Out ' The connection as EPFPG failed: if the tool is not installed yet, choose Install.' 'Yellow'
+            return $null
+        }
         Exit-Tool $script:ExitUsage 'The connection as EPFPG failed. If the tool is not installed yet, run epf_purge.bat install.'
     }
     if ($test.Container -eq 'CDB$ROOT') { Exit-Tool $script:ExitUsage 'Connected to CDB$ROOT: use the PDB service.' }
@@ -1152,12 +1234,15 @@ function Connect-Sys {
     return $sys
 }
 
+# Parameters of a purge or preflight. With $Plan, the run follows the plan:
+# its mode, depth and cutoff (Set-PlanScope) instead of the options and
+# prompts.
 function Get-PurgeContext {
-    param($Login, [string]$Action)
+    param($Login, [string]$Action, $Plan = $null)
     $ctx = [pscustomobject]@{
         Cred = $Login; SysCred = $null; Retention = ''; Cutoff = ''; Depth = ''; Mode = ''; BatchSize = '';
         DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $false; Backup = ''; Confirm = '';
-        PreflightRun = ''
+        PreflightRun = ''; MaxRedo = ''; NewPlan = $false; PlanId = ''; PlanStep = ''; PlanLabel = ''; Plan = $null
     }
     if ($Action -ne 'PURGE') {
         foreach ($name in @('dry-run', 'compact')) {
@@ -1171,7 +1256,9 @@ function Get-PurgeContext {
     }
     $cutoff = ''
     if (-not $script:Cli.Options.ContainsKey('retention')) { $cutoff = Get-Option 'cutoff' 'CUTOFF' '' }
-    if ($cutoff -ne '') {
+    if ($null -ne $Plan) {
+        Set-PlanScope $ctx $Plan $Action
+    } elseif ($cutoff -ne '') {
         $day = [datetime]::MinValue
         $today = (Get-Date).Add($script:ClockOffset).Date
         if (-not [datetime]::TryParseExact($cutoff.Trim(), 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
@@ -1199,12 +1286,20 @@ function Get-PurgeContext {
         }
         $ctx.Confirm = (@($codes | Select-Object -Unique) -join ',')
     }
-    $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
-    if ($ctx.Mode -eq 'LOGS') {
-        $ctx.Depth = 'LOGS'
-    } else {
-        $ctx.Depth = (Get-Input -Name 'depth' -Key 'DEPTH' -Prompt 'Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS)' `
-                                -Default 'ALL' -Pattern '^[A-Z_]+(,[A-Z_]+)*$' -Hint 'ALL, or module names separated by commas').ToUpper()
+    if ($null -eq $Plan) {
+        $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
+        if ($ctx.Mode -eq 'LOGS') {
+            $ctx.Depth = 'LOGS'
+        } else {
+            $ctx.Depth = (Get-Input -Name 'depth' -Key 'DEPTH' -Prompt 'Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS)' `
+                                    -Default 'ALL' -Pattern '^[A-Z_]+(,[A-Z_]+)*$' -Hint 'ALL, or module names separated by commas').ToUpper()
+        }
+    }
+    $maxRedo = Get-Option 'max-redo' 'MAX_REDO' ''
+    if ($maxRedo -ne '') {
+        $bytes = ConvertTo-Bytes $maxRedo
+        if ($null -eq $bytes) { Exit-Tool $script:ExitUsage ('--max-redo: a size such as 500M or 20G, got ' + $maxRedo + '.') }
+        $ctx.MaxRedo = ([long]$bytes).ToString([Globalization.CultureInfo]::InvariantCulture)
     }
     $batch = Get-Option 'batch-size' 'BATCH_SIZE' ''
     if ($batch -ne '') {
@@ -1226,6 +1321,241 @@ function Get-PurgeContext {
     $ctx.RedoLogs = Get-Choice 'redo-logs' 'REDO_LOGS' ''
     $ctx.UndoTuning = Get-Choice 'undo-tuning' 'UNDO_TUNING' ''
     return $ctx
+}
+
+# ----------------------------------------------------------------------------
+# Plans
+# ----------------------------------------------------------------------------
+
+# Size such as 500M, 20G or 1.5T (binary units), or bytes; $null when not
+# valid.
+function ConvertTo-Bytes {
+    param([string]$Text)
+    if ($Text -match '^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*$') {
+        $value = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+        $power = @{ '' = 0; 'K' = 1; 'M' = 2; 'G' = 3; 'T' = 4 }[$Matches[2].ToUpper()]
+        $bytes = [Math]::Floor($value * [Math]::Pow(1024, $power))
+        if ($bytes -ge 1) { return $bytes }
+    }
+    return $null
+}
+
+function Format-Bytes {
+    param([double]$Bytes)
+    $units = @('B', 'KB', 'MB', 'GB', 'TB')
+    $i = 0
+    while ($Bytes -ge 1024 -and $i -lt $units.Count - 1) { $Bytes = $Bytes / 1024; $i++ }
+    if ($i -eq 0) { return ([string][long]$Bytes + ' B') }
+    return ($Bytes.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + ' ' + $units[$i])
+}
+
+# The plan in the output of plan.sql or of a report (EPF_PLAN and
+# EPF_PLAN_STEP lines), or $null.
+function Read-PlanLines {
+    param([string]$Text)
+    $plan = $null
+    $steps = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^EPF_PLAN\|(.*)$') {
+            $f = $Matches[1].Trim().Split('|')
+            if ($f.Count -lt 23) { continue }
+            $plan = [pscustomobject]@{
+                Label = $f[0]; Id = $f[1]; Status = $f[2]; Mode = $f[3]; Depth = $f[4]; Cutoff = $f[5];
+                Retention = $f[6]; Steps = [int]$f[7]; Done = [int]$f[8]; NextStep = $f[9]; NextCutoff = $f[10];
+                PreflightRun = $f[11]; CheckedAt = $f[12]; Minutes = $f[13]; Batch = $f[14]; Undo = ($f[15] -eq 'Y');
+                Redo = ($f[16] -eq 'Y'); Backup = $f[17]; Confirm = $f[18]; Ready = $f[19]; CreatedBy = $f[20];
+                MaxRedo = $f[21]; Recent = $f[22]; StepList = $steps
+            }
+            if ($plan.Backup -eq '-') { $plan.Backup = '' }
+            if ($plan.Confirm -eq '-') { $plan.Confirm = '' }
+            if ($plan.MaxRedo -eq '-') { $plan.MaxRedo = '' }
+        } elseif ($line -match '^EPF_PLAN_STEP\|(.*)$') {
+            $f = $Matches[1].Trim().Split('|')
+            if ($f.Count -lt 9) { continue }
+            $steps.Add([pscustomobject]@{ Step = $f[1]; Cutoff = $f[2]; Roots = $f[3]; Rows = $f[4]; Redo = $f[5];
+                                          Status = $f[6]; Fits = $f[7]; LastRun = $f[8] })
+        }
+    }
+    return $plan
+}
+
+# The open plan (READY or IN_PROGRESS), or $null.
+function Get-OpenPlan {
+    param($Login)
+    $result = Invoke-SqlScript $Login (Join-Path $script:RunSqlDir 'plan.sql') @('SHOW', 'OPEN')
+    $plan = Read-PlanLines $result.Output
+    if ($null -ne $plan -and @('READY', 'IN_PROGRESS') -contains $plan.Status) { return $plan }
+    return $null
+}
+
+# The plan: its state and next step, its scope and last check, and with
+# -Choices the choices its purges follow.
+function Show-PlanSummary {
+    param($Plan, [switch]$Choices)
+    $next = 'no step left'
+    if ($Plan.NextStep -ne '-') { $next = 'next: step ' + $Plan.NextStep + ', rows before ' + $Plan.NextCutoff }
+    Write-Out (' Plan ' + $Plan.Label + '  ' + $Plan.Status + ': ' + $Plan.Done + ' of ' + $Plan.Steps + ' steps done, ' + $next) 'White'
+    Write-Out ('   mode ' + $Plan.Mode + ', depth ' + $Plan.Depth + ', rows before ' + $Plan.Cutoff + ' when it ends; checked by ' +
+               $Plan.PreflightRun + ' at ' + $Plan.CheckedAt + ' (' + $Plan.CreatedBy + ')')
+    if ($Choices) { Write-Out ('   choices ' + (Format-Choices $Plan.Batch $Plan.Undo $Plan.Redo $Plan.Backup $Plan.Confirm)) }
+}
+
+# Scope options given on the command line (the configuration file only
+# gives defaults).
+function Test-ScopeGiven {
+    foreach ($name in @('retention', 'cutoff', 'mode', 'depth')) {
+        if ($script:Cli.Options.ContainsKey($name)) { return $true }
+    }
+    return $false
+}
+
+function Get-DepthKey {
+    param([string]$Depth, [string]$Mode)
+    $items = @($Depth.ToUpper().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    if ($items -contains 'ALL') { return 'ALL' }
+    if ($Mode -eq 'CLOB_N_LOGS' -and $items -notcontains 'LOGS') { $items += 'LOGS' }
+    return ((@($items | Sort-Object -Unique)) -join ',')
+}
+
+# Every scope option given equals the plan's: mode, depth (not used with
+# --mode LOGS, which purges the LOGS module), and the cutoff (a retention
+# matches the plan's retention or its cutoff counted from today).
+function Test-PlanScope {
+    param($Plan)
+    $mode = $Plan.Mode
+    $modeGiven = $script:Cli.Options.ContainsKey('mode')
+    if ($modeGiven) {
+        $mode = ([string]$script:Cli.Options['mode']).Trim().ToUpper()
+        if ($mode -ne $Plan.Mode) { return $false }
+    }
+    if ($script:Cli.Options.ContainsKey('depth') -and -not ($modeGiven -and $mode -eq 'LOGS')) {
+        if ((Get-DepthKey ([string]$script:Cli.Options['depth']) $mode) -ne (Get-DepthKey $Plan.Depth $mode)) { return $false }
+    }
+    if ($script:Cli.Options.ContainsKey('cutoff')) {
+        if (([string]$script:Cli.Options['cutoff']).Trim() -ne $Plan.Cutoff) { return $false }
+    }
+    if ($script:Cli.Options.ContainsKey('retention')) {
+        $days = 0
+        if (-not [int]::TryParse(([string]$script:Cli.Options['retention']).Trim(), [ref]$days)) { return $false }
+        $cutoff = (Get-Date).Add($script:ClockOffset).Date.AddDays(-1 * $days).ToString('yyyy-MM-dd')
+        if ([string]$days -ne $Plan.Retention -and $cutoff -ne $Plan.Cutoff) { return $false }
+    }
+    return $true
+}
+
+# The run follows the plan: its mode and depth, and the cutoff of its next
+# step (a purge, or a dry run rehearsing it) or of the whole plan (a
+# preflight checking it again).
+function Set-PlanScope {
+    param($Ctx, $Plan, [string]$Action)
+    $Ctx.Mode = $Plan.Mode
+    $Ctx.Depth = $Plan.Depth
+    $cutoff = $Plan.Cutoff
+    $Ctx.PlanId = ''
+    $Ctx.PlanStep = ''
+    if ($Action -eq 'PURGE' -and $Plan.NextStep -ne '-') {
+        $cutoff = $Plan.NextCutoff
+        $Ctx.PlanId = $Plan.Id
+        $Ctx.PlanStep = $Plan.NextStep
+    }
+    $Ctx.PlanLabel = $Plan.Label
+    $Ctx.Plan = $Plan
+    $Ctx.Cutoff = $cutoff
+    $day = [datetime]::ParseExact($cutoff, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $Ctx.Retention = [string][int]((Get-Date).Add($script:ClockOffset).Date - $day).TotalDays
+}
+
+# The choices of the plan (saved with its latest preflight): values given on
+# the command line win; undo tuning, redo log sizing and confirmations add
+# up.
+function Use-PlanChoices {
+    param($Ctx, $Plan)
+    if ($Ctx.BatchSize -eq '') { $Ctx.BatchSize = $Plan.Batch }
+    if ($Ctx.Backup -eq '') { $Ctx.Backup = $Plan.Backup }
+    $Ctx.UndoTuning = $Ctx.UndoTuning -or $Plan.Undo
+    $Ctx.RedoLogs = $Ctx.RedoLogs -or $Plan.Redo
+    foreach ($code in @($Plan.Confirm.Split(',') | Where-Object { $_ -ne '' })) { Add-Confirm $Ctx $code }
+    if ($Ctx.MaxRedo -eq '') { $Ctx.MaxRedo = $Plan.MaxRedo }
+}
+
+# Wizard, before the next step of a plan that is not ready, was checked
+# more than preflight_valid_h hours ago or gets another --max-redo: a
+# preflight with the plan's scope and choices (and its questions) checks it
+# again, counting the roots anew. Returns the plan as it then stands; ends
+# the tool when the check fails, is stopped or leaves the requirements not
+# met.
+function Invoke-PlanCheck {
+    param($Ctx, $Plan)
+    $check = $Ctx.PSObject.Copy()
+    $check.PreflightRun = ''
+    $check.Cutoff = $Plan.Cutoff
+    $day = [datetime]::ParseExact($Plan.Cutoff, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $check.Retention = [string][int]((Get-Date).Add($script:ClockOffset).Date - $day).TotalDays
+    $check.PlanId = ''
+    $check.PlanStep = ''
+    $check.DryRun = $false
+    $check.Compact = $false
+    $check.NewPlan = $false
+    Write-Section 'CHECKING THE PLAN AGAIN (read-only preflight)'
+    $advice = Get-Advice $check
+    if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+    if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
+        Exit-Tool $script:ExitFail ('The preflight ' + (Get-RunLabel $advice.Run.RunId) + ' found errors (see the report above); nothing was changed.')
+    }
+    $unmet = Get-Unmet $advice
+    if ($unmet.Count -gt 0 -and -not $Ctx.DryRun) {
+        Exit-Tool $script:ExitAborted ('Not ready: ' + ($unmet -join ', ') + ' (REQUIREMENTS above). Meet them, then continue the plan; nothing was changed.')
+    }
+    foreach ($name in @('BatchSize', 'UndoTuning', 'RedoLogs', 'Backup', 'Confirm', 'MaxRedo')) { $Ctx.$name = $check.$name }
+    $fresh = Get-OpenPlan $Ctx.Cred
+    if ($null -eq $fresh -or $fresh.NextStep -eq '-') {
+        Exit-Tool $script:ExitAborted 'After the check the plan has no step left; nothing was changed.'
+    }
+    $Ctx.PreflightRun = $fresh.PreflightRun
+    return $fresh
+}
+
+# Lines of one report section, from its title to the next title.
+function Get-ReportSection {
+    param([string]$Report, [string]$Title)
+    $lines = @($Report -split "`r?`n")
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $inside = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $isTitle = ($i + 1 -lt $lines.Count) -and ($lines[$i + 1] -match '^ -{20,}') -and ($lines[$i] -match '^ [A-Z]')
+        if ($isTitle) {
+            if ($inside) { break }
+            if ($lines[$i] -match ('^ ' + [regex]::Escape($Title) + '(\s|$)')) { $inside = $true }
+        }
+        if ($inside -and $lines[$i] -notmatch '^EPF_[A-Z_]+\|') { $out.Add($lines[$i]) }
+    }
+    if ($out.Count -eq 0) { return '' }
+    return (($out.ToArray()) -join "`r`n") + "`r`n"
+}
+
+# plan: the open plan (or the latest), or --close.
+function Invoke-PlanAction {
+    $login = Connect-Tool
+    if ($script:Cli.Flags.ContainsKey('close')) {
+        $plan = Get-OpenPlan $login
+        if ($null -eq $plan) {
+            Write-Out ' No open plan.'
+            exit $script:ExitPass
+        }
+        Show-PlanSummary $plan -Choices
+        if (-not $script:Cli.Flags.ContainsKey('yes')) {
+            if (-not $script:Interactive) { Exit-Tool $script:ExitUsage 'Closing a plan: --yes is required with --non-interactive.' }
+            if (-not (Read-YesNo ('Close plan ' + $plan.Label + ' (its completed steps stay done)') $false)) {
+                Exit-Tool $script:ExitAborted 'Nothing was changed.'
+            }
+        }
+        $result = Invoke-SqlScript $login (Join-Path $script:RunSqlDir 'plan.sql') @('CLOSE', '-')
+        Show-Lines $result.Output -HideMachine
+        exit $result.ExitCode
+    }
+    $result = Invoke-SqlScript $login (Join-Path $script:RunSqlDir 'plan.sql') @('SHOW', 'CURRENT')
+    Show-Lines $result.Output -HideMachine
+    exit $result.ExitCode
 }
 
 # Wizard step: a read-only PREFLIGHT run with the chosen parameters. Its
@@ -1474,56 +1804,6 @@ function Format-Choices {
     return ($parts -join ', ')
 }
 
-# The choices saved with the latest preflight of the purge's scope
-# (saved.sql), or $null.
-function Get-SavedChoices {
-    param($Ctx)
-    $retentionArg = $Ctx.Retention
-    $cutoffArg = '-'
-    if ($Ctx.Cutoff -ne '') {
-        $retentionArg = '-'
-        $cutoffArg = $Ctx.Cutoff
-    }
-    $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'saved.sql') @($retentionArg, $cutoffArg, $Ctx.Mode, $Ctx.Depth)
-    foreach ($line in ($result.Output -split "`r?`n")) {
-        if ($line -match '^EPF_SAVED\|([^|]*)\|(\d+)\|(\d+)\|([YN])\|([YN])\|([^|]*)\|([^|]*)\|([YN-])\|([^|]*)\|(.*)$') {
-            $saved = [pscustomobject]@{
-                Label = $Matches[1]; RunId = $Matches[2]; Batch = $Matches[3]; Undo = ($Matches[4] -eq 'Y');
-                Redo = ($Matches[5] -eq 'Y'); Backup = $Matches[6]; Confirm = $Matches[7]; Ready = $Matches[8];
-                Created = $Matches[9]; Until = $Matches[10].Trim()
-            }
-            if ($saved.Backup -eq '-') { $saved.Backup = '' }
-            if ($saved.Confirm -eq '-') { $saved.Confirm = '' }
-            return $saved
-        }
-    }
-    return $null
-}
-
-# A purge follows the saved choices: values given on the command line win;
-# undo tuning, redo log sizing and confirmations add up. Its own preflight
-# reuses the root counts of that preflight.
-function Use-SavedChoices {
-    param($Ctx, $Saved)
-    if ($Ctx.BatchSize -eq '') { $Ctx.BatchSize = $Saved.Batch }
-    if ($Ctx.Backup -eq '') { $Ctx.Backup = $Saved.Backup }
-    $Ctx.UndoTuning = $Ctx.UndoTuning -or $Saved.Undo
-    $Ctx.RedoLogs = $Ctx.RedoLogs -or $Saved.Redo
-    foreach ($code in @($Saved.Confirm.Split(',') | Where-Object { $_ -ne '' })) { Add-Confirm $Ctx $code }
-    $Ctx.PreflightRun = $Saved.Label
-}
-
-# Batch size that keeps one batch within half of an online log of $LogBytes
-# (as the preflight's recommendation): two significant digits, 100-100000.
-function Get-BatchForLog {
-    param([double]$PerRoot, [double]$LogBytes)
-    $value = 0.5 * $LogBytes / $PerRoot
-    if ($value -le 100) { return 100 }
-    if ($value -ge 100000) { return 100000 }
-    $scale = [Math]::Pow(10, [Math]::Floor([Math]::Log10($value)) - 1)
-    return [int]([Math]::Floor($value / $scale) * $scale)
-}
-
 function Show-Review {
     param($Ctx, [string]$Action)
     Write-Section 'REVIEW'
@@ -1552,46 +1832,132 @@ function Show-Review {
         if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the preflight finds them not met)') }
     }
     if ($Ctx.PreflightRun -ne '') { Write-Out ('  Preflight     ' + $Ctx.PreflightRun + ' (the purge checks the requirements again with these choices)') }
+    if ($Ctx.PlanId -ne '') {
+        $what = 'step '
+        if ($Ctx.DryRun) { $what = 'rehearsal of step ' }
+        Write-Out ('  Plan          ' + $Ctx.PlanLabel + ', ' + $what + $Ctx.PlanStep + ' of ' + $Ctx.Plan.Steps +
+                   ' (the plan ends with rows before ' + $Ctx.Plan.Cutoff + ')')
+    }
 }
 
 # ----------------------------------------------------------------------------
 # Actions
 # ----------------------------------------------------------------------------
 
+# purge and preflight. -OpenPlan with -PlanKnown: the open plan the wizard
+# has already read.
 function Invoke-PurgeAction {
-    param([string]$Action, [switch]$Wizard)
-    $login = Connect-Tool
-    $ctx = Get-PurgeContext $login $Action
+    param([string]$Action, [switch]$Wizard, $Login = $null, [switch]$FollowPlan, $OpenPlan = $null, [switch]$PlanKnown)
+    $dry = ($Action -eq 'PURGE' -and $script:Cli.Flags.ContainsKey('dry-run'))
+    $newPlan = $script:Cli.Flags.ContainsKey('new')
+    if ($script:Cli.Options.ContainsKey('max-redo') -and $Action -eq 'PURGE' -and (-not $Wizard -or $dry)) {
+        Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to the wizard''s purge (its preflight plans the runs).'
+    }
+    $login = $Login
+    if ($null -eq $login) { $login = Connect-Tool }
 
-    # A purge follows the choices saved with the latest READY preflight of its
-    # scope (the wizard asks first). Otherwise the wizard runs that preflight
-    # now, with its questions.
-    if ($Action -eq 'PURGE') {
-        $saved = Get-SavedChoices $ctx
-        $use = $false
-        if ($null -ne $saved -and $saved.Ready -eq 'Y') {
-            $text = Format-Choices $saved.Batch $saved.Undo $saved.Redo $saved.Backup $saved.Confirm
-            Write-Out ''
-            Write-Out (' Choices saved with the preflight ' + $saved.Label + ' (' + $saved.Created + ', valid until ' +
-                       $saved.Until + '): ' + $text)
-            $use = $true
-            if ($Wizard) { $use = Read-YesNo ('Use the choices saved with ' + $saved.Label) $true }
-        } elseif ($null -ne $saved) {
-            Write-Out (' The latest preflight of this scope, ' + $saved.Label + ', is not ready; its choices are not used.') 'Yellow'
-        }
-        if ($use) {
-            Use-SavedChoices $ctx $saved
-        } elseif ($Wizard) {
-            Write-Section 'CHECKING THE DATABASE (read-only preflight)'
-            $advice = Get-Advice $ctx
-            $ctx.PreflightRun = Get-RunLabel $advice.Run.RunId
-            if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
-            if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
-                Exit-Tool $script:ExitFail ('The preflight ' + $ctx.PreflightRun + ' found errors (see the report above); nothing was changed.')
+    # The open plan: a purge carries out its next step (a dry run rehearses
+    # it), a preflight checks it again. Scope options that differ from it
+    # replace a plan with no step run yet. A plan in progress goes on: a
+    # purge of another scope is refused (the wizard asks) unless the
+    # operator starts over (--new); a preflight or dry run of another scope
+    # leaves it as it is.
+    $plan = $null
+    if (-not $newPlan) {
+        if ($PlanKnown) { $plan = $OpenPlan } else { $plan = Get-OpenPlan $login }
+    }
+    $follow = $false
+    if ($null -ne $plan) {
+        $follow = $FollowPlan -or (-not (Test-ScopeGiven)) -or (Test-PlanScope $plan)
+        if (-not $follow -and -not $dry) {
+            if ($plan.Status -eq 'READY') {
+                Write-Out (' The open plan ' + $plan.Label + ' has no step run yet; this ' + $Action.ToLower() +
+                           ' with other options replaces it.') 'Yellow'
+            } elseif ($Action -eq 'PREFLIGHT') {
+                Write-Out (' Plan ' + $plan.Label + ' of another scope is in progress: this preflight plans nothing' +
+                           ' (preflight --new starts over).') 'Yellow'
+            } else {
+                Write-Out ''
+                Show-PlanSummary $plan
+                $hint = 'Run purge without --retention, --cutoff, --mode or --depth to continue it, or add --new to start over.'
+                if (-not $script:Interactive) {
+                    Exit-Tool $script:ExitUsage ('Plan ' + $plan.Label + ' is in progress and the options given differ from it. ' + $hint)
+                }
+                Write-Out (' The options given differ from plan ' + $plan.Label + ', which is in progress.') 'Yellow'
+                $continue = 'Continue the plan'
+                if ($plan.NextStep -ne '-') { $continue = $continue + ' (step ' + $plan.NextStep + ' of ' + $plan.Steps + ': rows before ' + $plan.NextCutoff + ')' }
+                $answer = Read-Option @(($continue + '; the options given are not used'),
+                                        'Start over with the options given: the plan is closed, its completed steps stay done') `
+                                      'Cancel' '1'
+                if ($answer -eq 'S') { Exit-Tool $script:ExitAborted 'Cancelled; nothing was changed.' }
+                if ($answer -eq '1') { $follow = $true } else { $newPlan = $true }
             }
-            $unmet = Get-Unmet $advice
-            if ($unmet.Count -gt 0 -and -not $ctx.DryRun) {
-                Exit-Tool $script:ExitAborted ('Not ready: ' + ($unmet -join ', ') + ' (REQUIREMENTS above). Meet them, then run the purge again; nothing was changed.')
+        }
+        if (-not $follow) { $plan = $null }
+    }
+    if ($follow -and $Action -eq 'PURGE' -and $plan.NextStep -eq '-') {
+        Exit-Tool $script:ExitUsage ('Plan ' + $plan.Label + ' has no step left.')
+    }
+
+    $ctx = Get-PurgeContext $login $Action $plan
+    $ctx.NewPlan = $newPlan
+
+    if ($follow -and $Action -eq 'PREFLIGHT') {
+        Write-Out ''
+        Show-PlanSummary $plan
+        $text = Format-Choices $plan.Batch $plan.Undo $plan.Redo $plan.Backup $plan.Confirm
+        if (Read-YesNo ('Check the plan again with its choices (' + $text + ')') $true) { Use-PlanChoices $ctx $plan }
+    } elseif ($follow) {
+        # The purge follows the plan's choices and reuses the root counts of
+        # its preflight while they are valid (same cutoff, recent, nothing
+        # purged since).
+        $replan = $Wizard -and $ctx.MaxRedo -ne '' -and $ctx.MaxRedo -ne $plan.MaxRedo
+        Use-PlanChoices $ctx $plan
+        $ctx.PreflightRun = $plan.PreflightRun
+        Write-Out ''
+        if ($plan.Steps -gt 1) {
+            $verb = 'carries out'
+            if ($ctx.DryRun) { $verb = 'rehearses' }
+            Write-Out (' Plan ' + $plan.Label + ': this run ' + $verb + ' step ' + $plan.NextStep + ' of ' + $plan.Steps +
+                       ', rows before ' + $plan.NextCutoff + ' (' + $plan.Done + ' done; the plan ends with rows before ' +
+                       $plan.Cutoff + ').')
+        }
+        Write-Out (' Choices saved with the preflight ' + $plan.PreflightRun + ' (' + $plan.CheckedAt + '): ' +
+                   (Format-Choices $plan.Batch $plan.Undo $plan.Redo $plan.Backup $plan.Confirm))
+        if ($Wizard -and ($plan.Ready -ne 'Y' -or $plan.Recent -ne 'Y' -or $replan)) {
+            if ($replan) {
+                Write-Out (' The plan is checked again first, with runs of at most ' + (Format-Bytes ([double]$ctx.MaxRedo)) +
+                           ' of redo (--max-redo).') 'Yellow'
+            } elseif ($plan.Ready -ne 'Y') {
+                Write-Out ' The plan''s last check found requirements not met: it is checked again first.' 'Yellow'
+            } else {
+                Write-Out ' The plan was last checked more than preflight_valid_h hours ago: it is checked again first.' 'Yellow'
+            }
+            $plan = Invoke-PlanCheck $ctx $plan
+            Set-PlanScope $ctx $plan 'PURGE'
+        }
+    } elseif ($Action -eq 'PURGE' -and $Wizard) {
+        # No plan to follow: the wizard checks the database first (a read-only
+        # preflight with its questions). That preflight plans the purge, and
+        # this run carries out the plan's first step.
+        Write-Section 'CHECKING THE DATABASE (read-only preflight)'
+        $advice = Get-Advice $ctx
+        $ctx.PreflightRun = Get-RunLabel $advice.Run.RunId
+        $ctx.NewPlan = $false
+        if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+        if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
+            Exit-Tool $script:ExitFail ('The preflight ' + $ctx.PreflightRun + ' found errors (see the report above); nothing was changed.')
+        }
+        $unmet = Get-Unmet $advice
+        if ($unmet.Count -gt 0 -and -not $ctx.DryRun) {
+            Exit-Tool $script:ExitAborted ('Not ready: ' + ($unmet -join ', ') + ' (REQUIREMENTS above). Meet them, then run the purge again; nothing was changed.')
+        }
+        $plan = Get-OpenPlan $ctx.Cred
+        if ($null -ne $plan -and $plan.PreflightRun -eq $ctx.PreflightRun -and $plan.NextStep -ne '-') {
+            Set-PlanScope $ctx $plan 'PURGE'
+            if ($plan.Steps -gt 1) {
+                Write-Out (' The preflight planned the purge in ' + $plan.Steps + ' runs, older data first; this run carries out step ' +
+                           $plan.NextStep + ': rows before ' + $plan.NextCutoff + '.') 'Yellow'
             }
         }
     }
@@ -1621,8 +1987,9 @@ function Get-RunArgument {
 }
 
 function Invoke-SimpleScript {
-    param([string]$Script, [string[]]$Arguments)
-    $login = Connect-Tool
+    param([string]$Script, [string[]]$Arguments, $Login = $null)
+    $login = $Login
+    if ($null -eq $login) { $login = Connect-Tool }
     $result = Invoke-SqlScript $login (Join-Path $script:RunSqlDir $Script) $Arguments
     Show-Lines $result.Output
     exit $result.ExitCode
@@ -1646,11 +2013,57 @@ function Invoke-InstallAction {
     exit $result.ExitCode
 }
 
+# The menu. With an open plan it shows the plan and offers to continue it,
+# check it again, rehearse its next step or start over; without one, a
+# purge (the wizard's preflight plans it first) or a preflight.
 function Start-Wizard {
     Write-Out ''
     Write-Out ' EPF Data Purge' 'White'
     Write-Out (' ' + ('-' * ($script:Width - 1)))
-    Write-Out '  1  Purge'
+    $login = Connect-Tool -Soft
+    $plan = $null
+    $known = $false
+    if ($null -ne $login) {
+        $plan = Get-OpenPlan $login
+        $known = $true
+    }
+    if ($null -ne $plan) {
+        Write-Out ''
+        Show-PlanSummary $plan
+        Write-Out ''
+        $next = ''
+        if ($plan.NextStep -ne '-') { $next = ' (step ' + $plan.NextStep + ' of ' + $plan.Steps + ': rows before ' + $plan.NextCutoff + ')' }
+        Write-Out ('  1  Continue the plan' + $next)
+        Write-Out '  2  Check the plan again (read-only preflight with its choices)'
+        Write-Out '  3  Rehearse the next step (dry run)'
+        Write-Out '  4  Start over (a new preflight; the plan is closed, its completed steps stay done)'
+        Write-Out '  5  Report of a run'
+        Write-Out '  6  Status'
+        Write-Out '  7  Install or upgrade (SYS)'
+        Write-Out '  8  Uninstall (SYS)'
+        $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7', '8')
+        switch ($choice) {
+            '1' { Invoke-PurgeAction 'PURGE' -Wizard -Login $login -FollowPlan -OpenPlan $plan -PlanKnown }
+            '2' { Invoke-PurgeAction 'PREFLIGHT' -Login $login -FollowPlan -OpenPlan $plan -PlanKnown }
+            '3' {
+                $script:Cli.Flags['dry-run'] = $true
+                Invoke-PurgeAction 'PURGE' -Wizard -Login $login -FollowPlan -OpenPlan $plan -PlanKnown
+            }
+            '4' {
+                $script:Cli.Flags['new'] = $true
+                Invoke-PurgeAction 'PREFLIGHT' -Login $login
+            }
+            '5' {
+                $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
+                Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST') $login
+            }
+            '6' { Invoke-SimpleScript 'status.sql' @() $login }
+            '7' { Invoke-InstallAction }
+            '8' { Invoke-InstallAction -Uninstall }
+        }
+        return
+    }
+    Write-Out '  1  Purge (a read-only preflight checks the database and plans the purge first)'
     Write-Out '  2  Preflight only (read-only)'
     Write-Out '  3  Report of a run'
     Write-Out '  4  Status'
@@ -1658,13 +2071,13 @@ function Start-Wizard {
     Write-Out '  6  Uninstall (SYS)'
     $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6')
     switch ($choice) {
-        '1' { Invoke-PurgeAction 'PURGE' -Wizard }
-        '2' { Invoke-PurgeAction 'PREFLIGHT' }
+        '1' { Invoke-PurgeAction 'PURGE' -Wizard -Login $login -PlanKnown:$known }
+        '2' { Invoke-PurgeAction 'PREFLIGHT' -Login $login -PlanKnown:$known }
         '3' {
             $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
-            Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST')
+            Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST') $login
         }
-        '4' { Invoke-SimpleScript 'status.sql' @() }
+        '4' { Invoke-SimpleScript 'status.sql' @() $login }
         '5' { Invoke-InstallAction }
         '6' { Invoke-InstallAction -Uninstall }
     }
@@ -1698,6 +2111,18 @@ function Invoke-Main {
     if ($null -eq $script:SqlPlus) { Exit-Tool $script:ExitUsage 'sqlplus.exe was not found in PATH or in ORACLE_HOME\bin.' }
 
     $action = $script:Cli.Action
+    if ($script:Cli.Flags.ContainsKey('close') -and $action -ne 'plan') { Exit-Tool $script:ExitUsage '--close applies to plan.' }
+    if ($script:Cli.Flags.ContainsKey('new') -and @('purge', 'preflight') -notcontains $action) {
+        Exit-Tool $script:ExitUsage '--new applies to purge and preflight (the wizard''s menu offers to start over).'
+    }
+    if ($script:Cli.Options.ContainsKey('max-redo')) {
+        if ($null -ne $action -and @('purge', 'preflight') -notcontains $action) {
+            Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to the wizard''s purge.'
+        }
+        if ($null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['max-redo']))) {
+            Exit-Tool $script:ExitUsage ('--max-redo: a size such as 500M or 20G, got ' + $script:Cli.Options['max-redo'] + '.')
+        }
+    }
     if ($null -eq $action) {
         if (-not $script:Interactive) { Exit-Tool $script:ExitUsage 'An action is required with --non-interactive.' }
         Start-Wizard
@@ -1706,6 +2131,7 @@ function Invoke-Main {
     switch ($action) {
         'purge'     { Invoke-PurgeAction 'PURGE' -Wizard:$script:Interactive }
         'preflight' { Invoke-PurgeAction 'PREFLIGHT' }
+        'plan'      { Invoke-PlanAction }
         'report'    { Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST') }
         'status'    { Invoke-SimpleScript 'status.sql' @() }
         'stop'      { Invoke-SimpleScript 'stop.sql' @(Get-RunArgument 'ACTIVE') }

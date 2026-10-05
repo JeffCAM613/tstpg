@@ -26,6 +26,14 @@ CREATE OR REPLACE PACKAGE BODY epf_util AS
         RETURN 'R-' || LPAD(TO_CHAR(p_run_id), 6, '0');
     END run_label;
 
+    FUNCTION plan_label(p_plan_id IN NUMBER) RETURN VARCHAR2 IS
+    BEGIN
+        IF p_plan_id IS NULL THEN
+            RETURN NULL;
+        END IF;
+        RETURN 'P-' || LPAD(TO_CHAR(p_plan_id), 6, '0');
+    END plan_label;
+
     FUNCTION fmt_int(p_value IN NUMBER) RETURN VARCHAR2 IS
     BEGIN
         IF p_value IS NULL THEN

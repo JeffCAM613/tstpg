@@ -19,6 +19,15 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
 --   ORA-20125  invalid depth
 --   ORA-20126  invalid mode
 --   ORA-20127  invalid parameter value
+--   ORA-20128  a plan is in progress, or the plan step is not open
+--
+-- Plans (EPF_PLAN, EPF_PLAN_STEP): a PREFLIGHT run creates the plan of its
+-- scope or checks the open plan again (epf_purge); at most one plan is open.
+-- A purge that deletes either carries out the next step of the open plan
+-- (plan_id, plan_step), or replaces a plan not started yet; a plan in
+-- progress is closed only on request (new_plan, or close_plan). A purge run
+-- ending without residual rows completes its step; the last step completes
+-- the plan (DONE).
 -- ============================================================================
 
     -- Creates a run. Purge parameters are validated and normalised for
@@ -34,8 +43,13 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- commas) the operator confirms are handled although the preflight finds
     -- them not met. p_with_redo_logs: the online redo logs are enlarged when
     -- the purge starts (the caller does it unless dry run; PREFLIGHT and dry
-    -- runs check as if it were done). Before inserting, stale runs are marked
-    -- ABANDONED and history older than history_retention_days is removed.
+    -- runs check as if it were done). p_max_redo_bytes: the most redo one
+    -- run of the plan may write (a preflight plans its steps with it).
+    -- p_new_plan Y: the run starts over: the open plan is closed (a preflight
+    -- then creates a new one). p_plan_id, p_plan_step: the plan step a purge
+    -- run carries out (a dry run rehearses it); its mode, depth and cutoff
+    -- must be the step's. Before inserting, stale runs are marked ABANDONED
+    -- and history older than history_retention_days is removed.
     FUNCTION start_run(
         p_action           IN VARCHAR2,
         p_retention_days   IN NUMBER   DEFAULT NULL,
@@ -49,7 +63,11 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
         p_backup_choice    IN VARCHAR2 DEFAULT NULL,
         p_cutoff_date      IN DATE     DEFAULT NULL,
         p_confirm          IN VARCHAR2 DEFAULT NULL,
-        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N'
+        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N',
+        p_max_redo_bytes   IN NUMBER   DEFAULT NULL,
+        p_new_plan         IN VARCHAR2 DEFAULT 'N',
+        p_plan_id          IN NUMBER   DEFAULT NULL,
+        p_plan_step        IN NUMBER   DEFAULT NULL
     ) RETURN NUMBER;
 
     -- Takes the run lock in this session, sets the run RUNNING and binds the
@@ -96,18 +114,24 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
         p_confirm          IN VARCHAR2
     );
 
-    -- The choices saved with the latest PREFLIGHT run of the scope (cutoff
-    -- from p_cutoff_date or p_retention_days, mode, depth), ended SUCCESS or
-    -- WARNING within preflight_valid_h, through DBMS_OUTPUT:
-    --   EPF_SAVED|<run>|<run_id>|<batch>|<undo Y|N>|<redo logs Y|N>|<backup|->
-    --            |<confirmed|->|<ready Y|N|->|<created HH24:MI>|<valid until>
-    -- Nothing is printed when there is no such run.
-    PROCEDURE print_saved_choices(
-        p_retention_days IN NUMBER,
-        p_cutoff_date    IN DATE,
-        p_mode           IN VARCHAR2,
-        p_depth          IN VARCHAR2
-    );
+    -- The open plan (READY or IN_PROGRESS); NULL when none.
+    FUNCTION open_plan_id RETURN NUMBER;
+
+    -- Closes the open plan (CLOSED, with the OS user and p_reason); p_plan_id
+    -- returns it, NULL when no plan was open. Completed steps stay done.
+    PROCEDURE close_plan(p_reason IN VARCHAR2, p_plan_id OUT NUMBER);
+
+    -- At the end of purge run p_run_id: when it carried out a plan step and
+    -- p_complete (ended SUCCESS or WARNING without residual rows), the step
+    -- is DONE, and the plan too after its last step. A stopped or failed
+    -- step stays PENDING and is offered again. Emits PLAN_STEP.
+    PROCEDURE end_plan_step(p_run_id IN NUMBER, p_complete IN BOOLEAN);
+
+    -- At the end of preflight run p_run_id with status p_status: a preflight
+    -- that did not end SUCCESS or WARNING leaves no plan to follow. The plan
+    -- it made is closed; a plan it checked again keeps its previous check.
+    -- Emits PLAN.
+    PROCEDURE end_plan_check(p_run_id IN NUMBER, p_status IN VARCHAR2);
 
 END epf_control;
 /

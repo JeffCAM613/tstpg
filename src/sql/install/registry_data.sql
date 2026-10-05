@@ -196,7 +196,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.5.4', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.6.0', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -218,7 +218,7 @@ BEGIN
     put_setting('archive_margin_pct',     '20',    'Margin added to the redo estimate when the preflight checks the archive destination (requirement ARCHIVE)');
     put_setting('backup_max_age_h',       '24',    'A successful RMAN database backup newer than this many hours meets the BACKUP requirement');
     put_setting('delete_rows_s',          '50000', 'Rows deleted per second assumed for the time forecast until a purge on the database has measured it');
-    put_setting('preflight_valid_h',      '8',     'A purge reuses the root counts of a preflight with the same cutoff, mode and depth for this many hours');
+    put_setting('preflight_valid_h',      '8',     'A purge reuses the root counts of a preflight with the same cutoff, mode and depth for this many hours; the wizard checks a plan again when its last check is older');
 
     -- Remove settings that are no longer listed above.
     DELETE FROM epf_setting

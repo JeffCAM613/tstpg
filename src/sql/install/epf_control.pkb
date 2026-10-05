@@ -136,10 +136,42 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         RETURN l_batch;
     END norm_batch;
 
+    -- Progress of a plan: '<done> of <steps> steps done, next: rows before
+    -- <cutoff>'.
+    FUNCTION plan_progress(p_plan_id IN NUMBER) RETURN VARCHAR2 IS
+        l_total NUMBER;
+        l_done  NUMBER;
+        l_next  DATE;
+    BEGIN
+        SELECT COUNT(*), COUNT(CASE WHEN status = 'DONE' THEN 1 END),
+               MIN(CASE WHEN status = 'PENDING' THEN cutoff_date END)
+          INTO l_total, l_done, l_next
+          FROM epf_plan_step
+         WHERE plan_id = p_plan_id;
+        RETURN l_done || ' of ' || l_total || ' steps done'
+               || CASE WHEN l_next IS NOT NULL THEN ', next: rows before ' || TO_CHAR(l_next, 'YYYY-MM-DD') END;
+    END plan_progress;
+
+    -- Ends an open plan as CLOSED with the OS user and the reason (in the
+    -- caller's transaction).
+    PROCEDURE end_plan(p_plan_id IN NUMBER, p_reason IN VARCHAR2) IS
+    BEGIN
+        UPDATE epf_plan
+           SET status       = 'CLOSED',
+               closed_at    = epf_util.now_ts,
+               closed_by    = SYS_CONTEXT('USERENV', 'OS_USER'),
+               close_reason = SUBSTR(p_reason, 1, 400)
+         WHERE plan_id = p_plan_id
+           AND status IN ('READY', 'IN_PROGRESS');
+    END end_plan;
+
     PROCEDURE prune_history IS
         l_cutoff TIMESTAMP := epf_util.now_ts
                               - NUMTODSINTERVAL(epf_util.setting_num('history_retention_days'), 'DAY');
     BEGIN
+        DELETE FROM epf_plan_step
+         WHERE plan_id IN (SELECT plan_id FROM epf_plan WHERE status IN ('DONE', 'CLOSED') AND closed_at < l_cutoff);
+        DELETE FROM epf_plan WHERE status IN ('DONE', 'CLOSED') AND closed_at < l_cutoff;
         FOR t IN (SELECT c.table_name
                     FROM user_tab_columns c
                     JOIN user_tables u ON u.table_name = c.table_name
@@ -166,7 +198,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         p_backup_choice    IN VARCHAR2 DEFAULT NULL,
         p_cutoff_date      IN DATE     DEFAULT NULL,
         p_confirm          IN VARCHAR2 DEFAULT NULL,
-        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N'
+        p_with_redo_logs   IN VARCHAR2 DEFAULT 'N',
+        p_max_redo_bytes   IN NUMBER   DEFAULT NULL,
+        p_new_plan         IN VARCHAR2 DEFAULT 'N',
+        p_plan_id          IN NUMBER   DEFAULT NULL,
+        p_plan_step        IN NUMBER   DEFAULT NULL
     ) RETURN NUMBER IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_action    VARCHAR2(30) := UPPER(TRIM(p_action));
@@ -183,6 +219,14 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_redo      VARCHAR2(1)  := yes_no(p_with_redo_logs, 'with_redo_logs');
         l_backup    VARCHAR2(10) := norm_backup(p_backup_choice);
         l_confirm   VARCHAR2(100) := norm_confirm(p_confirm);
+        l_new_plan  VARCHAR2(1)  := yes_no(p_new_plan, 'new_plan');
+        l_open      NUMBER;
+        l_open_st   VARCHAR2(20);
+        l_open_mode VARCHAR2(30);
+        l_open_dep  VARCHAR2(200);
+        l_step_cut  DATE;
+        l_step_st   VARCHAR2(20);
+        l_closed    VARCHAR2(400);
         l_run_id    NUMBER;
     BEGIN
         IF l_action IS NULL OR l_action NOT IN ('PURGE', 'RECLAIM', 'PREFLIGHT') THEN
@@ -232,6 +276,46 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                 RAISE_APPLICATION_ERROR(-20127, 'Setting batch_rows_max must be a positive number of rows.');
             END IF;
         END IF;
+        IF p_max_redo_bytes IS NOT NULL AND (l_action NOT IN ('PURGE', 'PREFLIGHT') OR p_max_redo_bytes <= 0) THEN
+            RAISE_APPLICATION_ERROR(-20127, 'The most redo per run applies to preflight and purge runs and must be '
+                                            || 'a positive number of bytes, got: ' || p_max_redo_bytes);
+        END IF;
+
+        -- Plan checks, before any change: a plan step must be a pending step
+        -- of the open plan with the run's scope; a purge that deletes outside
+        -- the open plan needs new_plan while that plan is in progress.
+        SELECT MAX(plan_id) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(status) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(purge_mode) KEEP (DENSE_RANK LAST ORDER BY plan_id),
+               MAX(depth) KEEP (DENSE_RANK LAST ORDER BY plan_id)
+          INTO l_open, l_open_st, l_open_mode, l_open_dep
+          FROM epf_plan
+         WHERE status IN ('READY', 'IN_PROGRESS');
+        IF p_plan_id IS NOT NULL OR p_plan_step IS NOT NULL THEN
+            IF l_action <> 'PURGE' OR p_plan_id IS NULL OR p_plan_step IS NULL THEN
+                RAISE_APPLICATION_ERROR(-20127, 'A plan step applies to a purge run, given with its plan.');
+            END IF;
+            IF NVL(l_open, -1) <> p_plan_id THEN
+                RAISE_APPLICATION_ERROR(-20128, epf_util.plan_label(p_plan_id) || ' is not the open plan.');
+            END IF;
+            SELECT MAX(cutoff_date), MAX(status)
+              INTO l_step_cut, l_step_st
+              FROM epf_plan_step
+             WHERE plan_id = p_plan_id AND step_no = p_plan_step;
+            IF NVL(l_step_st, '-') <> 'PENDING' THEN
+                RAISE_APPLICATION_ERROR(-20128, 'Step ' || p_plan_step || ' of ' || epf_util.plan_label(p_plan_id)
+                                                || ' is not a pending step.');
+            END IF;
+            IF l_mode <> l_open_mode OR l_depth <> l_open_dep OR l_cutoff <> l_step_cut THEN
+                RAISE_APPLICATION_ERROR(-20128, 'The run does not match step ' || p_plan_step || ' of '
+                                                || epf_util.plan_label(p_plan_id) || ' (mode ' || l_open_mode
+                                                || ', depth ' || l_open_dep || ', cutoff '
+                                                || TO_CHAR(l_step_cut, 'YYYY-MM-DD') || ').');
+            END IF;
+        ELSIF l_action = 'PURGE' AND l_dry_run = 'N' AND l_new_plan = 'N' AND l_open_st = 'IN_PROGRESS' THEN
+            RAISE_APPLICATION_ERROR(-20128, 'Plan ' || epf_util.plan_label(l_open) || ' is in progress ('
+                                            || plan_progress(l_open) || '): continue it, or start over (new plan).');
+        END IF;
 
         UPDATE epf_run
            SET status   = 'ABANDONED',
@@ -245,15 +329,44 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         INSERT INTO epf_run (
             action, status, retention_days, cutoff_date, depth, purge_mode, batch_size, batch_rows,
             dry_run, with_reclaim, with_compact, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs,
+            plan_id, plan_step, max_redo_bytes, new_plan,
             created_at, db_name, container_name, client_host, os_user, tool_version
         ) VALUES (
             l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch, l_rows,
-            l_dry_run, l_reclaim, l_compact, l_undo, l_redo, l_backup, l_confirm, epf_util.now_ts,
+            l_dry_run, l_reclaim, l_compact, l_undo, l_redo, l_backup, l_confirm,
+            p_plan_id, p_plan_step, p_max_redo_bytes, l_new_plan, epf_util.now_ts,
             SYS_CONTEXT('USERENV', 'DB_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME'),
             SYS_CONTEXT('USERENV', 'HOST'), SYS_CONTEXT('USERENV', 'OS_USER'),
             epf_util.setting('tool_version')
         ) RETURNING run_id INTO l_run_id;
+
+        -- A purge that deletes a plan step puts the plan in progress; a run
+        -- that starts over closes the open plan; any other purge that deletes
+        -- replaces a plan not started yet. Dry runs change no plan. A closed
+        -- plan is reported as an event of the run (PLAN).
+        IF l_open IS NOT NULL THEN
+            IF p_plan_id IS NOT NULL THEN
+                IF l_dry_run = 'N' THEN
+                    UPDATE epf_plan SET status = 'IN_PROGRESS' WHERE plan_id = p_plan_id;
+                    UPDATE epf_plan_step
+                       SET last_run_id = l_run_id
+                     WHERE plan_id = p_plan_id AND step_no = p_plan_step;
+                END IF;
+            ELSIF l_new_plan = 'Y' AND (l_action = 'PREFLIGHT' OR (l_action = 'PURGE' AND l_dry_run = 'N')) THEN
+                l_closed := 'started over by ' || epf_util.run_label(l_run_id);
+            ELSIF l_action = 'PURGE' AND l_dry_run = 'N' THEN
+                l_closed := 'replaced by purge ' || epf_util.run_label(l_run_id);
+            END IF;
+            IF l_closed IS NOT NULL THEN
+                l_closed := l_closed || ' (' || plan_progress(l_open) || ')';
+                end_plan(l_open, l_closed);
+            END IF;
+        END IF;
         COMMIT;
+        IF l_closed IS NOT NULL THEN
+            epf_log.event(epf_log.c_info, 'PLAN', epf_util.plan_label(l_open) || ' closed: ' || l_closed,
+                          p_run_id => l_run_id);
+        END IF;
         RETURN l_run_id;
     END start_run;
 
@@ -448,42 +561,105 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         COMMIT;
     END set_choices;
 
-    PROCEDURE print_saved_choices(
-        p_retention_days IN NUMBER,
-        p_cutoff_date    IN DATE,
-        p_mode           IN VARCHAR2,
-        p_depth          IN VARCHAR2
-    ) IS
-        l_mode   VARCHAR2(30)   := normalize_mode(NVL(p_mode, 'FULL'));
-        l_depth  VARCHAR2(4000) := scope_depth(l_mode, normalize_depth(NVL(p_depth, 'ALL')));
-        l_cutoff DATE           := NVL(TRUNC(p_cutoff_date),
-                                       TRUNC(SYSDATE) - NVL(p_retention_days,
-                                                            epf_util.setting_num('retention_days_default')));
-        l_hours  NUMBER         := epf_util.setting_num('preflight_valid_h');
-        l_since  TIMESTAMP      := epf_util.now_ts - NUMTODSINTERVAL(l_hours, 'HOUR');
-        l_ready  VARCHAR2(1);
+    FUNCTION open_plan_id RETURN NUMBER IS
+        l_plan NUMBER;
     BEGIN
-        FOR r IN (SELECT run_id, batch_size, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs,
-                         created_at
-                    FROM epf_run
-                   WHERE action = 'PREFLIGHT' AND status IN ('SUCCESS', 'WARNING')
-                     AND cutoff_date = l_cutoff AND purge_mode = l_mode AND depth = l_depth
-                     AND created_at >= l_since
-                   ORDER BY run_id DESC
-                   FETCH FIRST 1 ROWS ONLY) LOOP
-            SELECT CASE WHEN COUNT(*) = 0 THEN '-'
-                        WHEN COUNT(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN 1 END) = 0 THEN 'Y'
-                        ELSE 'N' END
-              INTO l_ready
-              FROM epf_requirement
-             WHERE run_id = r.run_id;
-            DBMS_OUTPUT.PUT_LINE('EPF_SAVED|' || epf_util.run_label(r.run_id) || '|' || r.run_id || '|' || r.batch_size
-                                 || '|' || r.with_undo_tuning || '|' || r.with_redo_logs
-                                 || '|' || NVL(r.backup_choice, '-') || '|' || NVL(r.confirmed_reqs, '-')
-                                 || '|' || l_ready || '|' || TO_CHAR(r.created_at, 'HH24:MI')
-                                 || '|' || TO_CHAR(r.created_at + NUMTODSINTERVAL(l_hours, 'HOUR'), 'YYYY-MM-DD HH24:MI'));
-        END LOOP;
-    END print_saved_choices;
+        SELECT MAX(plan_id) INTO l_plan FROM epf_plan WHERE status IN ('READY', 'IN_PROGRESS');
+        RETURN l_plan;
+    END open_plan_id;
+
+    PROCEDURE close_plan(p_reason IN VARCHAR2, p_plan_id OUT NUMBER) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        IF NOT lock_is_free THEN
+            RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '
+                                            || NVL(epf_util.run_label(active_run_id), 'unknown run'));
+        END IF;
+        SELECT MAX(plan_id) INTO p_plan_id FROM epf_plan WHERE status IN ('READY', 'IN_PROGRESS');
+        IF p_plan_id IS NOT NULL THEN
+            end_plan(p_plan_id, p_reason);
+        END IF;
+        COMMIT;
+    END close_plan;
+
+    PROCEDURE end_plan_step(p_run_id IN NUMBER, p_complete IN BOOLEAN) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        l_plan  NUMBER;
+        l_step  NUMBER;
+        l_total NUMBER;
+        l_done  NUMBER;
+        l_next  DATE;
+    BEGIN
+        SELECT MAX(plan_id), MAX(plan_step)
+          INTO l_plan, l_step
+          FROM epf_run
+         WHERE run_id = p_run_id AND action = 'PURGE' AND dry_run = 'N';
+        IF l_plan IS NULL OR l_step IS NULL THEN
+            RETURN;
+        END IF;
+        IF p_complete THEN
+            UPDATE epf_plan_step
+               SET status = 'DONE', done_at = epf_util.now_ts, last_run_id = p_run_id
+             WHERE plan_id = l_plan AND step_no = l_step AND status = 'PENDING';
+        END IF;
+        SELECT COUNT(*), COUNT(CASE WHEN status = 'DONE' THEN 1 END),
+               MIN(CASE WHEN status = 'PENDING' THEN cutoff_date END)
+          INTO l_total, l_done, l_next
+          FROM epf_plan_step
+         WHERE plan_id = l_plan;
+        IF l_done = l_total THEN
+            UPDATE epf_plan
+               SET status = 'DONE', closed_at = epf_util.now_ts
+             WHERE plan_id = l_plan AND status IN ('READY', 'IN_PROGRESS');
+        END IF;
+        COMMIT;
+        epf_log.event(CASE WHEN p_complete THEN epf_log.c_ok ELSE epf_log.c_warn END, 'PLAN_STEP',
+                      epf_util.plan_label(l_plan) || ' step ' || l_step || ' of ' || l_total
+                      || CASE WHEN p_complete THEN ' done' ELSE ' not done: the next purge of the plan carries it on' END
+                      || CASE WHEN l_done = l_total THEN '; the plan is done'
+                              WHEN l_next IS NOT NULL THEN '; next: rows before ' || TO_CHAR(l_next, 'YYYY-MM-DD') END,
+                      p_rows => l_step, p_run_id => p_run_id);
+    END end_plan_step;
+
+    PROCEDURE end_plan_check(p_run_id IN NUMBER, p_status IN VARCHAR2) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        l_plan    NUMBER;
+        l_created NUMBER;
+        l_prev    NUMBER;
+        l_text    VARCHAR2(400);
+    BEGIN
+        IF UPPER(p_status) IN ('SUCCESS', 'WARNING') THEN
+            RETURN;
+        END IF;
+        SELECT MAX(plan_id), MAX(created_run_id)
+          INTO l_plan, l_created
+          FROM epf_plan
+         WHERE preflight_run_id = p_run_id AND status IN ('READY', 'IN_PROGRESS');
+        IF l_plan IS NULL THEN
+            RETURN;
+        END IF;
+        IF l_created = p_run_id THEN
+            end_plan(l_plan, 'its preflight ' || epf_util.run_label(p_run_id) || ' ended ' || UPPER(p_status));
+            l_text := ' closed: its preflight ' || epf_util.run_label(p_run_id) || ' ended ' || UPPER(p_status)
+                      || '; a preflight of the scope plans it again';
+        ELSE
+            SELECT MAX(run_id)
+              INTO l_prev
+              FROM epf_run
+             WHERE plan_id = l_plan AND action = 'PREFLIGHT' AND run_id < p_run_id AND status IN ('SUCCESS', 'WARNING');
+            IF l_prev IS NULL THEN
+                RETURN;
+            END IF;
+            UPDATE epf_plan
+               SET preflight_run_id = l_prev,
+                   checked_at       = (SELECT NVL(started_at, created_at) FROM epf_run WHERE run_id = l_prev)
+             WHERE plan_id = l_plan;
+            l_text := ' keeps the check of ' || epf_util.run_label(l_prev) || ': the preflight '
+                      || epf_util.run_label(p_run_id) || ' ended ' || UPPER(p_status);
+        END IF;
+        COMMIT;
+        epf_log.event(epf_log.c_warn, 'PLAN', epf_util.plan_label(l_plan) || l_text, p_run_id => p_run_id);
+    END end_plan_check;
 
 END epf_control;
 /

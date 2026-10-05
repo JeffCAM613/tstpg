@@ -138,6 +138,10 @@ BEGIN
             with_redo_logs  CHAR(1)        DEFAULT 'N' NOT NULL CHECK (with_redo_logs IN ('Y', 'N')),
             backup_choice   VARCHAR2(10)   CHECK (backup_choice IN ('CONFIRMED', 'NONE')),
             confirmed_reqs  VARCHAR2(100),
+            plan_id         NUMBER,
+            plan_step       NUMBER,
+            max_redo_bytes  NUMBER,
+            new_plan        CHAR(1)        DEFAULT 'N' NOT NULL CHECK (new_plan IN ('Y', 'N')),
             stop_requested  CHAR(1)        DEFAULT 'N' NOT NULL,
             created_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
             started_at      TIMESTAMP,
@@ -173,6 +177,15 @@ BEGIN
     -- batch_rows: rows a batch holds at most besides its batch_size roots
     -- (setting batch_rows_max when the run starts).
     add_column('EPF_RUN', 'BATCH_ROWS', 'NUMBER');
+    -- Plan of smaller runs (EPF_PLAN): plan_id and plan_step of the plan step
+    -- a purge run carries out (a dry run rehearses it); plan_id of the plan a
+    -- preflight created or checked again. max_redo_bytes: the most redo one
+    -- run of the plan may write, given by the operator (preflight).
+    -- new_plan: Y when the run starts over (closes the open plan).
+    add_column('EPF_RUN', 'PLAN_ID', 'NUMBER');
+    add_column('EPF_RUN', 'PLAN_STEP', 'NUMBER');
+    add_column('EPF_RUN', 'MAX_REDO_BYTES', 'NUMBER');
+    add_column('EPF_RUN', 'NEW_PLAN', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (new_plan IN ('Y', 'N'))]');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -596,6 +609,58 @@ BEGIN
             detail       VARCHAR2(2000),
             CONSTRAINT epf_req_option_pk PRIMARY KEY (run_id, req_code, option_code),
             CONSTRAINT epf_req_option_ck CHECK (met IN ('Y', 'N'))
+        )]');
+
+    -- Plans of smaller runs. A PREFLIGHT run creates the plan of its scope
+    -- (mode, depth, final cutoff), or checks again the open plan of that
+    -- scope; purge runs carry out its steps, older data first. At most one
+    -- plan is open (READY or IN_PROGRESS) in the database.
+    --   status         READY (no step run), IN_PROGRESS, DONE, CLOSED
+    --   preflight_run_id  the latest preflight of the plan: its choices are
+    --                  the plan's choices
+    --   step_limit_bytes  the most redo one step may write (archive room or
+    --                  the operator's limit); NULL: no limit, one step
+    create_table('EPF_PLAN', q'[
+        CREATE TABLE epf_plan (
+            plan_id           NUMBER GENERATED ALWAYS AS IDENTITY NOT NULL,
+            status            VARCHAR2(20)   NOT NULL,
+            purge_mode        VARCHAR2(30)   NOT NULL,
+            depth             VARCHAR2(200)  NOT NULL,
+            cutoff_date       DATE           NOT NULL,
+            retention_days    NUMBER,
+            created_run_id    NUMBER         NOT NULL,
+            preflight_run_id  NUMBER         NOT NULL,
+            step_limit_bytes  NUMBER,
+            limit_basis       VARCHAR2(400),
+            created_at        TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+            created_by        VARCHAR2(256),
+            checked_at        TIMESTAMP,
+            closed_at         TIMESTAMP,
+            closed_by         VARCHAR2(256),
+            close_reason      VARCHAR2(400),
+            CONSTRAINT epf_plan_pk        PRIMARY KEY (plan_id),
+            CONSTRAINT epf_plan_status_ck CHECK (status IN ('READY', 'IN_PROGRESS', 'DONE', 'CLOSED'))
+        )]');
+
+    -- Steps of a plan, in the order they run: the rows before cutoff_date,
+    -- with the estimates of the preflight that planned them. fits N: the
+    -- step alone passes the limit (one month of roots). last_run_id: the
+    -- latest purge run of the step; DONE when it ended without residual rows.
+    create_table('EPF_PLAN_STEP', q'[
+        CREATE TABLE epf_plan_step (
+            plan_id         NUMBER         NOT NULL,
+            step_no         NUMBER         NOT NULL,
+            cutoff_date     DATE           NOT NULL,
+            roots           NUMBER,
+            row_count       NUMBER,
+            redo_bytes      NUMBER,
+            delete_seconds  NUMBER,
+            fits            CHAR(1)        DEFAULT 'Y' NOT NULL,
+            status          VARCHAR2(20)   NOT NULL,
+            last_run_id     NUMBER,
+            done_at         TIMESTAMP,
+            CONSTRAINT epf_plan_step_pk PRIMARY KEY (plan_id, step_no),
+            CONSTRAINT epf_plan_step_ck CHECK (status IN ('PENDING', 'DONE') AND fits IN ('Y', 'N'))
         )]');
 
     -- Forecast per module: by the preflight (eligible roots, estimates) and

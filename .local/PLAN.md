@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Decisions D1-D18 applied; D19-D20 round 1 built and tested (0.5.0: requirements, gate, simulation, forecast against result; end-to-end 21/21 on EPFPG781), choices asked by the preflight and followed by the purge (0.5.1, set C passed), dry-run accuracy measured (set B: rows exact, space +2 to +7%, redo and undo +12 to +69% on a first purge); per-row forecast and LOB space fix (0.5.2, set E passed: second purge redo and undo within +-12%); first-purge estimate calibrated, deleting time per row, batches limited by rows, emptied blocks counted as free (0.5.3, set G passed: first purge within +-25%, second within +-11%, space within +-6%); lighter measuring and no redo log warning when the logs are to be enlarged (0.5.4, not yet run); round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered; parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied; D19-D20 round 1 built and tested (0.5.0: requirements, gate, simulation, forecast against result; end-to-end 21/21 on EPFPG781), choices asked by the preflight and followed by the purge (0.5.1, set C passed), dry-run accuracy measured (set B: rows exact, space +2 to +7%, redo and undo +12 to +69% on a first purge); per-row forecast and LOB space fix (0.5.2, set E passed: second purge redo and undo within +-12%); first-purge estimate calibrated, deleting time per row, batches limited by rows, emptied blocks counted as free (0.5.3, set G passed: first purge within +-25%, second within +-11%, space within +-6%); lighter measuring and no redo log warning when the logs are to be enlarged (0.5.4, set F passed after a test fix: a few measured batches forecast the whole purge within 4%); round 2 built (0.6.0: plan of smaller runs, plan lifecycle, menu; set H to run); phases 1-4 delivered; parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -456,8 +456,23 @@ The preflight decides whether a purge can run to the end on this database and pr
 - **Built in 0.5.4.**
   - The batches read redo and undo once per statement.
   - The redo log check uses the 1 GB logs planned with `--redo-logs`.
-
-  Round 2: the plan of smaller runs, the plan lifecycle (start over, check again with the saved choices) and the menu.
+- **Built in 0.6.0 (round 2).**
+  - Every preflight records the plan of its scope (EPF_PLAN, EPF_PLAN_STEP): one run, or several when the archive room (ARCHIVELOG, ARCHIVE not confirmed) or `--max-redo` cannot take its redo at once.
+    - Steps follow the months of the root dates, older data first. A month alone above the limit is a step of its own (`fits N`). The last step ends at the requested cutoff.
+    - ARCHIVE is met by SMALLER_RUNS when the plan has several runs that each fit.
+  - `purge` without scope options carries out the next step with the plan's choices, and `--dry-run` rehearses it. A step is DONE when its purge ends without residual rows (P1 PASS); a stopped or failed step is offered again.
+  - Lifecycle: READY, IN_PROGRESS, DONE, CLOSED, with at most one open plan.
+    - A run with other options replaces a READY plan.
+    - While a plan is in progress, a purge with other options is refused (exit 4; the wizard asks), and `--new` starts over.
+    - `plan` shows the open plan (or the latest), `plan --close` closes it; done steps stay done.
+  - A preflight of the same scope checks the plan again: done steps stay, the rest is planned anew, and CHANGES SINCE lists what moved since the previous check. A preflight that does not end leaves no plan to follow.
+  - The wizard's menu shows the open plan and offers continue, check again, rehearse and start over. Before a step it checks the plan again when the last check is not ready, older than `preflight_valid_h`, or `--max-redo` changes.
+  - The run folder gets `plan.txt` and `requirements.txt`.
+  - Differences from the design above:
+    - runs are split by months of the root dates; modules share every run;
+    - the operator sets the limit (`--max-redo`) instead of editing steps;
+    - a preflight of another scope while a plan is in progress plans nothing (PLAN_KEPT) instead of being refused;
+    - the choices no longer expire after `preflight_valid_h`: the plan keeps them, and only the reuse of root counts expires.
 
 ---
 

@@ -10,7 +10,9 @@
 # Connection: TNS alias or EZConnect string (PDB service in multitenant).
 TNS=localhost:1521/EPFPDB
 
-# Purge parameters.
+# Purge parameters. While a plan is open, a purge or preflight without
+# --retention, --cutoff, --mode or --depth on the command line follows the
+# plan instead.
 RETENTION_DAYS=30
 # Or a cutoff date instead of the retention: rows dated before this day.
 # Used only when no --retention is given.
@@ -41,6 +43,11 @@ UNDO_TUNING=N
 # Requirements the DBA confirms are handled although the preflight finds them
 # not met: ARCHIVE, UNDO, TEMP separated by commas.
 #CONFIRM=ARCHIVE
+
+# Plan of smaller runs: the most redo one run may write, such as 500M or 20G
+# (preflight, and the wizard's purge). The preflight then plans the purge in
+# runs of at most that much, older data first.
+#MAX_REDO=20G
 
 # Output.
 #LOG_DIR=D:\epf\logs

@@ -5,7 +5,8 @@
 #           in order, without further input: installation, SQL entry scripts,
 #           the wrapper (wizard answers are piped, the graceful stop is
 #           requested with the stop action), purges of every module and mode,
-#           compaction, redo log sizing, undo tuning, reports. Everything is
+#           a plan of smaller runs, compaction, redo log sizing, undo tuning,
+#           reports. Everything is
 #           written to one log file with a check list and a summary.
 # Usage   : run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list]
 #             --config  test configuration (default src\tests\e2e\test.conf)
@@ -494,6 +495,7 @@ $script:TestList = @(
     'T12  State after the stop: undo restored, nothing pending',
     'T12B PAYMENTS dry run: the simulation T13 is compared with',
     'T13  PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result',
+    'T13B Plan of smaller runs: LOGS in steps (--max-redo); continue, refuse, rehearse, close',
     'T14  LOGS purge with compaction, non-interactive, undo growth confirmed',
     'T15  BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive',
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
@@ -601,6 +603,9 @@ function Invoke-Suite {
 
     Invoke-Test 'T07' 'Usage errors: exit 4, nothing changed' {
         foreach ($case in @(@('purge', '--bogus'), @('reclaim'), @('preflight', '--non-interactive', '--compact'),
+                            @('plan', '--non-interactive', '--new'), @('status', '--non-interactive', '--close'),
+                            @('purge', '--non-interactive', '--max-redo', '1G'),
+                            @('preflight', '--non-interactive', '--max-redo', 'ten'),
                             @('purge', '--non-interactive', '--dry-run', '--compact'),
                             @('purge', '--non-interactive', '--batch-size', '50'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--cutoff', '2025-01-01'),
@@ -653,6 +658,8 @@ function Invoke-Suite {
         Assert-Manifest $run 'batch_size' '^200$'
         Assert-Manifest $run 'requirements_ready' '^Y$'
         Assert-Manifest $run 'step.PREFLIGHT.CHOICES.-' '^DONE'
+        Assert-Manifest $run 'plan' '^P-\d+$'
+        Assert-Manifest $run 'plan_steps' '^1$'
         if ($null -ne $run) { $saved = $run['run'] }
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--retention', $retention, '--mode', 'LOGS', '--dry-run') -TimeoutMin 30
         Assert-Exit $r @(0, 2)
@@ -667,6 +674,7 @@ function Invoke-Suite {
         Assert-Manifest $run 'redo_logs' '^Y$'
         Assert-Manifest $run 'preflight_run' ('^' + [regex]::Escape($saved) + '$')
         Assert-Manifest $run 'requirements_ready' '^Y$'
+        Assert-Manifest $run 'plan_step' '^1$'
     }
 
     Invoke-Test 'T09' 'preflight.sql NEW' {
@@ -723,6 +731,8 @@ function Invoke-Suite {
             Assert-Match $r $script:ChoicesSection
             Assert-Match $r 'Stopped: '
             Assert-NoMatch $r 'Checking again with these choices'
+            # A preflight that did not end leaves no plan to follow.
+            Assert-Manifest (Get-Run $r 'PREFLIGHT') 'plan_status' '^CLOSED$'
         } finally {
             $r = Invoke-Sql 'EPFPG' @("UPDATE epf_setting SET value = '" + $setting + "' WHERE name = 'backup_max_age_h';", 'COMMIT;', 'EXIT')
             Assert-Exit $r @(0)
@@ -782,6 +792,10 @@ function Invoke-Suite {
         Assert-Manifest $run 'backup' '^NONE$'
         Assert-Manifest $run 'requirements_ready' '^Y$'
         Assert-Manifest $run 'preflight_run' '^R-\d+$'
+        # The wizard's preflight planned the purge; the stopped step stays to do.
+        Assert-Manifest $run 'plan_step' '^1$'
+        Assert-Manifest $run 'plan_status' '^IN_PROGRESS$'
+        Assert-Manifest $run 'plan_done' '^0$'
         Assert-Manifest $run 'check.P3' '^PASS'
         Assert-Manifest $run 'check.P4' '^(PASS|WARN)'
         Assert-Manifest $run 'check.P6' '^PASS'
@@ -819,6 +833,8 @@ function Invoke-Suite {
         Assert-Manifest $run 'dry_run' '^Y$'
         Assert-Manifest $run 'undo_tuning' '^Y$'
         Assert-Manifest $run 'expected' '^(COMPLETE|FAIL|MAY_FAIL)\|'
+        # It rehearses the step T11 left to do (when T11 ran in this session).
+        if ($script:State.StoppedRun -ne '') { Assert-Manifest $run 'plan_step' '^1$' }
         if ($null -ne $run) {
             $script:State.DryRun = $run['run']
             if ($run.ContainsKey('expected')) { $script:State.DryRunExpected = ([string]$run['expected']).Split('|')[0] }
@@ -853,6 +869,12 @@ function Invoke-Suite {
         foreach ($check in @('P1', 'P3', 'P6', 'P7')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Assert-Manifest $run 'check.P2' '^(PASS|WARN)'
         Assert-Manifest $run 'check.P4' '^(PASS|WARN)'
+        # It carries out the step T11 left to do, the last of its plan.
+        if ($script:State.StoppedRun -ne '') {
+            Assert-Manifest $run 'plan_step' '^1$'
+            Assert-Manifest $run 'plan_status' '^DONE$'
+            Assert-Match $r 'is done: every step ran'
+        }
         # Forecast against result: rows exactly as the dry run counted them;
         # redo, undo, deleting time and space freed logged with their error.
         if ($null -ne $run) {
@@ -881,6 +903,108 @@ function Invoke-Suite {
         if ($script:State.DryRunExpected -ne '') {
             Add-Check ($script:State.DryRunExpected -ne 'FAIL') ('the dry run did not predict a failure (' + $script:State.DryRunExpected + ')')
         }
+    }
+
+    Invoke-Test 'T13B' 'Plan of smaller runs: LOGS in steps (--max-redo); continue, refuse, rehearse, close' {
+        # Older LOGS rows only (twice the suite's retention), so T14 still
+        # finds rows to purge. No plan is open to start with.
+        $retention = [string]([int]$script:Retention * 2)
+        $options = @('--retention', $retention, '--mode', 'LOGS', '--backup', 'none', '--confirm', 'UNDO')
+        $r = Invoke-Wrapper @('plan', '--close', '--non-interactive', '--yes')
+        Assert-Exit $r @(0)
+        $r = Invoke-Wrapper (@('preflight', '--non-interactive') + $options) -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'PREFLIGHT'
+        Assert-Manifest $run 'plan' '^P-\d+$'
+        Assert-Manifest $run 'plan_status' '^READY$'
+        Assert-Manifest $run 'plan_steps' '^1$'
+        Assert-Manifest $run 'step.PREFLIGHT.PLAN.-' '^DONE'
+        if ($null -eq $run -or -not $run.ContainsKey('plan')) { return }
+        $label = [string]$run['plan']
+        $planId = $label -replace '^P-0*', ''
+        Add-Check (Test-Path -LiteralPath (Join-Path (Join-Path $script:RunsDir $run['folder']) 'plan.txt')) 'plan.txt written'
+        Add-Check (Test-Path -LiteralPath (Join-Path (Join-Path $script:RunsDir $run['folder']) 'requirements.txt')) 'requirements.txt written'
+
+        # The redo of the plan and its months with roots: a limit of 60% of
+        # the redo needs at least two runs.
+        $q = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
+            ("SELECT 'PLANREDO|' || NVL(SUM(redo_bytes), 0) FROM epf_plan_step WHERE plan_id = " + $planId + ';'),
+            ("SELECT 'PLANMONTHS|' || COUNT(DISTINCT rm.month_start) FROM epf_root_month rm JOIN epf_plan p" +
+             " ON p.preflight_run_id = rm.run_id WHERE p.plan_id = " + $planId + ' AND rm.roots > 0;'),
+            'EXIT')
+        Assert-Exit $q @(0)
+        $redo = [double]0
+        $months = 0
+        foreach ($line in ($q.Output -split "`n")) {
+            if ($line -match '^PLANREDO\|(\d+)') { $redo = [double]$Matches[1] }
+            if ($line -match '^PLANMONTHS\|(\d+)') { $months = [int]$Matches[1] }
+        }
+        Write-TestLog ('  note plan ' + $label + ': redo estimate ' + $redo + ' bytes, ' + $months + ' months with roots')
+        if ($redo -le 0 -or $months -lt 2) {
+            Write-TestLog '  note fewer than 2 months of LOGS rows (or no redo estimate): the steps are not tested' 'Yellow'
+            $r = Invoke-Wrapper @('plan', '--close', '--non-interactive', '--yes')
+            Assert-Exit $r @(0)
+            return
+        }
+        $limit = [string][long][Math]::Ceiling($redo * 0.6)
+
+        # The same scope with --max-redo: the plan is checked again and split.
+        $r = Invoke-Wrapper (@('preflight', '--non-interactive', '--max-redo', $limit) + $options) -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r ' Plan       runs of at most '
+        Assert-Match $r 'CHANGES SINCE R-\d+'
+        Assert-Match $r ('Next    epf_purge\.bat purge carries out step 1 of \d+ of plan ' + [regex]::Escape($label))
+        $run = Get-Run $r 'PREFLIGHT'
+        Assert-Manifest $run 'plan' ('^' + [regex]::Escape($label) + '$')
+        Assert-Manifest $run 'plan_steps' '^([2-9]|\d\d+)$'
+        Assert-Manifest $run 'max_redo' ('^' + $limit + '$')
+        $steps = 0
+        if ($null -ne $run -and $run.ContainsKey('plan_steps')) { $steps = [int]$run['plan_steps'] }
+        if ($steps -lt 2) { return }
+
+        # purge without scope options carries out step 1 with the plan's choices.
+        $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes') -TimeoutMin 90 -StopOnTimeout
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r ('Plan ' + [regex]::Escape($label) + ': this run carries out step 1 of ' + $steps)
+        Assert-Match $r 'Choices saved with the preflight R-\d+'
+        Assert-Match $r ('Plan    ' + [regex]::Escape($label) + ': 1 of ' + $steps + ' steps done')
+        $run = Get-Run $r 'PURGE'
+        Assert-Manifest $run 'mode' '^LOGS$'
+        Assert-Manifest $run 'backup' '^NONE$'
+        Assert-Manifest $run 'confirmed' '^UNDO$'
+        Assert-Manifest $run 'check.P1' '^PASS'
+        Assert-Manifest $run 'plan_step' '^1$'
+        Assert-Manifest $run 'plan_done' '^1$'
+        Assert-Manifest $run 'plan_status' '^IN_PROGRESS$'
+
+        # Other options while the plan is in progress: refused, nothing run.
+        $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS',
+                              '--backup', 'none')
+        Assert-Exit $r @(4)
+        Assert-Match $r 'is in progress and the options given differ'
+        Add-Check ($r.Runs.Count -eq 0) 'no run created'
+
+        # A dry run rehearses step 2; the plan does not change.
+        $r = Invoke-Wrapper @('purge', '--non-interactive', '--dry-run') -TimeoutMin 60
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r ('this run rehearses step 2 of ' + $steps)
+        $run = Get-Run $r 'PURGE'
+        Assert-Manifest $run 'dry_run' '^Y$'
+        Assert-Manifest $run 'plan_step' '^2$'
+        Assert-Manifest $run 'plan_done' '^1$'
+
+        # plan shows it; plan --close closes it, the step done stays done.
+        $r = Invoke-Wrapper @('plan', '--non-interactive')
+        Assert-Exit $r @(0)
+        Assert-Match $r ('PLAN ' + [regex]::Escape($label) + '  IN_PROGRESS: 1 of ' + $steps + ' steps done')
+        Assert-Match $r 'done by R-\d+'
+        $r = Invoke-Wrapper @('plan', '--close', '--non-interactive', '--yes')
+        Assert-Exit $r @(0)
+        Assert-Match $r ('Plan ' + [regex]::Escape($label) + ' closed; the steps done stay done')
+        $r = Invoke-Wrapper @('plan', '--non-interactive')
+        Assert-Exit $r @(0)
+        Assert-Match $r 'No open plan\. The latest plan:'
+        Assert-Match $r ('PLAN ' + [regex]::Escape($label) + '  CLOSED: 1 of ' + $steps + ' steps done')
     }
 
     Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive, undo growth confirmed' {

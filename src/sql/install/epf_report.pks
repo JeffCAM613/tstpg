@@ -60,6 +60,9 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   EPF_EXPECTED|<run>|<COMPLETE|FAIL|MAY_FAIL>|<deleting seconds>|<bytes freed>|<redo bytes>
     --   EPF_FORECAST|<run>|<module>|<ROWS|REDO|UNDO|SECONDS|FREED>|<forecast>|<actual>|<forecast run>|<origin>
     --   EPF_VERDICT|<run>|<verdict>|exit=<n>
+    --   EPF_PLAN|... and EPF_PLAN_STEP|... for the plan of the run (print_plan)
+    --   EPF_PLAN_KEPT|<plan> when a preflight planned nothing: that plan of
+    --                        another scope is in progress
     PROCEDURE print_report(p_run_id IN NUMBER);
 
     -- Prints the preflight findings of run p_run_id as machine-readable lines
@@ -87,6 +90,13 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     -- steps not DONE, the last events, temporary indexes still present,
     -- active undo tuning, accounts still locked by a reclaim.
     PROCEDURE print_status;
+
+    -- Prints a plan of smaller runs with its steps: the open plan (p_which
+    -- OPEN), the open plan or else the latest one (CURRENT), the latest plan
+    -- (LATEST) or plan p_which (its number, or P-000123). Machine lines
+    -- EPF_PLAN and EPF_PLAN_STEP (see the report's PLAN section); 'No open
+    -- plan.' when there is none.
+    PROCEDURE print_plan(p_which IN VARCHAR2);
 
 END epf_report;
 /

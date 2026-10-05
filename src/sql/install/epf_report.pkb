@@ -321,11 +321,17 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
 
     PROCEDURE close_run(p_run_id IN NUMBER, p_status IN VARCHAR2, p_exit_code OUT NUMBER) IS
         l_verdict VARCHAR2(30);
+        l_p1      VARCHAR2(10);
     BEGIN
         evaluate(p_run_id, l_verdict, p_exit_code, p_status);
         IF UPPER(p_status) = 'STOPPED' THEN
             p_exit_code := 3;
         END IF;
+        -- A plan step is complete when its purge ended without residual rows;
+        -- a plan check counts when its preflight ended.
+        SELECT MAX(status) INTO l_p1 FROM epf_check WHERE run_id = p_run_id AND check_id = 'P1';
+        epf_control.end_plan_step(p_run_id, UPPER(p_status) IN ('SUCCESS', 'WARNING') AND l_p1 = 'PASS');
+        epf_control.end_plan_check(p_run_id, p_status);
         epf_control.finish(p_run_id => p_run_id, p_status => p_status, p_verdict => l_verdict,
                            p_exit_code => p_exit_code);
     END close_run;
@@ -1085,6 +1091,245 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END IF;
     END print_forecast_result;
 
+    -- ------------------------------------------------------------------
+    -- Plans
+    -- ------------------------------------------------------------------
+
+    -- Choices of a run as one line: batch size, undo tuning, redo log
+    -- sizing, backup choice, confirmations.
+    FUNCTION choices_text(p_run_id IN NUMBER) RETURN VARCHAR2 IS
+        l_text VARCHAR2(400);
+    BEGIN
+        FOR r IN (SELECT batch_size, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs
+                    FROM epf_run
+                   WHERE run_id = p_run_id) LOOP
+            l_text := 'batch ' || r.batch_size
+                      || CASE WHEN r.with_undo_tuning = 'Y' THEN ', undo tuning' END
+                      || CASE WHEN r.with_redo_logs = 'Y' THEN ', redo logs enlarged when the purge starts' END
+                      || CASE r.backup_choice WHEN 'NONE' THEN ', no backup'
+                                              WHEN 'CONFIRMED' THEN ', backup made another way' END
+                      || CASE WHEN r.confirmed_reqs IS NOT NULL THEN ', confirmed by the DBA: ' || r.confirmed_reqs END;
+        END LOOP;
+        RETURN l_text;
+    END choices_text;
+
+    -- A plan with its steps: scope, who planned it and when, the limit of a
+    -- run, the choices its purges follow, each step with its estimates and
+    -- state, and the next step. p_note follows the title. Machine lines:
+    --   EPF_PLAN|<plan>|<plan_id>|<status>|<mode>|<depth>|<cutoff>|<retention|->
+    --           |<steps>|<done>|<next step|->|<next cutoff|->|<preflight run>
+    --           |<checked at>|<minutes since checked>|<batch>|<undo Y|N>
+    --           |<redo logs Y|N>|<backup|->|<confirmed|->|<ready Y|N|->|<created by>
+    --           |<max redo bytes of the plan's preflight|->|<checked within preflight_valid_h Y|N>
+    --   EPF_PLAN_STEP|<plan>|<step>|<cutoff>|<roots>|<rows>|<redo>|<status>|<fits Y|N>|<last run|->
+    PROCEDURE print_plan_detail(p_plan_id IN NUMBER, p_note IN VARCHAR2 DEFAULT NULL) IS
+        l_plan    epf_plan%ROWTYPE;
+        l_pre     epf_run%ROWTYPE;
+        l_label   VARCHAR2(20) := epf_util.plan_label(p_plan_id);
+        l_total   NUMBER;
+        l_done    NUMBER;
+        l_next    NUMBER;
+        l_next_ct DATE;
+        l_noarch  NUMBER;
+        l_ready   VARCHAR2(1);
+        l_margin  NUMBER := 1 + epf_util.setting_num('archive_margin_pct') / 100;
+        l_open    BOOLEAN;
+        l_state   VARCHAR2(200);
+    BEGIN
+        SELECT * INTO l_plan FROM epf_plan WHERE plan_id = p_plan_id;
+        FOR r IN (SELECT * FROM epf_run WHERE run_id = l_plan.preflight_run_id) LOOP
+            l_pre := r;
+        END LOOP;
+        l_open := l_plan.status IN ('READY', 'IN_PROGRESS');
+        SELECT COUNT(*), COUNT(CASE WHEN status = 'DONE' THEN 1 END), MIN(CASE WHEN status = 'PENDING' THEN step_no END)
+          INTO l_total, l_done, l_next
+          FROM epf_plan_step
+         WHERE plan_id = p_plan_id;
+        SELECT MAX(cutoff_date) INTO l_next_ct FROM epf_plan_step WHERE plan_id = p_plan_id AND step_no = l_next;
+        SELECT COUNT(CASE WHEN req_code = 'ARCHIVE' AND met_by = 'NOARCHIVELOG' THEN 1 END),
+               CASE WHEN COUNT(*) = 0 THEN '-'
+                    WHEN COUNT(CASE WHEN status = 'NOT_MET' AND blocking = 'Y' THEN 1 END) = 0 THEN 'Y' ELSE 'N' END
+          INTO l_noarch, l_ready
+          FROM epf_requirement
+         WHERE run_id = l_plan.preflight_run_id;
+
+        title('PLAN ' || l_label || '  ' || l_plan.status || ': ' || l_done || ' of ' || l_total || ' steps done'
+              || CASE WHEN l_open AND l_next IS NOT NULL THEN ', next: step ' || l_next || ', rows before '
+                                                             || TO_CHAR(l_next_ct, 'YYYY-MM-DD') END);
+        IF p_note IS NOT NULL THEN
+            put('  ' || p_note);
+        END IF;
+        put('  Scope       mode ' || l_plan.purge_mode || ', depth ' || l_plan.depth || ', rows before '
+            || TO_CHAR(l_plan.cutoff_date, 'YYYY-MM-DD')
+            || CASE WHEN l_plan.retention_days IS NOT NULL THEN ' (retention ' || l_plan.retention_days
+                                                                || ' days when planned)' END);
+        put('  Planned     by ' || epf_util.run_label(l_plan.created_run_id) || ' on '
+            || TO_CHAR(l_plan.created_at, 'YYYY-MM-DD HH24:MI') || ' (' || NVL(l_plan.created_by, '-') || ')'
+            || CASE WHEN l_plan.preflight_run_id <> l_plan.created_run_id THEN
+                        '; checked again by ' || epf_util.run_label(l_plan.preflight_run_id) || ' at '
+                        || TO_CHAR(l_plan.checked_at, 'YYYY-MM-DD HH24:MI') END);
+        put('  Runs        ' || l_plan.limit_basis);
+        put('  Choices     ' || choices_text(l_plan.preflight_run_id)
+            || CASE l_ready WHEN 'Y' THEN '; requirements READY'
+                            WHEN 'N' THEN '; NOT READY (REQUIREMENTS of '
+                                          || epf_util.run_label(l_plan.preflight_run_id) || ')' END);
+        IF l_plan.status = 'CLOSED' THEN
+            put('  Closed      ' || TO_CHAR(l_plan.closed_at, 'YYYY-MM-DD HH24:MI') || ' by ' || NVL(l_plan.closed_by, '-')
+                || ': ' || l_plan.close_reason);
+        ELSIF l_plan.status = 'DONE' THEN
+            put('  Done        ' || TO_CHAR(l_plan.closed_at, 'YYYY-MM-DD HH24:MI'));
+        END IF;
+        put('  ' || l('Step', 6) || l('Rows before', 13) || r('Roots', 11) || r('Rows (est.)', 14)
+            || r('Redo (est.)', 13) || r('Archive need', 14) || r('Deleting', 10) || '  State');
+        FOR st IN (SELECT step_no, cutoff_date, roots, row_count, redo_bytes, delete_seconds, fits, status, last_run_id
+                     FROM epf_plan_step
+                    WHERE plan_id = p_plan_id
+                    ORDER BY step_no) LOOP
+            l_state := CASE WHEN st.status = 'DONE' THEN 'done by ' || epf_util.run_label(st.last_run_id)
+                            WHEN l_open AND st.step_no = l_next THEN
+                                 'next' || CASE WHEN st.last_run_id IS NOT NULL THEN
+                                                    ', ' || epf_util.run_label(st.last_run_id) || ' ended before its end'
+                                           END
+                            ELSE 'pending' END
+                       || CASE WHEN st.fits = 'N' THEN '; above the limit (one month)' END;
+            put('  ' || l(st.step_no, 6) || l(TO_CHAR(st.cutoff_date, 'YYYY-MM-DD'), 13) || r(n(st.roots), 11)
+                || r(n(st.row_count), 14) || r(b(st.redo_bytes), 13)
+                || r(CASE WHEN l_noarch > 0 THEN '-' ELSE b(st.redo_bytes * l_margin) END, 14)
+                || r(dur(st.delete_seconds), 10) || '  ' || l_state);
+        END LOOP;
+        IF l_open AND l_next IS NOT NULL THEN
+            IF l_noarch = 0 AND l_total > 1 THEN
+                put('  Between runs the DBA backs up and deletes the archived logs (RMAN: BACKUP ARCHIVELOG ALL DELETE INPUT).');
+            END IF;
+            put('  Next        epf_purge.bat purge   (step ' || l_next || ' of ' || l_total || ': rows before '
+                || TO_CHAR(l_next_ct, 'YYYY-MM-DD') || '; add --dry-run to rehearse it)');
+        END IF;
+        put('EPF_PLAN|' || l_label || '|' || p_plan_id || '|' || l_plan.status || '|' || l_plan.purge_mode
+            || '|' || l_plan.depth || '|' || TO_CHAR(l_plan.cutoff_date, 'YYYY-MM-DD')
+            || '|' || NVL(TO_CHAR(l_plan.retention_days), '-') || '|' || l_total || '|' || l_done
+            || '|' || NVL(TO_CHAR(l_next), '-') || '|' || NVL(TO_CHAR(l_next_ct, 'YYYY-MM-DD'), '-')
+            || '|' || epf_util.run_label(l_plan.preflight_run_id)
+            || '|' || NVL(TO_CHAR(l_plan.checked_at, 'YYYY-MM-DD HH24:MI'), '-')
+            || '|' || ROUND(NVL(epf_util.elapsed_s(l_plan.checked_at), 0) / 60)
+            || '|' || l_pre.batch_size || '|' || l_pre.with_undo_tuning || '|' || l_pre.with_redo_logs
+            || '|' || NVL(l_pre.backup_choice, '-') || '|' || NVL(l_pre.confirmed_reqs, '-') || '|' || l_ready
+            || '|' || NVL(l_plan.created_by, '-') || '|' || NVL(TO_CHAR(l_pre.max_redo_bytes), '-')
+            || '|' || CASE WHEN l_plan.checked_at >= epf_util.now_ts
+                                                     - NUMTODSINTERVAL(epf_util.setting_num('preflight_valid_h'), 'HOUR')
+                           THEN 'Y' ELSE 'N' END);
+        FOR st IN (SELECT step_no, cutoff_date, roots, row_count, redo_bytes, fits, status, last_run_id
+                     FROM epf_plan_step
+                    WHERE plan_id = p_plan_id
+                    ORDER BY step_no) LOOP
+            put('EPF_PLAN_STEP|' || l_label || '|' || st.step_no || '|' || TO_CHAR(st.cutoff_date, 'YYYY-MM-DD')
+                || '|' || st.roots || '|' || st.row_count || '|' || st.redo_bytes || '|' || st.status || '|' || st.fits
+                || '|' || NVL(epf_util.run_label(st.last_run_id), '-'));
+        END LOOP;
+    END print_plan_detail;
+
+    -- The plan of the run: the plan a preflight made or checked again, the
+    -- plan step a purge carried out or a dry run rehearsed. A preflight that
+    -- planned nothing, a plan of another scope being in progress, names it:
+    --   EPF_PLAN_KEPT|<plan>
+    PROCEDURE print_run_plan IS
+    BEGIN
+        IF g_run.plan_id IS NULL THEN
+            FOR e IN (SELECT message FROM epf_event
+                       WHERE run_id = g_run.run_id AND event_code = 'PLAN_KEPT'
+                       ORDER BY event_id) LOOP
+                title('PLAN');
+                put('  ' || e.message);
+                put('EPF_PLAN_KEPT|' || REGEXP_SUBSTR(e.message, 'P-[0-9]+'));
+            END LOOP;
+            RETURN;
+        END IF;
+        print_plan_detail(g_run.plan_id,
+                          CASE WHEN g_run.action = 'PURGE' AND g_run.plan_step IS NOT NULL THEN
+                                   'This run: ' || CASE WHEN g_run.dry_run = 'Y'
+                                                        THEN 'rehearsal of step ' || g_run.plan_step || ', nothing changed'
+                                                        ELSE 'step ' || g_run.plan_step END
+                          END);
+    END print_run_plan;
+
+    -- What changed since the plan's previous preflight: requirements, roots,
+    -- redo estimate, choices.
+    PROCEDURE print_changes IS
+        l_run   NUMBER := g_run.run_id;
+        l_prev  NUMBER;
+        l_count NUMBER := 0;
+        l_now   VARCHAR2(400);
+        l_then  VARCHAR2(400);
+    BEGIN
+        IF g_run.plan_id IS NULL THEN
+            RETURN;
+        END IF;
+        SELECT MAX(run_id) INTO l_prev
+          FROM epf_run
+         WHERE plan_id = g_run.plan_id AND action = 'PREFLIGHT' AND run_id < l_run;
+        IF l_prev IS NULL THEN
+            RETURN;
+        END IF;
+        title('CHANGES SINCE ' || epf_util.run_label(l_prev) || ' (the previous check of the plan)');
+        FOR q IN (SELECT c.req_code, p.status AS status_then, c.status AS status_now
+                    FROM epf_requirement c
+                    JOIN epf_requirement p ON p.run_id = l_prev AND p.req_code = c.req_code
+                   WHERE c.run_id = l_run AND p.status <> c.status
+                   ORDER BY c.seq) LOOP
+            put('  ' || l(q.req_code, 12) || REPLACE(q.status_then, '_', ' ') || ' -> ' || REPLACE(q.status_now, '_', ' '));
+            l_count := l_count + 1;
+        END LOOP;
+        FOR t IN (SELECT (SELECT SUM(roots) FROM epf_tree_est WHERE run_id = l_prev) AS roots_then,
+                         (SELECT SUM(roots) FROM epf_tree_est WHERE run_id = l_run) AS roots_now,
+                         (SELECT SUM(redo_bytes) FROM epf_forecast WHERE run_id = l_prev AND origin = 'PREFLIGHT') AS redo_then,
+                         (SELECT SUM(redo_bytes) FROM epf_forecast WHERE run_id = l_run AND origin = 'PREFLIGHT') AS redo_now
+                    FROM dual) LOOP
+            IF NVL(t.roots_then, -1) <> NVL(t.roots_now, -1) THEN
+                put('  ' || l('Roots', 12) || n(t.roots_then) || ' -> ' || n(t.roots_now));
+                l_count := l_count + 1;
+            END IF;
+            IF NVL(t.redo_then, -1) <> NVL(t.redo_now, -1) THEN
+                put('  ' || l('Redo (est.)', 12) || b(t.redo_then) || ' -> ' || b(t.redo_now));
+                l_count := l_count + 1;
+            END IF;
+        END LOOP;
+        l_then := choices_text(l_prev);
+        l_now  := choices_text(l_run);
+        IF NVL(l_then, '-') <> NVL(l_now, '-') THEN
+            put('  ' || l('Choices', 12) || l_then || ' -> ' || l_now);
+            l_count := l_count + 1;
+        END IF;
+        IF l_count = 0 THEN
+            put('  No change.');
+        END IF;
+    END print_changes;
+
+    PROCEDURE print_plan(p_which IN VARCHAR2) IS
+        l_plan  NUMBER;
+        l_which VARCHAR2(30) := UPPER(TRIM(NVL(p_which, 'OPEN')));
+    BEGIN
+        IF l_which IN ('OPEN', 'CURRENT') THEN
+            l_plan := epf_control.open_plan_id;
+            IF l_plan IS NULL AND l_which = 'CURRENT' THEN
+                SELECT MAX(plan_id) INTO l_plan FROM epf_plan;
+                IF l_plan IS NOT NULL THEN
+                    put('No open plan. The latest plan:');
+                END IF;
+            END IF;
+        ELSIF l_which = 'LATEST' THEN
+            SELECT MAX(plan_id) INTO l_plan FROM epf_plan;
+        ELSE
+            SELECT MAX(plan_id) INTO l_plan FROM epf_plan
+             WHERE plan_id = TO_NUMBER(REGEXP_SUBSTR(l_which, '[0-9]+'));
+        END IF;
+        IF l_plan IS NULL THEN
+            put(CASE l_which WHEN 'OPEN' THEN 'No open plan.' WHEN 'LATEST' THEN 'No plan recorded.'
+                             WHEN 'CURRENT' THEN 'No plan recorded.'
+                             ELSE 'Plan not found: ' || p_which END);
+            RETURN;
+        END IF;
+        print_plan_detail(l_plan);
+    END print_plan;
+
     PROCEDURE print_report(p_run_id IN NUMBER) IS
         l_verdict VARCHAR2(30);
         l_exit    NUMBER;
@@ -1107,11 +1352,14 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 print_forecast_result;
                 print_requirements;
             END IF;
+            print_run_plan;
             print_space;
         ELSIF g_run.action = 'PREFLIGHT' THEN
             print_forecast_table('PREFLIGHT');
             print_retention_options;
             print_requirements;
+            print_changes;
+            print_run_plan;
         END IF;
         print_checks(l_verdict, l_exit);
     END print_report;
@@ -1267,6 +1515,12 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         IF l_count = 0 THEN
             put('  no temporary index, undo tuning or locked account pending');
         END IF;
+        FOR p IN (SELECT plan_id, status, cutoff_date, purge_mode, depth
+                    FROM epf_plan
+                   WHERE status IN ('READY', 'IN_PROGRESS')) LOOP
+            put('Plan ' || epf_util.plan_label(p.plan_id) || '  ' || p.status || ': mode ' || p.purge_mode || ', depth '
+                || p.depth || ', rows before ' || TO_CHAR(p.cutoff_date, 'YYYY-MM-DD') || '; epf_purge.bat plan shows it');
+        END LOOP;
     END print_status;
 
 END epf_report;
