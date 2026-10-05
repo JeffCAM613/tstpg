@@ -14,7 +14,7 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
   - T08B, T10B and T11 used the same pattern positively and passed on the Choices line too, so they did not prove the questions section was there.
 - Fix: the four checks use the section header exactly, case-sensitive: `(?m-i)^ CHOICES +HH:MM:SS` (`$script:ChoicesSection`). Checked against sample lines: it matches the section, not the Choices line or the CHOICES step of the report.
 
-How to test: `.\src\tests\e2e\run_tests.bat --only T08` (T01 runs too): T08 passes. The next full run checks T08B, T10B and T11 with the exact pattern.
+How to test: `.\src\tests\e2e\run_tests.bat --only T08,T08B,T10B` (T01 runs too; about 10 minutes on the purged copy): 4 passed. T11 uses the same check and needs data to purge: the next full run covers it.
 
 ## 2026-10-05 - Measuring lighter, no redo log warning when the logs are to be enlarged (0.5.4)
 
