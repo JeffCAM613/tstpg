@@ -175,6 +175,7 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_depth     VARCHAR2(4000);
         l_mode      VARCHAR2(30);
         l_batch     NUMBER;
+        l_rows      NUMBER;
         l_dry_run   VARCHAR2(1)  := yes_no(p_dry_run, 'dry_run');
         l_reclaim   VARCHAR2(1)  := yes_no(p_with_reclaim, 'with_reclaim');
         l_compact   VARCHAR2(1)  := yes_no(p_with_compact, 'with_compact');
@@ -226,6 +227,10 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
             END IF;
             l_cutoff := TRUNC(SYSDATE) - l_retention;
             l_batch  := norm_batch(p_batch_size);
+            l_rows   := epf_util.setting_num('batch_rows_max');
+            IF l_rows IS NULL OR l_rows < 1 THEN
+                RAISE_APPLICATION_ERROR(-20127, 'Setting batch_rows_max must be a positive number of rows.');
+            END IF;
         END IF;
 
         UPDATE epf_run
@@ -238,11 +243,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         prune_history;
 
         INSERT INTO epf_run (
-            action, status, retention_days, cutoff_date, depth, purge_mode, batch_size,
+            action, status, retention_days, cutoff_date, depth, purge_mode, batch_size, batch_rows,
             dry_run, with_reclaim, with_compact, with_undo_tuning, with_redo_logs, backup_choice, confirmed_reqs,
             created_at, db_name, container_name, client_host, os_user, tool_version
         ) VALUES (
-            l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch,
+            l_action, 'CREATED', l_retention, l_cutoff, l_depth, l_mode, l_batch, l_rows,
             l_dry_run, l_reclaim, l_compact, l_undo, l_redo, l_backup, l_confirm, epf_util.now_ts,
             SYS_CONTEXT('USERENV', 'DB_NAME'), SYS_CONTEXT('USERENV', 'CON_NAME'),
             SYS_CONTEXT('USERENV', 'HOST'), SYS_CONTEXT('USERENV', 'OS_USER'),
@@ -296,7 +301,8 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                    ' mode=' || l_run.purge_mode || ' depth=' || l_run.depth
                    || ' retention=' || l_run.retention_days
                    || ' cutoff=' || TO_CHAR(l_run.cutoff_date, 'YYYY-MM-DD')
-                   || ' batch=' || l_run.batch_size || ' dry_run=' || l_run.dry_run
+                   || ' batch=' || l_run.batch_size || ' batch_rows=' || l_run.batch_rows
+                   || ' dry_run=' || l_run.dry_run
                END
             || ' reclaim=' || l_run.with_reclaim || ' compact=' || l_run.with_compact
             || ' undo_tuning=' || l_run.with_undo_tuning || ' redo_logs=' || l_run.with_redo_logs

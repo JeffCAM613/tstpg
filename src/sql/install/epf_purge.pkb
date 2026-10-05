@@ -4,6 +4,15 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     c_clear       CONSTANT VARCHAR2(10) := 'CLEAR';
     c_logs_module CONSTANT VARCHAR2(30) := 'LOGS';
     c_max_rounds  CONSTANT PLS_INTEGER  := 50;
+    -- Undo per byte of redo when undo is estimated from the redo (measured
+    -- on the registry trees: 0.43 to 0.68).
+    c_undo_share  CONSTANT NUMBER       := 0.5;
+    -- Seconds per batch (its statements and commit) added to the deleting
+    -- time when the rows per second are assumed (setting delete_rows_s).
+    c_batch_s     CONSTANT NUMBER       := 0.006;
+    -- A table's redo and undo per row are taken from a purge that processed
+    -- at least this many of its rows.
+    c_min_rows    CONSTANT NUMBER       := 1000;
 
     TYPE t_table IS RECORD (
         table_id      NUMBER,
@@ -77,6 +86,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     TYPE t_needs IS TABLE OF t_need INDEX BY PLS_INTEGER;
     TYPE t_position_map IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(4000);
 
+    -- Deleting time of a module summed over its trees (add_time): rows and
+    -- seconds, and how many trees took their speed from each source of
+    -- tree_speed (runs: the purges that measured trees; other_run: the
+    -- purge whose speed trees not purged yet take).
+    TYPE t_time IS RECORD (
+        row_total  NUMBER := 0,
+        seconds    NUMBER := 0,
+        runs       VARCHAR2(400),
+        n_tree     NUMBER := 0,
+        other_run  VARCHAR2(20),
+        n_run      NUMBER := 0,
+        n_set      NUMBER := 0,
+        no_time    BOOLEAN := FALSE
+    );
+
     g_run      epf_run%ROWTYPE;
     g_tables   t_tables;
     g_links    t_links;
@@ -100,6 +124,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     g_reuse_run  NUMBER;
     -- TRUE while recheck runs the redo and undo checks again (no events).
     g_silent     BOOLEAN := FALSE;
+    -- Rows per root of each tree (all its tables), set by check_redo.
+    g_rows_root  t_numbers;
+    -- Statistic numbers of 'redo size' and 'undo change vector size'.
+    g_redo_stat  NUMBER;
+    g_undo_stat  NUMBER;
 
     -- ------------------------------------------------------------------
     -- Names and SQL fragments
@@ -393,6 +422,46 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_bytes;
     END table_bytes;
 
+    FUNCTION stat_rows(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN NUMBER IS
+        l_rows NUMBER;
+    BEGIN
+        SELECT MAX(num_rows) INTO l_rows FROM dba_tables WHERE owner = p_owner AND table_name = p_table;
+        RETURN NVL(l_rows, 0);
+    END stat_rows;
+
+    -- Redo of deleting one row, estimated from optimizer statistics: the row
+    -- (average length R: its copy in undo and the change itself) and each
+    -- of its index entries (key length K): 1.2 R + 180 bytes, plus
+    -- 1.2 K + 162 bytes per index. The constants are calibrated on the redo
+    -- measured per row by purges of the registry trees.
+    FUNCTION row_redo_estimate(p_table_id IN NUMBER) RETURN NUMBER IS
+        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
+        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
+        l_row   NUMBER;
+        l_total NUMBER;
+    BEGIN
+        SELECT MAX(avg_row_len) INTO l_row FROM dba_tables WHERE owner = l_owner AND table_name = l_table;
+        l_total := 1.2 * NVL(l_row, 100) + 180;
+        FOR x IN (SELECT (SELECT NVL(SUM(tc.avg_col_len), 0)
+                            FROM dba_ind_columns ic
+                            JOIN dba_tab_columns tc
+                              ON tc.owner = ic.table_owner AND tc.table_name = ic.table_name
+                             AND tc.column_name = ic.column_name
+                           WHERE ic.index_owner = i.owner AND ic.index_name = i.index_name) AS key_len
+                    FROM dba_indexes i
+                   WHERE i.table_owner = l_owner AND i.table_name = l_table AND i.index_type <> 'LOB') LOOP
+            l_total := l_total + 1.2 * x.key_len + 162;
+        END LOOP;
+        RETURN ROUND(l_total);
+    END row_redo_estimate;
+
+    -- Rows a batch holds at most: the run's batch_rows (the setting
+    -- batch_rows_max for a run that did not record it).
+    FUNCTION rows_cap RETURN NUMBER IS
+    BEGIN
+        RETURN NVL(g_run.batch_rows, epf_util.setting_num('batch_rows_max'));
+    END rows_cap;
+
     FUNCTION column_text(p_columns IN SYS.ODCIVARCHAR2LIST, p_quoted IN BOOLEAN DEFAULT FALSE) RETURN VARCHAR2 IS
         l_out VARCHAR2(4000);
     BEGIN
@@ -502,6 +571,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         g_undo_cap   := NULL;
         g_reuse_run  := NULL;
         g_silent     := FALSE;
+        g_rows_root.DELETE;
         load_registry;
         SELECT module_code BULK COLLECT INTO g_modules
           FROM epf_module
@@ -785,6 +855,119 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_keys.COUNT;
     END group_roots;
 
+    -- Rows of the tree per key of each table with keys (the root and the
+    -- link sources below it; index: table_id), from optimizer statistics:
+    -- the row itself plus the rows of the tables without keys it anchors.
+    -- A table without keys is anchored at the source of its links with the
+    -- most rows. Weighs the roots when batches are limited by rows.
+    FUNCTION tree_factors(p_root_id IN NUMBER) RETURN t_numbers IS
+        l_ids    SYS.ODCINUMBERLIST := tree_tables(p_root_id);
+        l_out    t_numbers;
+        l_links  t_links;
+        l_tid    NUMBER;
+        l_src    NUMBER;
+        l_anchor NUMBER;
+        l_best   NUMBER;
+        l_rows   NUMBER;
+    BEGIN
+        FOR k IN 1 .. l_ids.COUNT LOOP
+            l_tid := l_ids(k);
+            IF g_tables(l_tid).reachable AND (l_tid = p_root_id OR has_keys(l_tid)) THEN
+                l_out(l_tid) := 1;
+            END IF;
+        END LOOP;
+        FOR k IN 1 .. l_ids.COUNT LOOP
+            l_tid := l_ids(k);
+            CONTINUE WHEN NOT g_tables(l_tid).reachable OR l_out.EXISTS(l_tid);
+            l_links  := links_of(l_tid);
+            l_anchor := NULL;
+            l_best   := -1;
+            FOR i IN 1 .. l_links.COUNT LOOP
+                l_src := l_links(i).source_table_id;
+                IF l_out.EXISTS(l_src) THEN
+                    l_rows := stat_rows(g_tables(l_src).owner, g_tables(l_src).table_name);
+                    IF l_rows > l_best THEN
+                        l_best   := l_rows;
+                        l_anchor := l_src;
+                    END IF;
+                END IF;
+            END LOOP;
+            IF l_anchor IS NOT NULL AND l_best > 0 THEN
+                l_out(l_anchor) := l_out(l_anchor)
+                                   + stat_rows(g_tables(l_tid).owner, g_tables(l_tid).table_name) / l_best;
+            END IF;
+        END LOOP;
+        RETURN l_out;
+    END tree_factors;
+
+    -- Numbers the batches of a tree whose roots carry different numbers of
+    -- rows (link sources with keys below the root). Roots in key order, the
+    -- roots of a group together; a new batch starts when the next root or
+    -- group would pass batch_size roots or the run's rows limit. The rows of
+    -- a root: its keys in each table with keys times that table's factor
+    -- (tree_factors). A root or group above the limit is a batch of its own.
+    PROCEDURE plan_batches(p_root_id IN NUMBER, p_factors IN t_numbers) IS
+        c_chunk   CONSTANT PLS_INTEGER := 10000;
+        l_run     NUMBER := g_run.run_id;
+        l_size    NUMBER := g_run.batch_size;
+        l_cap     NUMBER := rows_cap * 1000;
+        l_ids     VARCHAR2(4000);
+        l_case    VARCHAR2(32767);
+        l_cur     SYS_REFCURSOR;
+        l_keys    t_numbers;
+        l_weights t_numbers;
+        l_counts  t_numbers;
+        l_firsts  t_numbers;
+        l_batches t_numbers;
+        l_batch   NUMBER := 0;
+        l_roots   NUMBER := 0;
+        l_rows    NUMBER := 0;
+        k         PLS_INTEGER := p_factors.FIRST;
+    BEGIN
+        -- Factors in thousandths of a row: whole numbers in the statement.
+        WHILE k IS NOT NULL LOOP
+            IF k <> p_root_id THEN
+                l_ids  := l_ids || CASE WHEN l_ids IS NOT NULL THEN ', ' END || k;
+                l_case := l_case || ' WHEN ' || k || ' THEN ' || ROUND(p_factors(k) * 1000);
+            END IF;
+            k := p_factors.NEXT(k);
+        END LOOP;
+        OPEN l_cur FOR
+            'SELECT r.key_num, SUM(r.w) OVER (PARTITION BY r.group_key), COUNT(*) OVER (PARTITION BY r.group_key),'
+            || ' CASE WHEN ROW_NUMBER() OVER (PARTITION BY r.group_key ORDER BY r.key_num) = 1 THEN 1 ELSE 0 END'
+            || ' FROM (SELECT rk.key_num, rk.group_key, ' || ROUND(p_factors(p_root_id) * 1000) || ' + NVL(d.w, 0) AS w'
+            || ' FROM epf_work_key rk'
+            || ' LEFT JOIN (SELECT dk.root_key, SUM(CASE dk.table_id' || l_case || ' ELSE 0 END) AS w'
+            || ' FROM epf_work_key dk WHERE dk.run_id = :r1 AND dk.table_id IN (' || l_ids || ')'
+            || ' GROUP BY dk.root_key) d ON d.root_key = rk.key_num'
+            || ' WHERE rk.run_id = :r2 AND rk.table_id = :t2) r'
+            || ' ORDER BY r.group_key, r.key_num'
+            USING l_run, l_run, p_root_id;
+        LOOP
+            FETCH l_cur BULK COLLECT INTO l_keys, l_weights, l_counts, l_firsts LIMIT c_chunk;
+            EXIT WHEN l_keys.COUNT = 0;
+            FOR i IN 1 .. l_keys.COUNT LOOP
+                IF l_firsts(i) = 1 THEN
+                    IF l_batch = 0 OR (l_roots > 0 AND (l_roots + l_counts(i) > l_size OR l_rows + l_weights(i) > l_cap)) THEN
+                        l_batch := l_batch + 1;
+                        l_roots := 0;
+                        l_rows  := 0;
+                    END IF;
+                    l_roots := l_roots + l_counts(i);
+                    l_rows  := l_rows + l_weights(i);
+                END IF;
+                l_batches(i) := l_batch;
+            END LOOP;
+            FORALL i IN 1 .. l_keys.COUNT
+                UPDATE epf_work_key
+                   SET batch_no = l_batches(i)
+                 WHERE run_id = l_run AND table_id = p_root_id AND root_key = l_keys(i);
+            EXIT WHEN l_keys.COUNT < c_chunk;
+        END LOOP;
+        CLOSE l_cur;
+        COMMIT;
+    END plan_batches;
+
     PROCEDURE gather_work_key_stats IS
     BEGIN
         DBMS_STATS.GATHER_TABLE_STATS(
@@ -795,20 +978,32 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             no_invalidate => FALSE);
     END gather_work_key_stats;
 
+    -- Keys of the eligible roots of a tree and of the link sources below
+    -- them, with the roots held back and the groups that share a batch.
+    -- Batches hold batch_size roots and at most the run's rows limit: with
+    -- link sources with keys below the root the roots are weighed one by one
+    -- (plan_batches), otherwise each root counts for the rows per root of
+    -- the tree from optimizer statistics.
     PROCEDURE snapshot_tree(p_root_id IN NUMBER, p_action IN VARCHAR2, p_batches OUT NUMBER) IS
         l_root    t_table := g_tables(p_root_id);
         l_ids     SYS.ODCINUMBERLIST;
         l_tree    SYS.ODCINUMBERLIST;
+        l_factors t_numbers := tree_factors(p_root_id);
+        l_weigh   BOOLEAN := l_factors.COUNT > 1 AND NOT by_rowid(p_root_id);
+        l_per     NUMBER;
         l_roots   NUMBER;
         l_derived NUMBER := 0;
         l_held    NUMBER := 0;
         l_grouped NUMBER := 0;
         l_run     NUMBER := g_run.run_id;
     BEGIN
+        -- Roots per batch without weighing: batch_size, fewer when the rows
+        -- per root of the tree would pass the rows limit.
+        l_per := LEAST(g_run.batch_size, GREATEST(1, FLOOR(rows_cap / l_factors(p_root_id))));
         IF by_rowid(p_root_id) THEN
             EXECUTE IMMEDIATE
                 'INSERT INTO epf_work_key (run_id, table_id, batch_no, key_rowid)'
-                || ' SELECT ' || l_run || ', ' || p_root_id || ', CEIL(ROWNUM / ' || g_run.batch_size || '), rid'
+                || ' SELECT ' || l_run || ', ' || p_root_id || ', CEIL(ROWNUM / ' || l_per || '), rid'
                 || ' FROM (SELECT t.ROWID AS rid FROM ' || tq(p_root_id) || ' t WHERE t.'
                 || qc(l_root.date_column) || ' < ' || cutoff_literal || ' ORDER BY t.ROWID)';
             COMMIT;
@@ -816,7 +1011,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             EXECUTE IMMEDIATE
                 'INSERT INTO epf_work_key (run_id, table_id, batch_no, key_num, root_key, group_key)'
                 || ' SELECT ' || l_run || ', ' || p_root_id || ', CEIL(ROW_NUMBER() OVER (ORDER BY t.'
-                || qc(l_root.key_column) || ') / ' || g_run.batch_size || '), t.' || qc(l_root.key_column)
+                || qc(l_root.key_column) || ') / ' || CASE WHEN l_weigh THEN g_run.batch_size ELSE l_per END
+                || '), t.' || qc(l_root.key_column)
                 || ', t.' || qc(l_root.key_column) || ', t.' || qc(l_root.key_column)
                 || ' FROM ' || tq(p_root_id) || ' t WHERE t.' || qc(l_root.date_column) || ' < ' || cutoff_literal;
             COMMIT;
@@ -834,6 +1030,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             hold_back(p_root_id, l_held);
             l_grouped := group_roots(p_root_id);
         END IF;
+        IF l_weigh THEN
+            plan_batches(p_root_id, l_factors);
+        END IF;
 
         l_tree := tree_tables(p_root_id);
         SELECT COUNT(CASE WHEN table_id = p_root_id THEN 1 END),
@@ -846,7 +1045,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
         epf_log.event(epf_log.c_info, 'KEYS_SNAPSHOT',
                       tname(p_root_id) || ': ' || epf_util.fmt_int(l_roots) || ' rows before ' || cutoff_text
-                      || ' in ' || epf_util.fmt_int(p_batches) || ' batches'
+                      || ' in ' || epf_util.fmt_int(p_batches) || ' batches of up to '
+                      || CASE WHEN l_weigh THEN epf_util.fmt_int(g_run.batch_size) || ' roots and about '
+                                                || epf_util.fmt_int(rows_cap) || ' rows'
+                              ELSE epf_util.fmt_int(l_per) || ' roots' END
                       || CASE WHEN by_rowid(p_root_id) THEN ' (by ROWID)'
                               ELSE ', ' || epf_util.fmt_int(l_derived) || ' derived keys' END,
                       p_object_owner => l_root.owner, p_object_name => l_root.table_name, p_rows => l_roots);
@@ -891,14 +1093,20 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Counts every table of the module into EPF_TABLE_STAT (phase BEFORE or
     -- AFTER). p_complete: the module processed every batch; residual rows are
     -- then a warning, after a stop or a failure they are expected (checks P1
-    -- and P2 report them).
+    -- and P2 report them). AFTER keeps the rows, redo and undo of the purge
+    -- per table (p_processed, p_redo, p_undo); BEFORE of a deleting module
+    -- keeps the redo per row estimated from optimizer statistics.
     PROCEDURE count_tables(p_module IN VARCHAR2, p_action IN VARCHAR2, p_phase IN VARCHAR2,
-                           p_processed IN t_numbers, p_complete IN BOOLEAN DEFAULT TRUE) IS
+                           p_processed IN t_numbers, p_redo IN t_numbers, p_undo IN t_numbers,
+                           p_complete IN BOOLEAN DEFAULT TRUE) IS
         l_total     NUMBER;
         l_eligible  NUMBER;
         l_lob       NUMBER;
         l_held      NUMBER;
         l_processed NUMBER;
+        l_redo      NUMBER;
+        l_undo      NUMBER;
+        l_est       NUMBER;
         l_lobs      t_lobs;
         l_select    VARCHAR2(32767);
         l_residual  NUMBER;
@@ -945,14 +1153,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
 
             l_processed := NULL;
+            l_redo      := NULL;
+            l_undo      := NULL;
+            l_est       := NULL;
             IF p_phase = 'AFTER' THEN
                 l_processed := CASE WHEN p_processed.EXISTS(l_tid) THEN p_processed(l_tid) ELSE 0 END;
+                l_redo      := CASE WHEN p_redo.EXISTS(l_tid) THEN p_redo(l_tid) ELSE 0 END;
+                l_undo      := CASE WHEN p_undo.EXISTS(l_tid) THEN p_undo(l_tid) ELSE 0 END;
+            ELSIF p_action = c_delete THEN
+                l_est := row_redo_estimate(l_tid);
             END IF;
 
             INSERT INTO epf_table_stat (run_id, table_id, phase, total_rows, eligible_rows, retained_rows,
-                                        nonempty_lob_rows, processed_rows, held_rows, action)
+                                        nonempty_lob_rows, processed_rows, held_rows, action,
+                                        redo_bytes, undo_bytes, est_redo_row)
             VALUES (l_run, l_tid, p_phase, l_total, l_eligible, l_total - l_eligible,
-                    l_lob, l_processed, l_held, p_action);
+                    l_lob, l_processed, l_held, p_action, l_redo, l_undo, l_est);
             COMMIT;
 
             IF p_phase = 'BEFORE' THEN
@@ -1311,34 +1527,45 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_out;
     END batch_statements;
 
-    -- Statistic of this session so far (V$MYSTAT), e.g. 'redo size' or
-    -- 'undo change vector size'.
-    FUNCTION session_stat(p_name IN VARCHAR2) RETURN NUMBER IS
+    -- Statistic of this session so far (V$MYSTAT) by its number; the
+    -- numbers of 'redo size' and 'undo change vector size' are looked up
+    -- once (V$STATNAME).
+    FUNCTION session_stat(p_statistic IN NUMBER) RETURN NUMBER IS
         l_value NUMBER;
     BEGIN
-        SELECT m.value
-          INTO l_value
-          FROM v$mystat m
-          JOIN v$statname n ON n.statistic# = m.statistic#
-         WHERE n.name = p_name;
+        SELECT value INTO l_value FROM v$mystat WHERE statistic# = p_statistic;
         RETURN l_value;
     END session_stat;
 
     FUNCTION session_redo RETURN NUMBER IS
     BEGIN
-        RETURN session_stat('redo size');
+        IF g_redo_stat IS NULL THEN
+            SELECT statistic# INTO g_redo_stat FROM v$statname WHERE name = 'redo size';
+        END IF;
+        RETURN session_stat(g_redo_stat);
     END session_redo;
 
     FUNCTION session_undo RETURN NUMBER IS
     BEGIN
-        RETURN session_stat('undo change vector size');
+        IF g_undo_stat IS NULL THEN
+            SELECT statistic# INTO g_undo_stat FROM v$statname WHERE name = 'undo change vector size';
+        END IF;
+        RETURN session_stat(g_undo_stat);
     END session_undo;
 
+    -- Processes the batches of the module's trees. p_processed, p_table_redo
+    -- and p_table_undo add up per table (index: table_id) the rows, redo and
+    -- undo of its statements in the committed batches.
     PROCEDURE process_batches(p_module IN VARCHAR2, p_action IN VARCHAR2, p_roots IN SYS.ODCINUMBERLIST,
-                              p_total IN NUMBER, p_processed IN OUT NOCOPY t_numbers, p_result OUT VARCHAR2,
-                              p_redo OUT NUMBER, p_undo OUT NUMBER) IS
+                              p_total IN NUMBER, p_processed IN OUT NOCOPY t_numbers,
+                              p_table_redo IN OUT NOCOPY t_numbers, p_table_undo IN OUT NOCOPY t_numbers,
+                              p_result OUT VARCHAR2, p_redo OUT NUMBER, p_undo OUT NUMBER) IS
         l_stmts      t_stmts;
         l_batch      t_numbers;
+        l_b_redo     t_numbers;
+        l_b_undo     t_numbers;
+        l_s_redo     NUMBER;
+        l_s_undo     NUMBER;
         l_max        NUMBER;
         l_done       NUMBER := 0;
         l_rows       NUMBER := 0;
@@ -1410,14 +1637,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                     EXIT trees;
                 END IF;
                 l_batch.DELETE;
+                l_b_redo.DELETE;
+                l_b_undo.DELETE;
                 l_batch_rows := 0;
                 l_current    := p_roots(r);
                 BEGIN
                     FOR s IN 1 .. l_stmts.COUNT LOOP
                         l_current := l_stmts(s).table_id;
+                        l_s_redo  := session_redo;
+                        l_s_undo  := session_undo;
                         EXECUTE IMMEDIATE l_stmts(s).sql_text USING b;
                         l_n := SQL%ROWCOUNT;
                         l_batch(l_current) := CASE WHEN l_batch.EXISTS(l_current) THEN l_batch(l_current) ELSE 0 END + l_n;
+                        l_b_redo(l_current) := CASE WHEN l_b_redo.EXISTS(l_current) THEN l_b_redo(l_current) ELSE 0 END
+                                               + session_redo - l_s_redo;
+                        l_b_undo(l_current) := CASE WHEN l_b_undo.EXISTS(l_current) THEN l_b_undo(l_current) ELSE 0 END
+                                               + session_undo - l_s_undo;
                         l_batch_rows := l_batch_rows + l_n;
                     END LOOP;
                     COMMIT;
@@ -1439,7 +1674,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
                 k := l_batch.FIRST;
                 WHILE k IS NOT NULL LOOP
-                    p_processed(k) := CASE WHEN p_processed.EXISTS(k) THEN p_processed(k) ELSE 0 END + l_batch(k);
+                    p_processed(k)  := CASE WHEN p_processed.EXISTS(k) THEN p_processed(k) ELSE 0 END + l_batch(k);
+                    p_table_redo(k) := CASE WHEN p_table_redo.EXISTS(k) THEN p_table_redo(k) ELSE 0 END + l_b_redo(k);
+                    p_table_undo(k) := CASE WHEN p_table_undo.EXISTS(k) THEN p_table_undo(k) ELSE 0 END + l_b_undo(k);
                     k := l_batch.NEXT(k);
                 END LOOP;
                 l_tree_roots := l_tree_roots
@@ -1488,6 +1725,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_roots     SYS.ODCINUMBERLIST;
         l_active    SYS.ODCINUMBERLIST := SYS.ODCINUMBERLIST();
         l_processed t_numbers;
+        l_t_redo    t_numbers;
+        l_t_undo    t_numbers;
         l_batches   NUMBER;
         l_total     NUMBER := 0;
         l_created   NUMBER;
@@ -1529,7 +1768,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
         BEGIN
             epf_log.step_start('COUNT_BEFORE', p_module);
-            count_tables(p_module, l_action, 'BEFORE', l_processed);
+            count_tables(p_module, l_action, 'BEFORE', l_processed, l_t_redo, l_t_undo);
             count_orphans(p_module, 'BEFORE');
             epf_log.step_end('DONE');
         EXCEPTION
@@ -1552,7 +1791,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             IF NOT l_failed THEN
                 BEGIN
-                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_batch_res, l_redo, l_undo);
+                    process_batches(p_module, l_action, l_active, l_total, l_processed, l_t_redo, l_t_undo,
+                                    l_batch_res, l_redo, l_undo);
                     l_failed := l_batch_res = 'FAILED';
                 EXCEPTION
                     WHEN OTHERS THEN
@@ -1563,7 +1803,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             BEGIN
                 epf_log.step_start('COUNT_AFTER', p_module);
-                count_tables(p_module, l_action, 'AFTER', l_processed,
+                count_tables(p_module, l_action, 'AFTER', l_processed, l_t_redo, l_t_undo,
                              p_complete => NOT l_failed AND l_batch_res = 'DONE');
                 count_orphans(p_module, 'AFTER');
                 epf_log.step_end('DONE');
@@ -1854,30 +2094,6 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       || CASE WHEN l_outside > 0 THEN ', ' || l_outside || ' unindexed FK columns outside the registry' END);
     END check_indexes;
 
-    -- Approximate redo of deleting one row: the row goes to undo and its
-    -- deletion to redo (about twice the row length plus fixed overhead), and
-    -- every index entry of the row is removed the same way.
-    FUNCTION row_redo_estimate(p_table_id IN NUMBER) RETURN NUMBER IS
-        l_owner VARCHAR2(128) := g_tables(p_table_id).owner;
-        l_table VARCHAR2(128) := g_tables(p_table_id).table_name;
-        l_row   NUMBER;
-        l_total NUMBER;
-    BEGIN
-        SELECT MAX(avg_row_len) INTO l_row FROM dba_tables WHERE owner = l_owner AND table_name = l_table;
-        l_total := 2 * NVL(l_row, 100) + 300;
-        FOR x IN (SELECT (SELECT NVL(SUM(tc.avg_col_len), 0)
-                            FROM dba_ind_columns ic
-                            JOIN dba_tab_columns tc
-                              ON tc.owner = ic.table_owner AND tc.table_name = ic.table_name
-                             AND tc.column_name = ic.column_name
-                           WHERE ic.index_owner = i.owner AND ic.index_name = i.index_name) AS key_len
-                    FROM dba_indexes i
-                   WHERE i.table_owner = l_owner AND i.table_name = l_table AND i.index_type <> 'LOB') LOOP
-            l_total := l_total + 2 * (x.key_len + 10) + 250;
-        END LOOP;
-        RETURN l_total;
-    END row_redo_estimate;
-
     -- Redo per root of a tree: measured by the latest purge of the tree on
     -- this database that did the same (deleting or clearing LOB values:
     -- TREE_REDO events), otherwise estimated from optimizer statistics (rows
@@ -1926,6 +2142,204 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         p_source := 'estimated from optimizer statistics';
     END tree_redo;
 
+    -- Rows per root of a tree (all its tables; LOB values when clearing):
+    -- measured by the latest purge of the tree on this database that did
+    -- the same (rows it processed in the tables of the tree over the roots
+    -- of its TREE_REDO), otherwise from optimizer statistics (rows of the
+    -- tables over the rows of the root table). NULL without statistics on
+    -- the root table.
+    FUNCTION tree_rows_root(p_root_id IN NUMBER) RETURN NUMBER IS
+        l_owner     VARCHAR2(128) := g_tables(p_root_id).owner;
+        l_table     VARCHAR2(128) := g_tables(p_root_id).table_name;
+        l_module    VARCHAR2(30)  := g_tables(p_root_id).module_code;
+        l_action    VARCHAR2(10)  := module_action(g_tables(p_root_id).module_code);
+        l_ids       SYS.ODCINUMBERLIST := tree_tables(p_root_id);
+        l_run       NUMBER;
+        l_roots     NUMBER;
+        l_rows      NUMBER;
+        l_root_rows NUMBER;
+    BEGIN
+        SELECT MAX(ev.run_id) KEEP (DENSE_RANK LAST ORDER BY ev.event_id),
+               MAX(ev.rows_affected) KEEP (DENSE_RANK LAST ORDER BY ev.event_id)
+          INTO l_run, l_roots
+          FROM epf_event ev
+          JOIN epf_run rn ON rn.run_id = ev.run_id
+         WHERE ev.event_code = 'TREE_REDO'
+           AND ev.object_owner = l_owner AND ev.object_name = l_table
+           AND ev.rows_affected > 0 AND ev.bytes > 0
+           AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                         OR (rn.purge_mode = 'CLOB_N_LOGS' AND l_module = c_logs_module)
+                    THEN c_delete ELSE c_clear END = l_action;
+        IF l_run IS NOT NULL THEN
+            SELECT SUM(s.processed_rows)
+              INTO l_rows
+              FROM epf_table_stat s
+              JOIN epf_table e ON e.table_id = s.table_id
+             WHERE s.run_id = l_run AND s.phase = 'AFTER' AND e.root_table_id = p_root_id;
+            IF l_rows > 0 THEN
+                RETURN l_rows / l_roots;
+            END IF;
+        END IF;
+        l_root_rows := stat_rows(l_owner, l_table);
+        IF l_root_rows = 0 THEN
+            RETURN NULL;
+        END IF;
+        l_rows := 0;
+        FOR k IN 1 .. l_ids.COUNT LOOP
+            CONTINUE WHEN NOT g_tables(l_ids(k)).reachable;
+            l_rows := l_rows + stat_rows(g_tables(l_ids(k)).owner, g_tables(l_ids(k)).table_name);
+        END LOOP;
+        RETURN GREATEST(l_rows / l_root_rows, 1);
+    END tree_rows_root;
+
+    -- Rows per second of a tree for the deleting time (p_rate, NULL when
+    -- nothing applies), and where it comes from (p_kind):
+    --   TREE     the latest purge of the tree on this database that did the
+    --            same (p_run): rows of its tables over the seconds of its
+    --            batches (TREE_REDO)
+    --   RUN      the latest such purge of any tree (p_run), all its trees
+    --   SETTING  delete_rows_s (deleting only), plus c_batch_s per batch
+    PROCEDURE tree_speed(p_root_id IN NUMBER, p_action IN VARCHAR2, p_rate OUT NUMBER, p_run OUT NUMBER,
+                         p_kind OUT VARCHAR2) IS
+        l_owner   VARCHAR2(128) := g_tables(p_root_id).owner;
+        l_table   VARCHAR2(128) := g_tables(p_root_id).table_name;
+        l_module  VARCHAR2(30)  := g_tables(p_root_id).module_code;
+        l_elapsed NUMBER;
+        l_rows    NUMBER;
+    BEGIN
+        p_rate := NULL;
+        p_kind := NULL;
+        SELECT MAX(ev.run_id) KEEP (DENSE_RANK LAST ORDER BY ev.event_id),
+               MAX(ev.elapsed_s) KEEP (DENSE_RANK LAST ORDER BY ev.event_id)
+          INTO p_run, l_elapsed
+          FROM epf_event ev
+          JOIN epf_run rn ON rn.run_id = ev.run_id
+         WHERE ev.event_code = 'TREE_REDO'
+           AND ev.object_owner = l_owner AND ev.object_name = l_table
+           AND ev.rows_affected > 0 AND ev.elapsed_s > 0
+           AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                         OR (rn.purge_mode = 'CLOB_N_LOGS' AND l_module = c_logs_module)
+                    THEN c_delete ELSE c_clear END = p_action;
+        IF p_run IS NOT NULL THEN
+            SELECT SUM(s.processed_rows)
+              INTO l_rows
+              FROM epf_table_stat s
+              JOIN epf_table e ON e.table_id = s.table_id
+             WHERE s.run_id = p_run AND s.phase = 'AFTER' AND e.root_table_id = p_root_id;
+            IF l_rows > 0 THEN
+                p_rate := l_rows / l_elapsed;
+                p_kind := 'TREE';
+                RETURN;
+            END IF;
+        END IF;
+        SELECT MAX(ev.run_id)
+          INTO p_run
+          FROM epf_event ev
+          JOIN epf_run rn ON rn.run_id = ev.run_id
+          JOIN epf_table e ON e.owner = ev.object_owner AND e.table_name = ev.object_name
+         WHERE ev.event_code = 'TREE_REDO' AND ev.rows_affected > 0 AND ev.elapsed_s > 0
+           AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                         OR (rn.purge_mode = 'CLOB_N_LOGS' AND e.module_code = c_logs_module)
+                    THEN c_delete ELSE c_clear END = p_action;
+        IF p_run IS NOT NULL THEN
+            SELECT SUM(ev.elapsed_s)
+              INTO l_elapsed
+              FROM epf_event ev
+              JOIN epf_run rn ON rn.run_id = ev.run_id
+              JOIN epf_table e ON e.owner = ev.object_owner AND e.table_name = ev.object_name
+             WHERE ev.run_id = p_run AND ev.event_code = 'TREE_REDO' AND ev.rows_affected > 0 AND ev.elapsed_s > 0
+               AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
+                             OR (rn.purge_mode = 'CLOB_N_LOGS' AND e.module_code = c_logs_module)
+                        THEN c_delete ELSE c_clear END = p_action;
+            SELECT SUM(s.processed_rows)
+              INTO l_rows
+              FROM epf_table_stat s
+             WHERE s.run_id = p_run AND s.phase = 'AFTER' AND s.action = p_action;
+            IF l_rows > 0 AND l_elapsed > 0 THEN
+                p_rate := l_rows / l_elapsed;
+                p_kind := 'RUN';
+                RETURN;
+            END IF;
+        END IF;
+        p_run := NULL;
+        IF p_action = c_delete THEN
+            p_rate := epf_util.setting_num('delete_rows_s');
+            p_kind := 'SETTING';
+        END IF;
+    END tree_speed;
+
+    FUNCTION trees_text(p_count IN NUMBER) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN p_count || CASE WHEN p_count = 1 THEN ' tree' ELSE ' trees' END;
+    END trees_text;
+
+    -- Adds the deleting time of p_rows rows of a tree in p_batches batches
+    -- to a module's (rows / tree_speed, plus c_batch_s per batch with the
+    -- assumed speed). Rows or a speed unknown make the module's time unknown.
+    PROCEDURE add_time(p_time IN OUT NOCOPY t_time, p_root_id IN NUMBER, p_action IN VARCHAR2,
+                       p_rows IN NUMBER, p_batches IN NUMBER) IS
+        l_rate  NUMBER;
+        l_run   NUMBER;
+        l_kind  VARCHAR2(10);
+        l_label VARCHAR2(20);
+    BEGIN
+        tree_speed(p_root_id, p_action, l_rate, l_run, l_kind);
+        IF p_rows IS NULL OR NVL(l_rate, 0) <= 0 THEN
+            p_time.no_time := TRUE;
+            RETURN;
+        END IF;
+        p_time.row_total := p_time.row_total + p_rows;
+        p_time.seconds   := p_time.seconds + p_rows / l_rate
+                            + CASE WHEN l_kind = 'SETTING' THEN NVL(p_batches, 0) * c_batch_s ELSE 0 END;
+        IF l_kind = 'TREE' THEN
+            l_label := epf_util.run_label(l_run);
+            p_time.n_tree := p_time.n_tree + 1;
+            IF p_time.runs IS NULL THEN
+                p_time.runs := l_label;
+            ELSIF INSTR(p_time.runs, l_label) = 0 THEN
+                p_time.runs := SUBSTR(p_time.runs || ', ' || l_label, 1, 400);
+            END IF;
+        ELSIF l_kind = 'RUN' THEN
+            p_time.n_run     := p_time.n_run + 1;
+            p_time.other_run := epf_util.run_label(l_run);
+        ELSE
+            p_time.n_set := p_time.n_set + 1;
+        END IF;
+    END add_time;
+
+    -- Deleting seconds of a module; NULL when unknown.
+    FUNCTION time_seconds(p_time IN t_time) RETURN NUMBER IS
+    BEGIN
+        IF p_time.no_time THEN
+            RETURN NULL;
+        END IF;
+        RETURN p_time.seconds;
+    END time_seconds;
+
+    -- Basis of a module's deleting time (EPF_FORECAST.time_basis): its speed
+    -- in rows per second and where the speed of its trees comes from.
+    FUNCTION time_basis(p_time IN t_time) RETURN VARCHAR2 IS
+        l_assumed VARCHAR2(200) := epf_util.fmt_int(epf_util.setting_num('delete_rows_s')) || ' rows/s and '
+                                   || ROUND(c_batch_s * 1000) || ' ms per batch assumed (setting delete_rows_s)';
+    BEGIN
+        IF p_time.no_time OR p_time.seconds <= 0 THEN
+            RETURN NULL;
+        END IF;
+        RETURN 'about ' || epf_util.fmt_int(p_time.row_total / p_time.seconds) || ' rows/s, '
+               || CASE WHEN p_time.n_tree > 0 AND p_time.n_run + p_time.n_set = 0
+                       THEN 'measured per tree by ' || p_time.runs
+                       WHEN p_time.n_tree = 0 AND p_time.n_run = 0
+                       THEN l_assumed || ', no purge measured on this database yet'
+                       WHEN p_time.n_tree = 0 AND p_time.n_set = 0
+                       THEN 'at the speed of ' || p_time.other_run || ' (trees not purged yet)'
+                       ELSE CASE WHEN p_time.n_tree > 0 THEN 'measured per tree by ' || p_time.runs || '; ' END
+                            || CASE WHEN p_time.n_run > 0 THEN trees_text(p_time.n_run)
+                                                               || ' not purged yet at the speed of ' || p_time.other_run END
+                            || CASE WHEN p_time.n_run > 0 AND p_time.n_set > 0 THEN '; ' END
+                            || CASE WHEN p_time.n_set > 0 THEN trees_text(p_time.n_set) || ' at ' || l_assumed END
+                  END;
+    END time_basis;
+
     -- Batch size rounded down to two significant digits, between 100 and 100000.
     FUNCTION round_batch(p_value IN NUMBER) RETURN NUMBER IS
         l_scale NUMBER;
@@ -1948,19 +2362,29 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN NULL;
     END eligible_roots;
 
-    -- Root rows in one batch: the batch size, or fewer when fewer roots are eligible.
+    -- Root rows in one batch: the batch size, fewer when fewer roots are
+    -- eligible or when the rows per root of the tree (check_redo) would pass
+    -- the run's rows limit.
     FUNCTION batch_roots(p_root_id IN NUMBER) RETURN NUMBER IS
+        l_roots NUMBER := LEAST(g_run.batch_size, NVL(eligible_roots(p_root_id), g_run.batch_size));
     BEGIN
-        RETURN LEAST(g_run.batch_size, NVL(eligible_roots(p_root_id), g_run.batch_size));
+        IF g_rows_root.EXISTS(p_root_id) AND g_rows_root(p_root_id) > 0 THEN
+            l_roots := LEAST(l_roots, GREATEST(1, FLOOR(rows_cap / g_rows_root(p_root_id))));
+        END IF;
+        RETURN l_roots;
     END batch_roots;
 
-    -- Redo and undo per root of a tree, kept with the preflight run
+    -- Rows, redo and undo per root of a tree, kept with the preflight run
     -- (EPF_TREE_EST) for the requirements and the forecasts.
     PROCEDURE save_tree_redo(p_root_id IN NUMBER, p_per_root IN NUMBER, p_basis IN VARCHAR2) IS
-        l_run NUMBER := g_run.run_id;
+        l_run  NUMBER := g_run.run_id;
+        l_rows NUMBER;
     BEGIN
+        IF g_rows_root.EXISTS(p_root_id) THEN
+            l_rows := g_rows_root(p_root_id);
+        END IF;
         UPDATE epf_tree_est
-           SET redo_root = p_per_root, redo_basis = SUBSTR(p_basis, 1, 400)
+           SET redo_root = p_per_root, redo_basis = SUBSTR(p_basis, 1, 400), rows_root = l_rows
          WHERE run_id = l_run AND table_id = p_root_id;
         COMMIT;
     END save_tree_redo;
@@ -2037,6 +2461,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 END IF;
                 CONTINUE;
             END IF;
+            g_rows_root(r.table_id) := tree_rows_root(r.table_id);
             tree_redo(r.table_id, l_per_root, l_source);
             IF module_action(g_tables(r.table_id).module_code) <> c_delete THEN
                 -- LOB clearing: only a measurement by an earlier clearing purge
@@ -2203,7 +2628,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             ELSE
                 tree_redo(r.table_id, l_redo, l_source);
                 CONTINUE WHEN l_redo IS NULL;
-                l_per_root := 0.45 * l_redo;
+                l_per_root := c_undo_share * l_redo;
                 l_source   := 'estimated from the redo, ' || l_source;
                 l_rate     := NULL;
             END IF;
@@ -2434,41 +2859,6 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Requirements and forecasts
     -- ------------------------------------------------------------------
 
-    -- Redo written per second for the time forecast: measured by the latest
-    -- purge on this database that processed trees with the same action
-    -- (TREE_REDO bytes over their seconds), otherwise the setting
-    -- redo_rate_mb_s.
-    PROCEDURE redo_rate(p_action IN VARCHAR2, p_rate OUT NUMBER, p_basis OUT VARCHAR2) IS
-        l_last NUMBER;
-    BEGIN
-        SELECT MAX(ev.run_id)
-          INTO l_last
-          FROM epf_event ev
-          JOIN epf_run rn ON rn.run_id = ev.run_id
-          JOIN epf_table e ON e.owner = ev.object_owner AND e.table_name = ev.object_name
-         WHERE ev.event_code = 'TREE_REDO' AND ev.bytes > 0 AND ev.elapsed_s > 0
-           AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
-                         OR (rn.purge_mode = 'CLOB_N_LOGS' AND e.module_code = c_logs_module)
-                    THEN c_delete ELSE c_clear END = p_action;
-        IF l_last IS NOT NULL THEN
-            SELECT SUM(ev.bytes) / SUM(ev.elapsed_s)
-              INTO p_rate
-              FROM epf_event ev
-              JOIN epf_run rn ON rn.run_id = ev.run_id
-              JOIN epf_table e ON e.owner = ev.object_owner AND e.table_name = ev.object_name
-             WHERE ev.run_id = l_last
-               AND ev.event_code = 'TREE_REDO' AND ev.bytes > 0 AND ev.elapsed_s > 0
-               AND CASE WHEN rn.purge_mode IN ('FULL', 'LOGS')
-                             OR (rn.purge_mode = 'CLOB_N_LOGS' AND e.module_code = c_logs_module)
-                        THEN c_delete ELSE c_clear END = p_action;
-            p_basis := 'redo rate measured by ' || epf_util.run_label(l_last) || ', ' || epf_util.fmt_bytes(p_rate) || '/s';
-        ELSE
-            p_rate  := epf_util.setting_num('redo_rate_mb_s') * 1048576;
-            p_basis := 'assumed redo rate ' || epf_util.setting('redo_rate_mb_s')
-                       || ' MB/s (no purge measured on this database yet)';
-        END IF;
-    END redo_rate;
-
     -- Free space for archived logs: the smallest free space of the valid local
     -- archive destinations (recovery area: limit - used + reclaimable; ASM
     -- disk group: free). NULL when a destination cannot be measured from the
@@ -2553,13 +2943,6 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         END LOOP;
         RETURN l_fit;
     END fit_cutoff;
-
-    FUNCTION stat_rows(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN NUMBER IS
-        l_rows NUMBER;
-    BEGIN
-        SELECT MAX(num_rows) INTO l_rows FROM dba_tables WHERE owner = p_owner AND table_name = p_table;
-        RETURN NVL(l_rows, 0);
-    END stat_rows;
 
     -- Size of an index on p_columns of a table: rows x (key length + row
     -- address) plus block overhead, from optimizer statistics.
@@ -2906,26 +3289,29 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     END check_requirements;
 
     -- Forecast of the preflight per module (EPF_FORECAST, origin PREFLIGHT):
-    -- eligible roots, batches, redo and undo from the estimates per root, and
-    -- the deleting time at the measured (or assumed) redo rate.
+    -- eligible roots, batches (batch_roots per tree), redo and undo from the
+    -- estimates per root, and the deleting time of the rows the roots carry
+    -- (rows per root) at the speed of each tree (add_time).
     PROCEDURE forecast_preflight IS
         l_run     NUMBER := g_run.run_id;
-        l_batch   NUMBER := g_run.batch_size;
         l_module  VARCHAR2(30);
         l_action  VARCHAR2(10);
         l_roots   NUMBER;
         l_batches NUMBER;
+        l_tbatch  NUMBER;
         l_redo    NUMBER;
         l_undo    NUMBER;
         l_rbasis  VARCHAR2(400);
-        l_rate    NUMBER;
+        l_secs    NUMBER;
         l_tbasis  VARCHAR2(400);
+        l_time    t_time;
+        l_empty   t_time;
     BEGIN
         DELETE FROM epf_forecast WHERE run_id = l_run AND origin = 'PREFLIGHT';
         FOR m IN 1 .. g_modules.COUNT LOOP
             l_module := g_modules(m);
             l_action := module_action(l_module);
-            SELECT SUM(te.roots), SUM(CEIL(te.roots / l_batch)),
+            SELECT SUM(te.roots),
                    CASE WHEN COUNT(CASE WHEN te.roots > 0 AND te.redo_root IS NULL THEN 1 END) = 0
                         THEN NVL(SUM(te.roots * te.redo_root), 0) END,
                    CASE WHEN COUNT(CASE WHEN te.roots > 0 AND te.undo_root IS NULL THEN 1 END) = 0
@@ -2933,15 +3319,27 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                    MAX(te.redo_basis) KEEP (DENSE_RANK FIRST ORDER BY
                        CASE WHEN te.roots > 0 AND te.redo_root IS NULL THEN 0
                             WHEN te.redo_basis NOT LIKE 'measured%' THEN 1 ELSE 2 END)
-              INTO l_roots, l_batches, l_redo, l_undo, l_rbasis
+              INTO l_roots, l_redo, l_undo, l_rbasis
               FROM epf_tree_est te
               JOIN epf_table t ON t.table_id = te.table_id
              WHERE te.run_id = l_run AND t.module_code = l_module;
-            redo_rate(l_action, l_rate, l_tbasis);
+            l_batches := 0;
+            l_time    := l_empty;
+            FOR t IN (SELECT te.table_id, te.roots, te.rows_root
+                        FROM epf_tree_est te
+                        JOIN epf_table e ON e.table_id = te.table_id
+                       WHERE te.run_id = l_run AND e.module_code = l_module AND te.roots > 0
+                       ORDER BY te.table_id) LOOP
+                l_tbatch  := CEIL(t.roots / batch_roots(t.table_id));
+                l_batches := l_batches + l_tbatch;
+                add_time(l_time, t.table_id, l_action, t.roots * t.rows_root, l_tbatch);
+            END LOOP;
+            l_secs   := time_seconds(l_time);
+            l_tbasis := time_basis(l_time);
             INSERT INTO epf_forecast (run_id, origin, module_code, action, roots, row_count, batches, redo_bytes,
                                       undo_bytes, delete_seconds, freed_bytes, redo_basis, time_basis)
             VALUES (l_run, 'PREFLIGHT', l_module, l_action, l_roots, NULL, l_batches, l_redo,
-                    l_undo, l_redo / NULLIF(l_rate, 0), NULL, l_rbasis, l_tbasis);
+                    l_undo, l_secs, NULL, l_rbasis, l_tbasis);
         END LOOP;
         COMMIT;
     END forecast_preflight;
@@ -2994,15 +3392,16 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
     -- Forecast of a dry run per module (EPF_FORECAST, origin DRY_RUN): rows
     -- (or non-empty LOB values) and roots exactly as counted after holding
-    -- back, batches of the key snapshot, the deleting time, and the space
-    -- freed inside the segments (used space of each table x its eligible
-    -- share; LOB segments only when clearing). Redo and undo per tree: the
-    -- rows this dry run counted in the tables of the tree times the redo and
-    -- undo per row measured by the latest purge of the tree; without one, the
-    -- rows of each table times its estimate per row from optimizer
-    -- statistics (deleting only; undo 45% of the redo). Per row rather than
-    -- per root: roots of different ages carry very different numbers of
-    -- rows. Runs before the work keys are released.
+    -- back, batches of the key snapshot, the space freed inside the segments
+    -- (used space of each table x its eligible share; LOB segments only when
+    -- clearing), and redo and undo per table: the rows this dry run counted
+    -- in the table times the redo and undo per row measured by the latest
+    -- purge that processed at least c_min_rows of its rows, else measured for
+    -- its tree (tree_per_row), else estimated from optimizer statistics
+    -- (deleting only; undo c_undo_share of the redo). Per row rather than per
+    -- root: roots of different ages carry very different numbers of rows.
+    -- The deleting time of each tree: its rows at its speed (add_time). Runs
+    -- before the work keys are released.
     PROCEDURE forecast_dry_run IS
         l_run      NUMBER := g_run.run_id;
         l_module   VARCHAR2(30);
@@ -3014,19 +3413,35 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_undo     NUMBER;
         l_freed    NUMBER;
         l_rbasis   VARCHAR2(400);
-        l_rate     NUMBER;
+        l_secs     NUMBER;
         l_tbasis   VARCHAR2(400);
         l_root     NUMBER;
         l_t_rows   NUMBER;
-        l_t_redo   NUMBER;
+        l_t_batch  NUMBER;
         l_k_rows   NUMBER;
+        l_k_redo   NUMBER;
+        l_k_undo   NUMBER;
+        l_k_run    NUMBER;
+        l_k_est    NUMBER;
         l_pr_redo  NUMBER;
         l_pr_undo  NUMBER;
         l_mrun     NUMBER;
         l_unknown  BOOLEAN;
-        l_stats    BOOLEAN;
-        l_measured VARCHAR2(400);
+        l_est      NUMBER;
+        l_measured VARCHAR2(300);
         l_ids      SYS.ODCINUMBERLIST;
+        l_time     t_time;
+        l_empty    t_time;
+
+        PROCEDURE add_run(p_run IN NUMBER) IS
+            l_label VARCHAR2(20) := epf_util.run_label(p_run);
+        BEGIN
+            IF l_measured IS NULL THEN
+                l_measured := l_label;
+            ELSIF INSTR(l_measured, l_label) = 0 THEN
+                l_measured := SUBSTR(l_measured || ', ' || l_label, 1, 300);
+            END IF;
+        END add_run;
     BEGIN
         DELETE FROM epf_forecast WHERE run_id = l_run AND origin = 'DRY_RUN';
         FOR m IN 1 .. g_modules.COUNT LOOP
@@ -3047,8 +3462,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_redo     := 0;
             l_undo     := 0;
             l_unknown  := FALSE;
-            l_stats    := FALSE;
+            l_est      := 0;
             l_measured := NULL;
+            l_time     := l_empty;
             FOR r IN (SELECT e.table_id
                         FROM epf_table e
                        WHERE e.active = 'Y' AND e.role = 'ROOT' AND e.module_code = l_module
@@ -3061,44 +3477,55 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                   JOIN epf_table e ON e.table_id = s.table_id
                  WHERE s.run_id = l_run AND s.phase = 'BEFORE' AND e.root_table_id = l_root;
                 CONTINUE WHEN NVL(l_t_rows, 0) = 0;
+                SELECT NVL(MAX(batch_no), 0) INTO l_t_batch
+                  FROM epf_work_key
+                 WHERE run_id = l_run AND table_id = l_root;
+                add_time(l_time, l_root, l_action, l_t_rows, l_t_batch);
                 tree_per_row(l_root, l_action, l_pr_redo, l_pr_undo, l_mrun);
-                IF l_mrun IS NOT NULL THEN
-                    l_redo := l_redo + l_t_rows * l_pr_redo;
-                    l_undo := l_undo + l_t_rows * NVL(l_pr_undo, 0.45 * l_pr_redo);
-                    IF l_measured IS NULL THEN
-                        l_measured := epf_util.run_label(l_mrun);
-                    ELSIF INSTR(l_measured, epf_util.run_label(l_mrun)) = 0 THEN
-                        l_measured := l_measured || ', ' || epf_util.run_label(l_mrun);
+                l_ids := tree_tables(l_root);
+                FOR k IN 1 .. l_ids.COUNT LOOP
+                    CONTINUE WHEN NOT g_tables(l_ids(k)).reachable;
+                    SELECT MAX(CASE WHEN s.action = 'CLEAR' THEN s.nonempty_lob_rows ELSE s.eligible_rows END)
+                      INTO l_k_rows
+                      FROM epf_table_stat s
+                     WHERE s.run_id = l_run AND s.phase = 'BEFORE' AND s.table_id = l_ids(k);
+                    CONTINUE WHEN NVL(l_k_rows, 0) = 0;
+                    SELECT MAX(s.redo_bytes / s.processed_rows) KEEP (DENSE_RANK LAST ORDER BY s.run_id),
+                           MAX(s.undo_bytes / s.processed_rows) KEEP (DENSE_RANK LAST ORDER BY s.run_id),
+                           MAX(s.run_id)
+                      INTO l_k_redo, l_k_undo, l_k_run
+                      FROM epf_table_stat s
+                     WHERE s.table_id = l_ids(k) AND s.phase = 'AFTER' AND s.action = l_action
+                       AND s.processed_rows >= c_min_rows AND s.redo_bytes IS NOT NULL;
+                    IF l_k_run IS NOT NULL THEN
+                        l_redo := l_redo + l_k_rows * l_k_redo;
+                        l_undo := l_undo + l_k_rows * NVL(l_k_undo, c_undo_share * l_k_redo);
+                        add_run(l_k_run);
+                    ELSIF l_mrun IS NOT NULL THEN
+                        l_redo := l_redo + l_k_rows * l_pr_redo;
+                        l_undo := l_undo + l_k_rows * NVL(l_pr_undo, c_undo_share * l_pr_redo);
+                        add_run(l_mrun);
+                    ELSIF l_action = c_delete THEN
+                        l_k_est := row_redo_estimate(l_ids(k));
+                        l_redo  := l_redo + l_k_rows * l_k_est;
+                        l_undo  := l_undo + l_k_rows * c_undo_share * l_k_est;
+                        l_est   := l_est + 1;
+                    ELSE
+                        l_unknown := TRUE;
                     END IF;
-                ELSIF l_action = c_delete THEN
-                    l_ids    := tree_tables(l_root);
-                    l_t_redo := 0;
-                    FOR k IN 1 .. l_ids.COUNT LOOP
-                        CONTINUE WHEN NOT g_tables(l_ids(k)).reachable;
-                        SELECT MAX(s.eligible_rows)
-                          INTO l_k_rows
-                          FROM epf_table_stat s
-                         WHERE s.run_id = l_run AND s.phase = 'BEFORE' AND s.table_id = l_ids(k);
-                        IF NVL(l_k_rows, 0) > 0 THEN
-                            l_t_redo := l_t_redo + l_k_rows * row_redo_estimate(l_ids(k));
-                        END IF;
-                    END LOOP;
-                    l_redo  := l_redo + l_t_redo;
-                    l_undo  := l_undo + 0.45 * l_t_redo;
-                    l_stats := TRUE;
-                ELSE
-                    l_unknown := TRUE;
-                END IF;
+                END LOOP;
             END LOOP;
             IF l_unknown THEN
                 l_redo := NULL;
                 l_undo := NULL;
             END IF;
             l_rbasis := CASE WHEN l_unknown THEN 'no LOB clearing measured on this database yet'
-                             WHEN l_measured IS NOT NULL AND l_stats
-                             THEN 'per row, measured by ' || l_measured || '; other trees estimated from optimizer statistics'
+                             WHEN l_measured IS NOT NULL AND l_est > 0
+                             THEN 'per row, measured by ' || l_measured || '; ' || l_est
+                                  || CASE WHEN l_est = 1 THEN ' table' ELSE ' tables' END
+                                  || ' estimated from optimizer statistics'
                              WHEN l_measured IS NOT NULL THEN 'per row, measured by ' || l_measured
-                             WHEN l_stats THEN 'per row, estimated from optimizer statistics'
+                             WHEN l_est > 0 THEN 'per row, estimated from optimizer statistics'
                         END;
             SELECT SUM(x.used * x.eligible / NULLIF(x.total, 0))
               INTO l_freed
@@ -3115,11 +3542,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       FROM epf_table_stat s
                       JOIN epf_table t ON t.table_id = s.table_id
                      WHERE s.run_id = l_run AND s.phase = 'BEFORE' AND t.module_code = l_module) x;
-            redo_rate(l_action, l_rate, l_tbasis);
+            l_secs   := time_seconds(l_time);
+            l_tbasis := time_basis(l_time);
             INSERT INTO epf_forecast (run_id, origin, module_code, action, roots, row_count, batches, redo_bytes,
                                       undo_bytes, delete_seconds, freed_bytes, redo_basis, time_basis)
             VALUES (l_run, 'DRY_RUN', l_module, l_action, l_roots, l_rows, l_batches, l_redo,
-                    l_undo, l_redo / NULLIF(l_rate, 0), l_freed, l_rbasis, l_tbasis);
+                    l_undo, l_secs, l_freed, l_rbasis, l_tbasis);
             COMMIT;
             epf_log.event(epf_log.c_info, 'FORECAST',
                           l_module || ': ' || epf_util.fmt_int(l_rows) || ' '
@@ -3127,9 +3555,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                           || ', ' || epf_util.fmt_int(l_batches) || ' batches'
                           || CASE WHEN l_redo IS NOT NULL THEN
                                  ', about ' || epf_util.fmt_bytes(l_redo) || ' redo, '
-                                 || NVL(epf_util.fmt_bytes(l_undo), '-') || ' undo, '
-                                 || epf_util.fmt_duration(l_redo / NULLIF(l_rate, 0)) || ' deleting'
+                                 || NVL(epf_util.fmt_bytes(l_undo), '-') || ' undo'
                                  ELSE ', no redo estimate' END
+                          || CASE WHEN l_secs IS NOT NULL THEN ', ' || epf_util.fmt_duration(l_secs) || ' deleting' END
                           || CASE WHEN l_freed IS NOT NULL THEN ', about ' || epf_util.fmt_bytes(l_freed) || ' freed' END,
                           p_rows => l_rows, p_bytes => l_redo);
         END LOOP;

@@ -196,11 +196,12 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.5.2', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.5.3', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
     put_setting('batch_size_default',     '1000',  'Root rows per purge batch when none is given');
+    put_setting('batch_rows_max',         '200000', 'Rows a purge batch holds at most besides its batch size in root rows; a root whose tree alone holds more is a batch of its own');
     put_setting('progress_interval_s',    '5',     'Minimum seconds between progress events of one module');
     put_setting('lob_throttle_ms',        '500',   'Pause between LOB-clearing batches (space management background process)');
     put_setting('history_retention_days', '180',   'Runs older than this are removed at the start of a new run');
@@ -216,7 +217,7 @@ BEGIN
     put_setting('undo_cap_mb',            '4096',  'Undo tuning limits the growth of the undo tablespace to the largest of its current size, this value and 4 x the undo of one batch');
     put_setting('archive_margin_pct',     '20',    'Margin added to the redo estimate when the preflight checks the archive destination (requirement ARCHIVE)');
     put_setting('backup_max_age_h',       '24',    'A successful RMAN database backup newer than this many hours meets the BACKUP requirement');
-    put_setting('redo_rate_mb_s',         '30',    'Redo written per second assumed for the time forecast until a purge on the database has measured it');
+    put_setting('delete_rows_s',          '50000', 'Rows deleted per second assumed for the time forecast until a purge on the database has measured it');
     put_setting('preflight_valid_h',      '8',     'A purge reuses the root counts of a preflight with the same cutoff, mode and depth for this many hours');
 
     -- Remove settings that are no longer listed above.

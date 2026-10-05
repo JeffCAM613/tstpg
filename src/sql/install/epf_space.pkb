@@ -214,10 +214,16 @@ CREATE OR REPLACE PACKAGE BODY epf_space AS
                         full_bytes         => l_full,
                         partition_name     => s.partition_name);
                     l_method := 'ASSM';
+                    -- Blocks of a free-space band count at the middle of the
+                    -- band (FS1 0-25% free ... FS3 50-75% free). Blocks with at
+                    -- least 75% free (FS4) are counted as empty: they are blocks
+                    -- formatted but not filled yet, or emptied by deletes;
+                    -- counted at 12.5% used, a table emptied by a purge would
+                    -- still show an eighth of its blocks as used.
                     IF s.segment_type LIKE 'INDEX%' THEN
                         l_used := l_full;
                     ELSE
-                        l_used := l_full + l_fs1 * 0.875 + l_fs2 * 0.625 + l_fs3 * 0.375 + l_fs4 * 0.125;
+                        l_used := l_full + l_fs1 * 0.875 + l_fs2 * 0.625 + l_fs3 * 0.375;
                     END IF;
                     l_raw := l_used;
                     IF s.securefile = 'NO' AND p_phase = c_baseline THEN

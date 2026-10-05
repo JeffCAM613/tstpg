@@ -2,8 +2,102 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
-## 2026-10-05 - Set E step 1 on EPFPG783 (0.5.2, batch 530)
+## 2026-10-05 - First-purge estimate calibrated, deleting time per row, batches limited by rows, emptied blocks counted as free (0.5.3)
 
+Built from the set E measurements (entry below). Not yet run on a database.
+
+- Redo per row from optimizer statistics (`row_redo_estimate`):
+  - now 1.2 R + 180 B, plus 1.2 K + 162 B per index (R = avg_row_len, K = key length);
+  - was 2 R + 300 B, plus 2 K + 270 B per index;
+  - the factor 0.6 comes from set E, where the measured redo was 0.53 (PAYMENTS), 0.59 (BANK_STATEMENTS) and 0.73 (LOGS) times the old estimate.
+- Undo estimated as 0.5 times the redo, up from 0.45. Set E measured 0.49, 0.68 and 0.43 (0.50 overall).
+- Recomputed for set E step 1:
+
+  | Module | Redo | Undo |
+  |---|---|---|
+  | PAYMENTS | +14% | +16% |
+  | LOGS | -18% | -3% |
+  | BANK_STATEMENTS | +2% | -25% |
+
+- Deleting time is now rows divided by rows per second, no longer redo divided by a redo rate, so a wrong redo estimate no longer distorts it. Rows per second come from, in order:
+  - the latest purge of the same tree;
+  - else the latest purge on the database, all trees together;
+  - else the new setting `delete_rows_s` (50,000) plus 6 ms per batch.
+
+  `delete_rows_s` replaces `redo_rate_mb_s`. Set E measured 52,300 rows/s (PAYMENTS) and 54,800 rows/s (BANK_STATEMENTS). LOGS, at 530 rows per batch, spent about 6 ms per batch.
+- Recomputed for set E, time error (was):
+
+  | Module | Step 1, assumed speed | Step 2, measured per tree |
+  |---|---|---|
+  | PAYMENTS | +5% (+162%) | +33% (+30%) |
+  | LOGS | +2% (+90%) | -1% (-3%) |
+  | BANK_STATEMENTS | +13% (+255%) | -12% (+43%) |
+
+- The preflight forecast takes its deleting time from rows per root: from the latest purge of the tree, else from statistics (`EPF_TREE_EST.rows_root`).
+- Batches limited by rows. A new setting, `batch_rows_max` (200,000), is recorded with each run in `EPF_RUN.batch_rows`.
+  - A batch holds at most the batch size in roots and about 200,000 rows.
+  - Rows of a bulk payment = its keys in each table with keys (payments, import audits, workflow executions, invoices) times that table's rows per key from statistics. On the set E data that is about 675 rows for an old bulk payment, against 684 measured.
+  - A root above the limit gets a batch of its own. Grouped roots stay together.
+  - Trees without link sources with keys below the root use the same rows per root for every root: LOGS and BANK_STATEMENTS keep 530 roots per batch.
+  - Why: set E step 1 ran 341K rows per batch at 830 B and 19.1 us per row. Step 2 ran 158K rows per batch at 766 B and 14.3 us per row. Set B, at 683K rows per batch, cost 1,098 B and 29.6 us per row.
+  - On the step 1 data PAYMENTS goes from 248 batches to about 450.
+  - The preflight's batch redo and undo (REDO_LOGS, UNDO) use the batch limited by rows.
+- Redo and undo are now measured per table:
+  - stored in `EPF_TABLE_STAT.redo_bytes` and `undo_bytes` after the purge, with the statistics estimate per row in `est_redo_row` before it;
+  - REDO AND UNDO lists each table with rows, redo per row, undo per row and the estimate per row, plus machine lines `EPF_TABLE_REDO|run|table|rows|redo|undo|estimate`;
+  - the dry run uses a table's own measurement when a purge processed at least 1,000 of its rows, else its tree's, else statistics;
+  - purpose: calibrate the statistics formula per table from the next purges.
+- Space: blocks at least 75% free (ASSM FS4) now count as empty; before, they counted as 12.5% used.
+  - In set E step 2 the space forecast was +89% for PAYMENTS and +55% for BANK_STATEMENTS. Emptied blocks still counted 12.5% used: DIRECTORY_DISPATCHING showed 320.5 MB used after its last row was deleted, AUDIT_TRAIL 15.8 MB with 90 rows left.
+  - Table space figures are lower than in earlier versions, by up to an eighth of the emptied blocks.
+- Report:
+  - each SIMULATION and ESTIMATE basis line names its modules when the modules differ (set E printed two "Redo and undo per row" lines without saying which was LOGS);
+  - Parameters shows `batch 530 (at most 200,000 rows)`;
+  - KEYS_SNAPSHOT shows the batch limits;
+  - `EPF_ADVICE|UNDO_MAX_BATCH` comes from the largest undo per root.
+- Faster measuring: the session statistics are read by their statistic number, looked up once.
+
+How to test: set G on EPFPG783 after a refresh. It runs the same two steps as set E, with batch 530, `--redo-logs --undo-tuning --backup none`.
+- G1: pull and install. Pass if `EPFPG objects valid, tool version 0.5.3`.
+- G2, step 1 at 2023-09-28, dry run then purge. Pass if:
+  - KEYS_SNAPSHOT shows about 450 PAYMENTS batches of up to 530 roots and about 200,000 rows;
+  - FORECAST AND RESULT shows rows at 0.0%, redo and undo within about +-30%, deleting time within about +-30% and space freed within about +-10%.
+
+  Also compare the purge's PAYMENTS redo per row and time per row with set E step 1 (830 B, 19.1 us). REDO AND UNDO lists every table.
+- G3, step 2 at 2025-10-01, dry run then purge. Pass if:
+  - the dry run says `per row, measured by R-...` (now per table);
+  - FORECAST AND RESULT shows rows at 0.0%, redo and undo within about +-15%, deleting time within about +-35% and space freed within about +-15%. Set E had +89% and +55% space for PAYMENTS and BANK_STATEMENTS.
+- G4: collect the 4 reports into `.local\test.log`.
+
+## 2026-10-05 - Set E on EPFPG783 (0.5.2, batch 530): per-row forecast and LOB space carry-over verified
+
+Step 2 (E3), cutoff 2025-10-01:
+- Dry run R-000061 (1:33), then purge R-000062 (4:29): PASS. P4 passes this time, because the purge deleted the AUDIT_TRAIL rows with the old orphans.
+- The dry run used `Redo and undo per row, measured by R-000042` (the step 1 purge) and a redo rate of 42.3 MB/s, also measured by R-000042.
+- FORECAST AND RESULT:
+
+  | Module | Rows | Redo | Undo | Deleting time | Space freed |
+  |---|---|---|---|---|---|
+  | PAYMENTS | 0.0% | +8.3% | +5.4% | +29.9% | +89.0% |
+  | LOGS | 0.0% | -8.6% | -5.3% | -2.7% | +13.3% |
+  | BANK_STATEMENTS | 0.0% | -11.2% | -11.9% | +42.6% | +55.2% |
+
+  Set B's step 2, measured per bulk payment, was +122% for PAYMENTS redo.
+- LOB space carried over:
+  - used before was 3.3 GB, equal to what step 1 left (set B: 16.2 GB);
+  - the report says `Used before includes 6 BASICFILE LOB segments carried over`;
+  - freed 1.8 GB.
+- Space freed was forecast too high because emptied blocks count as 12.5% used (ASSM FS4 band midpoint). For example:
+  - DIRECTORY_DISPATCHING: 320.5 MB used after, with no rows left;
+  - PAYMENT_ADDITIONAL_INFO: 529.6 MB used after, with 83,926 of 3.7M rows left.
+
+  The forecast takes used before times the eligible share, so it counts that floor as freed. Fixed in 0.5.3.
+- The dry run printed two basis lines, `per row, measured by R-000042` and `...; other trees estimated from optimizer statistics`. The second was LOGS: OP.SPEC_TRT_LOG had no rows before step 1's cutoff, so step 1 did not measure it. The report did not say which module each line was for; 0.5.3 names them.
+- Per row, PAYMENTS:
+  - step 2 wrote 766 B of redo and took 14.3 us per row, at 158K rows per batch;
+  - step 1 wrote 830 B and took 19.1 us per row, at 341K rows per batch.
+
+Step 1 (E2), cutoff 2023-09-28:
 - Dry run R-000041 passed, and the purge passed with warnings.
 - FORECAST AND RESULT, first purge on this database (estimates from statistics, per row):
 
@@ -28,7 +122,7 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
   - LOGS: 1.84 KB against 1.31 KB.
 
   The assumed redo rate is 30 MB/s; this purge wrote about 41 MB/s.
-- To do after step 2: calibrate the statistics estimate and the default redo rate on these measurements, and limit batches by rows.
+- Calibrating the statistics estimate and the time forecast on these measurements, and limiting batches by rows: built in 0.5.3 (entry above).
 
 ## 2026-10-03 - Set B on EPFPG782: dry-run accuracy; per-row forecast and LOB space fix (0.5.2)
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Decisions D1-D18 applied; D19-D20 round 1 built and tested (0.5.0: requirements, gate, simulation, forecast against result; end-to-end 21/21 on EPFPG781), choices asked by the preflight and followed by the purge (0.5.1, set C passed), dry-run accuracy measured (set B: rows exact, space +2 to +7%, redo and undo +12 to +69% on a first purge); per-row forecast and LOB space fix built (0.5.2, not yet run), round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered; parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
+| Status | Decisions D1-D18 applied; D19-D20 round 1 built and tested (0.5.0: requirements, gate, simulation, forecast against result; end-to-end 21/21 on EPFPG781), choices asked by the preflight and followed by the purge (0.5.1, set C passed), dry-run accuracy measured (set B: rows exact, space +2 to +7%, redo and undo +12 to +69% on a first purge); per-row forecast and LOB space fix (0.5.2, set E passed: second purge redo and undo within +-12%); first-purge estimate calibrated, deleting time per row, batches limited by rows, emptied blocks counted as free (0.5.3, not yet run); round 2 (plan of smaller runs, lifecycle) to follow; phases 1-4 delivered; parity with the previous tool met for FULL on 2026-10-02 (only difference D8). Change history: `.local/changes.md`. |
 | Scope | Full rebuild of `bin/`, `sql/`, `config/`. Docs are out of scope for now (written after the tool is proven). The Linux `.sh` wrapper is regenerated in the final phase. |
 | Baseline | Repository state at commit `3f532e7` (21 files, 10,353 lines). |
 | Target DB | Assumed Oracle 19c Enterprise Edition (minimum 12.2). Edition-specific features (parallel DDL) are detected at runtime and disabled on SE2. |
@@ -307,7 +307,7 @@ Fixes F-01..F-06, F-08, P-01..P-04.
 
 ### 6.1 Flow per module
 
-1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`; the keys of every link source below the root (payment, import_audit, workflow executions, invoice) are derived once, each tagged with the root it belongs to (`root_key`). For deleting modules, roots are then held back (D16, 6.1.1) and roots whose trees reference each other share a group. Roots are numbered into batches of `batch_size` in key order while the snapshot is taken; the roots of a group move to the batch of the group's smallest key; a derived key belongs to the batch of its root. Roots without key column (no dependents: `file_integration`, `spec_trt_log`) snapshot `ROWID`s in physical order instead, and each delete re-checks the cutoff. Consequences:
+1. **Key snapshot.** Root keys older than the cutoff are inserted once into `EPF_WORK_KEY`; the keys of every link source below the root (payment, import_audit, workflow executions, invoice) are derived once, each tagged with the root it belongs to (`root_key`). For deleting modules, roots are then held back (D16, 6.1.1) and roots whose trees reference each other share a group. Roots are numbered into batches in key order: at most `batch_size` roots and about `batch_rows_max` rows per batch. A root's rows are estimated from its derived keys and the rows per key from statistics. The roots of a group share a batch. A derived key belongs to the batch of its root. Roots without key column (no dependents: `file_integration`, `spec_trt_log`) snapshot `ROWID`s in physical order instead, and each delete re-checks the cutoff. Consequences:
    - no cursor is held across commits: ORA-01555 cannot happen (F-01);
    - the total number of batches is known: progress % and ETA;
    - deletes join a real, indexed table with correct statistics instead of a collection (P-01);
@@ -444,6 +444,15 @@ The preflight decides whether a purge can run to the end on this database and pr
 - **Built in 0.5.1.**
   - The preflight asks for the choices, saves them with its run and checks again.
   - A purge or dry run of the same scope follows the latest READY preflight for `preflight_valid_h`; the wizard asks once.
+- **Built in 0.5.2.**
+  - The dry run forecasts redo and undo per row.
+  - BASICFILE LOB space carried over between purges.
+- **Built in 0.5.3.**
+  - The statistics estimate is calibrated on measured purges.
+  - Deleting time is forecast from rows per second.
+  - Batches are limited by rows as well as by roots (`batch_rows_max`).
+  - Redo and undo are measured per table.
+  - Blocks at least 75% free count as empty in the space figures.
 
   Round 2: the plan of smaller runs, the plan lifecycle (start over, check again with the saved choices) and the menu.
 

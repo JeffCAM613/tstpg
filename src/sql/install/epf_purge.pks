@@ -22,10 +22,15 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 -- purging session: no redo; its undo goes to the temporary tablespace)
 --   Root keys are taken once, then the keys of every link source below the
 --   root are derived with the root they belong to. Roots are numbered into
---   batches of batch_size in key order; roots whose trees reference each
---   other through an FK share a batch. A root without key column (and
---   without dependents) is snapshot by ROWID in physical order and its rows
---   are re-checked against the cutoff when processed.
+--   batches in key order; roots whose trees reference each other through an
+--   FK share a batch. A batch holds at most batch_size roots and about the
+--   run's batch_rows rows (setting batch_rows_max): the rows of a root are
+--   its keys in each table with keys times the rows of the tree per key of
+--   that table (optimizer statistics); a tree without link sources with keys
+--   below its root counts the same rows for every root. A root whose tree
+--   alone passes the limit is a batch of its own. A root without key column
+--   (and without dependents) is snapshot by ROWID in physical order and its
+--   rows are re-checked against the cutoff when processed.
 --
 -- Actions per module
 --   DELETE  modes FULL and LOGS, and the LOGS module in mode CLOB_N_LOGS.
@@ -53,7 +58,9 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --
 -- Counts (EPF_TABLE_STAT, phases BEFORE and AFTER)
 --   total, eligible, retained (total - eligible), non-empty LOB values
---   (CLEAR), processed (AFTER), held, orphans, action. Orphans per link
+--   (CLEAR), processed (AFTER), held, orphans, action; the redo and undo of
+--   the purge's statements on the table (AFTER) and the redo per row
+--   estimated from optimizer statistics (BEFORE, deleting). Orphans per link
 --   (EPF_LINK_STAT): rows on the pointing side whose value is not found on
 --   the pointed side; a link protected by an enabled, validated FK is not
 --   scanned. Space inside segments is captured with epf_space (BASELINE, and
@@ -107,20 +114,24 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --
 -- Forecast (EPF_FORECAST, per module)
 --   The preflight forecasts roots, batches, redo, undo (estimates per root,
---   EPF_TREE_EST) and the deleting time at the redo rate measured by the
---   latest purge on the database (else redo_rate_mb_s). A dry run ends with
---   step FORECAST: exact rows and roots after holding back, its batches, the
---   space freed inside the segments (used space x eligible share), and redo
---   and undo per row: the rows counted in the tables of each tree times the
---   redo and undo per row measured by the latest purge of the tree, else the
---   estimate per row from optimizer statistics (roots of different ages
---   carry very different numbers of rows, so a cost per root does not carry
---   over). The report of a purge compares its result with the latest
+--   EPF_TREE_EST) and the deleting time of the rows the roots carry (rows
+--   per root). A dry run ends with step FORECAST: exact rows and roots after
+--   holding back, its batches, the space freed inside the segments (used
+--   space x eligible share), and redo and undo per row: the rows counted in
+--   each table times the redo and undo per row measured for the table by the
+--   latest purge that processed enough of its rows, else measured for its
+--   tree, else the estimate per row from optimizer statistics (roots of
+--   different ages carry very different numbers of rows, so a cost per root
+--   does not carry over). Deleting time: the rows of each tree at the rows
+--   per second measured for the tree by its latest purge, else by the latest
+--   purge on the database, else the setting delete_rows_s plus a fixed time
+--   per batch. The report of a purge compares its result with the latest
 --   forecast.
 --
 -- Redo
 --   The redo written by each root tree is measured (V$MYSTAT) and recorded
---   as TREE_REDO (rows = roots processed, bytes = redo). Preflight compares
+--   as TREE_REDO (rows = roots processed, bytes = redo, elapsed seconds),
+--   and by the statements on each table (EPF_TABLE_STAT). Preflight compares
 --   the redo of a batch with the online redo logs and recommends a batch
 --   size; it uses the latest measurement of each tree, or an estimate from
 --   optimizer statistics when the tree has not been purged yet.

@@ -348,7 +348,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         IF g_run.purge_mode IS NOT NULL THEN
             put(' Parameters  mode ' || g_run.purge_mode || ', depth ' || g_run.depth || ', retention '
                 || g_run.retention_days || ' days (cutoff ' || TO_CHAR(g_run.cutoff_date, 'YYYY-MM-DD') || '), batch '
-                || n(g_run.batch_size) || ', dry run ' || g_run.dry_run || ', compact ' || g_run.with_compact
+                || n(g_run.batch_size)
+                || CASE WHEN g_run.batch_rows IS NOT NULL THEN ' (at most ' || n(g_run.batch_rows) || ' rows)' END
+                || ', dry run ' || g_run.dry_run || ', compact ' || g_run.with_compact
                 || ', reclaim ' || g_run.with_reclaim);
         END IF;
         put(' Time        started ' || NVL(TO_CHAR(g_run.started_at, 'YYYY-MM-DD HH24:MI:SS'), '-')
@@ -531,6 +533,32 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || r(b(t.undo), 10) || ' for ' || n(t.roots) || ' roots ('
                 || b(t.redo / NULLIF(t.roots, 0)) || ' redo per root)');
         END LOOP;
+        -- Per table: the redo and undo of its statements over the rows they
+        -- processed, and the redo per row estimated from optimizer statistics
+        -- before the purge (deleting).
+        l_module := NULL;
+        FOR t IN (SELECT e.module_code, e.owner || '.' || e.table_name AS table_label, a.processed_rows AS rows_done,
+                         a.redo_bytes, a.undo_bytes, bf.est_redo_row
+                    FROM epf_table_stat a
+                    JOIN epf_table e ON e.table_id = a.table_id
+                    JOIN epf_module m ON m.module_code = e.module_code
+                    LEFT JOIN epf_table_stat bf
+                      ON bf.run_id = a.run_id AND bf.table_id = a.table_id AND bf.phase = 'BEFORE'
+                   WHERE a.run_id = g_run.run_id AND a.phase = 'AFTER' AND a.processed_rows > 0
+                     AND a.redo_bytes IS NOT NULL
+                   ORDER BY m.display_order, a.redo_bytes DESC, e.table_id) LOOP
+            IF l_module IS NULL THEN
+                put('  ' || l('Per table', 18) || l('Table', 46) || r('Rows', 14) || r('Redo/row', 12)
+                    || r('Undo/row', 12) || r('Estimate/row', 14));
+            END IF;
+            put('  ' || l(CASE WHEN NVL(l_module, '-') <> t.module_code THEN t.module_code END, 18)
+                || l(t.table_label, 46) || r(n(t.rows_done), 14)
+                || r(b(t.redo_bytes / t.rows_done), 12) || r(b(t.undo_bytes / t.rows_done), 12)
+                || r(b(t.est_redo_row), 14));
+            put('EPF_TABLE_REDO|' || epf_util.run_label(g_run.run_id) || '|' || t.table_label || '|' || t.rows_done
+                || '|' || t.redo_bytes || '|' || t.undo_bytes || '|' || t.est_redo_row);
+            l_module := t.module_code;
+        END LOOP;
         -- Undo tuning as the purge found it at its start (undo tablespace size
         -- before and after: DATAFILES).
         FOR u IN (SELECT message
@@ -700,14 +728,32 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || r(n(l_roots), 12) || r(n(l_batch), 9) || r(b(l_redo), 11) || r(b(l_undo), 11) || r(dur(l_secs), 10)
                 || r(CASE WHEN p_origin = 'DRY_RUN' THEN b(l_freed) ELSE '-' END, 13));
         END IF;
-        FOR x IN (SELECT DISTINCT redo_basis FROM epf_forecast
-                   WHERE run_id = l_run AND origin = p_origin AND redo_basis IS NOT NULL) LOOP
+        -- One line per basis; the modules it applies to when they differ.
+        SELECT COUNT(DISTINCT redo_basis) INTO l_count
+          FROM epf_forecast
+         WHERE run_id = l_run AND origin = p_origin AND redo_basis IS NOT NULL;
+        FOR x IN (SELECT f.redo_basis,
+                         LISTAGG(f.module_code, ', ') WITHIN GROUP (ORDER BY m.display_order) AS modules
+                    FROM epf_forecast f
+                    JOIN epf_module m ON m.module_code = f.module_code
+                   WHERE f.run_id = l_run AND f.origin = p_origin AND f.redo_basis IS NOT NULL
+                   GROUP BY f.redo_basis
+                   ORDER BY MIN(m.display_order)) LOOP
             put('  Redo and undo ' || CASE WHEN x.redo_basis LIKE 'per row%' THEN x.redo_basis
-                                           ELSE 'per root, ' || x.redo_basis END);
+                                           ELSE 'per root, ' || x.redo_basis END
+                || CASE WHEN l_count > 1 THEN ' (' || x.modules || ')' END);
         END LOOP;
-        FOR x IN (SELECT DISTINCT time_basis FROM epf_forecast
-                   WHERE run_id = l_run AND origin = p_origin AND time_basis IS NOT NULL) LOOP
-            put('  Deleting time: ' || x.time_basis);
+        SELECT COUNT(DISTINCT time_basis) INTO l_count
+          FROM epf_forecast
+         WHERE run_id = l_run AND origin = p_origin AND time_basis IS NOT NULL;
+        FOR x IN (SELECT f.time_basis,
+                         LISTAGG(f.module_code, ', ') WITHIN GROUP (ORDER BY m.display_order) AS modules
+                    FROM epf_forecast f
+                    JOIN epf_module m ON m.module_code = f.module_code
+                   WHERE f.run_id = l_run AND f.origin = p_origin AND f.time_basis IS NOT NULL
+                   GROUP BY f.time_basis
+                   ORDER BY MIN(m.display_order)) LOOP
+            put('  Deleting time: ' || x.time_basis || CASE WHEN l_count > 1 THEN ' (' || x.modules || ')' END);
         END LOOP;
     END print_forecast_table;
 
@@ -1127,13 +1173,16 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END LOOP;
         SELECT MAX(batch_size) INTO l_count FROM epf_run WHERE run_id = p_run_id;
         put('EPF_ADVICE|RUN_BATCH|' || l_count);
-        -- Largest batch whose undo the undo tablespace holds 4 times (UNDO).
-        FOR u IN (SELECT rq.needed_bytes, rq.room_bytes, rn.batch_size
+        -- Largest batch (root rows) whose undo the undo tablespace holds 4
+        -- times (UNDO), from the largest undo per root of the trees.
+        FOR u IN (SELECT rq.room_bytes,
+                         (SELECT MAX(te.undo_root) FROM epf_tree_est te
+                           WHERE te.run_id = rq.run_id AND te.roots > 0) AS undo_root
                     FROM epf_requirement rq
-                    JOIN epf_run rn ON rn.run_id = rq.run_id
-                   WHERE rq.run_id = p_run_id AND rq.req_code = 'UNDO' AND rq.needed_bytes > 0
-                     AND rq.room_bytes > 0) LOOP
-            put('EPF_ADVICE|UNDO_MAX_BATCH|' || FLOOR(u.room_bytes / 4 / (u.needed_bytes / u.batch_size)));
+                   WHERE rq.run_id = p_run_id AND rq.req_code = 'UNDO' AND rq.room_bytes > 0) LOOP
+            IF u.undo_root > 0 THEN
+                put('EPF_ADVICE|UNDO_MAX_BATCH|' || FLOOR(u.room_bytes / 4 / u.undo_root));
+            END IF;
         END LOOP;
     END print_advice;
 

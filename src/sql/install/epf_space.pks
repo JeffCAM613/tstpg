@@ -25,7 +25,8 @@ CREATE OR REPLACE PACKAGE epf_space AUTHID DEFINER AS
     --   EPF_SPACE_USAGE   space used inside each segment except LOB indexes:
     --                       ASSM        DBMS_SPACE.SPACE_USAGE, block fullness
     --                                   (table and BASICFILE LOB blocks count at
-    --                                   the middle of their fullness band;
+    --                                   the middle of their fullness band,
+    --                                   blocks at least 75% free as empty;
     --                                   index blocks are full or free)
     --                       BASICFILE_EST  BASICFILE LOB segments after a
     --                                   purge: the chunks of deleted or cleared

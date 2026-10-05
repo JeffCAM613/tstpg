@@ -130,6 +130,7 @@ BEGIN
             depth           VARCHAR2(200),
             purge_mode      VARCHAR2(30),
             batch_size      NUMBER,
+            batch_rows      NUMBER,
             dry_run         CHAR(1)        DEFAULT 'N' NOT NULL,
             with_reclaim    CHAR(1)        DEFAULT 'N' NOT NULL,
             with_compact    CHAR(1)        DEFAULT 'N' NOT NULL,
@@ -169,6 +170,9 @@ BEGIN
     -- separated by commas), for example an archive directory whose free
     -- space the database cannot read.
     add_column('EPF_RUN', 'CONFIRMED_REQS', 'VARCHAR2(100)');
+    -- batch_rows: rows a batch holds at most besides its batch_size roots
+    -- (setting batch_rows_max when the run starts).
+    add_column('EPF_RUN', 'BATCH_ROWS', 'NUMBER');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -276,6 +280,9 @@ BEGIN
     -- nonempty_lob_rows counts non-empty LOB values (row x LOB column).
     -- held_rows: roots held back (root tables) or rows kept because a
     -- retained row still references them (tables reached by a reverse link).
+    -- redo_bytes, undo_bytes (AFTER): written by the statements of the purge
+    -- on the table. est_redo_row (BEFORE, deleting): redo per row estimated
+    -- from optimizer statistics, kept to compare with the measurement.
     create_table('EPF_TABLE_STAT', q'[
         CREATE TABLE epf_table_stat (
             run_id             NUMBER        NOT NULL,
@@ -289,11 +296,17 @@ BEGIN
             orphan_rows        NUMBER,
             held_rows          NUMBER,
             action             VARCHAR2(10),
+            redo_bytes         NUMBER,
+            undo_bytes         NUMBER,
+            est_redo_row       NUMBER,
             measured_at        TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
             CONSTRAINT epf_table_stat_pk PRIMARY KEY (run_id, table_id, phase)
         )]');
     add_column('EPF_TABLE_STAT', 'HELD_ROWS', 'NUMBER');
     add_column('EPF_TABLE_STAT', 'ACTION', 'VARCHAR2(10)');
+    add_column('EPF_TABLE_STAT', 'REDO_BYTES', 'NUMBER');
+    add_column('EPF_TABLE_STAT', 'UNDO_BYTES', 'NUMBER');
+    add_column('EPF_TABLE_STAT', 'EST_REDO_ROW', 'NUMBER');
 
     -- Orphans per registry link and phase: rows on the pointing side (the
     -- dependent for a direct link, the source for a reverse link) whose value
@@ -508,14 +521,16 @@ BEGIN
             CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE'))
         )]');
 
-    -- Per root tree of a preflight: eligible roots and the redo and undo per
-    -- root with their basis (measured by an earlier purge, or estimated).
+    -- Per root tree of a preflight: eligible roots, rows per root (all the
+    -- tables of the tree), and the redo and undo per root with their basis
+    -- (measured by an earlier purge, or estimated).
     create_table('EPF_TREE_EST', q'[
         CREATE TABLE epf_tree_est (
             run_id      NUMBER          NOT NULL,
             table_id    NUMBER          NOT NULL,
             action      VARCHAR2(10)    NOT NULL,
             roots       NUMBER,
+            rows_root   NUMBER,
             redo_root   NUMBER,
             redo_basis  VARCHAR2(400),
             undo_root   NUMBER,
@@ -523,6 +538,7 @@ BEGIN
             undo_rate   NUMBER,
             CONSTRAINT epf_tree_est_pk PRIMARY KEY (run_id, table_id)
         )]');
+    add_column('EPF_TREE_EST', 'ROWS_ROOT', 'NUMBER');
 
     -- Roots before the cutoff of a preflight per month of their date (the
     -- largest purge that fits the archive space, smaller runs).
