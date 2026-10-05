@@ -18,6 +18,18 @@ How to test: `.\src\tests\e2e\run_tests.bat --only T08,T08B,T10B` (T01 runs too;
 
 Rerun (F4) with the fix: T01, T08, T08B and T10B passed. T08B and T10B found the questions section itself this time.
 
+Forecast against result in T13 (PAYMENTS, retention 30, 87,728,675 rows). The dry run R-000010 took its costs from the first batches of the T11 purge, which the suite stops after 3 progress lines.
+
+| Measure | Forecast | Actual | Error |
+|---|---|---|---|
+| Rows | 87,728,675 | 87,728,675 | 0% |
+| Redo | 64,914,525,874 | 66,164,520,896 | -1.9% |
+| Undo | 32,510,348,226 | 33,499,216,076 | -3.0% |
+| Deleting time (s) | 1,264 | 1,312 | -3.7% |
+| Space freed | 17,383,983,090 | 17,313,281,186 | +0.4% |
+
+A few measured batches forecast the whole purge within 4%. The redo per row, 754 B, is set G's 753 B on another instance, at batches limited to about 200,000 rows.
+
 ## 2026-10-05 - Measuring lighter, no redo log warning when the logs are to be enlarged (0.5.4)
 
 - The batches read the session's redo and undo once after each statement, with both statistics in one V$MYSTAT query.
