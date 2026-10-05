@@ -1553,6 +1553,22 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN session_stat(g_undo_stat);
     END session_undo;
 
+    -- Redo and undo of this session so far, read together (one V$MYSTAT
+    -- query: the batches read them after every statement).
+    PROCEDURE session_redo_undo(p_redo OUT NUMBER, p_undo OUT NUMBER) IS
+    BEGIN
+        IF g_redo_stat IS NULL OR g_undo_stat IS NULL THEN
+            p_redo := session_redo;
+            p_undo := session_undo;
+            RETURN;
+        END IF;
+        SELECT SUM(CASE WHEN statistic# = g_redo_stat THEN value END),
+               SUM(CASE WHEN statistic# = g_undo_stat THEN value END)
+          INTO p_redo, p_undo
+          FROM v$mystat
+         WHERE statistic# IN (g_redo_stat, g_undo_stat);
+    END session_redo_undo;
+
     -- Processes the batches of the module's trees. p_processed, p_table_redo
     -- and p_table_undo add up per table (index: table_id) the rows, redo and
     -- undo of its statements in the committed batches.
@@ -1566,6 +1582,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_b_undo     t_numbers;
         l_s_redo     NUMBER;
         l_s_undo     NUMBER;
+        l_e_redo     NUMBER;
+        l_e_undo     NUMBER;
         l_max        NUMBER;
         l_done       NUMBER := 0;
         l_rows       NUMBER := 0;
@@ -1642,17 +1660,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 l_batch_rows := 0;
                 l_current    := p_roots(r);
                 BEGIN
+                    -- One read before the first statement and one after each:
+                    -- each statement's redo and undo is the difference.
+                    session_redo_undo(l_s_redo, l_s_undo);
                     FOR s IN 1 .. l_stmts.COUNT LOOP
                         l_current := l_stmts(s).table_id;
-                        l_s_redo  := session_redo;
-                        l_s_undo  := session_undo;
                         EXECUTE IMMEDIATE l_stmts(s).sql_text USING b;
                         l_n := SQL%ROWCOUNT;
+                        session_redo_undo(l_e_redo, l_e_undo);
                         l_batch(l_current) := CASE WHEN l_batch.EXISTS(l_current) THEN l_batch(l_current) ELSE 0 END + l_n;
                         l_b_redo(l_current) := CASE WHEN l_b_redo.EXISTS(l_current) THEN l_b_redo(l_current) ELSE 0 END
-                                               + session_redo - l_s_redo;
+                                               + l_e_redo - l_s_redo;
                         l_b_undo(l_current) := CASE WHEN l_b_undo.EXISTS(l_current) THEN l_b_undo(l_current) ELSE 0 END
-                                               + session_undo - l_s_undo;
+                                               + l_e_undo - l_s_undo;
+                        l_s_redo := l_e_redo;
+                        l_s_undo := l_e_undo;
                         l_batch_rows := l_batch_rows + l_n;
                     END LOOP;
                     COMMIT;
@@ -1683,8 +1705,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                                 + CASE WHEN l_batch.EXISTS(p_roots(r)) THEN l_batch(p_roots(r)) ELSE 0 END;
                 l_done := l_done + 1;
                 l_rows := l_rows + l_batch_rows;
-                p_redo := session_redo - l_redo_start;
-                p_undo := session_undo - l_undo_start;
+                -- As of the batch's last statement (its commit is counted
+                -- with the next reading).
+                p_redo := l_s_redo - l_redo_start;
+                p_undo := l_s_undo - l_undo_start;
                 epf_log.step_progress(l_done, p_redo);
 
                 IF l_done = 1 OR l_done = p_total OR l_last IS NULL OR epf_util.elapsed_s(l_last) >= l_interval THEN
@@ -2416,10 +2440,13 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- causes at most one log switch. A batch larger than a whole log is a
     -- warning: the session then waits on 'log file switch (checkpoint
     -- incomplete)'; larger online logs remove those waits, a smaller batch
-    -- only spreads them. Trees without eligible roots are not estimated.
+    -- only spreads them. With redo log sizing planned for the purge
+    -- (with_redo_logs) the batches are compared with 1 GB logs. Trees
+    -- without eligible roots are not estimated.
     PROCEDURE check_redo IS
         l_groups     NUMBER;
         l_min_log    NUMBER;
+        l_log        NUMBER;
         l_log_mode   VARCHAR2(12);
         l_switches   NUMBER;
         l_peak       NUMBER;
@@ -2434,6 +2461,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         SELECT log_mode INTO l_log_mode FROM v$database;
         g_min_log  := l_min_log;
         g_log_mode := l_log_mode;
+        l_log := CASE WHEN g_run.with_redo_logs = 'Y' AND l_min_log < 1073741824 THEN 1073741824 ELSE l_min_log END;
         SELECT NVL(SUM(cnt), 0), NVL(MAX(cnt), 0)
           INTO l_switches, l_peak
           FROM (SELECT COUNT(*) AS cnt
@@ -2481,18 +2509,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 CONTINUE;
             END IF;
             l_batch_redo := l_per_root * batch_roots(r.table_id);
-            l_recommend  := round_batch(0.5 * l_min_log / l_per_root);
+            l_recommend  := round_batch(0.5 * l_log / l_per_root);
             l_overall    := LEAST(NVL(l_overall, l_recommend), l_recommend);
-            IF l_batch_redo > l_min_log THEN
+            IF l_batch_redo > l_log THEN
                 l_over := TRUE;
             END IF;
-            note(CASE WHEN l_batch_redo > l_min_log THEN epf_log.c_warn ELSE epf_log.c_info END,
+            note(CASE WHEN l_batch_redo > l_log THEN epf_log.c_warn ELSE epf_log.c_info END,
                  'REDO_ESTIMATE',
                  'about ' || epf_util.fmt_bytes(l_per_root) || ' redo per root (' || l_source || '): '
                  || epf_util.fmt_bytes(l_batch_redo) || ' per batch of '
                  || epf_util.fmt_int(batch_roots(r.table_id))
-                 || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_min_log, 1), 'FM999990.0')
-                 || ' online logs; recommended batch size ' || epf_util.fmt_int(l_recommend),
+                 || ' = ' || TO_CHAR(ROUND(l_batch_redo / l_log, 1), 'FM999990.0')
+                 || ' online logs' || CASE WHEN l_log > l_min_log THEN ' of the 1 GB planned' END
+                 || '; recommended batch size ' || epf_util.fmt_int(l_recommend),
                  p_object_owner => g_tables(r.table_id).owner,
                  p_object_name => g_tables(r.table_id).table_name,
                  p_rows => l_recommend, p_bytes => l_per_root);
@@ -2504,7 +2533,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             END IF;
             note(CASE WHEN l_over THEN epf_log.c_warn ELSE epf_log.c_ok END, 'REDO_SUMMARY',
                  'Recommended batch size: ' || epf_util.fmt_int(l_overall)
-                 || ' (one batch within half of a ' || epf_util.fmt_bytes(l_min_log) || ' online log)'
+                 || ' (one batch within half of a ' || epf_util.fmt_bytes(l_log) || ' online log'
+                 || CASE WHEN l_log > l_min_log THEN ', the size planned for the purge' END || ')'
                  || CASE WHEN l_over THEN
                         '. With batch ' || epf_util.fmt_int(g_run.batch_size)
                         || ' a batch fills more than one online log: expect ''log file switch (checkpoint '

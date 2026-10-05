@@ -2,24 +2,47 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
-## 2026-10-05 - Set G step 1 on EPFPG782 (0.5.3, batch 530): first purge forecast within +-25%
+## 2026-10-05 - Measuring lighter, no redo log warning when the logs are to be enlarged (0.5.4)
 
-Same data and commands as set E step 1, on a refreshed EPFPG782.
-- 0.5.3 installed and compiled (G1).
-- Dry run R-000001 and purge R-000002 passed (G2).
+- The batches read the session's redo and undo once after each statement, with both statistics in one V$MYSTAT query.
+  - 0.5.3 read them four times per statement.
+  - In set G, LOGS took 32 s in both steps against 25 and 26 s in set E. Its 1,543 to 1,590 batches of 530 rows run 2 statements each, so the reads weigh most there.
+  - BATCH_PROGRESS counts the redo of a batch up to its last statement. Its commit is counted with the next reading.
+- REDO_LOGS check: with redo log sizing planned (`--redo-logs`), each batch is compared with the 1 GB logs the purge will use.
+  - Set G's dry run warned that a batch fills more than one of the 150 MB logs (REDO_ESTIMATE, REDO_SUMMARY), so a dry run ended PASS WITH WARNINGS for logs that the purge replaces first.
+  - The recommended batch size is then for 1 GB logs, as the wrapper's question already offers.
+
+How to test: set F (the full suite) on EPFPG781 installs 0.5.4.
+- In T08B (preflight with `--redo-logs`), REDO_SUMMARY says `the size planned for the purge`.
+- In the next two-step set, a dry run with `--redo-logs` on 150 MB logs ends PASS (P5 PASS), and LOGS deletes in about 25 s again.
+
+## 2026-10-05 - Set G on EPFPG782 (0.5.3, batch 530): first purge within +-25%, second within +-11%
+
+Same data and commands as set E, on a refreshed EPFPG782. All four steps passed.
+- G1: 0.5.3 installed and compiled.
+- G2, step 1 at 2023-09-28: dry run R-000001, then purge R-000002, PASS WITH WARNINGS (the AUDIT_TRAIL orphans, as before).
   - Parameters: `batch 530 (at most 200,000 rows)`.
   - PAYMENTS ran 493 batches: 479 of bulk payments, about 177K rows each, and 14 of file integrations. Set E ran 248 batches of 341K rows.
   - R-000001 was the first run on the copy, so the forecast came from statistics and the assumed speed. PAYMENTS 00:28:16 = 84,663,379 rows / 50,000 rows/s + 493 batches x 6 ms.
+- G3, step 2 at 2025-10-01: dry run R-000003, then purge R-000021, PASS.
+  - The dry run said `Redo and undo per row, measured by R-000002`. LOGS adds `1 table estimated from optimizer statistics`, which is SPEC_TRT_LOG with no rows in step 1.
+  - Its deleting time was `measured per tree by R-000002`.
+  - The run number went from R-000003 to R-000021: Oracle hands out identity values 20 at a time and its cache was lost between the two runs (an instance restart or memory pressure). No run is missing.
 - FORECAST AND RESULT, set G (set E):
 
-  | Module | Rows | Redo | Undo | Deleting time | Space freed |
-  |---|---|---|---|---|---|
-  | PAYMENTS | 0.0% | +25.4% (+89.5%) | +23.9% (+73.7%) | +15.5% (+161.8%) | +0.7% (+6.8%) |
-  | LOGS | 0.0% | -17.6% (+37.2%) | -3.2% (+45.2%) | -19.2% (+90.0%) | -5.4% (+1.6%) |
-  | BANK_STATEMENTS | 0.0% | +1.8% (+69.6%) | -24.7% (+12.9%) | -18.8% (+255.3%) | +0.1% (+2.4%) |
+  | Step | Module | Rows | Redo | Undo | Deleting time | Space freed |
+  |---|---|---|---|---|---|---|
+  | 1 | PAYMENTS | 0.0% | +25.4% (+89.5%) | +23.9% (+73.7%) | +15.5% (+161.8%) | +0.7% (+6.8%) |
+  | 1 | LOGS | 0.0% | -17.6% (+37.2%) | -3.2% (+45.2%) | -19.2% (+90.0%) | -5.4% (+1.6%) |
+  | 1 | BANK_STATEMENTS | 0.0% | +1.8% (+69.6%) | -24.7% (+12.9%) | -18.8% (+255.3%) | +0.1% (+2.4%) |
+  | 2 | PAYMENTS | 0.0% | -1.5% (+8.3%) | -1.0% (+5.4%) | +10.8% (+29.9%) | +5.3% (+89.0%) |
+  | 2 | LOGS | 0.0% | -8.7% (-8.6%) | -5.3% (-5.3%) | +2.5% (-2.7%) | +0.3% (+13.3%) |
+  | 2 | BANK_STATEMENTS | 0.0% | -9.4% (-11.2%) | -10.6% (-11.9%) | +26.3% (+42.6%) | 0.0% (+55.2%) |
 
-  LOGS and BANK_STATEMENTS came out as recomputed from set E. PAYMENTS redo came out +25% instead of the recomputed +14%, because the smaller batches lowered the actual redo.
-- Smaller batches, PAYMENTS, same rows:
+  In step 1, LOGS and BANK_STATEMENTS came out as recomputed from set E. PAYMENTS redo came out +25% instead of the recomputed +14%, because the smaller batches lowered the actual redo.
+  The step 2 BANK_STATEMENTS time is 4 s forecast against 3 s.
+  Space freed is now within +-6% in both steps: emptied blocks count as empty. Used after in step 2: PAYMENTS 103.5 MB, BANK_STATEMENTS 272 KB. Set E showed 1.0 GB and 344 MB.
+- Smaller batches, PAYMENTS step 1, same rows:
 
   | | Set E: 248 batches, 341K rows | Set G: 493 batches, 177K rows | Change |
   |---|---|---|---|
@@ -27,23 +50,32 @@ Same data and commands as set E step 1, on a refreshed EPFPG782.
   | Undo | 32.1 GB | 30.1 GB | -6% |
   | Deleting time | 26:57, 19.1 us per row | 24:28, 17.3 us per row | -9% |
 
-  Redo per row matched across instances at the same batch size before (parity on EPFPG781: 832 B; set E on EPFPG783: 831 B), so the redo drop comes from the batch size.
-  The time comparison is less clean. LOGS and BANK_STATEMENTS kept their batches and still took longer here (32 s against 25 s, 97 s against 70 s).
-  LOGS runs 1,543 batches of 530 rows, so the measuring added in 0.5.3 counts more there. Each statement now reads the session statistics four times.
-- Redo per row by table, measured against the statistics estimate:
-  - the two largest tables came out lower: PAYMENT_ADDITIONAL_INFO 620 B against 778 B (53.6M rows), PAYMENT_AUDIT 860 B against 1.2 KB (24.5M rows);
-  - most small tables came out 30 to 45% higher, for example WORKFLOW_EXECUTION 751 B against 540 B and NOTIFICATION_EXECUTION 571 B against 401 B. The likely reason: the purge creates 12 temporary indexes on PAYMENTS tables, and each adds an index entry per deleted row that the estimate does not count.
-- Undo per redo by table: 0.43 (AUDIT_TRAIL) to 0.70 (DIRECTORY_DISPATCHING). The single share of 0.5 left BANK_STATEMENTS undo at -25%.
-- Next, for 0.5.4:
-  - fit the estimate per table on these measurements, from row length, indexes and key lengths, counting the temporary indexes the purge will create;
-  - estimate undo per table;
-  - read both session statistics in one query, once per statement.
+  - Redo per row has matched across instances at the same batch size before (parity on EPFPG781: 832 B; set E on EPFPG783: 831 B), so the redo drop comes from the batch size.
+  - The time comparison is less clean. LOGS and BANK_STATEMENTS kept their batches and still took longer here: 32 s against 25 s, and 97 s against 70 s.
+  - The key snapshot of PAYMENTS took 57 s in the dry run and 76 s in the purge, against 48 s and 45 s in set E. Weighing the 123,745 bulk payments into batches costs those 10 to 30 s.
+- Redo per row by table (EPF_TABLE_REDO lines).
+  - The measured cost carries over between old and recent data. Step 2 against step 1:
+    - PAYMENT_ADDITIONAL_INFO 624 B against 620 B;
+    - PAYMENT_AUDIT 864 B against 860 B;
+    - PAYMENT 1,565 B against 1,527 B;
+    - AUDIT_TRAIL +9%, DIRECTORY_DISPATCHING +11%, TRANSMISSION_EXECUTION_AUDIT -14%;
+    - only BULK_PAYMENT_ADDITIONAL_INFO moved a lot: 995 B against 610 B.
 
-  G4 also collects the dictionary figures needed for the fit.
+    So the forecast after a first purge, which uses these measurements per table, is reliable.
+  - Against the statistics estimate, step 1:
+    - the two large child tables cost less than estimated: PAYMENT_ADDITIONAL_INFO 620 B against 778 B, PAYMENT_AUDIT 860 B against 1,252 B. They hold about 10 and 5 rows per payment, so the rows of one payment share blocks and are deleted together;
+    - most other tables cost 10 to 45% more, for example PAYMENT 1,527 B against 1,213 B, AUDIT_TRAIL 1,337 B against 1,102 B and WORKFLOW_EXECUTION 751 B against 540 B.
+  - Fitting the estimate to the dictionary figures (G4: row length, indexes, key lengths, LOB columns, temporary indexes) still leaves +-15 to 40% per table. I tried linear fits on row length, index count and key length, with and without a flag for many rows per parent. The statistics cannot see how the rows to delete sit in the blocks.
+    - Counting the temporary indexes would add 0.3% to the PAYMENTS total. Of the 12, only 6 are on columns with values, and those tables are small.
+    - The module totals are what the requirements and the outcome use: within +-25%. The largest module, PAYMENTS, comes out high (on the safe side).
+  - Undo per redo by table ranges from 0.43 (AUDIT_TRAIL) to 0.70 (DIRECTORY_DISPATCHING). The single share of 0.5 left BANK_STATEMENTS undo at -25% in step 1. Step 2 uses the per-table measurement: -11%.
+- Possible next step: reference costs per registry table from these measurements, scaled to the statistics of the database.
+  - These copies would then be forecast exactly by construction. That cannot be checked before a different database purges.
+  - Not built.
 
 ## 2026-10-05 - First-purge estimate calibrated, deleting time per row, batches limited by rows, emptied blocks counted as free (0.5.3)
 
-Built from the set E measurements (entry below). Set G tests it (entry above).
+Built from the set E measurements (entry below). Set G tested it (entry above).
 
 - Redo per row from optimizer statistics (`row_redo_estimate`):
   - now 1.2 R + 180 B, plus 1.2 K + 162 B per index (R = avg_row_len, K = key length);
