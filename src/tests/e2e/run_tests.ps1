@@ -53,6 +53,9 @@ $script:Only        = @()
 $script:From        = ''
 $script:Current     = $null
 $script:Results     = New-Object 'System.Collections.Generic.List[object]'
+# The section of the preflight's questions (CHOICES and the database clock),
+# matched case-sensitively: every preflight ends with a line ' Choices ...'.
+$script:ChoicesSection = '(?m-i)^ CHOICES +\d\d:\d\d:\d\d'
 $script:Aborted     = $false
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
                          StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0;
@@ -623,7 +626,7 @@ function Invoke-Suite {
         Assert-Match $r 'REQUIREMENTS'
         Assert-Match $r ' RESULT  (READY|NOT READY)'
         Assert-NoMatch $r '(?m)^EPF_REQ\|'
-        Assert-NoMatch $r ' CHOICES '
+        Assert-NoMatch $r $script:ChoicesSection
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
         Assert-Manifest $run 'requirements_ready' '^(Y|N)$'
@@ -642,7 +645,7 @@ function Invoke-Suite {
         $r = Invoke-Wrapper @('preflight', '--retention', $retention, '--mode', 'LOGS', '--undo-tuning', '--redo-logs',
                               '--backup', 'none') -Answers @('200') -TimeoutMin 30
         Assert-Exit $r @(0, 2)
-        Assert-Match $r ' CHOICES '
+        Assert-Match $r $script:ChoicesSection
         Assert-Match $r 'READY with these choices'
         Assert-Match $r 'Next    epf_purge.bat purge'
         $saved = ''
@@ -717,7 +720,7 @@ function Invoke-Suite {
             # saved and the exit code is 3.
             $r = Invoke-Wrapper @('preflight', '--retention', $script:Retention, '--mode', 'LOGS') -Answers @('S', 'S', 'S') -TimeoutMin 30
             Assert-Exit $r @(3)
-            Assert-Match $r ' CHOICES '
+            Assert-Match $r $script:ChoicesSection
             Assert-Match $r 'Stopped: '
             Assert-NoMatch $r 'Checking again with these choices'
         } finally {
@@ -755,7 +758,7 @@ function Invoke-Suite {
         Assert-Match $r 'CHECKING THE DATABASE'
         # The wizard's preflight asks its questions (here only the batch size)
         # and checks again with the answers.
-        Assert-Match $r ' CHOICES '
+        Assert-Match $r $script:ChoicesSection
         Assert-Match $r 'READY with these choices'
         Assert-Match $r 'Recommended batch size with 1 GB online logs'
         # The purge checks the requirements again with the wizard's choices,

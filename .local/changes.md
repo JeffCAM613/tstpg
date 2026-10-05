@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-05 - Set F: the full suite on EPFPG781 (0.5.4), 21 of 22; T08 assertion fixed
+
+- 21 passed, 1 failed, in 1:16:06. 0.5.4 compiled (T03, T04) and every purge, stop, wizard and report test passed:
+  - the graceful stop with batches limited by rows (T11);
+  - the PAYMENTS purge to the end with its forecast against result (T13);
+  - compaction (T14), LOB clearing (T15) and the menu wizard (T16).
+- T08 failed on its own check, not on the tool.
+  - Every preflight ends with a line ` Choices <choices> (saved with R-...)` (since 0.5.1).
+  - T08 checked that a non-interactive preflight shows no questions with `Assert-NoMatch ' CHOICES '`. PowerShell's `-match` ignores case, so the Choices line matched.
+  - T08B, T10B and T11 used the same pattern positively and passed on the Choices line too, so they did not prove the questions section was there.
+- Fix: the four checks use the section header exactly, case-sensitive: `(?m-i)^ CHOICES +HH:MM:SS` (`$script:ChoicesSection`). Checked against sample lines: it matches the section, not the Choices line or the CHOICES step of the report.
+
+How to test: `.\src\tests\e2e\run_tests.bat --only T08` (T01 runs too): T08 passes. The next full run checks T08B, T10B and T11 with the exact pattern.
+
 ## 2026-10-05 - Measuring lighter, no redo log warning when the logs are to be enlarged (0.5.4)
 
 - The batches read the session's redo and undo once after each statement, with both statistics in one V$MYSTAT query.
