@@ -2,6 +2,33 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - Set R: DATA 41.7 GB -> 11.9 GB; INITIAL, the move limit and the report's reason fixed (0.7.3)
+
+Set R on EPFPG781 (0.7.2), the copy H5 purged. R0 (install 0.7.2, then T18C, T18D, T18F and T19) and R1 (the assessment: start 41.7 GB, forecast 8.9 GB) passed. R2, the compaction R-000059, took 6 min 25 s in all:
+- DATA went from 41.7 GB to 11.9 GB: 29.8 GB given back, status COMPACTED, verdict PASS WITH WARNINGS.
+- R1 969/969 indexes usable and identical (10.4 GB of indexes rebuilt as 3.2 GB); R2 2,553 constraints; R3 no new invalid object; R4 688/688 row counts; R5 717/717 table and LOB attributes; R6 never above the start size, autoextend YES (32 TB) before and after; R9 KDCM, OP, OPPAYMENTS, OPREPORTS and SUPER locked for 5.5 minutes and restored.
+- Steps: assessment 23 s, baseline 10 s, release 9 s, compaction 37 s (6 tables moved), index rebuilds 4 min 26 s, verify 10 s.
+- R7 WARN (11.9 GB for 10.5 GB of segments) and P5 WARN (PUBLIC_DML: 15 write grants to PUBLIC on tables in scope).
+
+What the events and the dictionary showed:
+- **AUDIT_ARCHIVE came back as 783 MB.** It had 0.3 MB of table and 3.2 MB of LOB, and the row counts did not change, yet the moved table segment is exactly 783 MB. A move or rebuild creates the segment again with its INITIAL storage, allocated at once. An import typically leaves the source size there.
+  - Its estimate was 64 KB. The move fitted, but a table that comes back at its old size gives nothing back and needs room nobody planned for.
+  - Fix: a move or rebuild sets INITIAL 64 KB on a segment whose INITIAL is larger than it needs (above its estimate and 1 MB). This applies to the table or IOT index, the overflow, each LOB segment, and each rebuilt index. Event INITIAL_RESET, and the table's Detail in TABLES says what it was.
+  - The data and every compared attribute stay as they were; only the stored INITIAL changes.
+- **The file stopped at the move limit, not at a pin.** DIRECTORY_DISPATCHING held the top again after its first move. Its second and third moves did leave the top: 21.8 -> 13.8 GB. It was back at the top only after three other tables had moved off it, and FILE_DONE stopped the file: "moved 3 times, still at the top". The limit counted every move.
+  - Fix: `reclaim_unit_moves` (3) now counts only the moves that leave a table's copy at the top again; a table moves 10 times at most.
+- **R7 blamed the wrong segment.** It named OP.WEB_RAPPORT, the LONG table that stays, which ends at 125.7 MB. R8 said "682 below a segment that stays".
+  - Fix: where each datafile stopped and why is kept with its tablespace (new column EPF_RECLAIM_TS.stop_detail), shown under TABLESPACES as "stopped:", and used by R7.
+  - Tables not reached now read "not moved: below where its datafile stopped (FILE_DONE)", and R8 "below where the datafile stopped".
+- **PUBLIC_DML** now names the tables (up to 10) besides the count.
+- Lab: RT_FAT is created with INITIAL 40 MB, more than it needs after the deletes; T18B asserts INITIAL_RESET for it.
+
+Checked offline: the package scans find nothing (declarations, order, aggregates over aliases, private functions in SQL).
+
+Version 0.7.3 (packages and a new column): install again.
+
+How to test: on EPFPG781 as set R left it, install 0.7.3, then `run_tests.bat --only T18A,T18B,T18C,T18D,T18F,T19`. Then a second compaction of DATA, which is a compaction of an already compacted tablespace. DIRECTORY_DISPATCHING may move again, and at most the 1.4 GB of free space inside the file can come back. AUDIT_ARCHIVE, now at about 4.3 GB in the file, moves only if the compaction reaches it or uses it to make room; with its INITIAL of 783 MB it then shows INITIAL_RESET. The status page has it as R5.
+
 ## 2026-10-06 - H8 complete; a worker whose client is gone is waited for, or its sqlplus ended (0.7.2)
 
 The rerun of T18A and T18B (`--only T18A,T18B,T18F,T19`) passed: 5 of 5, and no connection hung this time. With the first H8 run, all 10 tests of H8 passed on 0.7.1.

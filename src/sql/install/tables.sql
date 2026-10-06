@@ -574,6 +574,7 @@ BEGIN
     --   growth_bytes    how far a datafile may grow above its start size
     --   peak_bytes      largest total datafile size reached during the run
     --   end_*           datafile size, high-water mark and segments at the end
+    --   stop_detail     where each datafile stopped shrinking and why (FILE_DONE)
     create_table('EPF_RECLAIM_TS', q'[
         CREATE TABLE epf_reclaim_ts (
             run_id             NUMBER         NOT NULL,
@@ -606,6 +607,7 @@ BEGIN
             CONSTRAINT epf_reclaim_ts_ck CHECK (status IN ('ASSESSED', 'COMPACTED', 'PARTIAL', 'UNCHANGED',
                                                            'FAILED'))
         )]');
+    add_column('EPF_RECLAIM_TS', 'STOP_DETAIL', 'VARCHAR2(2000)');
 
     -- Temporary supporting indexes created for a purge. owner is the index
     -- owner (the tool schema); table_owner.table_name is the indexed table.

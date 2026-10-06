@@ -468,7 +468,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             l_soft := 0;
             l_detail := NULL;
             l_value := NULL;
-            FOR t IN (SELECT r.tablespace_name, r.end_bytes, r.end_segment_bytes, r.file_count, r.status,
+            FOR t IN (SELECT r.tablespace_name, r.end_bytes, r.end_segment_bytes, r.file_count, r.status, r.stop_detail,
                              (SELECT MAX(i.owner || '.' || i.object_name || ' (' || i.blocker_reason || ')')
                                      KEEP (DENSE_RANK LAST ORDER BY i.top_block)
                                 FROM epf_ts_inventory i
@@ -483,7 +483,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                     l_soft := l_soft + 1;
                     l_detail := add_detail(l_detail, t.tablespace_name || ' ' || b(t.end_bytes) || ' for '
                                                      || b(t.end_segment_bytes) || ' of segments: '
-                                                     || CASE WHEN t.status = 'PARTIAL'
+                                                     || CASE WHEN t.stop_detail IS NOT NULL THEN t.stop_detail
+                                                             WHEN t.status = 'PARTIAL'
                                                              THEN 'tables did not fit, failed or were not reached'
                                                              WHEN t.top_pin IS NOT NULL
                                                              THEN 'a segment that stays holds the top, ' || t.top_pin
@@ -531,7 +532,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             add_check('R8', CASE WHEN l_bad > 0 THEN 'FAIL' WHEN l_soft > 0 THEN 'WARN' ELSE 'PASS' END, r_title('R8'),
                       l_ok || ' of ' || l_total || ' moved'
                       || CASE WHEN l_total - l_ok - l_bad - l_soft > 0
-                              THEN ', ' || (l_total - l_ok - l_bad - l_soft) || ' below a segment that stays' END
+                              THEN ', ' || (l_total - l_ok - l_bad - l_soft) || ' below where the datafile stopped' END
                       || CASE WHEN l_soft > 0 THEN ', ' || l_soft || ' not moved' END
                       || CASE WHEN l_bad > 0 THEN ', ' || l_bad || ' failed' END, l_detail);
         END IF;
@@ -1845,7 +1846,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             || r('Indexes', 9) || r('Pins', 7) || r('Forecast', 12) || r('End', 12) || r('Peak', 12)
             || r('Given back', 12) || '  Status');
         FOR t IN (SELECT tablespace_name, file_count, start_bytes, segment_bytes, unit_count, index_count, pin_count,
-                         est_final_bytes, end_bytes, peak_bytes, status, detail, moved_count
+                         est_final_bytes, end_bytes, peak_bytes, status, detail, moved_count, stop_detail
                     FROM epf_reclaim_ts
                    WHERE run_id = g_run.run_id
                    ORDER BY start_bytes DESC, tablespace_name) LOOP
@@ -1861,6 +1862,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || '  ' || t.status);
             IF t.detail IS NOT NULL THEN
                 put('    forecast: ' || t.detail);
+            END IF;
+            IF t.stop_detail IS NOT NULL THEN
+                put('    stopped: ' || t.stop_detail);
             END IF;
         END LOOP;
         IF l_count = 0 THEN

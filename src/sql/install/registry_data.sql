@@ -196,7 +196,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.7.2', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.7.3', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -211,7 +211,7 @@ BEGIN
     put_setting('disconnect_timeout_s',   '300',   'Seconds a reclaim waits for POST_TRANSACTION disconnects before IMMEDIATE');
     put_setting('reclaim_growth_mb',      '0',     'How far a reclaim may grow a datafile above its size at the start, to move a table that does not fit below');
     put_setting('reclaim_margin_mb',      '64',    'Free space a reclaim leaves at the end of each datafile it compacts');
-    put_setting('reclaim_unit_moves',     '3',     'Moves of one table at most in a reclaim (a table that stays at the top is not moved again)');
+    put_setting('reclaim_unit_moves',     '3',     'Moves of one table in a reclaim after which its copy holds the top of its datafile again; then it is not moved again (10 moves at most)');
     put_setting('reclaim_test_pause_s',   '0',     'Tests only: the next compaction pauses this many seconds (at most 600) after each table that moves, or until a stop is requested, then sets this back to 0', p_force => TRUE);
     put_setting('reclaim_row_counts',     'Y',     'A reclaim counts the rows of every table it moves before and after (Y or N)');
     put_setting('compact_min_free_pct',   '20',    'Compaction only processes tables with at least this share freed inside');

@@ -1386,6 +1386,8 @@ function Invoke-Suite {
         # first), and the copy of a table that moves lands lower in the file.
         Assert-Match $r 'MAKING_ROOM'
         Assert-Match $r 'UNIT_MOVED +EPF_RT\.RT_TOP'
+        # RT_FAT's INITIAL (40 MB) is more than it needs: its move sets 64 KB.
+        Assert-Match $r 'INITIAL_RESET +EPF_RT\.RT_FAT'
         foreach ($step in @('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'REBUILD_INDEXES', 'RESTORE_FILES', 'RESIZE',
                             'VERIFY', 'UNLOCK_ACCOUNTS')) {
             Assert-Manifest $run ('step.RECLAIM.' + $step + '.-') '^DONE\|'

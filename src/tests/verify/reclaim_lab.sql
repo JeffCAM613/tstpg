@@ -16,6 +16,8 @@
 --           inside segments: RT_FAT keeps a fifth of its rows), and RT_TOP,
 --           created last, holds the top of the datafile. RT_TOP does not fit
 --           in the free space at first: RT_FAT moves first to make room.
+--           RT_FAT is created with INITIAL 40 MB, more than it needs after the
+--           deletes, so its move sets INITIAL 64 KB.
 --           CHECK prints the state the tests compare (LAB| lines). CLEANUP
 --           removes the accounts, the role and the tablespace.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/tests/verify/reclaim_lab.sql SETUP|CHECK|CLEANUP
@@ -132,7 +134,9 @@ BEGIN
         run('CREATE TABLE epf_rt.rt_child (id NUMBER CONSTRAINT rt_child_pk PRIMARY KEY, '
             || 'heap_id NUMBER CONSTRAINT rt_child_fk REFERENCES epf_rt.rt_heap, note VARCHAR2(500)) TABLESPACE ' || c_ts);
         run('CREATE INDEX epf_rt.rt_child_ix ON epf_rt.rt_child (heap_id) TABLESPACE ' || c_ts);
-        run('CREATE TABLE epf_rt.rt_fat (id NUMBER, pad VARCHAR2(2000)) TABLESPACE ' || c_ts);
+        -- RT_FAT has an INITIAL larger than it needs once most of its rows are
+        -- deleted, as an imported table has: its move sets INITIAL 64 KB.
+        run('CREATE TABLE epf_rt.rt_fat (id NUMBER, pad VARCHAR2(2000)) TABLESPACE ' || c_ts || ' STORAGE (INITIAL 40M)');
         -- Dropped later: free space low in the datafile, and the recycle bin.
         run('CREATE TABLE epf_rt.rt_fill (id NUMBER, pad VARCHAR2(2000)) TABLESPACE ' || c_ts);
         run('CREATE TABLE epf_rt.rt_bin (id NUMBER, pad VARCHAR2(2000)) TABLESPACE ' || c_ts);
