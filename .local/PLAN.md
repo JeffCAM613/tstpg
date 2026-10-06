@@ -523,6 +523,7 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 | Partitioned table, index or LOB; cluster; nested table; queue table; MV container; MV log with rowids; flashback archive table; table with a LONG or object-type column, a domain or partitioned index, or a disabled function-based index; segment of an Oracle-maintained owner; recycle-bin object; temporary segment; index left as found | PIN, with the reason |
 
 - A pin is not a blocker: the datafile cannot shrink below it, everything above it is still compacted. The report lists the highest pins per tablespace with position and reason.
+- Recycle-bin objects: `DBA_EXTENTS` does not list their segments and `DBA_FREE_SPACE` counts them as free (seen on 19c in H5: the lab's dropped table was missing from the inventory). The requirement RECYCLEBIN counts them from `DBA_RECYCLEBIN` (7.9); confirmed, FREEZE_FILES purges them before the files stop growing.
 - A table stored outside the targets whose LOB segments are inside moves too (the MOVE rebuilds the table in its own tablespace, which may grow): warned (TABLE_OUTSIDE_SCOPE).
 - Segmentless objects, partition default attributes, user defaults and quotas need no handling: nothing is repointed.
 
@@ -536,8 +537,8 @@ PK/UK/FK constraints are never dropped. While a unique index is unusable, DML on
 | LOCK_ACCOUNTS | 7.7. |
 | BASELINE | Once the accounts are locked, so no write changes the counts afterwards. Fingerprint (EPF_OBJECT_BASELINE): every index of the run, the constraints of the tables in scope and the foreign keys to them, the tables that move with their attributes and row counts, their LOB columns, the invalid objects; the datafiles (EPF_FILE_SNAP). |
 | RELEASE_INDEXES | 7.3 step 1. |
-| FREEZE_FILES | AUTOEXTEND OFF on every datafile of every target (recorded first in EPF_INSTANCE_CHANGE, RECLAIM_DATAFILE), then each file resized to its highest block. Frozen together, because a table that moves writes its LOB segments into another target. |
-| COMPACT (per tablespace, the largest first) | Loop: pick the unit holding the highest block of a datafile not done; if its need (estimate plus one extent per segment) exceeds the free space, **make room**: move the table that frees the most (purged tables: at least 1 MB and 10 % free inside) and fits, repeatedly; if still short, grow that file within its room; move the unit; resize the files down to their highest block. A file is done when its highest block is a pin, an index left as found, or a unit that did not fit, failed or moved `reclaim_unit_moves` times. Stop requests are honored between moves. |
+| FREEZE_FILES | The recycle-bin objects of the targets are purged when the DBA confirmed it (`--confirm RECYCLEBIN`; PURGE TABLESPACE, RECYCLEBIN_PURGED). AUTOEXTEND OFF on every datafile of every target (recorded first in EPF_INSTANCE_CHANGE, RECLAIM_DATAFILE), then each file resized to its highest block. Frozen together, because a table that moves writes its LOB segments into another target. |
+| COMPACT (per tablespace, the largest first) | Loop: pick the unit holding the highest block of a datafile not done; if its need (estimate plus one extent per segment) exceeds the free space, **make room**: move the table that frees the most (purged tables: at least 1 MB and 10 % free inside) and fits, repeatedly; if still short, grow that file within its room; move the unit; resize the files down to their highest block. A unit that moved already and holds the top again moves lower only when it fits in the free space as it is (no growth: that room lies above it); otherwise, or when that move fails, it keeps its move (MOVED) and the file is done. A file is done when its highest block is a pin, an index left as found, or a unit that did not fit, failed, moved `reclaim_unit_moves` times or cannot move lower after its move. Stop requests are honored before every move, also right after the moves that made room. |
 | REBUILD_INDEXES | While the files are still frozen: each index's tablespace first grows within its room when short. An index that does not fit is rebuilt after its growth settings are restored, with resumable space allocation (a warning: the file may end above its start size; an unusable index would stop the application). |
 | RESTORE_FILES | Growth settings back as recorded. |
 | RESIZE | Each datafile to its highest block plus `reclaim_margin_mb`; a file that is not autoextensible is reported (FILE_NO_GROWTH). |
@@ -566,7 +567,8 @@ Units not reached are STAYED (below a pin: moving them gains nothing) or SKIPPED
 - `ddl_lock_timeout` (default 30 s) on every DDL; ORA-00054 retried `ddl_retries` times (default 3, after 30/60/120 s); a table still busy stays where it is (MOVE_BUSY).
 - A MOVE is atomic: a failed or interrupted move leaves the table where it was.
 - **Recorded before changed**: datafile growth (EPF_INSTANCE_CHANGE), account locks (EPF_ACCOUNT_ACTION), released indexes (EPF_RECLAIM_OBJECT RELEASED). A crash between the record and the change is harmless: the restore checks the live state.
-- **Stop request**: honored between moves; the restore path runs; the run ends STOPPED with the units not reached SKIPPED.
+- **Stop request**: honored before every move; the restore path runs; the run ends STOPPED with the units not reached SKIPPED.
+- **Test pause** (tests only): setting `reclaim_test_pause_s` makes the next compaction pause after each table that moves (TEST_PAUSE), up to that many seconds or until a stop is requested; the compaction sets it back to 0 when it reads it, and every install resets it. T18C and T18D use it, because a stop request or a kill takes a connection of its own (about 15 s on the test network) while the lab's compaction takes seconds.
 - **Worker session lost** (killed, connection lost): `reclaim.sql` prints `EPF_RECLAIM_STATUS=` only when the run ended in the session. Without it the wrapper runs mode RESTORE in the same run, in a new SYS session (rebuilds, growth settings, resize, verify, accounts).
 - **Wrapper lost too**: the next `reclaim` restores what is pending first (PREPARE, adoption of released indexes); `reclaim --restore` does it on its own; `status` lists every pending item with that command; uninstall refuses while anything is pending; history pruning keeps the records of such runs.
 - A later reclaim continues from the current layout: there is no resume step, the assessment sees what is left.
@@ -575,7 +577,7 @@ Units not reached are STAYED (below a pin: moving them gains nothing) or SKIPPED
 
 | Requirement | Blocking | Met when |
 |-------------|----------|----------|
-| RECYCLEBIN | yes | no recycle-bin object in the targets (while the files cannot grow, Oracle purges them to make room), or `--confirm RECYCLEBIN` |
+| RECYCLEBIN | yes | no recycle-bin object in the targets, counted from `DBA_RECYCLEBIN` (while the files cannot grow, Oracle purges them to make room), or `--confirm RECYCLEBIN`: FREEZE_FILES then purges them first |
 | ARCHIVE | yes (ARCHIVELOG only) | the archive destination has room for the redo of the moves and rebuilds plus `archive_margin_pct`, or `--confirm ARCHIVE` |
 | TEMP | yes | the temporary tablespace of SYS holds 1.5 x the largest rebuild (free plus growth), or `--confirm TEMP` |
 | BACKUP | no (advice) | an RMAN database backup within `backup_max_age_h` |
@@ -855,7 +857,7 @@ I cannot run Oracle in this environment, so each phase ships test scripts and ex
 | V8 | `DBMS_SPACE.SPACE_USAGE` for table, index, BASICFILE and SECUREFILE LOB segments; cost on large segments. |
 | V9 | `ALTER SYSTEM DISCONNECT SESSION ... POST_TRANSACTION` and account lock/unlock from inside a PDB. |
 | V10 | Resumable space allocation suspends and resumes; `V$SESSION_LONGOPS` reports MOVE and REBUILD progress. |
-| V11 | The copy of a table that moves goes to the lowest free space that fits (first fit), so the highest block of the file drops after each move. Lab: T18B (RT_TOP moves lower, the file shrinks). |
+| V11 | The copy of a table that moves goes to the lowest free space that fits (first fit), so the highest block of the file drops after each move. Lab: T18B (RT_TOP moves lower, the file shrinks). H5 (0.7.0): the copy of RT_TOP took the free space below it (file 342 -> 260 MB); it came out larger (80 -> 103 MB) and needed nearly all of that space, so its last extents lay just below its old place and it held the top again. Since 0.7.1 such a table moves again only when it fits below as it is. |
 | V12 | `MOVE` with `LOB (c) STORE AS SECUREFILE (TABLESPACE t)` (or BASICFILE) keeps every other LOB attribute: chunk, retention, cache, compression, deduplication, encryption, in-row, segment name. R5 compares them on every run. |
 | V13 | A killed worker session: the DDL in progress rolls back, and the restore in a new session rebuilds the released indexes, restores the growth settings and unlocks the accounts. Lab: T18D. |
 
@@ -897,6 +899,7 @@ One command runs every current test against one refreshed test database and writ
 
 | Test | Covers |
 |------|--------|
+| T00 | Static checks, no database: the wrapper and the suite parse, call only defined commands, and no `+` takes a list on its right (the comma binds tighter) |
 | T01 | Precheck and safety gate: database name, non-CDB, single instance, log mode, redo logs, undo, statistics of the root tables |
 | T02 | Environment survey, appended to the log |
 | T03, T04 | Install through the wrapper, then again with `install.sql` (idempotent upgrade) |
@@ -912,7 +915,7 @@ One command runs every current test against one refreshed test database and writ
 | T18A-T18F | Reclaim on a scratch tablespace (`src/tests/verify/reclaim_lab.sql`: tables of every kind, a pin low in the file, the top table needing room): the assessment changes nothing; the requirement gate (recycle bin); the compaction with room making and R1-R9, the file shrinks and everything is restored; a stop (STOPPED, restored); a killed worker restored in the same run, then `reclaim --restore`; the assessment of the application tablespaces (read-only); cleanup |
 | T19 | Final state: redo logs, undo_retention as before, no active instance change, no account left locked or index left released by a reclaim, no temporary index left, no run left RUNNING |
 
-Every step records the command (passwords masked), its full output, exit code and the manifest of each run it created; checks compare exit codes, output patterns and manifest values, and any SP2-/PLS-/compile or missing-object error fails the step. Ctrl+C itself is not scripted (the console is redirected); the stop action exercises the same graceful stop. `--only`, `--from` re-run parts; T01 always runs.
+Every step records the command (passwords masked), its full output, exit code and the manifest of each run it created; checks compare exit codes, output patterns and manifest values, and any SP2-/PLS-/compile or missing-object error fails the step. A step that times out is reported first: the processes it started and what the database sessions of the machine and of the runs are doing (event, blocker, SQL), from a separate SYS session. Ctrl+C itself is not scripted (the console is redirected); the stop action exercises the same graceful stop. `--only`, `--from` re-run parts; T01 always runs.
 
 ### 12.6 Parity check (`src/tests/parity`)
 
@@ -1016,6 +1019,6 @@ Also settled:
 | LONG conversion changes an application contract | Per-item approval with dependents shown; irreversible nature stated; every conversion reported. |
 | Client objects of an unsupported kind in a target tablespace | Classified as pins with their reason; the file stops shrinking at the highest one, which the report names (R7). |
 | The table at the top does not fit in the free space below | Room making with the tables that have free space inside them (purged tables) first; then `reclaim_growth_mb`; otherwise MOVE_NO_ROOM names it and the file stops there (R8 WARN). |
-| Oracle places a moved copy high instead of low | V11; a table moves at most `reclaim_unit_moves` times; FILE_DONE names where each file stopped. |
+| Oracle places a moved copy high instead of low | V11; a table moves at most `reclaim_unit_moves` times, and again only when it fits below as it is; FILE_DONE names where each file stopped. |
 | Tool-schema privileges considered too broad by security | EPFPG holds only purge/report rights (3.4); DBA-level work runs only as SYS, supplied per run. |
 | Two wrapper implementations drift (bat/ps1 vs sh) | Logic in the database; wrappers only render events; phase 8 compares manifests from both. |

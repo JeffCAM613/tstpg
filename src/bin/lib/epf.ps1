@@ -40,6 +40,8 @@ $script:ExitUsage   = 4
 
 $script:Modes = @('FULL', 'CLOB', 'LOGS', 'CLOB_N_LOGS')
 $script:Width = 80
+# Seconds a connection test may take before it is ended and tried again.
+$script:ConnectTimeoutS = 120
 
 # sqlplus sessions read their standard input in the console code page. With a
 # UTF-8 console (code page 65001) .NET would begin every session's input with
@@ -525,36 +527,47 @@ function Test-SessionFailure {
 }
 
 # Connection test (the only statement the wrapper sends itself): container
-# name and, for EPFPG, the installed tool version.
+# name and, for EPFPG, the installed tool version. A session that does not
+# answer within $script:ConnectTimeoutS seconds (a connection that hangs) is
+# ended and tried once more; TimedOut then tells the caller.
 function Test-DbConnection {
     param($Login, [switch]$WithVersion)
-    $process = Start-SqlProcess
-    $in = $process.StandardInput
-    $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
-    $in.WriteLine((Get-ConnectLine $Login))
-    if ($WithVersion) {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
-    } else {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
-    }
-    $in.WriteLine('EXIT')
-    $in.Close()
-    $out = $process.StandardOutput.ReadToEndAsync()
-    $err = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
-    $text = $out.Result + $err.Result
-    $received = Get-Date
-    foreach ($line in ($text -split "`r?`n")) {
-        if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
-            $container = $Matches[1]
-            $version = $Matches[2].Trim()
-            $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
-            # Database clock minus this machine's clock, to the minute.
-            $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
-            return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text }
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $process = Start-SqlProcess
+        $in = $process.StandardInput
+        $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
+        $in.WriteLine((Get-ConnectLine $Login))
+        if ($WithVersion) {
+            $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
+        } else {
+            $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
         }
+        $in.WriteLine('EXIT')
+        $in.Close()
+        $out = $process.StandardOutput.ReadToEndAsync()
+        $err = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($script:ConnectTimeoutS * 1000)) {
+            try { $process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
+            Write-Out (' No answer from ' + $Login.Tns + ' as ' + $Login.User + ' within ' + $script:ConnectTimeoutS +
+                       ' s (attempt ' + $attempt + ' of 2).') 'Yellow'
+            continue
+        }
+        $process.WaitForExit()
+        $text = $out.Result + $err.Result
+        $received = Get-Date
+        foreach ($line in ($text -split "`r?`n")) {
+            if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
+                $container = $Matches[1]
+                $version = $Matches[2].Trim()
+                $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+                # Database clock minus this machine's clock, to the minute.
+                $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
+                return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text; TimedOut = $false }
+            }
+        }
+        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $false }
     }
-    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text }
+    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = ''; TimedOut = $true }
 }
 
 # "+06:00" for a clock offset; empty when the clocks agree.
@@ -1013,7 +1026,8 @@ function Invoke-ToolRun {
 
         # A preflight with prompts: the operator's choices for each
         # requirement not met, saved with the run (Ctrl+C is a normal key
-        # meanwhile).
+        # meanwhile). Stopped at a question, the preflight did not end: it
+        # ends STOPPED, which closes the plan it made (no plan to follow).
         if ($Action -eq 'PREFLIGHT' -and $preflightOk -and $script:Interactive -and -not $state.StopRequested) {
             Disable-StopKey $state
             try {
@@ -1021,6 +1035,7 @@ function Invoke-ToolRun {
             } finally {
                 $state.StopKeys = Enable-StopKey
             }
+            if ($state.Stopped) { $status = 'STOPPED' }
         }
 
         if ($Action -eq 'PURGE' -and $preflightOk) {
@@ -1254,6 +1269,10 @@ function Connect-Tool {
     $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
     $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
     $test = Test-DbConnection $login -WithVersion
+    if ($test.TimedOut) {
+        Exit-Tool $script:ExitFail ('The database did not answer the connection as EPFPG (twice, ' + $script:ConnectTimeoutS +
+                                    ' s each): check the network and the listener, then try again.')
+    }
     if (-not $test.Ok) {
         Show-Lines $test.Output -Indent
         if ($Soft) {
@@ -1279,6 +1298,10 @@ function Connect-Sys {
     $secret = Read-Secret -Prompt 'SYS password' -EnvName 'EPF_SYS_PASSWORD' -ConfigKey 'SYS_PASSWORD'
     $sys = New-Login -User 'sys' -Secret $secret -Tns $Tns -Sysdba
     $test = Test-DbConnection $sys
+    if ($test.TimedOut) {
+        Exit-Tool $script:ExitFail ('The database did not answer the connection as SYS (twice, ' + $script:ConnectTimeoutS +
+                                    ' s each): check the network and the listener, then try again.')
+    }
     if (-not $test.Ok) {
         Show-Lines $test.Output -Indent
         Exit-Tool $script:ExitUsage 'The connection as SYS failed.'
@@ -1667,6 +1690,17 @@ function Get-Unmet {
         }
     }
     return ,$codes
+}
+
+# Batch size that keeps one batch within half of an online log of $LogBytes
+# (as the preflight's recommendation): two significant digits, 100-100000.
+function Get-BatchForLog {
+    param([double]$PerRoot, [double]$LogBytes)
+    $value = 0.5 * $LogBytes / $PerRoot
+    if ($value -le 100) { return 100 }
+    if ($value -ge 100000) { return 100000 }
+    $scale = [Math]::Pow(10, [Math]::Floor([Math]::Log10($value)) - 1)
+    return [int]([Math]::Floor($value / $scale) * $scale)
 }
 
 # Batch size offered: the preflight's recommendation (for 1 GB online logs
@@ -2248,7 +2282,7 @@ function Invoke-ReclaimChoices {
         $stop = 'the requirement is not met'
         switch ($code) {
             'RECYCLEBIN' {
-                $option = 'Oracle may purge them while the datafiles cannot grow (FLASHBACK TABLE ... TO BEFORE DROP can then not restore them)'
+                $option = 'They may be lost: the compaction purges them first (FLASHBACK TABLE ... TO BEFORE DROP can then no longer restore them)'
                 $stop = 'the DBA purges them (PURGE TABLESPACE <name>), then run the reclaim again'
             }
             'ARCHIVE' {

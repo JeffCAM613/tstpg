@@ -19,6 +19,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     g_margin   NUMBER := 0;
     g_moves    NUMBER := 3;
     g_retries  NUMBER := 3;
+    g_pause    NUMBER := 0;
 
     -- Fingerprints of the objects a compaction may affect, read once the
     -- accounts are locked and before any object changes (baseline), and again
@@ -1313,22 +1314,25 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         DELETE FROM epfpg.epf_req_option WHERE run_id = g_run.run_id;
         DELETE FROM epfpg.epf_requirement WHERE run_id = g_run.run_id;
 
-        SELECT COUNT(*), NVL(SUM(bytes), 0)
+        -- Read from DBA_RECYCLEBIN: DBA_EXTENTS does not list the segments of
+        -- recycle-bin objects (DBA_FREE_SPACE counts them as free).
+        SELECT COUNT(*), NVL(SUM(r.space * t.block_size), 0)
           INTO l_count, l_bytes
-          FROM epfpg.epf_ts_inventory
-         WHERE run_id = g_run.run_id AND kind = 'RECYCLEBIN';
+          FROM dba_recyclebin r
+          JOIN dba_tablespaces t ON t.tablespace_name = r.ts_name
+         WHERE r.ts_name IN (SELECT x.tablespace_name FROM epfpg.epf_reclaim_ts x WHERE x.run_id = g_run.run_id);
         l_met := l_count = 0 OR confirmed('RECYCLEBIN');
         add_req('RECYCLEBIN', 1, CASE WHEN l_met THEN 'MET' ELSE 'NOT_MET' END, 'Y',
                 'No recycle-bin object in the tablespaces',
                 'While the datafiles cannot grow, Oracle makes room for the moves by purging recycle-bin objects of '
                 || 'the tablespace; they could then no longer be restored with FLASHBACK TABLE ... TO BEFORE DROP.',
                 CASE WHEN l_count = 0 THEN 'none'
-                     ELSE l_count || ' recycle-bin segments, ' || b(l_bytes) END,
+                     ELSE l_count || ' recycle-bin objects, ' || b(l_bytes) END,
                 NULL, NULL, CASE WHEN l_count = 0 THEN 'NONE' WHEN l_met THEN 'CONFIRMED' END);
         add_opt('RECYCLEBIN', 'PURGE', 1, l_count = 0, 'The DBA purges them first',
                 'PURGE TABLESPACE <name>, or PURGE TABLE for each object');
         add_opt('RECYCLEBIN', 'CONFIRMED', 2, l_count > 0 AND confirmed('RECYCLEBIN'), 'Confirm they may be purged',
-                '--confirm RECYCLEBIN');
+                '--confirm RECYCLEBIN: the compaction purges them (PURGE TABLESPACE) before the datafiles stop growing');
 
         SELECT log_mode INTO l_log FROM v$database;
         SELECT NVL(SUM(est_bytes), 0)
@@ -1718,13 +1722,32 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN l_sql;
     END move_sql;
 
+    -- Datafile p_file cannot shrink further (FILE_DONE): its highest block
+    -- belongs to p_owner.p_name, which stays there for p_why.
+    PROCEDURE file_done(p_file IN NUMBER, p_owner IN VARCHAR2, p_name IN VARCHAR2, p_why IN VARCHAR2) IS
+        l_file VARCHAR2(513);
+        l_bs   NUMBER;
+        l_top  NUMBER;
+    BEGIN
+        SELECT d.file_name, t.block_size
+          INTO l_file, l_bs
+          FROM dba_data_files d
+          JOIN dba_tablespaces t ON t.tablespace_name = d.tablespace_name
+         WHERE d.file_id = p_file;
+        SELECT MAX(top_block) INTO l_top FROM epfpg.epf_ts_inventory WHERE run_id = g_run.run_id AND file_id = p_file;
+        say(epfpg.epf_log.c_info, 'FILE_DONE',
+            l_file || ' stops at ' || b((NVL(l_top, 0) + 1) * l_bs) || ': its highest block belongs to ' || p_owner || '.'
+            || p_name || ' (' || p_why || ')');
+    END file_done;
+
     -- The unit holding the highest block of a datafile of p_ts that is still
     -- compacting (p_item NULL when none is left). A datafile whose highest
     -- block belongs to a segment that cannot move (a pin, or an index that
-    -- was not released), or to a table that did not fit, failed or moved
-    -- reclaim_unit_moves times, is done: it cannot shrink further. A segment
-    -- that stays but is gone meanwhile (a recycle-bin object Oracle purged, a
-    -- temporary segment) leaves the inventory.
+    -- was not released), or to a table that did not fit, failed, moved
+    -- reclaim_unit_moves times or could not move lower after it moved, is
+    -- done: it cannot shrink further. A segment that stays but is gone
+    -- meanwhile (a recycle-bin object Oracle purged, a temporary segment)
+    -- leaves the inventory.
     PROCEDURE pick(p_ts IN VARCHAR2, p_done IN OUT NOCOPY t_flags, p_item OUT NUMBER, p_file OUT NUMBER) IS
         l_best     NUMBER := -1;
         l_top_item NUMBER;
@@ -1735,15 +1758,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_type     VARCHAR2(30);
         l_status   VARCHAR2(20);
         l_attempts NUMBER;
+        l_last_ora NUMBER;
         l_owner    VARCHAR2(128);
         l_name     VARCHAR2(128);
         l_detail   VARCHAR2(4000);
-        l_bs       NUMBER;
     BEGIN
         p_item := NULL;
         p_file := NULL;
-        SELECT block_size INTO l_bs FROM dba_tablespaces WHERE tablespace_name = p_ts;
-        FOR f IN (SELECT file_id, file_name FROM dba_data_files WHERE tablespace_name = p_ts ORDER BY file_id) LOOP
+        FOR f IN (SELECT file_id FROM dba_data_files WHERE tablespace_name = p_ts ORDER BY file_id) LOOP
             WHILE NOT p_done.EXISTS(f.file_id) LOOP
                 SELECT MAX(item_id) KEEP (DENSE_RANK LAST ORDER BY top_block),
                        MAX(top_block),
@@ -1756,8 +1778,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     p_done(f.file_id) := TRUE;
                     EXIT;
                 END IF;
-                SELECT unit_type, move_status, attempts, owner, object_name, detail
-                  INTO l_type, l_status, l_attempts, l_owner, l_name, l_detail
+                SELECT unit_type, move_status, attempts, last_ora, owner, object_name, detail
+                  INTO l_type, l_status, l_attempts, l_last_ora, l_owner, l_name, l_detail
                   FROM epfpg.epf_reclaim_object
                  WHERE run_id = g_run.run_id AND item_id = l_top_item;
                 IF l_type NOT IN ('TABLE', 'IOT') THEN
@@ -1774,15 +1796,16 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                         CONTINUE;
                     END IF;
                 END IF;
-                IF l_type NOT IN ('TABLE', 'IOT') OR l_status IN ('NO_ROOM', 'FAILED') OR l_attempts >= g_moves THEN
+                IF l_type NOT IN ('TABLE', 'IOT') OR l_status IN ('NO_ROOM', 'FAILED') OR l_attempts >= g_moves
+                   OR (l_status = 'MOVED' AND l_last_ora IS NOT NULL) THEN
                     p_done(f.file_id) := TRUE;
-                    say(epfpg.epf_log.c_info, 'FILE_DONE',
-                        f.file_name || ' stops at ' || b((l_top + 1) * l_bs) || ': its highest block belongs to '
-                        || l_owner || '.' || l_name || ' ('
-                        || CASE WHEN l_type = 'PIN' THEN l_detail
-                                WHEN l_type = 'INDEX' THEN 'index left as found'
-                                WHEN l_status IN ('NO_ROOM', 'FAILED') THEN LOWER(REPLACE(l_status, '_', ' '))
-                                ELSE 'moved ' || l_attempts || ' times, still at the top' END || ')');
+                    file_done(f.file_id, l_owner, l_name,
+                              CASE WHEN l_type = 'PIN' THEN l_detail
+                                   WHEN l_type = 'INDEX' THEN 'index left as found'
+                                   WHEN l_status IN ('NO_ROOM', 'FAILED') THEN LOWER(REPLACE(l_status, '_', ' '))
+                                   WHEN l_status = 'MOVED' AND l_last_ora IS NOT NULL
+                                   THEN 'moved; it could not move lower (ORA-' || LPAD(l_last_ora, 5, '0') || ')'
+                                   ELSE 'moved ' || l_attempts || ' times, still at the top' END);
                 ELSIF l_top > l_best THEN
                     l_best := l_top;
                     p_item := l_top_item;
@@ -1814,18 +1837,39 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN NULL;
     END room_maker;
 
+    -- Tests only (setting reclaim_test_pause_s, consumed by the compaction
+    -- that reads it): after each table that moved, the compaction waits that
+    -- many seconds, or until a stop is requested, so that a test can stop the
+    -- run or end its session at a known point.
+    PROCEDURE test_pause IS
+    BEGIN
+        IF g_pause = 0 THEN
+            RETURN;
+        END IF;
+        say(epfpg.epf_log.c_info, 'TEST_PAUSE', 'Pause of up to ' || g_pause || ' s after the move (setting '
+                                                || 'reclaim_test_pause_s, tests only)');
+        FOR i IN 1 .. g_pause LOOP
+            EXIT WHEN epfpg.epf_control.stop_requested(g_run.run_id);
+            DBMS_LOCK.SLEEP(1);
+        END LOOP;
+    END test_pause;
+
     -- Moves unit p_item within its tablespaces. p_file: the datafile of p_ts
     -- whose highest block the unit holds; a move that does not fit is tried
     -- once more after that file grew by all its room (grow_file), and a unit
     -- that still does not fit (NO_ROOM), is in use (ORA-00054) or fails
-    -- otherwise (FAILED, an error) stays where it was. p_file NULL: a move
-    -- that makes room for the unit at the top; when it does not fit, the
-    -- unit keeps its status and is no longer a room maker. After a move its
-    -- positions are read again and the datafiles resized down.
+    -- otherwise (FAILED, an error) stays where it was. A unit that moved
+    -- already (at the top again) is not tried after a growth, and when it
+    -- cannot move lower it keeps its move (MOVED, with the error in last_ora:
+    -- its datafile is then done). p_file NULL: a move that makes room for the
+    -- unit at the top; when it does not fit, the unit keeps its status and is
+    -- no longer a room maker. After a move its positions are read again and
+    -- the datafiles resized down.
     PROCEDURE move_unit(p_ts IN VARCHAR2, p_item IN NUMBER, p_file IN NUMBER) IS
         l_owner   VARCHAR2(128);
         l_table   VARCHAR2(128);
         l_type    VARCHAR2(30);
+        l_prior   VARCHAR2(20);
         l_est     NUMBER;
         l_bytes   NUMBER;
         l_sql     VARCHAR2(32767);
@@ -1841,8 +1885,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_freed   NUMBER;
         l_grown   NUMBER := 0;
     BEGIN
-        SELECT owner, object_name, unit_type
-          INTO l_owner, l_table, l_type
+        SELECT owner, object_name, unit_type, move_status
+          INTO l_owner, l_table, l_type, l_prior
           FROM epfpg.epf_reclaim_object
          WHERE run_id = g_run.run_id AND item_id = p_item;
         SELECT NVL(SUM(est_bytes), 0), NVL(SUM(bytes), 0)
@@ -1864,7 +1908,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     l_code := SQLCODE;
                     l_msg := SQLERRM;
             END;
-            EXIT WHEN l_done OR NOT is_space_error(l_code) OR p_file IS NULL OR k = 2;
+            EXIT WHEN l_done OR NOT is_space_error(l_code) OR p_file IS NULL OR l_prior = 'MOVED' OR k = 2;
             l_grown := grow_file(p_ts, p_file, 1125899906842624);
             EXIT WHEN l_grown = 0;
         END LOOP;
@@ -1885,12 +1929,28 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 l_owner || '.' || l_table || ': ' || b(l_bytes) || ' -> ' || b(l_new) || '; ' || p_ts || ' '
                 || b(l_before) || ' -> ' || b(l_after)
                 || CASE WHEN p_file IS NULL THEN ' (it made room for the table at the top)' END
+                || CASE WHEN l_prior = 'MOVED' THEN ' (moved again, lower)' END
                 || CASE WHEN l_grown > 0 THEN ' (the datafile first grew by ' || b(l_grown) || ' to fit it)' END
                 || ' (' || epfpg.epf_util.fmt_duration(epfpg.epf_util.elapsed_s(l_started)) || ')',
                 p_owner => l_owner, p_object => l_table, p_bytes => l_new);
+            test_pause;
             RETURN;
         END IF;
         l_freed := trim_ts(p_ts, 0, FALSE);
+        IF l_prior = 'MOVED' THEN
+            -- Moved already: it stays where its last move put it.
+            UPDATE epfpg.epf_reclaim_object
+               SET last_ora = ABS(l_code), ended_at = epfpg.epf_util.now_ts,
+                   detail = SUBSTR('moved; it could not move lower: ' || l_msg || ' [' || l_sql || ']', 1, 4000)
+             WHERE run_id = g_run.run_id AND item_id = p_item;
+            COMMIT;
+            say(CASE WHEN is_space_error(l_code) THEN epfpg.epf_log.c_info ELSE epfpg.epf_log.c_warn END,
+                'MOVE_AGAIN_NOT_DONE',
+                l_owner || '.' || l_table || ' moved already and holds the top of ' || p_ts || ' again; it could not '
+                || 'move lower and stays where its move put it: ' || l_msg,
+                p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));
+            RETURN;
+        END IF;
         IF p_file IS NULL AND is_space_error(l_code) THEN
             -- A room maker that does not fit is no longer one (its estimate
             -- becomes its size); it moves when it is at the top.
@@ -1929,23 +1989,54 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END IF;
     END move_unit;
 
+    -- Purges the recycle-bin objects of p_ts when the DBA confirmed it
+    -- (--confirm RECYCLEBIN, requirement RECYCLEBIN): while the datafiles
+    -- cannot grow Oracle would purge them anyway to make room, and a segment
+    -- of theirs, which DBA_EXTENTS does not list, could keep a datafile from
+    -- shrinking. Returns the objects purged.
+    FUNCTION purge_recyclebin(p_ts IN VARCHAR2) RETURN PLS_INTEGER IS
+        l_count NUMBER;
+        l_bytes NUMBER;
+    BEGIN
+        IF NOT confirmed('RECYCLEBIN') THEN
+            RETURN 0;
+        END IF;
+        SELECT COUNT(*), NVL(SUM(r.space * t.block_size), 0)
+          INTO l_count, l_bytes
+          FROM dba_recyclebin r
+          JOIN dba_tablespaces t ON t.tablespace_name = r.ts_name
+         WHERE r.ts_name = p_ts;
+        IF l_count = 0 THEN
+            RETURN 0;
+        END IF;
+        EXECUTE IMMEDIATE 'PURGE TABLESPACE ' || q(p_ts);
+        say(epfpg.epf_log.c_ok, 'RECYCLEBIN_PURGED',
+            p_ts || ': ' || l_count || ' recycle-bin objects purged (' || b(l_bytes) || '), as the DBA confirmed '
+            || '(--confirm RECYCLEBIN)', p_rows => l_count, p_bytes => l_bytes);
+        RETURN l_count;
+    END purge_recyclebin;
+
     -- Stops the datafiles of every tablespace of the run from growing and
-    -- resizes them to their highest block (step FREEZE_FILES): a table that
-    -- moves writes its LOB segments into their tablespace, which may be
-    -- another tablespace of the run.
+    -- resizes them to their highest block (step FREEZE_FILES), after the
+    -- recycle-bin objects the DBA confirmed are purged: a table that moves
+    -- writes its LOB segments into their tablespace, which may be another
+    -- tablespace of the run.
     PROCEDURE freeze_all(p_message OUT VARCHAR2) IS
         l_files PLS_INTEGER := 0;
         l_count PLS_INTEGER;
         l_freed NUMBER := 0;
+        l_bin   PLS_INTEGER := 0;
     BEGIN
         FOR t IN (SELECT tablespace_name FROM epfpg.epf_reclaim_ts WHERE run_id = g_run.run_id
                    ORDER BY start_bytes DESC, tablespace_name) LOOP
+            l_bin := l_bin + purge_recyclebin(t.tablespace_name);
             freeze_files(t.tablespace_name, l_count);
             l_files := l_files + l_count;
             l_freed := l_freed + trim_ts(t.tablespace_name, 0, FALSE);
             track_peak(t.tablespace_name);
         END LOOP;
-        p_message := l_files || ' datafiles stopped growing, ' || b(l_freed) || ' above the highest blocks given back';
+        p_message := CASE WHEN l_bin > 0 THEN l_bin || ' recycle-bin objects purged, ' END
+                     || l_files || ' datafiles stopped growing, ' || b(l_freed) || ' above the highest blocks given back';
     END freeze_all;
 
     -- A stop was requested: the compaction of p_ts ends here (reported once).
@@ -1963,8 +2054,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- the highest block of a datafile moves down, until every datafile stops
     -- or a stop is requested. When it does not fit in the free space, the
     -- tables with the most free space inside them move first (room_maker),
-    -- then its datafile grows within its room. Units not reached are STAYED
-    -- (below a segment that stays), or SKIPPED after a stop request.
+    -- then its datafile grows within its room. A table that moved already and
+    -- holds the top again moves lower only when it fits in the free space as
+    -- it is (the room a datafile would grow by lies above it); otherwise its
+    -- datafile is done. A stop request is honored before every move. Units
+    -- not reached are STAYED (below a segment that stays), or SKIPPED after
+    -- a stop request.
     PROCEDURE compact_ts(p_ts IN VARCHAR2) IS
         l_done   t_flags;
         l_item   NUMBER;
@@ -1979,6 +2074,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_start  NUMBER := ts_bytes(p_ts);
         l_freed  NUMBER;
         l_status VARCHAR2(20);
+        l_was    VARCHAR2(20);
         l_why    VARCHAR2(100);
         l_owner  VARCHAR2(128);
         l_name   VARCHAR2(128);
@@ -1993,12 +2089,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             EXIT WHEN stop_now(p_ts);
             pick(p_ts, l_done, l_item, l_file);
             EXIT WHEN l_item IS NULL;
+            SELECT owner, object_name, move_status
+              INTO l_owner, l_name, l_was
+              FROM epfpg.epf_reclaim_object
+             WHERE run_id = g_run.run_id AND item_id = l_item;
             l_need := need(l_item, p_ts);
             l_free := free_bytes(p_ts);
             IF l_need > l_free THEN
-                SELECT owner, object_name INTO l_owner, l_name
-                  FROM epfpg.epf_reclaim_object
-                 WHERE run_id = g_run.run_id AND item_id = l_item;
                 LOOP
                     EXIT WHEN l_need <= l_free OR stop_now(p_ts);
                     l_maker := room_maker(p_ts, l_free, l_item);
@@ -2010,9 +2107,22 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     l_free := free_bytes(p_ts);
                 END LOOP;
                 EXIT WHEN g_stopped;
-                IF l_need > l_free THEN
+                IF l_need > l_free AND NVL(l_was, '-') <> 'MOVED' THEN
                     l_free := l_free + grow_file(p_ts, l_file, l_need - l_free);
                 END IF;
+            END IF;
+            -- A stop requested meanwhile (while tables moved to make room)
+            -- ends the compaction before this move.
+            EXIT WHEN stop_now(p_ts);
+            IF l_was = 'MOVED' AND l_need > l_free THEN
+                l_why := 'about ' || b(l_need) || ' needed to move it lower, ' || b(l_free) || ' free';
+                UPDATE epfpg.epf_reclaim_object
+                   SET detail = 'holds the top again after its move: ' || l_why
+                 WHERE run_id = g_run.run_id AND item_id = l_item;
+                COMMIT;
+                l_done(l_file) := TRUE;
+                file_done(l_file, l_owner, l_name, 'moved; ' || l_why);
+                CONTINUE;
             END IF;
             move_unit(p_ts, l_item, l_file);
             SELECT COUNT(*), NVL(SUM(bytes), 0)
@@ -2600,6 +2710,15 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         g_margin := GREATEST(NVL(epfpg.epf_util.setting_num('reclaim_margin_mb'), 64), 0) * c_mb;
         g_moves := GREATEST(NVL(epfpg.epf_util.setting_num('reclaim_unit_moves'), 3), 1);
         g_retries := GREATEST(NVL(epfpg.epf_util.setting_num('ddl_retries'), 3), 0);
+        -- The test pause applies to one compaction: reading it sets it back to 0.
+        g_pause := 0;
+        IF g_mode = 'COMPACT' THEN
+            g_pause := LEAST(GREATEST(TRUNC(NVL(epfpg.epf_util.setting_num('reclaim_test_pause_s'), 0)), 0), 600);
+            IF g_pause > 0 THEN
+                UPDATE epfpg.epf_setting SET value = '0' WHERE name = 'reclaim_test_pause_s';
+                COMMIT;
+            END IF;
+        END IF;
         SELECT NVL(MAX(item_id), 0) INTO g_item FROM epfpg.epf_reclaim_object WHERE run_id = p_run_id;
         UPDATE epfpg.epf_run
            SET reclaim_mode = NVL(reclaim_mode, g_mode),

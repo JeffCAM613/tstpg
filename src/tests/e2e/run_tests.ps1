@@ -61,6 +61,7 @@ $script:Results     = New-Object 'System.Collections.Generic.List[object]'
 # matched case-sensitively: every preflight ends with a line ' Choices ...'.
 $script:ChoicesSection = '(?m-i)^ CHOICES +\d\d:\d\d:\d\d'
 $script:Aborted     = $false
+$script:InHangReport = $false
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
                          StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0;
                          DryRun = ''; DryRunExpected = '' }
@@ -193,9 +194,43 @@ function Stop-Orphans {
     return $count
 }
 
+# On a timeout, before the process tree is ended: the processes the step
+# started, and what the database sessions of this machine and of the tool's
+# runs are doing, read in a separate SYS session (3 minutes at most). Not for
+# the report's own session.
+function Write-HangReport {
+    param([datetime]$Since)
+    if ($script:InHangReport -or $script:SysPw -eq '') { return }
+    $script:InHangReport = $true
+    try {
+        Write-TestLog '---- timeout: the processes of the step and the database sessions'
+        foreach ($p in @(Get-CimInstance Win32_Process | Where-Object {
+                             $_.CreationDate -ge $Since -and @('cmd.exe', 'powershell.exe', 'sqlplus.exe') -contains $_.Name
+                         } | Sort-Object CreationDate)) {
+            Write-TestLog ('  process ' + $p.Name + ' PID ' + $p.ProcessId + ', parent ' + $p.ParentProcessId + ', started ' +
+                           $p.CreationDate.ToString('HH:mm:ss'))
+        }
+        $machine = ([string]$env:COMPUTERNAME).ToUpper()
+        $null = Invoke-Sql 'SYS' @(
+            'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 1000 TRIMOUT ON',
+            ("SELECT 'SESSION|' || s.sid || ',' || s.serial# || '|' || s.username || '|' || s.status || '|' || s.program || '|' || " +
+             "s.client_identifier || '|' || s.state || '|' || s.event || '|' || s.seconds_in_wait || ' s|blocker ' || " +
+             "s.blocking_session || '|logon ' || TO_CHAR(s.logon_time, 'HH24:MI:SS') || '|' || " +
+             "(SELECT SUBSTR(q.sql_text, 1, 120) FROM v`$sql q WHERE q.sql_id = s.sql_id AND ROWNUM = 1) " +
+             "FROM v`$session s WHERE s.type = 'USER' AND s.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')) " +
+             "AND (UPPER(s.machine) LIKE '%" + $machine + "' OR s.client_identifier LIKE 'EPF:%') ORDER BY s.logon_time;"),
+            'EXIT') -TimeoutMin 3 -Display 'sqlplus -S -L /nolog (SYS, sessions of this machine and of the runs)'
+    } catch {
+        Write-TestLog ('  the report failed: ' + $_.Exception.Message) 'Yellow'
+    } finally {
+        $script:InHangReport = $false
+    }
+}
+
 # Starts a process with the given standard input, writes every output line to
 # the log as it arrives, calls $OnLine for each line, and ends it after the
-# timeout (with $OnTimeout called first, and 15 more minutes, when given).
+# timeout (with $OnTimeout called first, and 15 more minutes, when given; a
+# report of the processes and sessions first).
 # Once the process has exited, its output is read for 15 more seconds at
 # most: a process it left running can keep the pipe open.
 function Invoke-Process {
@@ -238,6 +273,7 @@ function Invoke-Process {
                 continue
             }
             $timedOut = $true
+            Write-HangReport $started
             Write-TestLog '---- timeout: process tree ended'
             Stop-Tree $process.Id
             break
@@ -373,11 +409,77 @@ function Assert-UndoLimits {
 }
 
 # The reclaim lab (src/tests/verify/reclaim_lab.sql, SYS) in mode SETUP, CHECK
-# or CLEANUP.
+# or CLEANUP. A CHECK reads the dictionary in seconds: one that does not
+# answer within 5 minutes fails a check and is tried once more, so that the
+# checks after it still compare the lab.
 function Invoke-Lab {
     param([string]$Mode, [int]$TimeoutMin = 15)
     $path = Join-Path $script:VerifyDir 'reclaim_lab.sql'
-    return (Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin $TimeoutMin)
+    if ($Mode -ne 'CHECK') { return (Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin $TimeoutMin) }
+    $r = Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin 5
+    Add-Check (-not $r.TimedOut) 'the lab check answered within 5 minutes'
+    if ($r.TimedOut) { $r = Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin 5 }
+    return $r
+}
+
+# Setting reclaim_test_pause_s: the next compaction pauses this many seconds
+# after each table that moves (a known point to request a stop or end the
+# worker session), and sets it back to 0 when it reads it.
+function Set-TestPause {
+    param([int]$Seconds)
+    $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                              ("UPDATE epf_setting SET value = '" + $Seconds + "' WHERE name = 'reclaim_test_pause_s';"),
+                              'COMMIT;', "SELECT 'PAUSE|' || value FROM epf_setting WHERE name = 'reclaim_test_pause_s';",
+                              'EXIT')
+    Assert-Exit $r @(0)
+    Assert-Match $r ('(?m)^PAUSE\|' + $Seconds + '\s*$')
+}
+
+# The value of setting reclaim_test_pause_s, '' when it cannot be read.
+function Get-TestPause {
+    $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                              "SELECT 'PAUSE|' || value FROM epf_setting WHERE name = 'reclaim_test_pause_s';", 'EXIT')
+    if ($r.Output -match '(?m)^PAUSE\|(\d+)') { return $Matches[1] }
+    return ''
+}
+
+# Static checks of a PowerShell script: it parses, every command it calls is
+# defined in it or known to PowerShell, and no "+" takes a list as its right
+# operand ("a" + $x, 'b' is one string: the comma binds tighter than +).
+function Test-Script {
+    param([string]$Path)
+    $name = Split-Path -Leaf $Path
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    $first = ''
+    if ($errors.Count -gt 0) { $first = ': line ' + $errors[0].Extent.StartLineNumber + ' ' + $errors[0].Message }
+    Add-Check ($errors.Count -eq 0) ($name + ' parses' + $first)
+    $defined = @{}
+    foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        $defined[$f.Name.ToLower()] = $true
+    }
+    $missing = @()
+    foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $command = $c.GetCommandName()
+        if ($null -eq $command -or $defined.ContainsKey($command.ToLower())) { continue }
+        if ($null -eq (Get-Command $command -ErrorAction SilentlyContinue)) {
+            $missing += ($command + ' (line ' + $c.Extent.StartLineNumber + ')')
+        }
+    }
+    Add-Check ($missing.Count -eq 0) ($name + ' calls only defined commands' +
+                                      $(if ($missing.Count -gt 0) { ': ' + ($missing -join ', ') } else { '' }))
+    $traps = @()
+    foreach ($e in $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                ($n.Operator -eq 'Plus' -or $n.Operator -eq 'Minus') -and
+                $n.Right -is [System.Management.Automation.Language.ArrayLiteralAst]
+            }, $true)) {
+        $traps += ('line ' + $e.Extent.StartLineNumber)
+    }
+    Add-Check ($traps.Count -eq 0) ($name + ' has no + or - with a list on its right' +
+                                    $(if ($traps.Count -gt 0) { ': ' + ($traps -join ', ') } else { '' }))
 }
 
 # The state of the lab in the LAB| lines of reclaim_lab.sql: datafile size and
@@ -548,6 +650,7 @@ function Invoke-Test {
 # ----------------------------------------------------------------------------
 
 $script:TestList = @(
+    'T00  Static checks of the wrapper and of this suite (no database)',
     'T01  Precheck: database identity, non-CDB, redo logs, undo (SYS; safety gate)',
     'T02  Environment survey (src/tests/verify/environment.sql)',
     'T03  Install through the wrapper (install action)',
@@ -580,6 +683,11 @@ $script:TestList = @(
 )
 
 function Invoke-Suite {
+    Invoke-Test 'T00' 'Static checks of the wrapper and of this suite (no database)' {
+        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf.ps1')
+        Test-Script (Join-Path $script:TestDir 'run_tests.ps1')
+    }
+
     Invoke-Test 'T01' 'Precheck: database identity, non-CDB, redo logs, undo (SYS; safety gate)' -Required -Always {
         $r = Invoke-Sql 'SYS' @(
             'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
@@ -815,8 +923,13 @@ function Invoke-Suite {
             # A preflight that did not end leaves no plan to follow.
             Assert-Manifest (Get-Run $r 'PREFLIGHT') 'plan_status' '^CLOSED$'
         } finally {
-            $r = Invoke-Sql 'EPFPG' @("UPDATE epf_setting SET value = '" + $setting + "' WHERE name = 'backup_max_age_h';", 'COMMIT;', 'EXIT')
+            # The statement in parentheses: the comma binds tighter than +.
+            $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                                      ("UPDATE epf_setting SET value = '" + $setting + "' WHERE name = 'backup_max_age_h';"),
+                                      'COMMIT;', "SELECT 'SETTING|' || value FROM epf_setting WHERE name = 'backup_max_age_h';",
+                                      'EXIT')
             Assert-Exit $r @(0)
+            Assert-Match $r ('(?m)^SETTING\|' + $setting + '\s*$')
         }
     }
 
@@ -1198,6 +1311,9 @@ function Invoke-Suite {
         $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
                             -TimeoutMin 60 -StopOnTimeout
         Assert-Exit $r @(0, 2)
+        # Confirmed: the recycle-bin object is purged before the datafile
+        # stops growing.
+        if ($before.RecycleBin -gt 0) { Assert-Match $r 'RECYCLEBIN_PURGED' }
         $run = Get-Run $r 'RECLAIM'
         Assert-Manifest $run 'reclaim_mode' '^COMPACT$'
         Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
@@ -1216,11 +1332,16 @@ function Invoke-Suite {
         Assert-LabSame $before $after
         Add-Check ($after.FileBytes -lt $before.FileBytes) ('EPF_RT_DATA datafile shrank: ' + $before.FileBytes + ' -> ' +
                                                          $after.FileBytes + ' bytes (segments ' + $after.Segments + ')')
+        Add-Check ($after.RecycleBin -eq 0) ('no recycle-bin object left in EPF_RT_DATA (' + $after.RecycleBin + ')')
         $s = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $s @(0)
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
     }
 
+    # T18C and T18D: the compaction pauses after each table that moves
+    # (setting reclaim_test_pause_s), so that the stop request or the end of
+    # the worker session, which take a connection of their own, arrive while
+    # it runs.
     Invoke-Test 'T18C' 'Reclaim lab: a stop during the compaction ends STOPPED with everything restored' {
         $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
         Assert-Exit $lab @(0)
@@ -1228,18 +1349,25 @@ function Invoke-Suite {
         $script:State.StopSent = $false
         $onLine = {
             param($line)
-            if (-not $script:State.StopSent -and $line -match 'UNIT_MOVED') {
+            if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
                 $script:State.StopSent = $true
-                Write-TestLog '---- a table moved: requesting a graceful stop'
+                Write-TestLog '---- a table moved and the compaction pauses: requesting a graceful stop'
                 $s = Invoke-Wrapper @('stop', '--non-interactive')
                 Assert-Exit $s @(0)
             }
         }
-        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                            -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        try {
+            Set-TestPause 120
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            Add-Check ((Get-TestPause) -eq '0') 'the compaction set reclaim_test_pause_s back to 0'
+        } finally {
+            Set-TestPause 0
+        }
         Add-Check $script:State.StopSent 'stop requested after the first table moved'
         Assert-Exit $r @(3)
         Assert-Match $r 'STOP_HONORED'
+        Assert-Match $r 'RECYCLEBIN_PURGED'
         $run = Get-Run $r 'RECLAIM'
         Assert-Manifest $run 'status' '^STOPPED$'
         foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
@@ -1257,9 +1385,9 @@ function Invoke-Suite {
         $script:State.StopSent = $false
         $onLine = {
             param($line)
-            if (-not $script:State.StopSent -and $line -match 'UNIT_MOVED') {
+            if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
                 $script:State.StopSent = $true
-                Write-TestLog '---- a table moved: killing the worker session (SYS)'
+                Write-TestLog '---- a table moved and the compaction pauses: killing the worker session (SYS)'
                 $k = Invoke-Sql 'SYS' @(
                     'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON',
                     "BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); END LOOP; END;",
@@ -1268,8 +1396,14 @@ function Invoke-Suite {
                 Assert-Match $k 'KILLED\|\d+'
             }
         }
-        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                            -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        try {
+            Set-TestPause 120
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            Add-Check ((Get-TestPause) -eq '0') 'the compaction set reclaim_test_pause_s back to 0'
+        } finally {
+            Set-TestPause 0
+        }
         Add-Check $script:State.StopSent 'worker session killed after the first table moved'
         Assert-Exit $r @(1)
         Assert-Match $r 'The worker session ended before the reclaim finished'

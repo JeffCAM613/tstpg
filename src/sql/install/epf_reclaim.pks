@@ -9,16 +9,20 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 --   1. Every index of a table that moves, and every index stored in a target
 --      tablespace, is released (ALTER INDEX ... UNUSABLE drops its segment);
 --      the space it held becomes free space inside the datafiles.
---   2. The datafiles of every target tablespace stop growing until the
---      indexes are rebuilt (AUTOEXTEND OFF, recorded and restored) and are
---      resized to their highest allocated block.
+--   2. The recycle-bin objects of the target tablespaces are purged when the
+--      DBA confirmed it (--confirm RECYCLEBIN; without it they stop the run
+--      before any change). The datafiles of every target tablespace stop
+--      growing until the indexes are rebuilt (AUTOEXTEND OFF, recorded and
+--      restored) and are resized to their highest allocated block.
 --   3. The table holding the highest block of a datafile moves within its
 --      tablespace (ALTER TABLE ... MOVE, with every LOB segment it keeps in a
 --      target tablespace): the copy takes free space below, which is all the
 --      free space the file has; the old segment is released; the file is
 --      resized down to its new highest block. Repeated until the highest
 --      block belongs to a segment that cannot move (a pin) or nothing is left
---      to move.
+--      to move. A table whose copy holds the highest block again moves lower
+--      only when it fits in the free space as it is; otherwise the file stops
+--      there. A stop request is honored before every move.
 --   4. The released indexes are rebuilt in their tablespace, the growth
 --      settings of the datafiles restored, the datafiles resized to their
 --      highest block plus setting reclaim_margin_mb, objects invalidated by
@@ -29,8 +33,8 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- Disk usage: a datafile never grows above its size at the start of the run,
 -- plus setting reclaim_growth_mb (default 0): a table or an index that does
 -- not fit in the free space may use the room the file has given back so far
--- (a table lands higher, then moves down again when it is at the top). Every
--- datafile only shrinks otherwise. No second tablespace, no copy of a
+-- (a table lands higher, then moves down again when it is at the top and
+-- fits below). Every datafile only shrinks otherwise. No second tablespace, no copy of a
 -- datafile. One exception, reported as a warning: an index that does not fit
 -- within that room is rebuilt after the growth settings are restored, since
 -- an index left unusable stops the application.
@@ -48,8 +52,12 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- tables and indexes, clusters, nested tables, queue tables, materialized
 -- views, tables with a LONG or object-type column, a domain or partitioned
 -- index, a materialized view log with rowids or a flashback archive, segments
--- of Oracle-maintained accounts, recycle-bin objects and temporary segments.
--- A datafile cannot shrink below a pin.
+-- of Oracle-maintained accounts and temporary segments. A datafile cannot
+-- shrink below a pin.
+--
+-- Tests only: setting reclaim_test_pause_s makes the next compaction pause
+-- after each table that moves (a known point to stop it or end its session);
+-- the compaction sets it back to 0 when it reads it.
 --
 -- Invoker rights: called as SYS (the DDL runs with the caller's rights),
 -- through run/reclaim.sql, in a session bound to the run

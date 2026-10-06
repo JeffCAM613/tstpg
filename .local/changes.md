@@ -2,6 +2,52 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-06 - Set H, H5: 17 of 29 passed; every cause found and fixed (0.7.1)
+
+H4 passed: other options with and without prompts, start over (`--new`), `plan --close`.
+
+H5, the full suite on EPFPG781 (2:47:49): 17 passed, 12 failed. Each failure was traced in the log (`.local/h5.log`, the failed sections of test.log).
+
+- **T08B, T11, T16 (then T12, T17, T18): a wrapper function lost in 0.6.0.**
+  - `Get-BatchDefault` calls `Get-BatchForLog` when `--redo-logs` is chosen; 0.6.0 removed it together with `Use-SavedChoices`.
+  - The preflight's batch-size question threw, and the run ended FAILED without an error event; its plan closed ("its preflight ... ended FAILED"). The exception text has no "error" in it, so it is not in the extract.
+  - T12 (status STOPPED) needed T11's stop; T17 and T18 report the latest run, T16's failed preflight (exit 1).
+  - Fix: the function is back. New test T00 parses the wrapper and the suite and fails on any command that is neither defined nor known to PowerShell; this was the only one.
+  - Offline, with the fake sqlplus extended for the questions: the preflight with every requirement met asks only the batch size ("Recommended batch size with 1 GB online logs: 530"), saves the choices (choices.sql `40 200 Y Y NONE -`) and ends READY; the wizard's purge goes through CHOICES, REVIEW, REDO LOGS, PREFLIGHT with the choices, UNDO TUNING, PURGE and the restore.
+- **T10B: a preflight stopped at its questions kept its plan.** It ended WARNING (exit 3), so its plan stayed READY. A preflight that does not end leaves no plan to follow (PLAN 6.10). Fix: it ends STOPPED, which closes the plan it made. Offline: finish.sql gets STOPPED, exit 3.
+- **T10B left `backup_max_age_h` at 0 on EPFPG781.**
+  - Its restore went to sqlplus as one line, `UPDATE ...; COMMIT; EXIT`. In PowerShell the comma binds tighter than `+`, so `"..." + $setting + "...", 'COMMIT;', 'EXIT'` is one string. sqlplus never ran the UPDATE, and the step passed on exit code 0. The reclaim reports of T18A-T18D show the effect ("an RMAN backup within 0 hours").
+  - Fix: parentheses, and the value is read back and checked. T00 also fails on any `+` or `-` with a list on its right (none left).
+  - EPFPG781 needs the setting back by hand: H7 in the status page.
+- **T18A, T18B: recycle-bin objects not found.**
+  - The requirement counted inventory rows marked RECYCLEBIN. DBA_EXTENTS does not list the segments of recycle-bin objects (DBA_FREE_SPACE counts them as free). The lab's dropped table, 10 MB, was missing from the inventory: the assessment's segments are 285.6 MB, the lab's DBA_SEGMENTS 295.6 MB.
+  - So RECYCLEBIN was MET, and T18B's gate run compacted instead of stopping.
+  - Fix: counted from DBA_RECYCLEBIN. With `--confirm RECYCLEBIN`, FREEZE_FILES now purges them (PURGE TABLESPACE, event RECYCLEBIN_PURGED) before the files stop growing. Oracle would purge them anyway once the files cannot grow, and a segment that DBA_EXTENTS does not show could keep a file from shrinking.
+- **T18B, T18C, T18D: a table that had moved was reported as not moved, with a warning.**
+  - Every compaction of the lab did the same. RT_FAT moved to make room (72 -> 14 MB). Then RT_TOP moved (80 -> 103 MB) and the file went from 342 to 260 MB.
+  - RT_TOP's copy came out larger and took nearly all the free space below, so it held the top again. It was picked again (up to `reclaim_unit_moves` moves), did not fit (ORA-01652), and that failure overwrote MOVED with NO_ROOM. The result: R8 "1 of 6 moved ... RT_TOP no room", a MOVE_NO_ROOM warning, verdict PASS WITH WARNINGS, although the run did what it could.
+  - Fix: a table that moved already moves again only when it fits in the free space as it is. The file does not grow for it: that room lies above it. Otherwise its file is done (FILE_DONE "moved; about ... needed to move it lower"). If such a move fails anyway, the table keeps MOVED, with the error in last_ora and MOVE_AGAIN_NOT_DONE (INFO; WARN for an error other than space).
+- **A stop requested while tables moved to make room was honored only after the next move.** Found while reading the loop for T18C: after the room-making moves, the table at the top moved before the next stop check. In production that table can be large. Fix: a stop check right before every move.
+- **T18C, T18D: the stop and the kill arrived after the run had ended.** The lab's compaction takes about 3 s. A stop through the wrapper took 32 s and the SYS kill 16 s (a connection takes about 15 s on this network). The stop ended with ORA-20124 "No run is active", and the kill found no session. Fix, for the tests only:
+  - Setting `reclaim_test_pause_s` makes the next compaction pause after each table that moves (event TEST_PAUSE), until a stop is requested or the time is up.
+  - The compaction sets it back to 0 when it reads it, and every install resets it.
+  - T18C and T18D set 120 s, act on the TEST_PAUSE line, and check that the setting is back to 0.
+- **T08 (30 min) and T18C's last lab check (15 min) hung without one line of output.**
+  - T08's wrapper printed nothing, not even "Connected to": it hung in its first connection, the connection test, which had no time limit. The next test connected at once.
+  - The lab check is a sqlplus SYS session that prints at the end of its block, so where it waited is unknown.
+  - The cause is not in the log. The changes below make sure a hang cannot stay silent, and that the next one explains itself:
+    - The wrapper's connection test now waits at most 120 s. Then it tries once more, then ends with exit 1 and "The database did not answer the connection".
+    - On any timeout, the suite first logs the processes the step started, and what the database sessions of this machine and of the runs are doing (event, wait, blocker, SQL), from a separate SYS session.
+    - The lab check now times out after 5 minutes (it takes seconds) and fails a check. It is then tried once more, so the comparisons after it still run.
+
+Also seen, not a failure: T18D's lab check found the file at 268 MB, after the run ended it at 260 MB. That is one 8 MB extension (the file's NEXT) once autoextend was back on, not made by the tool; probably Oracle's space preallocation after the moves. R6 measures at the end of the run.
+
+Checked offline: both scripts parse, and every command they call is defined. The PL/SQL scans of the engine found nothing: undeclared names, calls before definition, aggregates over aliases, private functions in SQL. The wrapper's unit checks pass (25, with three new ones for the batch size for 1 GB logs). The three wrapper paths above run end to end with the fake sqlplus.
+
+Version 0.7.1: the engine, the settings and the wrapper changed; install again.
+
+How to test: H7 and set R in the status page. On EPFPG781 as H5 left it, install 0.7.1 and set `backup_max_age_h` back to 24. Then run the tests that need no purge data: `run_tests.bat --only T00,T10B,T18A,T18B,T18C,T18D,T18E,T18F,T19`. The purge flows (T08, T08B, T11, T12, T16, T17, T18) need data: they run in the full suite on a refreshed copy after set R.
+
 ## 2026-10-06 - Set H, H1: first compile of 0.7.0 failed on EPF_RECLAIM; fixed
 
 - H1 on EPFPG781: the tables, registry, settings and 92 grants installed; every package compiled except the body of EPF_RECLAIM.
@@ -21,6 +67,16 @@ H1 again: the body now parses, and the compile's semantic checks found one state
 - Fix: `ORDER BY top_block DESC, owner, object_name` (the alias).
 - A scan of every package body for an aggregate in ORDER BY or HAVING over a name that is also a select-list alias found no other case.
 - The compiler listed no other error in the body.
+
+H2 passed (LOGS, retention 400, EPFPG781):
+- R-000001 planned one step: 1,659,402 roots, 1.7 GB redo, NOARCHIVELOG.
+- R-000002 with `--max-redo 300M` checked the same plan again (CHANGES SINCE: no change) and split it into 7 steps, 2018-06-01 to 2025-09-01, each at most 299.6 MB. The steps add up to the same roots and redo.
+- P5 WARN only for UNDO_ESTIMATE (confirmed with `--confirm UNDO`).
+- The last lines: R-000001 `Next    epf_purge.bat purge follows these choices (plan P-000001)`; R-000002 `Next    epf_purge.bat purge carries out step 1 of 7 of plan P-000001 (rows before 2018-06-01)`. The Choices line of R-000001 omits `batch 1000` (default batch, no option given); R-000002 takes it from the plan. Cosmetic.
+
+H3 passed (menu):
+- Rehearsal (menu 3): REVIEW `Plan          P-000001, rehearsal of step 1 of 7 (the plan ends with rows before 2025-09-01)`; report `This run: rehearsal of step 1, nothing changed`, plan still READY, 0 of 7 done.
+- Step 1 (menu 1, R-000004): `PASS WITH WARNINGS (SUCCESS)`, exit 2; plan `IN_PROGRESS: 1 of 7 steps done, next: step 2, rows before 2021-09-01`; last line `Plan    P-000001: 1 of 7 steps done. Next: epf_purge.bat purge (step 2, rows before 2021-09-01)`.
 
 ## 2026-10-06 - Reclaim: compaction in place, with a hard limit on disk usage (0.7.0)
 
