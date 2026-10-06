@@ -1236,8 +1236,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
 
     -- The segments that move or are rebuilt with an INITIAL larger than they
     -- need (above 1 MB and above initial_need, as initial_clause decides):
-    -- one event with their count and the largest; their move or rebuild sets
-    -- INITIAL 64 KB. Typically the size of the segment when it was exported.
+    -- an event for each of the 50 largest (INITIAL_SEGMENT), then one with
+    -- their count and the five largest (INITIAL_OVERSIZED); their move or
+    -- rebuild sets INITIAL 64 KB. Typically the size of the segment when it
+    -- was exported.
     PROCEDURE report_initial IS
         l_count PLS_INTEGER := 0;
         l_total NUMBER := 0;
@@ -1259,6 +1261,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             IF s.initial_bytes > GREATEST(l_need, c_mb) THEN
                 l_count := l_count + 1;
                 l_total := l_total + s.initial_bytes;
+                IF l_count <= 50 THEN
+                    say(epfpg.epf_log.c_info, 'INITIAL_SEGMENT',
+                        s.owner || '.' || s.object_name || ' (' || LOWER(s.segment_type) || '): INITIAL '
+                        || b(s.initial_bytes) || ', about ' || b(l_need) || ' needed',
+                        p_owner => s.owner, p_object => s.object_name, p_bytes => s.initial_bytes);
+                END IF;
                 IF l_count <= 5 THEN
                     l_list := l_list || CASE WHEN l_count > 1 THEN ', ' END || s.owner || '.' || s.object_name || ' ('
                               || LOWER(s.segment_type) || ') INITIAL ' || b(s.initial_bytes) || ', about ' || b(l_need)

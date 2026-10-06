@@ -806,7 +806,8 @@ function Format-Seconds {
 # Detail events that go to console.log only when they are INFO: the report
 # carries their substance.
 $script:DetailEvents = @('IDX_MISSING', 'REDO_ESTIMATE', 'UNDO_ESTIMATE', 'TABLE_ELIGIBLE', 'TEMP_INDEX_CREATED',
-                         'TEMP_INDEX_DROPPED', 'PIN', 'UNIT_MOVED', 'INDEX_REBUILT', 'FILE_GROWTH_OFF', 'FILE_KEPT')
+                         'TEMP_INDEX_DROPPED', 'PIN', 'UNIT_MOVED', 'INDEX_REBUILT', 'FILE_GROWTH_OFF', 'FILE_KEPT',
+                         'INITIAL_SEGMENT')
 
 # EV|event_id|HH24:MI:SS|severity|phase|event_code|owner.object|message
 function Show-Event {
