@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-06 - Set H, H1: first compile of 0.7.0 failed on EPF_RECLAIM; fixed
+
+- H1 on EPFPG781: the tables, registry, settings and 92 grants installed; every package compiled except the body of EPF_RECLAIM.
+  - The error: PLS-00103 at line 1451, `Encountered the symbol "CURSOR"`.
+  - The cause: the shared fingerprint cursor `c_fingerprint` was declared between two procedures. In a package body every declaration must come before the first subprogram.
+- Fix: the cursor moved to the package-level declarations, after the globals. Nothing else changed; still 0.7.0.
+- A syntax error stops the compile before the semantic checks, so three more checks ran here on the three changed packages. Each first caught a planted error.
+  - Every l_ and p_ name a subprogram uses is declared in it, and every named argument (`p_x =>`) is a parameter of some package.
+  - No private subprogram is called before its definition.
+  - No package-level declaration comes after the first subprogram, in any package.
+  - Result: nothing found.
+
+How to test: H1 again (`git pull`, then `src\bin\epf_purge.bat install --tns $db`). The install is safe to re-run. Pass if it ends with `EPFPG objects valid, tool version 0.7.0`.
+
 ## 2026-10-06 - Reclaim: compaction in place, with a hard limit on disk usage (0.7.0)
 
 Why: a purge frees space inside the tables, but the datafiles keep their size. The reclaim gives that space back to the disk, keeps disk usage under control the whole time, and leaves every object as it found it.

@@ -20,6 +20,62 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     g_moves    NUMBER := 3;
     g_retries  NUMBER := 3;
 
+    -- Fingerprints of the objects a compaction may affect, read once the
+    -- accounts are locked and before any object changes (baseline), and again
+    -- before the accounts are unlocked (verify), with the same expressions:
+    -- the indexes of the run, the constraints of the tables in scope and the
+    -- foreign keys referencing the tables that move, the tables that move and
+    -- their LOB columns. Attributes as key=value pairs separated by ';'
+    -- (EPF_OBJECT_BASELINE).
+    CURSOR c_fingerprint(p_run IN NUMBER) IS
+        SELECT 'INDEX' AS object_type, i.owner, i.index_name AS name, i.table_owner, i.table_name,
+               i.tablespace_name, i.status, NULL AS validated, TRIM(i.degree) AS degree, i.logging,
+               'status=' || i.status || ';tablespace=' || i.tablespace_name || ';degree=' || TRIM(i.degree)
+               || ';logging=' || i.logging || ';type=' || i.index_type || ';uniqueness=' || i.uniqueness
+               || ';visibility=' || i.visibility || ';compression=' || i.compression || ';pct_free=' || i.pct_free
+                   AS fp
+          FROM dba_indexes i
+         WHERE (i.owner, i.index_name) IN (SELECT o.owner, o.object_name
+                                             FROM epfpg.epf_reclaim_object o
+                                            WHERE o.run_id = p_run AND o.unit_type = 'INDEX')
+        UNION ALL
+        SELECT 'CONSTRAINT', c.owner, c.constraint_name, c.owner, c.table_name, NULL, c.status, c.validated, NULL,
+               NULL,
+               'status=' || c.status || ';validated=' || c.validated || ';type=' || c.constraint_type
+               || ';deferrable=' || c.deferrable || ';deferred=' || c.deferred || ';rely=' || c.rely
+          FROM dba_constraints c
+         WHERE (c.owner, c.table_name) IN (SELECT o.table_owner, o.table_name
+                                             FROM epfpg.epf_reclaim_object o
+                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT', 'INDEX')
+                                              AND o.table_name IS NOT NULL)
+            OR (c.constraint_type = 'R'
+                AND (c.r_owner, c.r_constraint_name) IN (SELECT p.owner, p.constraint_name
+                                                           FROM dba_constraints p
+                                                           JOIN epfpg.epf_reclaim_object o
+                                                             ON o.owner = p.owner AND o.object_name = p.table_name
+                                                          WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT')
+                                                            AND p.constraint_type IN ('P', 'U')))
+        UNION ALL
+        SELECT 'TABLE', t.owner, t.table_name, t.owner, t.table_name, t.tablespace_name, NULL, NULL,
+               TRIM(t.degree), t.logging,
+               'tablespace=' || t.tablespace_name || ';logging=' || t.logging || ';degree=' || TRIM(t.degree)
+               || ';pct_free=' || t.pct_free || ';ini_trans=' || t.ini_trans || ';compression=' || t.compression
+               || ';compress_for=' || t.compress_for || ';iot_type=' || t.iot_type
+          FROM dba_tables t
+         WHERE (t.owner, t.table_name) IN (SELECT o.owner, o.object_name
+                                             FROM epfpg.epf_reclaim_object o
+                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT'))
+        UNION ALL
+        SELECT 'LOB', l.owner, l.column_name, l.owner, l.table_name, l.tablespace_name, NULL, NULL, NULL, l.logging,
+               'tablespace=' || l.tablespace_name || ';logging=' || l.logging || ';securefile=' || l.securefile
+               || ';chunk=' || l.chunk || ';pctversion=' || l.pctversion || ';retention=' || l.retention
+               || ';cache=' || l.cache || ';encrypt=' || l.encrypt || ';compression=' || l.compression
+               || ';deduplication=' || l.deduplication || ';in_row=' || l.in_row || ';segment=' || l.segment_name
+          FROM dba_lobs l
+         WHERE (l.owner, l.table_name) IN (SELECT o.owner, o.object_name
+                                             FROM epfpg.epf_reclaim_object o
+                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT'));
+
     -- ------------------------------------------------------------------
     -- Helpers
     -- ------------------------------------------------------------------
@@ -1440,62 +1496,6 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- ------------------------------------------------------------------
     -- Compaction
     -- ------------------------------------------------------------------
-
-    -- Fingerprints of the objects a compaction may affect, read once the
-    -- accounts are locked and before any object changes (baseline), and again
-    -- before the accounts are unlocked (verify)
-    -- with the same expressions: the indexes of the run, the constraints of
-    -- the tables in scope and the foreign keys referencing the tables that
-    -- move, the tables that move and their LOB columns. Attributes as
-    -- key=value pairs separated by ';' (EPF_OBJECT_BASELINE).
-    CURSOR c_fingerprint(p_run IN NUMBER) IS
-        SELECT 'INDEX' AS object_type, i.owner, i.index_name AS name, i.table_owner, i.table_name,
-               i.tablespace_name, i.status, NULL AS validated, TRIM(i.degree) AS degree, i.logging,
-               'status=' || i.status || ';tablespace=' || i.tablespace_name || ';degree=' || TRIM(i.degree)
-               || ';logging=' || i.logging || ';type=' || i.index_type || ';uniqueness=' || i.uniqueness
-               || ';visibility=' || i.visibility || ';compression=' || i.compression || ';pct_free=' || i.pct_free
-                   AS fp
-          FROM dba_indexes i
-         WHERE (i.owner, i.index_name) IN (SELECT o.owner, o.object_name
-                                             FROM epfpg.epf_reclaim_object o
-                                            WHERE o.run_id = p_run AND o.unit_type = 'INDEX')
-        UNION ALL
-        SELECT 'CONSTRAINT', c.owner, c.constraint_name, c.owner, c.table_name, NULL, c.status, c.validated, NULL,
-               NULL,
-               'status=' || c.status || ';validated=' || c.validated || ';type=' || c.constraint_type
-               || ';deferrable=' || c.deferrable || ';deferred=' || c.deferred || ';rely=' || c.rely
-          FROM dba_constraints c
-         WHERE (c.owner, c.table_name) IN (SELECT o.table_owner, o.table_name
-                                             FROM epfpg.epf_reclaim_object o
-                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT', 'INDEX')
-                                              AND o.table_name IS NOT NULL)
-            OR (c.constraint_type = 'R'
-                AND (c.r_owner, c.r_constraint_name) IN (SELECT p.owner, p.constraint_name
-                                                           FROM dba_constraints p
-                                                           JOIN epfpg.epf_reclaim_object o
-                                                             ON o.owner = p.owner AND o.object_name = p.table_name
-                                                          WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT')
-                                                            AND p.constraint_type IN ('P', 'U')))
-        UNION ALL
-        SELECT 'TABLE', t.owner, t.table_name, t.owner, t.table_name, t.tablespace_name, NULL, NULL,
-               TRIM(t.degree), t.logging,
-               'tablespace=' || t.tablespace_name || ';logging=' || t.logging || ';degree=' || TRIM(t.degree)
-               || ';pct_free=' || t.pct_free || ';ini_trans=' || t.ini_trans || ';compression=' || t.compression
-               || ';compress_for=' || t.compress_for || ';iot_type=' || t.iot_type
-          FROM dba_tables t
-         WHERE (t.owner, t.table_name) IN (SELECT o.owner, o.object_name
-                                             FROM epfpg.epf_reclaim_object o
-                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT'))
-        UNION ALL
-        SELECT 'LOB', l.owner, l.column_name, l.owner, l.table_name, l.tablespace_name, NULL, NULL, NULL, l.logging,
-               'tablespace=' || l.tablespace_name || ';logging=' || l.logging || ';securefile=' || l.securefile
-               || ';chunk=' || l.chunk || ';pctversion=' || l.pctversion || ';retention=' || l.retention
-               || ';cache=' || l.cache || ';encrypt=' || l.encrypt || ';compression=' || l.compression
-               || ';deduplication=' || l.deduplication || ';in_row=' || l.in_row || ';segment=' || l.segment_name
-          FROM dba_lobs l
-         WHERE (l.owner, l.table_name) IN (SELECT o.owner, o.object_name
-                                             FROM epfpg.epf_reclaim_object o
-                                            WHERE o.run_id = p_run AND o.unit_type IN ('TABLE', 'IOT'));
 
     -- Fingerprint once the accounts are locked, before any object changes
     -- (EPF_OBJECT_BASELINE): c_fingerprint, row counts of the tables that
