@@ -62,6 +62,9 @@ $script:Results     = New-Object 'System.Collections.Generic.List[object]'
 $script:ChoicesSection = '(?m-i)^ CHOICES +\d\d:\d\d:\d\d'
 $script:Aborted     = $false
 $script:InHangReport = $false
+# Seconds a sqlplus session may take to connect before it is ended and tried
+# again (Invoke-Sql); about 15 s on the test network.
+$script:ConnectTimeoutS = 120
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
                          StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0;
                          DryRun = ''; DryRunExpected = '' }
@@ -195,9 +198,10 @@ function Stop-Orphans {
 }
 
 # On a timeout, before the process tree is ended: the processes the step
-# started, and what the database sessions of this machine and of the tool's
-# runs are doing, read in a separate SYS session (3 minutes at most). Not for
-# the report's own session.
+# started; what the database sessions of this machine, of the tool's runs
+# and of any sqlplus are doing, read in a separate SYS session (one
+# connection attempt, 3 minutes at most); and the answer of the listener
+# (tnsping, when the client has it). Not for the report's own session.
 function Write-HangReport {
     param([datetime]$Since)
     if ($script:InHangReport -or $script:SysPw -eq '') { return }
@@ -213,13 +217,19 @@ function Write-HangReport {
         $machine = ([string]$env:COMPUTERNAME).ToUpper()
         $null = Invoke-Sql 'SYS' @(
             'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 1000 TRIMOUT ON',
-            ("SELECT 'SESSION|' || s.sid || ',' || s.serial# || '|' || s.username || '|' || s.status || '|' || s.program || '|' || " +
-             "s.client_identifier || '|' || s.state || '|' || s.event || '|' || s.seconds_in_wait || ' s|blocker ' || " +
-             "s.blocking_session || '|logon ' || TO_CHAR(s.logon_time, 'HH24:MI:SS') || '|' || " +
+            "SELECT 'NOW|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') || '|user sessions ' || COUNT(*) FROM v`$session WHERE type = 'USER';",
+            ("SELECT 'SESSION|' || s.sid || ',' || s.serial# || '|' || s.username || '|' || s.status || '|' || s.machine || '|' || " +
+             "s.program || '|' || s.client_identifier || '|' || s.state || '|' || s.event || '|' || s.seconds_in_wait || " +
+             "' s|blocker ' || s.blocking_session || '|logon ' || TO_CHAR(s.logon_time, 'HH24:MI:SS') || '|' || " +
              "(SELECT SUBSTR(q.sql_text, 1, 120) FROM v`$sql q WHERE q.sql_id = s.sql_id AND ROWNUM = 1) " +
              "FROM v`$session s WHERE s.type = 'USER' AND s.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')) " +
-             "AND (UPPER(s.machine) LIKE '%" + $machine + "' OR s.client_identifier LIKE 'EPF:%') ORDER BY s.logon_time;"),
-            'EXIT') -TimeoutMin 3 -Display 'sqlplus -S -L /nolog (SYS, sessions of this machine and of the runs)'
+             "AND (UPPER(s.machine) LIKE '%" + $machine + "' OR s.client_identifier LIKE 'EPF:%' " +
+             "OR LOWER(s.program) LIKE 'sqlplus%') ORDER BY s.logon_time;"),
+            'EXIT') -TimeoutMin 3 -Attempts 1 -Display 'sqlplus -S -L /nolog (SYS, sessions of this machine, of the runs and of sqlplus)'
+        $tnsping = Join-Path (Split-Path -Parent $script:SqlPlus) 'tnsping.exe'
+        if (Test-Path -LiteralPath $tnsping) {
+            $null = Invoke-Process -File $tnsping -Arguments ($script:Tns + ' 3') -Display ('tnsping ' + $script:Tns + ' 3') -TimeoutMin 2
+        }
     } catch {
         Write-TestLog ('  the report failed: ' + $_.Exception.Message) 'Yellow'
     } finally {
@@ -231,12 +241,18 @@ function Write-HangReport {
 # the log as it arrives, calls $OnLine for each line, and ends it after the
 # timeout (with $OnTimeout called first, and 15 more minutes, when given; a
 # report of the processes and sessions first).
+# With $ReadyMarker (a sqlplus session): only $FirstLines go first, with a
+# PROMPT of the marker; sqlplus prints it once the CONNECT has finished, and
+# only then are $InputLines sent. A marker that does not come within
+# $script:ConnectTimeoutS seconds ends the process (ConnectHang): nothing
+# else had been sent to it.
 # Once the process has exited, its output is read for 15 more seconds at
 # most: a process it left running can keep the pipe open.
 function Invoke-Process {
     param([string]$File, [string]$Arguments, [string]$Display, [string[]]$InputLines = @(),
           [string[]]$InputDisplay = @(), [int]$TimeoutMin = 15, [scriptblock]$OnLine = $null,
-          [scriptblock]$OnTimeout = $null, [string]$WorkDir = '')
+          [scriptblock]$OnTimeout = $null, [string]$WorkDir = '', [string[]]$FirstLines = @(),
+          [string]$ReadyMarker = '')
     if ($WorkDir -eq '') { $WorkDir = $script:SessionDir }
     Write-TestLog ('$ ' + $Display)
     foreach ($l in $InputDisplay) { Write-TestLog ('  < ' + $l) }
@@ -251,8 +267,17 @@ function Invoke-Process {
     $info.WorkingDirectory = $WorkDir
     $started = Get-Date
     $process = [System.Diagnostics.Process]::Start($info)
-    foreach ($l in $InputLines) { $process.StandardInput.WriteLine($l) }
-    $process.StandardInput.Close()
+    $ready = ($ReadyMarker -eq '')
+    if ($ready) {
+        foreach ($l in $InputLines) { $process.StandardInput.WriteLine($l) }
+        $process.StandardInput.Close()
+    } else {
+        foreach ($l in $FirstLines) { $process.StandardInput.WriteLine($l) }
+        $process.StandardInput.WriteLine('PROMPT ' + $ReadyMarker)
+        $process.StandardInput.Flush()
+    }
+    $readyBy = $started.AddSeconds($script:ConnectTimeoutS)
+    $connectHang = $false
     $errors = $process.StandardError.ReadToEndAsync()
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $deadline = $started.AddMinutes($TimeoutMin)
@@ -263,6 +288,15 @@ function Invoke-Process {
     $orphans = 0
     while ($true) {
         if ($null -eq $pending) { $pending = $process.StandardOutput.ReadLineAsync() }
+        if (-not $ready -and (Get-Date) -ge $readyBy) {
+            $connectHang = $true
+            $timedOut = $true
+            Write-TestLog ('---- no answer to the connection within ' + $script:ConnectTimeoutS + ' s')
+            Write-HangReport $started
+            Write-TestLog '---- connection ended'
+            Stop-Tree $process.Id
+            break
+        }
         $left = [int]($deadline - (Get-Date)).TotalMilliseconds
         if ($left -le 0) {
             if ($null -ne $OnTimeout -and -not $graceUsed) {
@@ -293,6 +327,12 @@ function Invoke-Process {
         $line = $pending.Result
         $pending = $null
         if ($null -eq $line) { break }
+        if (-not $ready -and $line -eq $ReadyMarker) {
+            $ready = $true
+            foreach ($l in $InputLines) { $process.StandardInput.WriteLine($l) }
+            $process.StandardInput.Close()
+            continue
+        }
         $lines.Add($line)
         Write-TestLog $line
         if ($null -ne $OnLine) { $null = & $OnLine $line }
@@ -310,7 +350,7 @@ function Invoke-Process {
     Write-TestLog ('exit ' + $code + ' (' + (Format-Duration $seconds) + ')')
     $orphans = $orphans + (Stop-Orphans $started)
     return [pscustomobject]@{ ExitCode = $code; Output = ($lines -join "`n"); TimedOut = $timedOut; Runs = @();
-                              Orphans = $orphans }
+                              Orphans = $orphans; ConnectHang = $connectHang }
 }
 
 function Get-RunFolders {
@@ -357,10 +397,12 @@ function Invoke-Wrapper {
 }
 
 # Runs sqlplus as SYS or EPFPG with the given commands after the CONNECT line
-# (written to standard input; logged with the password masked).
+# (written to standard input; logged with the password masked). The commands
+# are sent once the session has connected; a connection that hangs is ended
+# and tried again, $Attempts in all (each one is in the log).
 function Invoke-Sql {
     param([string]$User, [string[]]$Commands, [string[]]$CommandDisplay = @(), [int]$TimeoutMin = 15,
-          [string]$Display = '')
+          [string]$Display = '', [int]$Attempts = 3)
     if ($User -eq 'SYS') {
         $connect = 'CONNECT sys/"' + $script:SysPw + '"@' + $script:Tns + ' AS SYSDBA'
         $shown = 'CONNECT sys/********@' + $script:Tns + ' AS SYSDBA'
@@ -370,9 +412,14 @@ function Invoke-Sql {
     }
     if ($CommandDisplay.Count -eq 0) { $CommandDisplay = $Commands }
     if ($Display -eq '') { $Display = 'sqlplus -S -L /nolog (' + $User + ')' }
-    $result = Invoke-Process -File $script:SqlPlus -Arguments '-S -L /nolog' -Display $Display `
-                             -InputLines (@($connect) + $Commands + @('EXIT 9')) `
-                             -InputDisplay (@($shown) + $CommandDisplay) -TimeoutMin $TimeoutMin
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if ($attempt -gt 1) { Write-TestLog ('---- connection attempt ' + $attempt + ' of ' + $Attempts) 'Yellow' }
+        $result = Invoke-Process -File $script:SqlPlus -Arguments '-S -L /nolog' -Display $Display `
+                                 -FirstLines @($connect) -ReadyMarker 'EPF_TEST_CONNECTED' `
+                                 -InputLines ($Commands + @('EXIT 9')) `
+                                 -InputDisplay (@($shown) + $CommandDisplay) -TimeoutMin $TimeoutMin
+        if (-not $result.ConnectHang) { break }
+    }
     Test-Clean $result
     return $result
 }
@@ -1272,7 +1319,7 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T18A' 'Reclaim lab: a scratch tablespace; its assessment (dry run) changes nothing' {
-        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
         Assert-Exit $lab @(0)
         Assert-Match $lab 'LAB\|SETUP\|DONE'
         $before = Read-Lab $lab
@@ -1343,7 +1390,7 @@ function Invoke-Suite {
     # the worker session, which take a connection of their own, arrive while
     # it runs.
     Invoke-Test 'T18C' 'Reclaim lab: a stop during the compaction ends STOPPED with everything restored' {
-        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
         Assert-Exit $lab @(0)
         $before = Read-Lab $lab
         $script:State.StopSent = $false
@@ -1379,7 +1426,7 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T18D' 'Reclaim lab: a worker session killed during the compaction is restored in the same run' {
-        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
         Assert-Exit $lab @(0)
         $before = Read-Lab $lab
         $script:State.StopSent = $false
@@ -1490,6 +1537,7 @@ function Invoke-Main {
     $script:Retention = Get-Value $config 'RETENTION_DAYS' '30'
     $script:StopAfter = [int](Get-Value $config 'STOP_AFTER_BATCHES' '3')
     $script:PayBatch = Get-Value $config 'PAYMENTS_BATCH_SIZE'
+    $script:ConnectTimeoutS = [int](Get-Value $config 'CONNECT_TIMEOUT_S' '120')
     if ($script:Tns -eq '' -or $script:ExpectedDb -eq '') { Exit-Suite 4 'TNS and EXPECTED_DB must be set in the configuration.' }
     if ((Get-Value $config 'DESTRUCTIVE_OK').ToUpper() -ne 'YES') {
         Exit-Suite 4 ('DESTRUCTIVE_OK is not YES: the tests purge ' + $script:ExpectedDb + ' and enlarge its redo logs. Set it in ' + $configPath + '.')
@@ -1511,7 +1559,8 @@ function Invoke-Main {
     New-Item -ItemType Directory -Path $script:RunsDir -Force | Out-Null
     $script:LogFile = Join-Path $script:SessionDir 'test.log'
     $script:WrapperConf = Join-Path $script:SessionDir 'wrapper.conf'
-    [System.IO.File]::WriteAllText($script:WrapperConf, "# Empty wrapper configuration: every value comes from the command line.`r`n", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($script:WrapperConf, ("# Wrapper configuration of the tests: every other value comes from the command line.`r`n" +
+                                                         'CONNECT_TIMEOUT_S=' + $script:ConnectTimeoutS + "`r`n"), [System.Text.Encoding]::ASCII)
 
     $selection = 'all'
     if ($script:Only.Count -gt 0) { $selection = 'only ' + ($script:Only -join ',') }

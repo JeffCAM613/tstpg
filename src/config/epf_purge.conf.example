@@ -9,6 +9,10 @@
 
 # Connection: TNS alias or EZConnect string (PDB service in multitenant).
 TNS=localhost:1521/EPFPDB
+# Seconds a sqlplus session may take to connect, 10-3600. A session that has
+# not connected by then is ended and started again, 3 attempts in all;
+# nothing has been sent to it yet.
+#CONNECT_TIMEOUT_S=120
 
 # Purge parameters. While a plan is open, a purge or preflight without
 # --retention, --cutoff, --mode or --depth on the command line follows the
@@ -53,7 +57,8 @@ UNDO_TUNING=N
 # every tablespace holding segments of the application schemas.
 #RECLAIM_TABLESPACES=DATA
 # Requirements of a reclaim the DBA confirms are handled although the
-# assessment finds them not met: ARCHIVE, TEMP, RECYCLEBIN.
+# assessment finds them not met: ARCHIVE, TEMP, RECYCLEBIN (the compaction
+# then purges the recycle-bin objects of its tablespaces first).
 #RECLAIM_CONFIRM=TEMP
 
 # Output.

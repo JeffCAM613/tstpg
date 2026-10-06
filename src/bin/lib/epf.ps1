@@ -40,8 +40,11 @@ $script:ExitUsage   = 4
 
 $script:Modes = @('FULL', 'CLOB', 'LOGS', 'CLOB_N_LOGS')
 $script:Width = 80
-# Seconds a connection test may take before it is ended and tried again.
+# Seconds a sqlplus session may take to connect before it is ended and
+# started again (configuration key CONNECT_TIMEOUT_S), and the line it
+# prints once connected (Start-Session).
 $script:ConnectTimeoutS = 120
+$script:ReadyMarker = 'EPF_SESSION_READY'
 
 # sqlplus sessions read their standard input in the console code page. With a
 # UTF-8 console (code page 65001) .NET would begin every session's input with
@@ -526,48 +529,104 @@ function Test-SessionFailure {
     return ($Text -match 'SP2-0640|SP2-0310|ORA-01017|ORA-12154|ORA-12514|ORA-12541|ORA-12170|ORA-28000|ORA-01045|ORA-01034')
 }
 
+# A sqlplus session for $Login. Only the CONNECT line goes first, with a
+# marker after it: sqlplus prints the marker once the CONNECT has finished,
+# whether it succeeded or not. A session whose marker does not come within
+# $script:ConnectTimeoutS seconds hangs in the connection; nothing else has
+# been sent to it, so it is ended and a new one started, 3 attempts in all.
+# With a run state the live view goes on meanwhile. Returns Process, Errors
+# (standard error, being read), Lines (printed before the marker, such as a
+# connection error), Ready and TimedOut.
+function Start-Session {
+    param($Login, $State = $null)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $process = Start-SqlProcess
+        $errors = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.WriteLine((Get-ConnectLine $Login))
+        $process.StandardInput.WriteLine('PROMPT ' + $script:ReadyMarker)
+        $process.StandardInput.Flush()
+        $lines.Clear()
+        $deadline = (Get-Date).AddSeconds($script:ConnectTimeoutS)
+        $pending = $null
+        while ($true) {
+            if ($null -eq $pending) { $pending = $process.StandardOutput.ReadLineAsync() }
+            if ($pending.Wait(1000)) {
+                $line = $pending.Result
+                $pending = $null
+                if ($null -eq $line) {
+                    # sqlplus ended before the marker: its output says why.
+                    return [pscustomobject]@{ Process = $process; Errors = $errors; Lines = $lines; Ready = $false;
+                                              TimedOut = $false }
+                }
+                if ($line -eq $script:ReadyMarker) {
+                    return [pscustomobject]@{ Process = $process; Errors = $errors; Lines = $lines; Ready = $true;
+                                              TimedOut = $false }
+                }
+                $lines.Add($line)
+                continue
+            }
+            if ($null -ne $State) {
+                Test-StopKey $State
+                Update-LiveView $State
+            }
+            if ((Get-Date) -ge $deadline) { break }
+        }
+        try {
+            if (-not $process.HasExited) { $process.Kill() }
+        } catch {
+            Write-Out (' ' + $_.Exception.Message) 'Yellow'
+        }
+        Write-Out (' No answer from ' + $Login.Tns + ' as ' + $Login.User + ' within ' + $script:ConnectTimeoutS +
+                   ' s (connection attempt ' + $attempt + ' of 3).') 'Yellow'
+    }
+    return [pscustomobject]@{ Process = $null; Errors = $null; Lines = $lines; Ready = $false; TimedOut = $true }
+}
+
 # Connection test (the only statement the wrapper sends itself): container
-# name and, for EPFPG, the installed tool version. A session that does not
-# answer within $script:ConnectTimeoutS seconds (a connection that hangs) is
-# ended and tried once more; TimedOut then tells the caller.
+# name and, for EPFPG, the installed tool version. TimedOut: the database did
+# not answer the connection (Start-Session) or the query.
 function Test-DbConnection {
     param($Login, [switch]$WithVersion)
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $process = Start-SqlProcess
-        $in = $process.StandardInput
-        $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
-        $in.WriteLine((Get-ConnectLine $Login))
-        if ($WithVersion) {
-            $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
-        } else {
-            $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
+    $session = Start-Session $Login
+    if (-not $session.Ready) {
+        $text = ($session.Lines -join "`r`n")
+        if ($null -ne $session.Process) {
+            $session.Process.WaitForExit()
+            $text = $text + "`r`n" + $session.Errors.Result
         }
-        $in.WriteLine('EXIT')
-        $in.Close()
-        $out = $process.StandardOutput.ReadToEndAsync()
-        $err = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($script:ConnectTimeoutS * 1000)) {
-            try { $process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
-            Write-Out (' No answer from ' + $Login.Tns + ' as ' + $Login.User + ' within ' + $script:ConnectTimeoutS +
-                       ' s (attempt ' + $attempt + ' of 2).') 'Yellow'
-            continue
-        }
-        $process.WaitForExit()
-        $text = $out.Result + $err.Result
-        $received = Get-Date
-        foreach ($line in ($text -split "`r?`n")) {
-            if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
-                $container = $Matches[1]
-                $version = $Matches[2].Trim()
-                $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
-                # Database clock minus this machine's clock, to the minute.
-                $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
-                return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text; TimedOut = $false }
-            }
-        }
-        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $false }
+        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $session.TimedOut }
     }
-    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = ''; TimedOut = $true }
+    $process = $session.Process
+    $in = $process.StandardInput
+    $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
+    if ($WithVersion) {
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
+    } else {
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
+    }
+    $in.WriteLine('EXIT')
+    $in.Close()
+    $out = $process.StandardOutput.ReadToEndAsync()
+    if (-not $process.WaitForExit($script:ConnectTimeoutS * 1000)) {
+        try { $process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
+        Write-Out (' No answer to the connection test from ' + $Login.Tns + ' within ' + $script:ConnectTimeoutS + ' s.') 'Yellow'
+        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = ''; TimedOut = $true }
+    }
+    $process.WaitForExit()
+    $text = ($session.Lines -join "`r`n") + "`r`n" + $out.Result + $session.Errors.Result
+    $received = Get-Date
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
+            $container = $Matches[1]
+            $version = $Matches[2].Trim()
+            $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            # Database clock minus this machine's clock, to the minute.
+            $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
+            return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text; TimedOut = $false }
+        }
+    }
+    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $false }
 }
 
 # "+06:00" for a clock offset; empty when the clocks agree.
@@ -580,29 +639,42 @@ function Format-Offset {
     return ($sign + ('{0:00}:{1:00}' -f [Math]::Floor($abs.TotalHours), $abs.Minutes))
 }
 
-# Runs one entry script in its own sqlplus session and waits for it. With a
-# run state, the live view is refreshed every 2 seconds meanwhile and Ctrl+C
+# Runs one entry script in its own sqlplus session and waits for it. The
+# script is sent once the session has connected (Start-Session). With a run
+# state, the live view is refreshed every 2 seconds meanwhile and Ctrl+C
 # requests a graceful stop. The raw output goes to $LogName in the run folder.
 function Invoke-SqlScript {
     param($Login, [string]$Script, [string[]]$Arguments = @(), $State = $null, [string]$LogName = '')
-    $process = Start-SqlProcess
-    $in = $process.StandardInput
-    $in.WriteLine((Get-ConnectLine $Login))
-    $in.WriteLine((Get-ScriptLine $Script $Arguments))
-    $in.WriteLine('EXIT 9')
-    $in.Close()
-    $out = $process.StandardOutput.ReadToEndAsync()
-    $err = $process.StandardError.ReadToEndAsync()
-    while (-not $process.WaitForExit(2000)) {
-        if ($null -ne $State) {
-            Test-StopKey $State
-            Update-LiveView $State
+    $session = Start-Session $Login $State
+    $text = ($session.Lines -join "`r`n")
+    if ($session.Ready) {
+        $process = $session.Process
+        $in = $process.StandardInput
+        $in.WriteLine((Get-ScriptLine $Script $Arguments))
+        $in.WriteLine('EXIT 9')
+        $in.Close()
+        $out = $process.StandardOutput.ReadToEndAsync()
+        while (-not $process.WaitForExit(2000)) {
+            if ($null -ne $State) {
+                Test-StopKey $State
+                Update-LiveView $State
+            }
         }
+        $process.WaitForExit()
+        if ($text -ne '') { $text = $text + "`r`n" }
+        $text = $text + $out.Result + $session.Errors.Result
+        $code = $process.ExitCode
+        if ($code -eq 0 -and (Test-SessionFailure $text)) { $code = $script:ExitFail }
+    } else {
+        if ($session.TimedOut) {
+            $text = 'The database did not answer the connection as ' + $Login.User + ' (3 attempts of ' +
+                    $script:ConnectTimeoutS + ' s); ' + (Split-Path -Leaf $Script) + ' did not run.'
+        } else {
+            $session.Process.WaitForExit()
+            $text = $text + "`r`n" + $session.Errors.Result
+        }
+        $code = $script:ExitFail
     }
-    $process.WaitForExit()
-    $text = $out.Result + $err.Result
-    $code = $process.ExitCode
-    if ($code -eq 0 -and (Test-SessionFailure $text)) { $code = $script:ExitFail }
     if ($LogName -ne '' -and $null -ne $State -and $null -ne $State.Folder) {
         [System.IO.File]::WriteAllText((Join-Path $State.Folder $LogName), $text, [System.Text.Encoding]::ASCII)
     }
@@ -611,13 +683,21 @@ function Invoke-SqlScript {
 
 # The monitor: one sqlplus session kept open for the whole run. It creates
 # (or attaches) the run and so holds the run lock, polls the live view and
-# ends the run.
+# ends the run. Throws a TimeoutException when the session does not connect
+# (Start-Session).
 function Open-Monitor {
     param($Login)
-    $process = Start-SqlProcess
-    $process.StandardInput.WriteLine((Get-ConnectLine $Login))
-    $errors = $process.StandardError.ReadToEndAsync()
-    return [pscustomobject]@{ Process = $process; Pending = $null; Errors = $errors }
+    $session = Start-Session $Login
+    if (-not $session.Ready) {
+        $message = 'The monitor session did not connect'
+        if ($session.TimedOut) {
+            $message = $message + ': no answer from the database (3 attempts of ' + $script:ConnectTimeoutS + ' s).'
+        } else {
+            $message = $message + ': ' + (@($session.Lines) -join ' | ')
+        }
+        throw (New-Object System.TimeoutException($message))
+    }
+    return [pscustomobject]@{ Process = $session.Process; Pending = $null; Errors = $session.Errors }
 }
 
 # Sends one command to the monitor and returns the lines it printed up to an
@@ -678,8 +758,9 @@ function Reset-Monitor {
     }
     $attach = Get-ScriptLine (Join-Path $script:RunSqlDir 'attach.sql') @([string]$State.RunId)
     for ($attempt = 1; $attempt -le 5; $attempt++) {
-        $State.Monitor = Open-Monitor $State.Cred
+        $State.Monitor = $null
         try {
+            $State.Monitor = Open-Monitor $State.Cred
             $lines = Invoke-MonitorCommand $State.Monitor $attach 60000
             if (($lines -join "`n") -match 'EPF_ATTACHED=') { return }
             Write-Out (' ..       attach: ' + (@($lines | Where-Object { $_ -match 'ORA-' }) -join ' ')) 'Yellow'
@@ -851,7 +932,11 @@ function New-RunFolder {
 # when no run could be created.
 function Open-Run {
     param($State, [string[]]$Begin)
-    $State.Monitor = Open-Monitor $State.Cred
+    try {
+        $State.Monitor = Open-Monitor $State.Cred
+    } catch {
+        Exit-Tool $script:ExitFail ($_.Exception.Message + ' No run was created.')
+    }
     try {
         $lines = Invoke-MonitorCommand $State.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'begin_run.sql') $Begin) 120000
     } catch {
@@ -1270,8 +1355,8 @@ function Connect-Tool {
     $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
     $test = Test-DbConnection $login -WithVersion
     if ($test.TimedOut) {
-        Exit-Tool $script:ExitFail ('The database did not answer the connection as EPFPG (twice, ' + $script:ConnectTimeoutS +
-                                    ' s each): check the network and the listener, then try again.')
+        Exit-Tool $script:ExitFail ('The database did not answer the connection as EPFPG (3 attempts of ' +
+                                    $script:ConnectTimeoutS + ' s): check the network and the listener, then try again.')
     }
     if (-not $test.Ok) {
         Show-Lines $test.Output -Indent
@@ -1299,8 +1384,8 @@ function Connect-Sys {
     $sys = New-Login -User 'sys' -Secret $secret -Tns $Tns -Sysdba
     $test = Test-DbConnection $sys
     if ($test.TimedOut) {
-        Exit-Tool $script:ExitFail ('The database did not answer the connection as SYS (twice, ' + $script:ConnectTimeoutS +
-                                    ' s each): check the network and the listener, then try again.')
+        Exit-Tool $script:ExitFail ('The database did not answer the connection as SYS (3 attempts of ' +
+                                    $script:ConnectTimeoutS + ' s): check the network and the listener, then try again.')
     }
     if (-not $test.Ok) {
         Show-Lines $test.Output -Indent
@@ -2556,6 +2641,12 @@ function Invoke-Main {
     }
     if (Test-Path -LiteralPath $configPath) { $script:Config = Read-ConfigFile $configPath }
     if (Test-ConfigYes 'NO_COLOR') { $script:UseColor = $false }
+    $timeout = Get-Option 'connect-timeout' 'CONNECT_TIMEOUT_S' ''
+    if ($timeout -ne '') {
+        $seconds = Test-Value $timeout -Min 10 -Max 3600
+        if ($null -eq $seconds) { Exit-Tool $script:ExitUsage ('CONNECT_TIMEOUT_S: a whole number of seconds from 10 to 3600, got ' + $timeout + '.') }
+        $script:ConnectTimeoutS = [int]$seconds
+    }
 
     if ($script:Cli.Flags.ContainsKey('reclaim')) {
         Exit-Tool $script:ExitUsage '--reclaim is not available in this version: run epf_purge.bat reclaim after the purge.'

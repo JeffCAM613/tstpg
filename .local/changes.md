@@ -2,6 +2,33 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-06 - Set H, H7 and H8: 0.7.1 on Oracle; a connection that never completes is retried (wrapper and suite)
+
+H7 passed: 0.7.1 installed on EPFPG781 (the changed reclaim package compiled without error), `backup_max_age_h` back to 24.
+
+H8 (`--only T00,T10B,T18A,T18B,T18C,T18D,T18E,T18F,T19`): 8 of 10 passed.
+- Confirmed on Oracle:
+  - T10B: a preflight stopped at its questions ends STOPPED and closes its plan; the restore of `backup_max_age_h` is read back.
+  - T18C: the compaction paused after the first move (TEST_PAUSE), and the stop arrived during the pause. The run ended STOPPED with R1-R4 and R9 PASS and the lab as before. The confirmed recycle-bin object was purged (RECYCLEBIN_PURGED).
+  - T18D: the worker was killed during the pause and restored in the same run; `reclaim --restore` then found nothing.
+  - T00, T18E, T18F, T19.
+- T18A: the lab SETUP hung for its 30 minutes. The lab was never created, so T18A's assessment and T18B's compaction found no tablespace (ORA-20161). The rerun (`--only T18A,T18B,T18F,T19`) hung at the same place.
+- The new hang report showed the cause. The SETUP's sqlplus process was running, but the database had no session from this machine: the query of the sessions of this machine and of the runs returned nothing. The report's own connection worked in 17 s.
+  - The connection never completed. The cause lies in the network, the listener or the logon, not in the SQL.
+  - T08's hang in H5 (no line before "Connected to") fits the same pattern.
+
+Fix, in the wrapper and in the suite: a session is first sent only the CONNECT line and a PROMPT marker. sqlplus prints the marker once the CONNECT has finished, successful or not, and only then does the script, query or monitor command follow. Without the marker within `CONNECT_TIMEOUT_S` (default 120 s), the session is ended and started again, 3 attempts in all; nothing had been sent to it. After 3 attempts the step fails with "The database did not answer the connection ... (3 attempts of N s)".
+- Wrapper: Start-Session, used by the connection test, by every script (Invoke-SqlScript) and by the monitor (Open-Monitor). Open-Run ends with a message when the monitor cannot connect, and Reset-Monitor counts it as a failed attempt. Configuration key `CONNECT_TIMEOUT_S` (10-3600).
+- Suite: Invoke-Sql connects the same way, with `CONNECT_TIMEOUT_S` in test.conf, which it also passes to the wrapper. The hang report uses one attempt and adds the total of user sessions, the sessions of any sqlplus, and tnsping when the client has it. The lab SETUP is limited to 10 minutes; it takes under one.
+- Offline, with the fake sqlplus extended so that the first CONNECT, or every CONNECT, hangs:
+  - the wrapper retries after the limit and goes on, or stops after 3 attempts with the message and exit 1;
+  - the suite's T01 retries after its limit and passes;
+  - the three earlier wrapper paths and the wizard's purge still run end to end, and T00 passes on both scripts.
+
+No database change: the installed 0.7.1 stays, so a pull is enough.
+
+How to test: pull (no install), then `run_tests.bat --only T18A,T18B,T18F,T19`. Pass: 5 passed. If a connection hangs, the log shows `---- no answer to the connection within 120 s`, the report, then `---- connection attempt 2 of 3`, and the test goes on.
+
 ## 2026-10-06 - Set H, H5: 17 of 29 passed; every cause found and fixed (0.7.1)
 
 H4 passed: other options with and without prompts, start over (`--new`), `plan --close`.

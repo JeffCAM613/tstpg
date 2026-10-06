@@ -34,3 +34,7 @@ STOP_AFTER_BATCHES=3
 # Batch size of the PAYMENTS purge of T13 when T11 did not run in the same
 # session (T13 otherwise uses T11's batch size). Empty: the tool's default.
 PAYMENTS_BATCH_SIZE=
+
+# Seconds a sqlplus session of the tests may take to connect before it is
+# ended and tried again (3 attempts; nothing has been sent to it yet).
+CONNECT_TIMEOUT_S=120
