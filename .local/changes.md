@@ -12,11 +12,7 @@ Changes (engine, 0.7.4):
   - So the compaction does not start, and QUOTA cannot be confirmed with `--confirm`: the DBA gives the owner a quota (`ALTER USER <owner> QUOTA UNLIMITED ON <tablespace>`).
   - An owner with a limited quota and room is MET. A table larger than that room stays where it is (MOVE_NO_QUOTA, a warning like MOVE_NO_ROOM) instead of failing the run.
 - **Queue tables, Oracle Text and spatial tables.**
-  - These now stay where they are, with the reason, as the queue table itself already did: the tables Oracle keeps for a queue table (`AQ$_<queue table>_*`), the tables of an Oracle Text index (`DR$...`) and those of a spatial index (`MDRT_...# Change history
-
-Newest first. Each entry: date, what changed, why, and how to test when relevant.
-
-).
+  - These now stay where they are, with the reason, as the queue table itself already did: the tables Oracle keeps for a queue table (`AQ$_<queue table>_*`), the tables of an Oracle Text index (`DR$...`) and those of a spatial index (`MDRT_...$`).
   - Their indexes are left as found (not released). Before, they were moved and their indexes released like any other. Oracle maintains these objects and may refuse DDL on them, so the release step could have failed mid-run.
 - **A LOB or IOT overflow segment in another tablespace of the run.** A move writes the table's segments again in every tablespace that holds them, but free space was checked only in the tablespace being compacted. Now, before a move, each other tablespace of the run that is short grows within its room (never above its size at the start), and it is resized down again after the move.
 - **Several datafiles in one tablespace.** A copy that lands at the top of another datafile of the tablespace now counts as a return to the top (setting reclaim_unit_moves), as a copy at the top of the same file did.
