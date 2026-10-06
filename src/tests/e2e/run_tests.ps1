@@ -455,18 +455,33 @@ function Assert-UndoLimits {
     }
 }
 
-# The reclaim lab (src/tests/verify/reclaim_lab.sql, SYS) in mode SETUP, CHECK
-# or CLEANUP. A CHECK reads the dictionary in seconds: one that does not
-# answer within 5 minutes fails a check and is tried once more, so that the
-# checks after it still compare the lab.
+# The reclaim lab (src/tests/verify/reclaim_lab.sql, SYS; -Layout 2:
+# reclaim_lab2.sql) in mode SETUP, CHECK or CLEANUP (layout 2: QUOTA too). A
+# CHECK reads the dictionary in seconds: one that does not answer within 5
+# minutes fails a check and is tried once more, so that the checks after it
+# still compare the lab.
 function Invoke-Lab {
-    param([string]$Mode, [int]$TimeoutMin = 15)
+    param([string]$Mode, [int]$TimeoutMin = 15, [int]$Layout = 1)
     $path = Join-Path $script:VerifyDir 'reclaim_lab.sql'
+    if ($Layout -eq 2) { $path = Join-Path $script:VerifyDir 'reclaim_lab2.sql' }
     if ($Mode -ne 'CHECK') { return (Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin $TimeoutMin) }
     $r = Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin 5
     Add-Check (-not $r.TimedOut) 'the lab check answered within 5 minutes'
     if ($r.TimedOut) { $r = Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin 5 }
     return $r
+}
+
+# What reclaim run $Label leaves where it is (EPF_RECLAIM_OBJECT): the tables
+# and segments that stay and the indexes left as found, as
+# KEPT|<PIN or INDEX>|<owner.name>|<reason> lines.
+function Get-ReclaimKept {
+    param([string]$Label)
+    $id = Get-RunNumber $Label
+    return (Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 600 TRIMOUT ON',
+                                 ("SELECT 'KEPT|' || unit_type || '|' || owner || '.' || object_name || '|' || " +
+                                  "SUBSTR(detail, 1, 300) FROM epf_reclaim_object WHERE run_id = " + $id +
+                                  " AND (unit_type = 'PIN' OR move_status = 'KEPT') ORDER BY owner, object_name;"),
+                                 'EXIT'))
 }
 
 # Setting reclaim_test_pause_s: the next compaction pauses this many seconds
@@ -726,6 +741,7 @@ $script:TestList = @(
     'T18D Reclaim lab: a worker session killed during the compaction is restored in the same run',
     'T18E Reclaim: assessment of the application tablespaces (dry run, read-only)',
     'T18F Reclaim lab removed',
+    'T18G Reclaim lab 2: two datafiles, index and LOB tablespaces, a queue table, INITIAL of each kind, quota gate',
     'T19  Final state: redo logs, undo_retention, pending changes, runs'
 )
 
@@ -1501,6 +1517,96 @@ function Invoke-Suite {
 
     Invoke-Test 'T18F' 'Reclaim lab removed' {
         $lab = Invoke-Lab 'CLEANUP'
+        Assert-Exit $lab @(0)
+        Assert-Match $lab 'LAB\|CLEANUP\|DONE'
+        $lab = Invoke-Lab 'CLEANUP' -Layout 2
+        Assert-Exit $lab @(0)
+        Assert-Match $lab 'LAB\|CLEANUP\|DONE'
+    }
+
+    # T18G: the second lab layout (reclaim_lab2.sql). Every table that moves
+    # there has segments with an INITIAL larger than it needs, of each kind;
+    # its owner starts above its quota on EPF_RT2_DATA. The lab removes itself
+    # at the end (T18F removes one left by an earlier session).
+    Invoke-Test 'T18G' 'Reclaim lab 2: two datafiles, index and LOB tablespaces, a queue table, INITIAL of each kind, quota gate' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10 -Layout 2
+        Assert-Exit $lab @(0)
+        Assert-Match $lab 'LAB\|SETUP\|DONE'
+        $before = Read-Lab $lab
+        $initial = @()
+        foreach ($line in ($lab.Output -split "`n")) {
+            if ($line.Trim() -match '^LAB\|INITIAL\|([^|]+)\|') { $initial += $Matches[1] }
+        }
+        Write-TestLog ('  note segments with an INITIAL above 1 MB: ' + ($initial -join ', '))
+        foreach ($label in @('RT2_HEAP', 'RT2_HEAP_PK', 'RT2_IOT_PK', 'RT2_IOT.OVERFLOW', 'RT2_BLOB.B')) {
+            Add-Check ($initial -contains $label) ($label + ' has an INITIAL above 1 MB before the compaction')
+        }
+        $spaces = 'EPF_RT2_DATA,EPF_RT2_INDX,EPF_RT2_SIDE'
+        # Assessment: the owner is above its quota on EPF_RT2_DATA.
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', $spaces) -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^ASSESS$'
+        Assert-Manifest $run 'req.QUOTA' '^NOT_MET\|Y\|'
+        foreach ($ts in @('EPF_RT2_DATA', 'EPF_RT2_INDX', 'EPF_RT2_SIDE')) { Assert-Manifest $run ('tablespace.' + $ts) '^ASSESSED\|' }
+        Assert-Match $r 'INITIAL_OVERSIZED'
+        Assert-Match $r 'EPF_RT2 uses [^\n]*EPF_RT2_DATA, above its quota'
+        if ($null -ne $run) {
+            $k = Get-ReclaimKept $run['run']
+            Assert-Exit $k @(0)
+            Assert-Match $k 'KEPT\|PIN\|EPF_RT2\.RT2_LONG\|LONG column'
+            Assert-Match $k 'KEPT\|PIN\|EPF_RT2\.RT2_QT\|queue table'
+            Write-Note $k 'KEPT\|PIN\|EPF_RT2\.AQ\$_RT2_QT_[A-Z]+\|table of queue table RT2_QT' 'tables Oracle keeps for the queue table stay'
+            Write-Note $k 'KEPT\|INDEX\|EPF_RT2\.[^|]+\|on a (queue table|table of queue table)' 'indexes of the queue tables left as found'
+            Assert-NoMatch $k 'KEPT\|[A-Z]+\|EPF_RT2\.RT2_(HEAP|IOT|SLOB|BLOB|TOP)'
+        }
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK' -Layout 2)) -SameSize
+        # Quota raised: the compaction runs.
+        $q = Invoke-Lab 'QUOTA' -Layout 2
+        Assert-Exit $q @(0)
+        Assert-Match $q 'LAB\|QUOTA\|DONE'
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', $spaces) -TimeoutMin 60 -StopOnTimeout
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^COMPACT$'
+        Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
+        Assert-Manifest $run 'req.QUOTA' '^MET\|'
+        foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
+        foreach ($check in @('R5', 'R6', 'R7', 'R8', 'P5')) { Assert-Manifest $run ('check.' + $check) '^(PASS|WARN)' }
+        Assert-Manifest $run 'tablespace.EPF_RT2_DATA' '^(COMPACTED|PARTIAL)\|'
+        foreach ($step in @('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'REBUILD_INDEXES', 'RESTORE_FILES', 'RESIZE',
+                            'VERIFY', 'UNLOCK_ACCOUNTS')) {
+            Assert-Manifest $run ('step.RECLAIM.' + $step + '.-') '^DONE\|'
+        }
+        # Each kind of segment: its move or rebuild set INITIAL 64 KB.
+        Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_HEAP:[^\n]*table '
+        Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_IOT:[^\n]*index [^\n]*overflow '
+        Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_BLOB:[^\n]*LOB B '
+        if ($initial -contains 'RT2_SLOB.C') {
+            Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_SLOB:[^\n]*LOB C '
+        } else {
+            Write-TestLog '  note the SECUREFILE LOB segment was not created with its INITIAL of 8 MB: nothing to reset' 'Yellow'
+        }
+        $check = Invoke-Lab 'CHECK' -Layout 2
+        $left = @()
+        foreach ($line in ($check.Output -split "`n")) {
+            if ($line.Trim() -match '^LAB\|INITIAL\|([^|]+)\|') { $left += $Matches[1] }
+        }
+        $reset = @($initial | Where-Object { @('RT2_HEAP', 'RT2_HEAP_PK', 'RT2_IOT_PK', 'RT2_IOT.OVERFLOW', 'RT2_BLOB.B',
+                                               'RT2_SLOB.C') -contains $_ })
+        $kept = @($reset | Where-Object { $left -contains $_ })
+        Add-Check ($reset.Count -gt 0 -and $kept.Count -eq 0) ('INITIAL 64 KB now for ' + ($reset -join ', ') +
+                                                              $(if ($kept.Count -gt 0) { '; still above 1 MB: ' + ($kept -join ', ') } else { '' }))
+        $other = @($left | Where-Object { $reset -notcontains $_ })
+        if ($other.Count -gt 0) { Write-TestLog ('  note other segments with an INITIAL above 1 MB: ' + ($other -join ', ')) 'Yellow' }
+        $after = Read-Lab $check
+        Assert-LabSame $before $after
+        Add-Check ($after.FileBytes -lt $before.FileBytes) ('the lab datafiles shrank: ' + $before.FileBytes + ' -> ' +
+                                                         $after.FileBytes + ' bytes (segments ' + $after.Segments + ')')
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Exit $s @(0)
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+        $lab = Invoke-Lab 'CLEANUP' -Layout 2
         Assert-Exit $lab @(0)
         Assert-Match $lab 'LAB\|CLEANUP\|DONE'
     }

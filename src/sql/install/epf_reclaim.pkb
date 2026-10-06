@@ -132,6 +132,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN p_code IN (-1652, -1653, -1654, -1658, -1659, -1683, -1688, -1691, -1692);
     END is_space_error;
 
+    -- The owner of the segment has no space quota left for it in the
+    -- tablespace (ORA-01536), or none there (ORA-01950).
+    FUNCTION is_quota_error(p_code IN NUMBER) RETURN BOOLEAN IS
+    BEGIN
+        RETURN p_code IN (-1536, -1950);
+    END is_quota_error;
+
     -- The operator confirmed blocking requirement p_code (EPF_RUN.confirmed_reqs).
     FUNCTION confirmed(p_code IN VARCHAR2) RETURN BOOLEAN IS
     BEGIN
@@ -437,6 +444,26 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN CEIL(LEAST(p_bytes, NVL(l_est, p_bytes)));
     END estimate;
 
+    -- Bytes a segment of type p_type (TABLE, INDEX, LOBSEGMENT) whose
+    -- estimate is p_est holds once it moves or is rebuilt, to decide its
+    -- INITIAL (initial_clause): p_est, or for an index its leaf blocks by its
+    -- optimizer statistics plus a tenth (branch blocks) when that is less. A
+    -- smaller INITIAL never keeps a segment from growing; the space a move or
+    -- rebuild needs is still planned with p_est.
+    FUNCTION initial_need(p_owner IN VARCHAR2, p_name IN VARCHAR2, p_type IN VARCHAR2, p_est IN NUMBER)
+        RETURN NUMBER IS
+        l_stat NUMBER;
+    BEGIN
+        IF p_type = 'INDEX' THEN
+            SELECT MAX(i.leaf_blocks * t.block_size * 1.1)
+              INTO l_stat
+              FROM dba_indexes i
+              JOIN dba_tablespaces t ON t.tablespace_name = i.tablespace_name
+             WHERE i.owner = p_owner AND i.index_name = p_name AND i.leaf_blocks IS NOT NULL;
+        END IF;
+        RETURN CEIL(LEAST(NVL(p_est, 0), NVL(l_stat, NVL(p_est, 0))));
+    END initial_need;
+
     -- The tablespace of table p_owner.p_table: of its index segment for an
     -- index-organized table.
     FUNCTION home_ts(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
@@ -482,12 +509,47 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN l_id;
     END table_item;
 
+    -- Why table p_owner.p_table is maintained by an Oracle feature, which
+    -- alone may move it, NULL when it is not: a queue table and the tables
+    -- Oracle keeps for it (AQ$_<queue table>_*), the tables of an Oracle Text
+    -- index (DR$<index>$*, DR#<index>*) and of a spatial index (MDRT_*$,
+    -- MDXT_*$).
+    FUNCTION internal_reason(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
+        l_name VARCHAR2(128);
+    BEGIN
+        SELECT MAX(queue_table) INTO l_name FROM dba_queue_tables WHERE owner = p_owner AND queue_table = p_table;
+        IF l_name IS NOT NULL THEN
+            RETURN 'queue table (moved only with the queue tools)';
+        END IF;
+        SELECT MAX(queue_table)
+          INTO l_name
+          FROM dba_queue_tables
+         WHERE owner = p_owner AND p_table LIKE 'AQ$\_' || REPLACE(queue_table, '_', '\_') || '\_%' ESCAPE '\';
+        IF l_name IS NOT NULL THEN
+            RETURN 'table of queue table ' || l_name || ' (moved only with the queue tools)';
+        END IF;
+        SELECT MAX(index_name)
+          INTO l_name
+          FROM dba_indexes
+         WHERE owner = p_owner AND index_type = 'DOMAIN'
+           AND (p_table LIKE 'DR$' || REPLACE(index_name, '_', '\_') || '$%' ESCAPE '\'
+                OR p_table LIKE 'DR#' || REPLACE(index_name, '_', '\_') || '%' ESCAPE '\');
+        IF l_name IS NOT NULL THEN
+            RETURN 'table of Oracle Text index ' || l_name || ' (moved only with the index)';
+        END IF;
+        IF p_table LIKE 'MDRT\_%$' ESCAPE '\' OR p_table LIKE 'MDXT\_%$' ESCAPE '\' THEN
+            RETURN 'table of a spatial index (moved only with the index)';
+        END IF;
+        RETURN NULL;
+    END internal_reason;
+
     -- The item of index p_owner.p_index, created when missing: PENDING
     -- (released, then rebuilt) when it is usable; RELEASED when an earlier
     -- compaction released it and it is still unusable (this run rebuilds it;
     -- an assessment only reports it); KEPT when it is unusable for another
-    -- reason (left as found). NULL for an index the reclaim does not handle
-    -- (IOT top, LOB, domain, cluster, partitioned, temporary).
+    -- reason, or belongs to a table an Oracle feature maintains
+    -- (internal_reason): left as found. NULL for an index the reclaim does not
+    -- handle (IOT top, LOB, domain, cluster, partitioned, temporary).
     FUNCTION index_item(p_owner IN VARCHAR2, p_index IN VARCHAR2) RETURN NUMBER IS
         l_id     NUMBER;
         l_type   VARCHAR2(27);
@@ -505,6 +567,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_bytes  NUMBER;
         l_est    NUMBER;
         l_prev_bytes NUMBER;
+        l_internal   VARCHAR2(400);
     BEGIN
         SELECT MAX(item_id)
           INTO l_id
@@ -528,6 +591,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
          WHERE o.unit_type = 'INDEX' AND o.owner = p_owner AND o.object_name = p_index
            AND o.run_id <> g_run.run_id AND o.move_status IN ('RELEASED', 'FAILED')
            AND o.run_id IN (SELECT r.run_id FROM epfpg.epf_run r WHERE r.reclaim_mode IN ('COMPACT', 'RESTORE'));
+        l_internal := internal_reason(l_towner, l_table);
         IF l_status = 'UNUSABLE' AND l_prev IS NOT NULL THEN
             l_state := 'RELEASED';
             l_detail := 'released by ' || epfpg.epf_util.run_label(l_prev) || ' and still unusable';
@@ -539,6 +603,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                  WHERE unit_type = 'INDEX' AND owner = p_owner AND object_name = p_index
                    AND run_id <> g_run.run_id AND move_status IN ('RELEASED', 'FAILED');
             END IF;
+        ELSIF l_internal IS NOT NULL THEN
+            l_state := 'KEPT';
+            l_orig := l_status;
+            l_detail := 'on a ' || l_internal;
         ELSIF l_status = 'VALID' AND NVL(l_func, 'ENABLED') <> 'DISABLED' THEN
             l_state := 'PENDING';
             l_orig := 'VALID';
@@ -566,7 +634,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
 
     -- Why table p_owner.p_table cannot move, NULL when it can.
     FUNCTION unit_blocker(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
-        l_count NUMBER;
+        l_count  NUMBER;
+        l_reason VARCHAR2(400);
     BEGIN
         SELECT COUNT(*) INTO l_count FROM dba_tab_columns
          WHERE owner = p_owner AND table_name = p_table AND data_type IN ('LONG', 'LONG RAW');
@@ -603,9 +672,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         IF l_count > 0 THEN
             RETURN 'disabled function-based index (it could not be rebuilt after the move)';
         END IF;
-        SELECT COUNT(*) INTO l_count FROM dba_queue_tables WHERE owner = p_owner AND queue_table = p_table;
-        IF l_count > 0 THEN
-            RETURN 'queue table (moved only with the queue tools)';
+        l_reason := internal_reason(p_owner, p_table);
+        IF l_reason IS NOT NULL THEN
+            RETURN l_reason;
         END IF;
         SELECT COUNT(*) INTO l_count FROM dba_mviews WHERE owner = p_owner AND container_name = p_table;
         IF l_count > 0 THEN
@@ -1145,6 +1214,46 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END LOOP;
     END report_ts;
 
+    -- The segments that move or are rebuilt with an INITIAL larger than they
+    -- need (above 1 MB and above initial_need, as initial_clause decides):
+    -- one event with their count and the largest; their move or rebuild sets
+    -- INITIAL 64 KB. Typically the size of the segment when it was exported.
+    PROCEDURE report_initial IS
+        l_count PLS_INTEGER := 0;
+        l_total NUMBER := 0;
+        l_need  NUMBER;
+        l_list  VARCHAR2(2000);
+    BEGIN
+        FOR s IN (SELECT i.owner, i.object_name, i.segment_type, MAX(g.initial_extent) AS initial_bytes,
+                         SUM(i.est_bytes) AS est
+                    FROM epfpg.epf_ts_inventory i
+                    JOIN dba_segments g
+                      ON g.owner = i.owner AND g.segment_name = i.object_name AND g.segment_type = i.segment_type
+                     AND g.tablespace_name = i.tablespace_name AND g.partition_name IS NULL
+                   WHERE i.run_id = g_run.run_id AND i.handler IN ('MOVE', 'RELEASE')
+                     AND i.segment_type IN ('TABLE', 'INDEX', 'LOBSEGMENT') AND i.sub_name IS NULL
+                   GROUP BY i.owner, i.object_name, i.segment_type
+                  HAVING MAX(g.initial_extent) > c_mb
+                   ORDER BY 4 DESC, 1, 2) LOOP
+            l_need := initial_need(s.owner, s.object_name, s.segment_type, s.est);
+            IF s.initial_bytes > GREATEST(l_need, c_mb) THEN
+                l_count := l_count + 1;
+                l_total := l_total + s.initial_bytes;
+                IF l_count <= 5 THEN
+                    l_list := l_list || CASE WHEN l_count > 1 THEN ', ' END || s.owner || '.' || s.object_name || ' ('
+                              || LOWER(s.segment_type) || ') INITIAL ' || b(s.initial_bytes) || ', about ' || b(l_need)
+                              || ' needed';
+                END IF;
+            END IF;
+        END LOOP;
+        IF l_count > 0 THEN
+            say(epfpg.epf_log.c_info, 'INITIAL_OVERSIZED',
+                l_count || ' segments that move or are rebuilt have an INITIAL larger than they need (' || b(l_total)
+                || ' in all): ' || l_list || CASE WHEN l_count > 5 THEN ' and ' || (l_count - 5) || ' more' END
+                || '; their move or rebuild sets INITIAL 64 KB');
+        END IF;
+    END report_initial;
+
     -- Sessions of account p_user, listed as events.
     PROCEDURE list_sessions(p_user IN VARCHAR2) IS
     BEGIN
@@ -1319,6 +1428,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     --   TEMP        room in the temporary tablespace for the largest index
     --               rebuild (blocking)
     --   BACKUP      a recent RMAN database backup (advice)
+    --   QUOTA       every owner of a table that moves or an index that is
+    --               rebuilt can be given space where they are (blocking, not
+    --               confirmable: an index that cannot be rebuilt stays
+    --               unusable)
     -- A blocking requirement the operator confirms counts as met (CONFIRMED).
     PROCEDURE check_requirements IS
         l_count   NUMBER;
@@ -1337,6 +1450,16 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_last    DATE;
         l_hours   NUMBER := NVL(epfpg.epf_util.setting_num('backup_max_age_h'), 24);
         l_margin  NUMBER := NVL(epfpg.epf_util.setting_num('archive_margin_pct'), 20);
+        l_pairs   PLS_INTEGER := 0;
+        l_limited PLS_INTEGER := 0;
+        l_short   PLS_INTEGER := 0;
+        l_shown   PLS_INTEGER := 0;
+        l_text    VARCHAR2(2000);
+        l_qmax    NUMBER;
+        l_qused   NUMBER;
+        l_qrows   NUMBER;
+        l_unlim   NUMBER;
+        l_issue   VARCHAR2(1000);
     BEGIN
         DELETE FROM epfpg.epf_req_option WHERE run_id = g_run.run_id;
         DELETE FROM epfpg.epf_requirement WHERE run_id = g_run.run_id;
@@ -1432,6 +1555,76 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 NULL, NULL, CASE WHEN l_met THEN 'RMAN' END);
         add_opt('BACKUP', 'RMAN', 1, l_met, 'A recent database backup',
                 'an RMAN backup within ' || l_hours || ' hours, or a backup made another way');
+
+        -- A move or a rebuild writes the segment again in the space quota of
+        -- its owner, also when SYS runs it. Per owner and tablespace: the
+        -- largest move (its estimate there) and the index space released
+        -- before the moves. An owner without a quota there, or above it, can
+        -- be given no space; one with a limited quota keeps the tables larger
+        -- than its room where they are.
+        FOR x IN (SELECT owner, ts, MAX(move_need) AS move_need, SUM(freed) AS freed
+                    FROM (SELECT i.owner, i.tablespace_name AS ts, SUM(i.est_bytes) AS move_need, 0 AS freed
+                            FROM epfpg.epf_ts_inventory i
+                           WHERE i.run_id = g_run.run_id AND i.handler = 'MOVE'
+                           GROUP BY i.owner, i.tablespace_name, i.item_id
+                          UNION ALL
+                          SELECT o.owner, o.source_ts, 0, NVL(o.bytes, 0)
+                            FROM epfpg.epf_reclaim_object o
+                           WHERE o.run_id = g_run.run_id AND o.unit_type = 'INDEX'
+                             AND o.move_status IN ('PENDING', 'RELEASED') AND o.source_ts IS NOT NULL)
+                   GROUP BY owner, ts
+                   ORDER BY owner, ts) LOOP
+            l_pairs := l_pairs + 1;
+            l_issue := NULL;
+            SELECT COUNT(*) INTO l_unlim
+              FROM dba_sys_privs
+             WHERE grantee = x.owner AND privilege = 'UNLIMITED TABLESPACE';
+            IF l_unlim = 0 THEN
+                SELECT MAX(max_bytes), MAX(bytes), COUNT(*)
+                  INTO l_qmax, l_qused, l_qrows
+                  FROM dba_ts_quotas
+                 WHERE username = x.owner AND tablespace_name = x.ts;
+                IF l_qrows = 0 THEN
+                    l_short := l_short + 1;
+                    l_issue := x.owner || ' has no quota on ' || x.ts;
+                ELSIF l_qmax = -1 THEN
+                    NULL;
+                ELSIF l_qused > l_qmax THEN
+                    l_short := l_short + 1;
+                    l_issue := x.owner || ' uses ' || b(l_qused) || ' of ' || x.ts || ', above its quota of ' || b(l_qmax);
+                ELSE
+                    l_limited := l_limited + 1;
+                    l_issue := x.owner || ' on ' || x.ts || ': quota ' || b(l_qmax) || ', ' || b(l_qused) || ' used'
+                               || CASE WHEN x.move_need > l_qmax - l_qused + x.freed
+                                       THEN ' (a table needing more than ' || b(l_qmax - l_qused + x.freed)
+                                            || ' stays where it is)' END;
+                END IF;
+            END IF;
+            IF l_issue IS NOT NULL THEN
+                l_shown := l_shown + 1;
+                IF l_shown <= 5 THEN
+                    l_text := l_text || CASE WHEN l_shown > 1 THEN '; ' END || l_issue;
+                END IF;
+            END IF;
+        END LOOP;
+        IF l_shown > 5 THEN
+            l_text := l_text || '; and ' || (l_shown - 5) || ' more';
+        END IF;
+        IF l_pairs = 0 THEN
+            add_req('QUOTA', 5, 'NOT_APPLICABLE', 'Y', 'Space quotas of the owners',
+                    'A table that moves and an index that is rebuilt are written in the space quota of their owner.',
+                    'no table moves and no index is rebuilt', NULL, NULL, NULL);
+        ELSE
+            add_req('QUOTA', 5, CASE WHEN l_short = 0 THEN 'MET' ELSE 'NOT_MET' END, 'Y', 'Space quotas of the owners',
+                    'A table that moves and an index that is rebuilt are written again in the space quota of their '
+                    || 'owner, also when SYS runs the reclaim; an owner without a quota there, or above it, is refused '
+                    || 'the space (ORA-01950, ORA-01536), and an index that cannot be rebuilt stays unusable.',
+                    CASE WHEN l_shown = 0 THEN 'every owner may use unlimited space in its tablespaces' ELSE l_text END,
+                    NULL, NULL,
+                    CASE WHEN l_short > 0 THEN NULL WHEN l_limited > 0 THEN 'ROOM' ELSE 'UNLIMITED' END);
+            add_opt('QUOTA', 'RAISE', 1, l_short = 0, 'Each owner has a quota above what it uses',
+                    'ALTER USER <owner> QUOTA UNLIMITED ON <tablespace>, or a quota above its use');
+        END IF;
         COMMIT;
     END check_requirements;
 
@@ -1497,6 +1690,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             forecast_ts(t.tablespace_name);
             report_ts(t.tablespace_name);
         END LOOP;
+        report_initial;
         plan_accounts;
         check_requirements;
         -- With db_securefile FORCE or ALWAYS Oracle may store a BASICFILE LOB
@@ -1726,9 +1920,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
 
     -- A segment that moves or is rebuilt is created again with its INITIAL
     -- storage, all allocated at once. An INITIAL larger than the segment needs
-    -- (above its estimate and 1 MB; typically the size of its source when it
-    -- was imported) is set to 64 KB instead: returns the STORAGE clause, and
-    -- adds p_what with the former INITIAL to p_note. Otherwise NULL.
+    -- (above p_est, its initial_need, and 1 MB; typically the size of the
+    -- segment when it was exported) is set to 64 KB instead: returns the
+    -- STORAGE clause, and adds p_what with the former INITIAL to p_note.
+    -- Otherwise NULL.
     FUNCTION initial_clause(p_initial IN NUMBER, p_est IN NUMBER, p_what IN VARCHAR2, p_note IN OUT NOCOPY VARCHAR2)
         RETURN VARCHAR2 IS
     BEGIN
@@ -1774,8 +1969,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             RAISE_APPLICATION_ERROR(-20161, 'No tablespace found for ' || p_owner || '.' || p_table);
         END IF;
         l_sql := 'ALTER TABLE ' || qn(p_owner, p_table) || ' MOVE TABLESPACE ' || q(l_ts)
-                 || CASE WHEN p_type = 'IOT' THEN initial_clause(l_initial, seg_est(p_owner, l_top, 'INDEX'), 'index',
-                                                                 p_note)
+                 || CASE WHEN p_type = 'IOT'
+                         THEN initial_clause(l_initial, initial_need(p_owner, l_top, 'INDEX', seg_est(p_owner, l_top, 'INDEX')),
+                                             'index', p_note)
                          ELSE initial_clause(l_initial, seg_est(p_owner, p_table, 'TABLE'), 'table', p_note) END;
         IF l_ovf IS NOT NULL THEN
             l_sql := l_sql || ' OVERFLOW TABLESPACE ' || q(l_ovf)
@@ -1943,11 +2139,41 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END LOOP;
     END test_pause;
 
+    -- The other tablespaces of the run where unit p_item has segments (a LOB
+    -- or an IOT overflow stored apart from its table), which its move writes
+    -- again too. p_grow TRUE: each one whose free space is short of what the
+    -- move writes there (need) first grows within its room (grow_ts); FALSE:
+    -- each is resized down to its highest block (trim_ts). Returns the bytes
+    -- added or given back.
+    FUNCTION other_ts(p_item IN NUMBER, p_ts IN VARCHAR2, p_grow IN BOOLEAN) RETURN NUMBER IS
+        l_bytes NUMBER := 0;
+        l_need  NUMBER;
+        l_free  NUMBER;
+    BEGIN
+        FOR t IN (SELECT DISTINCT tablespace_name
+                    FROM epfpg.epf_ts_inventory
+                   WHERE run_id = g_run.run_id AND item_id = p_item AND tablespace_name <> p_ts
+                   ORDER BY tablespace_name) LOOP
+            IF p_grow THEN
+                l_need := need(p_item, t.tablespace_name);
+                l_free := free_bytes(t.tablespace_name);
+                IF l_need > l_free THEN
+                    l_bytes := l_bytes + grow_ts(t.tablespace_name, l_need - l_free);
+                END IF;
+            ELSE
+                l_bytes := l_bytes + trim_ts(t.tablespace_name, 0, FALSE);
+            END IF;
+        END LOOP;
+        RETURN l_bytes;
+    END other_ts;
+
     -- Moves unit p_item within its tablespaces. p_file: the datafile of p_ts
     -- whose highest block the unit holds; a move that does not fit is tried
     -- once more after that file grew by all its room (grow_file), and a unit
-    -- that still does not fit (NO_ROOM), is in use (ORA-00054) or fails
-    -- otherwise (FAILED, an error) stays where it was. A unit that moved
+    -- that still does not fit or exceeds its owner's quota (NO_ROOM), is in
+    -- use (ORA-00054) or fails otherwise (FAILED, an error) stays where it
+    -- was. The other tablespaces of the run where it has segments grow within
+    -- their room first when they are short (other_ts). A unit that moved
     -- already (at the top again) is not tried after a growth, and when it
     -- cannot move lower it keeps its move (MOVED, with the error in last_ora:
     -- its datafile is then done). p_file NULL: a move that makes room for the
@@ -1973,8 +2199,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_started TIMESTAMP := epfpg.epf_util.now_ts;
         l_freed   NUMBER;
         l_grown   NUMBER := 0;
+        l_other   NUMBER := 0;
         l_note    VARCHAR2(1000);
-        l_holder  NUMBER;
+        l_tops    NUMBER;
         l_again   BOOLEAN := FALSE;
     BEGIN
         SELECT owner, object_name, unit_type, move_status
@@ -1991,6 +2218,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
            SET attempts = attempts + 1, started_at = NVL(started_at, l_started)
          WHERE run_id = g_run.run_id AND item_id = p_item;
         COMMIT;
+        IF NVL(l_prior, '-') <> 'MOVED' THEN
+            l_other := other_ts(p_item, p_ts, TRUE);
+        END IF;
         FOR k IN 1 .. 2 LOOP
             BEGIN
                 ddl(l_sql);
@@ -2010,15 +2240,19 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
               INTO l_top
               FROM epfpg.epf_ts_inventory
              WHERE run_id = g_run.run_id AND item_id = p_item AND file_id = p_file;
-            l_freed := trim_ts(p_ts, 0, FALSE);
+            l_freed := trim_ts(p_ts, 0, FALSE) + other_ts(p_item, p_ts, FALSE);
             l_after := ts_bytes(p_ts);
-            -- A unit at the top whose copy holds the top again (counted for pick).
+            -- A unit at the top whose copy holds the top of a datafile of p_ts
+            -- again, this one or another (counted for pick).
             IF p_file IS NOT NULL THEN
-                SELECT MAX(item_id) KEEP (DENSE_RANK LAST ORDER BY top_block)
-                  INTO l_holder
-                  FROM epfpg.epf_ts_inventory
-                 WHERE run_id = g_run.run_id AND file_id = p_file;
-                IF l_holder = p_item THEN
+                SELECT COUNT(*)
+                  INTO l_tops
+                  FROM (SELECT MAX(item_id) KEEP (DENSE_RANK LAST ORDER BY top_block) AS holder
+                          FROM epfpg.epf_ts_inventory
+                         WHERE run_id = g_run.run_id AND tablespace_name = p_ts
+                         GROUP BY file_id)
+                 WHERE holder = p_item;
+                IF l_tops > 0 THEN
                     l_again := TRUE;
                     g_at_top(p_item) := CASE WHEN g_at_top.EXISTS(p_item) THEN g_at_top(p_item) ELSE 0 END + 1;
                 END IF;
@@ -2041,13 +2275,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 || CASE WHEN p_file IS NULL THEN ' (it made room for the table at the top)' END
                 || CASE WHEN l_prior = 'MOVED' THEN ' (moved again)' END
                 || CASE WHEN l_again THEN ' (its copy holds the top again)' END
-                || CASE WHEN l_grown > 0 THEN ' (the datafile first grew by ' || b(l_grown) || ' to fit it)' END
+                || CASE WHEN l_grown + l_other > 0 THEN ' (datafiles first grew by ' || b(l_grown + l_other)
+                                                        || ' to fit it)' END
                 || ' (' || epfpg.epf_util.fmt_duration(epfpg.epf_util.elapsed_s(l_started)) || ')',
                 p_owner => l_owner, p_object => l_table, p_bytes => l_new);
             test_pause;
             RETURN;
         END IF;
-        l_freed := trim_ts(p_ts, 0, FALSE);
+        l_freed := trim_ts(p_ts, 0, FALSE) + other_ts(p_item, p_ts, FALSE);
         IF l_prior = 'MOVED' THEN
             -- Moved already: it stays where its last move put it.
             UPDATE epfpg.epf_reclaim_object
@@ -2055,14 +2290,15 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                    detail = SUBSTR('moved; it could not move lower: ' || l_msg || ' [' || l_sql || ']', 1, 4000)
              WHERE run_id = g_run.run_id AND item_id = p_item;
             COMMIT;
-            say(CASE WHEN is_space_error(l_code) THEN epfpg.epf_log.c_info ELSE epfpg.epf_log.c_warn END,
+            say(CASE WHEN is_space_error(l_code) OR is_quota_error(l_code) THEN epfpg.epf_log.c_info
+                     ELSE epfpg.epf_log.c_warn END,
                 'MOVE_AGAIN_NOT_DONE',
                 l_owner || '.' || l_table || ' moved already and holds the top of ' || p_ts || ' again; it could not '
                 || 'move lower and stays where its move put it: ' || l_msg,
                 p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));
             RETURN;
         END IF;
-        IF p_file IS NULL AND is_space_error(l_code) THEN
+        IF p_file IS NULL AND (is_space_error(l_code) OR is_quota_error(l_code)) THEN
             -- A room maker that does not fit is no longer one (its estimate
             -- becomes its size); it moves when it is at the top.
             UPDATE epfpg.epf_ts_inventory
@@ -2074,13 +2310,18 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 || p_ts || ' to make room: ' || l_msg, p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));
             RETURN;
         END IF;
-        l_status := CASE WHEN is_space_error(l_code) THEN 'NO_ROOM' ELSE 'FAILED' END;
+        l_status := CASE WHEN is_space_error(l_code) OR is_quota_error(l_code) THEN 'NO_ROOM' ELSE 'FAILED' END;
         UPDATE epfpg.epf_reclaim_object
            SET move_status = l_status, last_ora = ABS(l_code), ended_at = epfpg.epf_util.now_ts,
                detail = SUBSTR(l_msg || ' [' || l_sql || ']', 1, 4000)
          WHERE run_id = g_run.run_id AND item_id = p_item;
         COMMIT;
-        IF l_status = 'NO_ROOM' THEN
+        IF is_quota_error(l_code) THEN
+            say(epfpg.epf_log.c_warn, 'MOVE_NO_QUOTA',
+                l_owner || '.' || l_table || ' (about ' || b(l_est) || ' after the move) does not fit in the space quota '
+                || 'of ' || l_owner || ' (the DBA can raise it: ALTER USER ... QUOTA); it stays where it was: ' || l_msg,
+                p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));
+        ELSIF l_status = 'NO_ROOM' THEN
             say(epfpg.epf_log.c_warn, 'MOVE_NO_ROOM',
                 l_owner || '.' || l_table || ' (about ' || b(l_est) || ' after the move) does not fit in the free '
                 || 'space of ' || p_ts || ' below its highest block'
@@ -2331,7 +2572,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             END IF;
         END IF;
         BEGIN
-            l_clause := initial_clause(l_initial, l_est, 'INITIAL', l_note);
+            l_clause := initial_clause(l_initial, initial_need(l_owner, l_name, 'INDEX', l_est), 'INITIAL', l_note);
             ddl('ALTER INDEX ' || qn(l_owner, l_name) || ' REBUILD TABLESPACE ' || q(l_ts) || l_clause);
         EXCEPTION
             WHEN OTHERS THEN

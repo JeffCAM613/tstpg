@@ -60,8 +60,8 @@ BEGIN
                          'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME',
                          'V_$UNDOSTAT', 'V_$ARCHIVE_DEST', 'V_$RECOVERY_FILE_DEST', 'V_$ASM_DISKGROUP',
                          'V_$RMAN_BACKUP_JOB_DETAILS', 'DBA_TEMP_FREE_SPACE', 'DBA_TEMP_FILES',
-                         'DBA_TRIGGERS', 'DBA_ROLES', 'DBA_ROLE_PRIVS', 'DBA_OBJECT_TABLES', 'DBA_QUEUE_TABLES',
-                         'DBA_MVIEWS', 'DBA_MVIEW_LOGS', 'DBA_FLASHBACK_ARCHIVE_TABLES'))) LOOP
+                         'DBA_TRIGGERS', 'DBA_ROLES', 'DBA_ROLE_PRIVS', 'DBA_SYS_PRIVS', 'DBA_OBJECT_TABLES',
+                         'DBA_QUEUE_TABLES', 'DBA_MVIEWS', 'DBA_MVIEW_LOGS', 'DBA_FLASHBACK_ARCHIVE_TABLES'))) LOOP
         run_grant('GRANT SELECT ON sys.' || v.view_name || ' TO epfpg');
     END LOOP;
 

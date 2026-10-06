@@ -2374,8 +2374,9 @@ function Invoke-ReclaimRun {
 }
 
 # The question for each blocking requirement the assessment found not met:
-# the DBA confirms it (--confirm), or the reclaim stops. A requirement that
-# is advice (BACKUP) is shown. Returns $false when the operator stopped.
+# the DBA confirms it (--confirm), or the reclaim stops; QUOTA cannot be
+# confirmed (the reclaim stops). A requirement that is advice (BACKUP) is
+# shown. Returns $false when the operator stopped.
 function Invoke-ReclaimChoices {
     param($Ctx, $Advice)
     $unmet = Get-Unmet $Advice -All
@@ -2403,6 +2404,10 @@ function Invoke-ReclaimChoices {
             'TEMP' {
                 $option = 'The DBA confirms TEMP has room for the index rebuilds'
                 $stop = 'add room to TEMP, then run the reclaim again'
+            }
+            'QUOTA' {
+                $stop = 'the DBA gives the owners listed a quota above what they use (ALTER USER <owner> QUOTA ' +
+                        'UNLIMITED ON <tablespace>), then run the reclaim again'
             }
         }
         if ($option -eq '') {
@@ -2464,8 +2469,11 @@ function Show-ReclaimNext {
         if ((Read-ReclaimTs $Run.Report).Count -eq 0) {
             Write-Out ' Next    nothing to reclaim.'
         } elseif ($unmet.Count -gt 0) {
-            Write-Out (' Next    not ready (' + ($unmet -join ', ') + '): meet them, or the DBA confirms them (--confirm), ' +
-                       'then run the reclaim') 'Yellow'
+            # QUOTA cannot be confirmed: only the DBA meets it.
+            $confirmable = @($unmet | Where-Object { @('ARCHIVE', 'TEMP', 'RECYCLEBIN') -contains $_ })
+            $how = 'meet them'
+            if ($confirmable.Count -gt 0) { $how = $how + ', or the DBA confirms ' + ($confirmable -join ', ') + ' (--confirm)' }
+            Write-Out (' Next    not ready (' + ($unmet -join ', ') + '): ' + $how + ', then run the reclaim') 'Yellow'
         } else {
             Write-Out (' Next    epf_purge.bat reclaim' + $scope + $confirm + ' compacts them (SYS; the accounts listed ' +
                        'are locked meanwhile)') 'Green'

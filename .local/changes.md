@@ -2,6 +2,52 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - Reclaim hardened for other databases; second lab layout (0.7.4)
+
+Why: every reclaim so far ran on one layout. That is EPFPG781 and a lab built like it: one bigfile tablespace, autoallocate extents, indexes and LOBs beside their tables. The next source is the same Oracle version and the same application (an older version, fewer tables), from another client whose DBA may have laid it out differently. I audited the whole reclaim engine for anything that worked only because of this layout and found six gaps. None of them occurred on EPFPG781.
+
+Changes (engine, 0.7.4):
+- **Space quotas: new requirement QUOTA, blocking.**
+  - A move or a rebuild writes the segment again in the space quota of its owner, also when SYS runs it. An owner without a quota on the tablespace, or above it, is refused the space (ORA-01950, ORA-01536). A released index that cannot be rebuilt would stay unusable.
+  - So the compaction does not start, and QUOTA cannot be confirmed with `--confirm`: the DBA gives the owner a quota (`ALTER USER <owner> QUOTA UNLIMITED ON <tablespace>`).
+  - An owner with a limited quota and room is MET. A table larger than that room stays where it is (MOVE_NO_QUOTA, a warning like MOVE_NO_ROOM) instead of failing the run.
+- **Queue tables, Oracle Text and spatial tables.**
+  - These now stay where they are, with the reason, as the queue table itself already did: the tables Oracle keeps for a queue table (`AQ$_<queue table>_*`), the tables of an Oracle Text index (`DR$...`) and those of a spatial index (`MDRT_...# Change history
+
+Newest first. Each entry: date, what changed, why, and how to test when relevant.
+
+).
+  - Their indexes are left as found (not released). Before, they were moved and their indexes released like any other. Oracle maintains these objects and may refuse DDL on them, so the release step could have failed mid-run.
+- **A LOB or IOT overflow segment in another tablespace of the run.** A move writes the table's segments again in every tablespace that holds them, but free space was checked only in the tablespace being compacted. Now, before a move, each other tablespace of the run that is short grows within its room (never above its size at the start), and it is resized down again after the move.
+- **Several datafiles in one tablespace.** A copy that lands at the top of another datafile of the tablespace now counts as a return to the top (setting reclaim_unit_moves), as a copy at the top of the same file did.
+- **INITIAL in the dry run.** The assessment lists the segments that move or are rebuilt with an INITIAL larger than they need: event INITIAL_OVERSIZED, with their count, the total and the five largest. On EPFPG781 it should name OPPAYMENTS.AUDIT_ARCHIVE (INITIAL 783 MB), which confirms the cause found in set R without a separate query.
+- **An index's INITIAL** is now judged by its optimizer statistics (leaf blocks) when no purge has measured it. Before, its estimate was its size, so an index whose INITIAL was its size at export was rebuilt at that size.
+- **Grant:** EPFPG now gets DBA_SYS_PRIVS at install; QUOTA reads it. Without the grant the package would not compile.
+
+Wrapper: when QUOTA is not met, the reclaim stops and says what the DBA does. The dry run's "Next" line no longer offers `--confirm` for it.
+
+Second lab layout, src/tests/verify/reclaim_lab2.sql, with test T18G. Every new path, and the 0.7.3 paths that set R did not reach, now runs on Oracle before a new source does:
+- EPF_RT2_DATA has two datafiles with uniform 1 MB extents; the second is not autoextensible. EPF_RT2_INDX holds the indexes (uniform 256 KB). EPF_RT2_SIDE holds the LOB segments and an IOT overflow (autoallocate).
+- Low in the files are segments that stay: a LONG table, and a queue table with its internal tables.
+- Each table that moves has an INITIAL larger than it needs, one of each kind: a compressed table (BASIC) with its primary key index, an IOT with its overflow, a SECUREFILE LOB (CACHE), and a BASICFILE LOB (PCTVERSION 0).
+- The lab writes the space a purge would have measured in the LOB and overflow segments (EPF_SPACE_USAGE, run 0); the rows are removed with the lab.
+- Its owner starts above its quota on EPF_RT2_DATA.
+- T18G:
+  - The dry run finds QUOTA not met and lists the oversized INITIALs. The LONG table and the queue table stay, and nothing changes.
+  - The lab raises the quota, and the compaction runs: R1-R4 and R9 PASS; R5-R8 PASS or WARN.
+  - Each kind of segment has its INITIAL reset, shown by the events and by the dictionary afterwards. The lab is as before (rows, indexes, LOB attributes, account, growth settings), the datafiles are smaller, and nothing is pending.
+  - The lab removes itself. T18F removes both labs.
+
+Checked offline:
+- The package scans find nothing.
+- Every dictionary view the reclaim package reads is granted; DBA_SYS_PRIVS was missing.
+- T00 and T01 pass with the fake sqlplus (now 0.7.4).
+- The wrapper checks pass: 29, of which 4 are new (QUOTA stops without a question).
+
+Version 0.7.4: install again.
+
+How to test (R5 on the status page): on EPFPG781, pull, then `src\bin\epf_purge.bat install --tns EPFPG781`, then `src\tests\e2e\run_tests.bat --only T18A,T18B,T18C,T18D,T18F,T18G,T19`. Expect 8 passed (T01 always runs). Then the dry run `src\bin\epf_purge.bat reclaim --tns EPFPG781 --dry-run --non-interactive`: INITIAL_OVERSIZED should name AUDIT_ARCHIVE, and QUOTA should be MET. Then the compaction, `src\bin\epf_purge.bat reclaim --tns EPFPG781 --non-interactive --yes`.
+
 ## 2026-10-07 - Set R: DATA 41.7 GB -> 11.9 GB; INITIAL, the move limit and the report's reason fixed (0.7.3)
 
 Set R on EPFPG781 (0.7.2), the copy H5 purged. R0 (install 0.7.2, then T18C, T18D, T18F and T19) and R1 (the assessment: start 41.7 GB, forecast 8.9 GB) passed. R2, the compaction R-000059, took 6 min 25 s in all:

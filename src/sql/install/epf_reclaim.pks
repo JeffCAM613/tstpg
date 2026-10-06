@@ -22,7 +22,9 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 --      block belongs to a segment that cannot move (a pin) or nothing is left
 --      to move. A table whose copy holds the highest block again moves lower
 --      only when it fits in the free space as it is; otherwise the file stops
---      there. A stop request is honored before every move.
+--      there. A stop request is honored before every move. A segment whose
+--      INITIAL is larger than it needs (an export artifact; listed by the
+--      assessment) is moved or rebuilt with INITIAL 64 KB.
 --   4. The released indexes are rebuilt in their tablespace, the growth
 --      settings of the datafiles restored, the datafiles resized to their
 --      highest block plus setting reclaim_margin_mb, objects invalidated by
@@ -34,10 +36,13 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- plus setting reclaim_growth_mb (default 0): a table or an index that does
 -- not fit in the free space may use the room the file has given back so far
 -- (a table lands higher, then moves down again when it is at the top and
--- fits below). Every datafile only shrinks otherwise. No second tablespace, no copy of a
--- datafile. One exception, reported as a warning: an index that does not fit
--- within that room is rebuilt after the growth settings are restored, since
--- an index left unusable stops the application.
+-- fits below; a LOB or overflow segment stored in another target tablespace
+-- likewise). Every datafile only shrinks otherwise. No second tablespace, no
+-- copy of a datafile. One exception, reported as a warning: an index that
+-- does not fit within that room is rebuilt after the growth settings are
+-- restored, since an index left unusable stops the application. Requirement
+-- QUOTA (not confirmable) keeps the compaction from starting when an owner
+-- has no space quota where its segments are written again, or is above it.
 --
 -- Data safety: a MOVE is atomic (the table stays where it was when it
 -- fails); constraints are never dropped; while a unique index is released,
@@ -49,11 +54,13 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- request, and in a later run when the session was lost.
 --
 -- Not moved (pins, reported with their position and reason): partitioned
--- tables and indexes, clusters, nested tables, queue tables, materialized
--- views, tables with a LONG or object-type column, a domain or partitioned
--- index, a materialized view log with rowids or a flashback archive, segments
--- of Oracle-maintained accounts and temporary segments. A datafile cannot
--- shrink below a pin.
+-- tables and indexes, clusters, nested tables, queue tables and the tables
+-- Oracle keeps for them, tables of Oracle Text and spatial indexes,
+-- materialized views, tables with a LONG or object-type column, a domain or
+-- partitioned index, a materialized view log with rowids or a flashback
+-- archive, segments of Oracle-maintained accounts and temporary segments. The
+-- indexes of queue, Oracle Text and spatial tables are left as they are. A
+-- datafile cannot shrink below a pin.
 --
 -- Tests only: setting reclaim_test_pause_s makes the next compaction pause
 -- after each table that moves (a known point to stop it or end its session);
