@@ -25,6 +25,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- datafile again; a unit moves c_move_cap times at most in a run.
     g_at_top   t_counts;
     c_move_cap CONSTANT PLS_INTEGER := 10;
+    -- Per owner, read once per run (internal_reason): Q when it has queue
+    -- tables, D when it has domain indexes, '-' otherwise, in that order.
+    TYPE t_flag_text IS TABLE OF VARCHAR2(2) INDEX BY VARCHAR2(128);
+    g_features t_flag_text;
 
     -- Fingerprints of the objects a compaction may affect, read once the
     -- accounts are locked and before any object changes (baseline), and again
@@ -515,30 +519,46 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- index (DR$<index>$*, DR#<index>*) and of a spatial index (MDRT_*$,
     -- MDXT_*$).
     FUNCTION internal_reason(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
-        l_name VARCHAR2(128);
+        l_name  VARCHAR2(128);
+        l_count NUMBER;
+        l_flags VARCHAR2(2);
     BEGIN
-        SELECT MAX(queue_table) INTO l_name FROM dba_queue_tables WHERE owner = p_owner AND queue_table = p_table;
-        IF l_name IS NOT NULL THEN
-            RETURN 'queue table (moved only with the queue tools)';
-        END IF;
-        SELECT MAX(queue_table)
-          INTO l_name
-          FROM dba_queue_tables
-         WHERE owner = p_owner AND p_table LIKE 'AQ$\_' || REPLACE(queue_table, '_', '\_') || '\_%' ESCAPE '\';
-        IF l_name IS NOT NULL THEN
-            RETURN 'table of queue table ' || l_name || ' (moved only with the queue tools)';
-        END IF;
-        SELECT MAX(index_name)
-          INTO l_name
-          FROM dba_indexes
-         WHERE owner = p_owner AND index_type = 'DOMAIN'
-           AND (p_table LIKE 'DR$' || REPLACE(index_name, '_', '\_') || '$%' ESCAPE '\'
-                OR p_table LIKE 'DR#' || REPLACE(index_name, '_', '\_') || '%' ESCAPE '\');
-        IF l_name IS NOT NULL THEN
-            RETURN 'table of Oracle Text index ' || l_name || ' (moved only with the index)';
+        IF p_owner IS NULL OR p_table IS NULL THEN
+            RETURN NULL;
         END IF;
         IF p_table LIKE 'MDRT\_%$' ESCAPE '\' OR p_table LIKE 'MDXT\_%$' ESCAPE '\' THEN
             RETURN 'table of a spatial index (moved only with the index)';
+        END IF;
+        IF NOT g_features.EXISTS(p_owner) THEN
+            SELECT COUNT(*) INTO l_count FROM dba_queue_tables WHERE owner = p_owner;
+            l_flags := CASE WHEN l_count > 0 THEN 'Q' ELSE '-' END;
+            SELECT COUNT(*) INTO l_count FROM dba_indexes WHERE owner = p_owner AND index_type = 'DOMAIN';
+            g_features(p_owner) := l_flags || CASE WHEN l_count > 0 THEN 'D' ELSE '-' END;
+        END IF;
+        l_flags := g_features(p_owner);
+        IF SUBSTR(l_flags, 1, 1) = 'Q' THEN
+            SELECT MAX(queue_table) INTO l_name FROM dba_queue_tables WHERE owner = p_owner AND queue_table = p_table;
+            IF l_name IS NOT NULL THEN
+                RETURN 'queue table (moved only with the queue tools)';
+            END IF;
+            SELECT MAX(queue_table)
+              INTO l_name
+              FROM dba_queue_tables
+             WHERE owner = p_owner AND p_table LIKE 'AQ$\_' || REPLACE(queue_table, '_', '\_') || '\_%' ESCAPE '\';
+            IF l_name IS NOT NULL THEN
+                RETURN 'table of queue table ' || l_name || ' (moved only with the queue tools)';
+            END IF;
+        END IF;
+        IF SUBSTR(l_flags, 2, 1) = 'D' THEN
+            SELECT MAX(index_name)
+              INTO l_name
+              FROM dba_indexes
+             WHERE owner = p_owner AND index_type = 'DOMAIN'
+               AND (p_table LIKE 'DR$' || REPLACE(index_name, '_', '\_') || '$%' ESCAPE '\'
+                    OR p_table LIKE 'DR#' || REPLACE(index_name, '_', '\_') || '%' ESCAPE '\');
+            IF l_name IS NOT NULL THEN
+                RETURN 'table of Oracle Text index ' || l_name || ' (moved only with the index)';
+            END IF;
         END IF;
         RETURN NULL;
     END internal_reason;
@@ -3119,6 +3139,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         g_margin := GREATEST(NVL(epfpg.epf_util.setting_num('reclaim_margin_mb'), 64), 0) * c_mb;
         g_moves := GREATEST(NVL(epfpg.epf_util.setting_num('reclaim_unit_moves'), 3), 1);
         g_at_top.DELETE;
+        g_features.DELETE;
         g_retries := GREATEST(NVL(epfpg.epf_util.setting_num('ddl_retries'), 3), 0);
         -- The test pause applies to one compaction: reading it sets it back to 0.
         g_pause := 0;
