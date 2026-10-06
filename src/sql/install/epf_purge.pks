@@ -171,5 +171,12 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
     -- FAILED or STOPPED. A dry run stops after the counts and its forecast.
     PROCEDURE run(p_run_id IN NUMBER, p_status OUT VARCHAR2);
 
+    -- Free space for archived logs: the smallest free space of the valid
+    -- local archive destinations (recovery area: limit - used + reclaimable;
+    -- ASM disk group: free). NULL when a destination cannot be measured from
+    -- the database (a directory); p_where describes every destination. Also
+    -- used by the reclaim's requirement ARCHIVE.
+    PROCEDURE archive_room(p_room OUT NUMBER, p_where OUT VARCHAR2);
+
 END epf_purge;
 /

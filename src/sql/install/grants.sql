@@ -43,7 +43,9 @@ BEGIN
         DBMS_OUTPUT.PUT_LINE('  revoke ' || p.privilege || ' (not needed)');
     END LOOP;
 
-    -- Dictionary views read by preflight, monitor and report
+    -- Dictionary views read by preflight, monitor, report and the reclaim
+    -- assessment (the reclaim package is compiled with these grants and run
+    -- by SYS)
     FOR v IN (SELECT column_value AS view_name
                 FROM TABLE(SYS.ODCIVARCHAR2LIST(
                          'DBA_USERS', 'DBA_TS_QUOTAS', 'DBA_TABLESPACES', 'DBA_DATA_FILES',
@@ -58,7 +60,8 @@ BEGIN
                          'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME',
                          'V_$UNDOSTAT', 'V_$ARCHIVE_DEST', 'V_$RECOVERY_FILE_DEST', 'V_$ASM_DISKGROUP',
                          'V_$RMAN_BACKUP_JOB_DETAILS', 'DBA_TEMP_FREE_SPACE', 'DBA_TEMP_FILES',
-                         'DBA_TRIGGERS'))) LOOP
+                         'DBA_TRIGGERS', 'DBA_ROLES', 'DBA_ROLE_PRIVS', 'DBA_OBJECT_TABLES', 'DBA_QUEUE_TABLES',
+                         'DBA_MVIEWS', 'DBA_MVIEW_LOGS', 'DBA_FLASHBACK_ARCHIVE_TABLES'))) LOOP
         run_grant('GRANT SELECT ON sys.' || v.view_name || ' TO epfpg');
     END LOOP;
 

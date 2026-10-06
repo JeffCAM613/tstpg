@@ -196,7 +196,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.6.0', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.7.0', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -207,10 +207,12 @@ BEGIN
     put_setting('history_retention_days', '180',   'Runs older than this are removed at the start of a new run');
     put_setting('ddl_lock_timeout_s',     '30',    'ddl_lock_timeout used for every DDL issued by the tool');
     put_setting('ddl_retries',            '3',     'Retries after ORA-00054 before a DDL is reported as failed');
-    put_setting('resumable_timeout_s',    '1800',  'Resumable space allocation timeout during reclaim');
-    put_setting('disconnect_timeout_s',   '300',   'Seconds to wait for POST_TRANSACTION disconnects before IMMEDIATE');
-    put_setting('parallel_min_mb',        '1024',  'Indexes at least this large are rebuilt in parallel (Enterprise Edition)');
-    put_setting('resize_every_mb',        '1024',  'Old datafiles are resized after this many MB have been moved');
+    put_setting('resumable_timeout_s',    '1800',  'A reclaim''s index rebuild waits this many seconds for space (resumable) before it fails');
+    put_setting('disconnect_timeout_s',   '300',   'Seconds a reclaim waits for POST_TRANSACTION disconnects before IMMEDIATE');
+    put_setting('reclaim_growth_mb',      '0',     'How far a reclaim may grow a datafile above its size at the start, to move a table that does not fit below');
+    put_setting('reclaim_margin_mb',      '64',    'Free space a reclaim leaves at the end of each datafile it compacts');
+    put_setting('reclaim_unit_moves',     '3',     'Moves of one table at most in a reclaim (a table that stays at the top is not moved again)');
+    put_setting('reclaim_row_counts',     'Y',     'A reclaim counts the rows of every table it moves before and after (Y or N)');
     put_setting('compact_min_free_pct',   '20',    'Compaction only processes tables with at least this share freed inside');
     put_setting('temp_index_min_mb',      '64',    'A missing index on a link column is created for the purge only on tables at least this large');
     put_setting('undo_retention_s',       '60',    'undo_retention set by undo tuning (undo.sql APPLY) for the duration of a purge');
@@ -223,7 +225,6 @@ BEGIN
     -- Remove settings that are no longer listed above.
     DELETE FROM epf_setting
      WHERE name NOT IN (SELECT column_value FROM TABLE(g_settings));
-    put_setting('restore_datafile_paths', 'Y',     'Move swapped datafiles back to their original path (Enterprise Edition)');
 
     COMMIT;
     DBMS_OUTPUT.PUT_LINE('  registry: ' || g_tables.COUNT || ' tables, ' || g_links.COUNT || ' links');

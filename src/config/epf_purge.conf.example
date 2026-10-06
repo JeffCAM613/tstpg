@@ -49,6 +49,13 @@ UNDO_TUNING=N
 # runs of at most that much, older data first.
 #MAX_REDO=20G
 
+# Reclaim (SYS): the tablespaces to compact, separated by commas; unset for
+# every tablespace holding segments of the application schemas.
+#RECLAIM_TABLESPACES=DATA
+# Requirements of a reclaim the DBA confirms are handled although the
+# assessment finds them not met: ARCHIVE, TEMP, RECYCLEBIN.
+#RECLAIM_CONFIRM=TEMP
+
 # Output.
 #LOG_DIR=D:\epf\logs
 NO_COLOR=N

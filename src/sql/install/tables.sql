@@ -57,6 +57,23 @@ DECLARE
             DBMS_OUTPUT.PUT_LINE('  added    column ' || p_table || '.' || p_column);
         END IF;
     END add_column;
+
+    -- Gives a check constraint its current condition: drops the constraint
+    -- when present and adds it again (validated against the existing rows).
+    PROCEDURE set_check(p_table IN VARCHAR2, p_constraint IN VARCHAR2, p_condition IN VARCHAR2) IS
+        l_count PLS_INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+          INTO l_count
+          FROM all_constraints
+         WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+           AND table_name = p_table
+           AND constraint_name = p_constraint;
+        IF l_count > 0 THEN
+            EXECUTE IMMEDIATE 'ALTER TABLE ' || p_table || ' DROP CONSTRAINT ' || p_constraint;
+        END IF;
+        EXECUTE IMMEDIATE 'ALTER TABLE ' || p_table || ' ADD CONSTRAINT ' || p_constraint || ' CHECK (' || p_condition || ')';
+    END set_check;
 BEGIN
     -- Settings: tunables with defaults. Values changed by the operator are
     -- kept on upgrade (registry_data.sql inserts missing names only).
@@ -142,6 +159,8 @@ BEGIN
             plan_step       NUMBER,
             max_redo_bytes  NUMBER,
             new_plan        CHAR(1)        DEFAULT 'N' NOT NULL CHECK (new_plan IN ('Y', 'N')),
+            reclaim_mode    VARCHAR2(10)   CHECK (reclaim_mode IN ('ASSESS', 'COMPACT', 'RESTORE')),
+            reclaim_scope   VARCHAR2(4000),
             stop_requested  CHAR(1)        DEFAULT 'N' NOT NULL,
             created_at      TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
             started_at      TIMESTAMP,
@@ -186,6 +205,12 @@ BEGIN
     add_column('EPF_RUN', 'PLAN_STEP', 'NUMBER');
     add_column('EPF_RUN', 'MAX_REDO_BYTES', 'NUMBER');
     add_column('EPF_RUN', 'NEW_PLAN', q'[CHAR(1) DEFAULT 'N' NOT NULL CHECK (new_plan IN ('Y', 'N'))]');
+    -- Reclaim runs (epf_reclaim): reclaim_mode ASSESS (read-only assessment,
+    -- also a dry run), COMPACT (compaction in place) or RESTORE (completes an
+    -- interrupted reclaim); reclaim_scope the tablespaces requested, NULL for
+    -- every candidate.
+    add_column('EPF_RUN', 'RECLAIM_MODE', q'[VARCHAR2(10) CHECK (reclaim_mode IN ('ASSESS', 'COMPACT', 'RESTORE'))]');
+    add_column('EPF_RUN', 'RECLAIM_SCOPE', 'VARCHAR2(4000)');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -413,8 +438,25 @@ BEGIN
     create_index('EPF_SPACE_USAGE_IX',
         'CREATE INDEX epf_space_usage_ix ON epf_space_usage (run_id, phase)');
 
-    -- Reclaim fingerprint: indexes, constraints, invalid objects, row counts,
-    -- account status.
+    -- Reclaim fingerprint, taken once the accounts are locked and before any
+    -- object changes (detail), and again before the accounts are unlocked
+    -- (detail_after), as key=value pairs separated by ';', compared by the
+    -- report. object_type:
+    --   INDEX        an index the reclaim releases, rebuilds or leaves as
+    --                found (table_owner, table_name; status, tablespace,
+    --                degree, logging, type, uniqueness, visibility,
+    --                compression, pct_free)
+    --   CONSTRAINT   a constraint on a table in scope, or a foreign key
+    --                referencing a table that moves (status, validated,
+    --                type, deferrable, deferred, rely)
+    --   TABLE        a table that moves (row_count before, row_count_after
+    --                after; tablespace, logging, degree, storage attributes)
+    --   LOB          a LOB column of a table that moves (name: column; LOB
+    --                attributes and segment)
+    --   INVALID      an object invalid before the reclaim (detail: type)
+    --   NEW_INVALID  an object invalid after the recompilation that was not
+    --                invalid before (detail: type)
+    -- detail_after NULL: the object no longer exists.
     create_table('EPF_OBJECT_BASELINE', q'[
         CREATE TABLE epf_object_baseline (
             run_id           NUMBER         NOT NULL,
@@ -430,10 +472,19 @@ BEGIN
             row_count        NUMBER,
             detail           VARCHAR2(4000)
         )]');
+    add_column('EPF_OBJECT_BASELINE', 'TABLE_OWNER', 'VARCHAR2(128)');
+    add_column('EPF_OBJECT_BASELINE', 'ROW_COUNT_AFTER', 'NUMBER');
+    add_column('EPF_OBJECT_BASELINE', 'DETAIL_AFTER', 'VARCHAR2(4000)');
     create_index('EPF_OBJECT_BASELINE_IX',
         'CREATE INDEX epf_object_baseline_ix ON epf_object_baseline (run_id, object_type)');
 
-    -- Everything that lives in or points at a target tablespace.
+    -- Segments of the tablespaces a reclaim compacts, one row per segment
+    -- and datafile: top_block is the highest block the segment occupies in
+    -- that file, item_id the reclaim item it belongs to (EPF_RECLAIM_OBJECT):
+    -- handler MOVE (a table that moves with its LOB segments), RELEASE (an
+    -- index released and rebuilt) or PIN (a segment that does not move;
+    -- blocker_reason says why); est_bytes the bytes it is expected to need
+    -- after a move or rebuild. Rows of a segment are replaced after it moves.
     create_table('EPF_TS_INVENTORY', q'[
         CREATE TABLE epf_ts_inventory (
             run_id           NUMBER         NOT NULL,
@@ -450,10 +501,33 @@ BEGIN
                                                           'USER_DEFAULT', 'QUOTA', 'DB_DEFAULT',
                                                           'RECYCLEBIN'))
         )]');
+    add_column('EPF_TS_INVENTORY', 'ITEM_ID', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'FILE_ID', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'TOP_BLOCK', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'EST_BYTES', 'NUMBER');
     create_index('EPF_TS_INVENTORY_IX',
         'CREATE INDEX epf_ts_inventory_ix ON epf_ts_inventory (run_id, tablespace_name)');
+    create_index('EPF_TS_INVENTORY_FILE_IX',
+        'CREATE INDEX epf_ts_inventory_file_ix ON epf_ts_inventory (run_id, file_id, top_block)');
+    create_index('EPF_TS_INVENTORY_ITEM_IX',
+        'CREATE INDEX epf_ts_inventory_item_ix ON epf_ts_inventory (run_id, item_id)');
 
-    -- Reclaim journal per movable unit.
+    -- Reclaim journal, one row per item of a run (item_id):
+    --   unit_type TABLE or IOT  a table that moves within its tablespaces with
+    --                           its LOB segments (and IOT overflow);
+    --                           move_status PENDING, MOVED, STAYED (the
+    --                           datafile stopped above it), NO_ROOM, FAILED,
+    --                           SKIPPED (not reached: stop request, error or
+    --                           interruption)
+    --   unit_type INDEX         an index released (UNUSABLE, segment dropped)
+    --                           and rebuilt; move_status PENDING, RELEASED,
+    --                           REBUILT, FAILED, KEPT (unusable before: left as
+    --                           found), ADOPTED (released by this run's
+    --                           predecessor, rebuilt by a later run)
+    --   unit_type PIN           a segment that does not move (detail: why)
+    -- bytes: allocated before; est_bytes: estimated after the move;
+    -- after_bytes: allocated after; top_file_id, top_block: highest block
+    -- before (after_top_block after); orig_status: index status before.
     create_table('EPF_RECLAIM_OBJECT', q'[
         CREATE TABLE epf_reclaim_object (
             run_id       NUMBER         NOT NULL,
@@ -470,8 +544,68 @@ BEGIN
             started_at   TIMESTAMP,
             ended_at     TIMESTAMP
         )]');
+    add_column('EPF_RECLAIM_OBJECT', 'ITEM_ID', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'TABLE_OWNER', 'VARCHAR2(128)');
+    add_column('EPF_RECLAIM_OBJECT', 'TABLE_NAME', 'VARCHAR2(128)');
+    add_column('EPF_RECLAIM_OBJECT', 'EST_BYTES', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'AFTER_BYTES', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'TOP_FILE_ID', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'TOP_BLOCK', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'AFTER_TOP_BLOCK', 'NUMBER');
+    add_column('EPF_RECLAIM_OBJECT', 'ORIG_STATUS', 'VARCHAR2(20)');
+    add_column('EPF_RECLAIM_OBJECT', 'DETAIL', 'VARCHAR2(4000)');
     create_index('EPF_RECLAIM_OBJECT_IX',
         'CREATE INDEX epf_reclaim_object_ix ON epf_reclaim_object (run_id, move_status)');
+    create_index('EPF_RECLAIM_OBJECT_ITEM_IX',
+        'CREATE INDEX epf_reclaim_object_item_ix ON epf_reclaim_object (run_id, item_id)');
+
+    -- Per reclaim run and tablespace: the assessment (sizes, items, forecast)
+    -- and the result. Sizes are totals over the tablespace's datafiles.
+    --   status          ASSESSED, COMPACTED, PARTIAL (stopped, or a segment did
+    --                   not fit or failed), UNCHANGED (nothing to move), FAILED
+    --   start_bytes     datafile size when the run started
+    --   start_hwm_bytes highest allocated block, in bytes
+    --   segment_bytes   allocated bytes of every segment
+    --   unit_*          tables that move: count, allocated bytes, estimate after
+    --   index_*         indexes released and rebuilt: count, bytes, estimate
+    --   pin_*           segments that do not move: count, bytes, highest block
+    --                   (bytes from the start of its file)
+    --   est_final_bytes forecast datafile size at the end
+    --   growth_bytes    how far a datafile may grow above its start size
+    --   peak_bytes      largest total datafile size reached during the run
+    --   end_*           datafile size, high-water mark and segments at the end
+    create_table('EPF_RECLAIM_TS', q'[
+        CREATE TABLE epf_reclaim_ts (
+            run_id             NUMBER         NOT NULL,
+            tablespace_name    VARCHAR2(128)  NOT NULL,
+            bigfile            VARCHAR2(3),
+            block_size         NUMBER,
+            file_count         NUMBER,
+            status             VARCHAR2(20)   DEFAULT 'ASSESSED' NOT NULL,
+            start_bytes        NUMBER,
+            start_hwm_bytes    NUMBER,
+            segment_bytes      NUMBER,
+            unit_count         NUMBER,
+            unit_bytes         NUMBER,
+            unit_est_bytes     NUMBER,
+            index_count        NUMBER,
+            index_bytes        NUMBER,
+            index_est_bytes    NUMBER,
+            pin_count          NUMBER,
+            pin_bytes          NUMBER,
+            pin_top_bytes      NUMBER,
+            est_final_bytes    NUMBER,
+            growth_bytes       NUMBER,
+            peak_bytes         NUMBER,
+            end_bytes          NUMBER,
+            end_hwm_bytes      NUMBER,
+            end_segment_bytes  NUMBER,
+            moved_count        NUMBER,
+            detail             VARCHAR2(4000),
+            CONSTRAINT epf_reclaim_ts_pk PRIMARY KEY (run_id, tablespace_name),
+            CONSTRAINT epf_reclaim_ts_ck CHECK (status IN ('ASSESSED', 'COMPACTED', 'PARTIAL', 'UNCHANGED',
+                                                           'FAILED'))
+        )]');
 
     -- Temporary supporting indexes created for a purge. owner is the index
     -- owner (the tool schema); table_owner.table_name is the indexed table.
@@ -513,9 +647,12 @@ BEGIN
             CONSTRAINT epf_long_conv_ck  CHECK (decision IN ('CONVERT', 'SKIP'))
         )]');
 
-    -- Instance changes made by epf_tuning for the duration of a purge, with
-    -- the original values needed to restore them (restored_at NULL while
-    -- active). Kept outside history pruning: applied_run_id is not RUN_ID.
+    -- Instance changes made for the duration of a run, with the original
+    -- values needed to restore them (restored_at NULL while active): undo
+    -- tuning for a purge (epf_tuning; UNDO_RETENTION, UNDO_DATAFILE) and the
+    -- growth of the datafiles a reclaim compacts (epf_reclaim;
+    -- RECLAIM_DATAFILE). Kept outside history pruning: applied_run_id is not
+    -- RUN_ID.
     create_table('EPF_INSTANCE_CHANGE', q'[
         CREATE TABLE epf_instance_change (
             change_id            NUMBER GENERATED ALWAYS AS IDENTITY NOT NULL,
@@ -531,8 +668,10 @@ BEGIN
             restored_at          TIMESTAMP,
             applied_run_id       NUMBER,
             CONSTRAINT epf_instance_change_pk PRIMARY KEY (change_id),
-            CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE'))
+            CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE'))
         )]');
+    set_check('EPF_INSTANCE_CHANGE', 'EPF_INSTANCE_CHANGE_CK',
+              q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE')]');
 
     -- Per root tree of a preflight: eligible roots, rows per root (all the
     -- tables of the tree), and the redo and undo per root with their basis

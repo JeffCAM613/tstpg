@@ -1,0 +1,88 @@
+CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
+-- ============================================================================
+-- EPF Data Purge - Disk space reclaim (compaction in place)
+-- ============================================================================
+-- A purge frees space inside segments but not on disk: a datafile can only be
+-- resized down to its highest allocated block. The reclaim gives that space
+-- back to the disk by compacting each target tablespace in place:
+--
+--   1. Every index of a table that moves, and every index stored in a target
+--      tablespace, is released (ALTER INDEX ... UNUSABLE drops its segment);
+--      the space it held becomes free space inside the datafiles.
+--   2. The datafiles of every target tablespace stop growing until the
+--      indexes are rebuilt (AUTOEXTEND OFF, recorded and restored) and are
+--      resized to their highest allocated block.
+--   3. The table holding the highest block of a datafile moves within its
+--      tablespace (ALTER TABLE ... MOVE, with every LOB segment it keeps in a
+--      target tablespace): the copy takes free space below, which is all the
+--      free space the file has; the old segment is released; the file is
+--      resized down to its new highest block. Repeated until the highest
+--      block belongs to a segment that cannot move (a pin) or nothing is left
+--      to move.
+--   4. The released indexes are rebuilt in their tablespace, the growth
+--      settings of the datafiles restored, the datafiles resized to their
+--      highest block plus setting reclaim_margin_mb, objects invalidated by
+--      the run recompiled; the fingerprint of the objects and the row counts
+--      taken when the accounts were locked are taken again (compared by the
+--      report).
+--
+-- Disk usage: a datafile never grows above its size at the start of the run,
+-- plus setting reclaim_growth_mb (default 0): a table or an index that does
+-- not fit in the free space may use the room the file has given back so far
+-- (a table lands higher, then moves down again when it is at the top). Every
+-- datafile only shrinks otherwise. No second tablespace, no copy of a
+-- datafile. One exception, reported as a warning: an index that does not fit
+-- within that room is rebuilt after the growth settings are restored, since
+-- an index left unusable stops the application.
+--
+-- Data safety: a MOVE is atomic (the table stays where it was when it
+-- fails); constraints are never dropped; while a unique index is released,
+-- writes to its table fail (ORA-01502) instead of bypassing it. The accounts
+-- owning or writing the tables that move are locked and their sessions
+-- disconnected while the compaction runs (D10, D15). Every change outside the
+-- data is recorded before it is made (EPF_INSTANCE_CHANGE, EPF_ACCOUNT_ACTION,
+-- EPF_RECLAIM_OBJECT) and undone on every exit path: after a failure, a stop
+-- request, and in a later run when the session was lost.
+--
+-- Not moved (pins, reported with their position and reason): partitioned
+-- tables and indexes, clusters, nested tables, queue tables, materialized
+-- views, tables with a LONG or object-type column, a domain or partitioned
+-- index, a materialized view log with rowids or a flashback archive, segments
+-- of Oracle-maintained accounts, recycle-bin objects and temporary segments.
+-- A datafile cannot shrink below a pin.
+--
+-- Invoker rights: called as SYS (the DDL runs with the caller's rights),
+-- through run/reclaim.sql, in a session bound to the run
+-- (epf_control.enter). Single-instance databases; in a multitenant database,
+-- inside the PDB.
+--
+-- Error codes
+--   ORA-20160  not SYS, CDB$ROOT, RAC, or the session is not bound to the run
+--   ORA-20161  invalid mode, or a tablespace that cannot be reclaimed
+-- ============================================================================
+
+    -- Runs reclaim run p_run_id (action RECLAIM) in this session:
+    --   p_mode ASSESS   read-only: the tablespaces, what moves and what stays,
+    --                   the forecast, the accounts and sessions, the
+    --                   requirements (also for a dry run)
+    --          COMPACT  restores what an earlier reclaim left pending, assesses,
+    --                   locks the accounts, records the baseline, releases the
+    --                   indexes, stops the datafiles growing, compacts each
+    --                   tablespace, then always runs the restore path: index
+    --                   rebuilds, datafile growth settings, final resize,
+    --                   recompilation, state after (fingerprint, row
+    --                   counts), accounts
+    --          RESTORE  the restore path only, for everything a reclaim left
+    --                   pending (indexes still released, datafile settings,
+    --                   locked accounts), in a new run or in the run whose
+    --                   worker session ended without it
+    -- p_tablespaces: tablespaces to compact, separated by commas; NULL for
+    -- every candidate (permanent tablespaces holding segments of the
+    -- app_schemas, except SYSTEM, SYSAUX and the tool's tablespace).
+    -- Blocking requirements not met and not confirmed (EPF_RUN.confirmed_reqs)
+    -- stop a COMPACT run before any change.
+    -- p_status returns SUCCESS, WARNING, FAILED or STOPPED.
+    PROCEDURE run(p_run_id IN NUMBER, p_mode IN VARCHAR2, p_tablespaces IN VARCHAR2, p_status OUT VARCHAR2);
+
+END epf_reclaim;
+/

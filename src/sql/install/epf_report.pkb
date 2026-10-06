@@ -72,8 +72,498 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         IF LENGTH(p_list) > 3800 THEN
             RETURN p_list;
         END IF;
-        RETURN p_list || CASE WHEN p_list IS NOT NULL THEN '; ' END || p_item;
+        RETURN SUBSTR(p_list || CASE WHEN p_list IS NOT NULL THEN '; ' END || p_item, 1, 3900);
     END add_detail;
+
+    -- P5: errors and warnings of the run (every action).
+    PROCEDURE check_errors(p_status IN VARCHAR2) IS
+        l_run      NUMBER := g_run.run_id;
+        l_errors   NUMBER;
+        l_warnings NUMBER;
+        l_detail   VARCHAR2(4000);
+    BEGIN
+        SELECT COUNT(CASE WHEN severity = 'ERROR' THEN 1 END), COUNT(CASE WHEN severity = 'WARN' THEN 1 END)
+          INTO l_errors, l_warnings
+          FROM epf_event
+         WHERE run_id = l_run AND event_code <> 'RUN_END';
+        FOR t IN (SELECT event_code, severity, COUNT(*) AS cnt
+                    FROM epf_event
+                   WHERE run_id = l_run AND event_code <> 'RUN_END' AND severity IN ('ERROR', 'WARN')
+                   GROUP BY event_code, severity
+                   ORDER BY severity, event_code) LOOP
+            l_detail := add_detail(l_detail, t.event_code || ' x' || t.cnt);
+        END LOOP;
+        add_check('P5', CASE WHEN l_errors > 0 OR p_status = 'FAILED' THEN 'FAIL'
+                             WHEN l_warnings > 0 THEN 'WARN' ELSE 'PASS' END,
+                  'Errors during the run',
+                  l_errors || ' errors, ' || l_warnings || ' warnings'
+                  || CASE WHEN p_status = 'FAILED' THEN ', run FAILED' END, l_detail);
+    END check_errors;
+
+    -- Value of key p_key in fingerprint p_fp (key=value pairs separated by
+    -- ';', EPF_OBJECT_BASELINE).
+    FUNCTION fp_value(p_fp IN VARCHAR2, p_key IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN REGEXP_SUBSTR(';' || p_fp, ';' || p_key || '=([^;]*)', 1, 1, NULL, 1);
+    END fp_value;
+
+    -- The attributes of fingerprint p_after that differ from p_before, as
+    -- "key before->after" separated by commas; NULL when none differ. p_keys:
+    -- only these keys; p_skip: every key but these (lists separated by
+    -- commas).
+    FUNCTION attr_diff(p_before IN VARCHAR2, p_after IN VARCHAR2, p_keys IN VARCHAR2 DEFAULT NULL,
+                       p_skip IN VARCHAR2 DEFAULT NULL) RETURN VARCHAR2 IS
+        l_diff VARCHAR2(4000);
+        l_pair VARCHAR2(4000);
+        l_key  VARCHAR2(100);
+        l_old  VARCHAR2(4000);
+        l_new  VARCHAR2(4000);
+        l_i    PLS_INTEGER := 1;
+    BEGIN
+        LOOP
+            l_pair := REGEXP_SUBSTR(p_before, '[^;]+', 1, l_i);
+            EXIT WHEN l_pair IS NULL;
+            l_key := SUBSTR(l_pair, 1, INSTR(l_pair, '=') - 1);
+            IF (p_keys IS NULL OR INSTR(',' || p_keys || ',', ',' || l_key || ',') > 0)
+               AND (p_skip IS NULL OR INSTR(',' || p_skip || ',', ',' || l_key || ',') = 0) THEN
+                l_old := SUBSTR(l_pair, INSTR(l_pair, '=') + 1);
+                l_new := fp_value(p_after, l_key);
+                IF NVL(l_old, '-') <> NVL(l_new, '-') THEN
+                    l_diff := SUBSTR(l_diff || CASE WHEN l_diff IS NOT NULL THEN ', ' END || l_key || ' '
+                                     || NVL(l_old, '-') || '->' || NVL(l_new, '-'), 1, 3900);
+                END IF;
+            END IF;
+            l_i := l_i + 1;
+        END LOOP;
+        RETURN l_diff;
+    END attr_diff;
+
+    FUNCTION r_title(p_id IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN CASE p_id
+                   WHEN 'R1' THEN 'Indexes usable and identical'
+                   WHEN 'R2' THEN 'Constraints identical'
+                   WHEN 'R3' THEN 'No new invalid objects'
+                   WHEN 'R4' THEN 'Row counts identical'
+                   WHEN 'R5' THEN 'Table and LOB attributes kept'
+                   WHEN 'R6' THEN 'Datafiles within their start size'
+                   WHEN 'R7' THEN 'Efficiency'
+                   WHEN 'R8' THEN 'Tables moved'
+                   WHEN 'R9' THEN 'Accounts restored'
+               END;
+    END r_title;
+
+    -- Checks R1-R9 of a reclaim run (see the specification).
+    PROCEDURE check_reclaim IS
+        l_run      NUMBER := g_run.run_id;
+        l_restore  BOOLEAN := NVL(g_run.reclaim_mode, '-') = 'RESTORE';
+        -- A restore run checks what every reclaim left pending.
+        l_all      VARCHAR2(1) := CASE WHEN g_run.reclaim_mode = 'RESTORE' THEN 'Y' ELSE 'N' END;
+        l_base     NUMBER;
+        l_verified NUMBER;
+        l_started  NUMBER;
+        l_total    NUMBER;
+        l_ok       NUMBER;
+        l_bad      NUMBER;
+        l_soft     NUMBER;
+        l_gone     NUMBER;
+        l_count    NUMBER;
+        l_value    VARCHAR2(200);
+        l_detail   VARCHAR2(4000);
+        l_diff     VARCHAR2(4000);
+        l_hard     VARCHAR2(4000);
+        l_light    VARCHAR2(4000);
+        l_before   VARCHAR2(30);
+        l_after    VARCHAR2(30);
+        l_margin   NUMBER := NVL(epf_util.setting_num('reclaim_margin_mb'), 64) * 1048576;
+
+        -- R2-R5 cannot be evaluated: SKIP or WARN with the reason; TRUE when
+        -- the check is done.
+        FUNCTION not_compared(p_id IN VARCHAR2) RETURN BOOLEAN IS
+        BEGIN
+            IF l_restore THEN
+                add_check(p_id, 'SKIP', r_title(p_id), 'restore only');
+            ELSIF l_base = 0 THEN
+                add_check(p_id, 'SKIP', r_title(p_id), 'nothing moved');
+            ELSIF l_verified = 0 THEN
+                add_check(p_id, 'WARN', r_title(p_id), 'not verified: the run ended before step VERIFY');
+            ELSE
+                RETURN FALSE;
+            END IF;
+            RETURN TRUE;
+        END not_compared;
+    BEGIN
+        IF g_run.dry_run = 'Y' THEN
+            FOR k IN 1 .. 9 LOOP
+                add_check('R' || k, 'SKIP', r_title('R' || k), 'assessment');
+            END LOOP;
+            RETURN;
+        END IF;
+        SELECT COUNT(CASE WHEN step_code = 'BASELINE' AND status = 'DONE' THEN 1 END),
+               COUNT(CASE WHEN step_code = 'VERIFY' AND status = 'DONE' THEN 1 END),
+               COUNT(CASE WHEN step_code IN ('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'COMPACT')
+                           AND started_at IS NOT NULL THEN 1 END)
+          INTO l_base, l_verified, l_started
+          FROM epf_step
+         WHERE run_id = l_run AND phase = 'RECLAIM';
+
+        -- R1 indexes: with the fingerprint, every attribute but the status
+        -- identical and the status VALID (an index unusable before and left
+        -- as found keeps its status); otherwise the indexes of the run usable
+        -- now.
+        SELECT COUNT(*) INTO l_total
+          FROM epf_reclaim_object
+         WHERE run_id = l_run AND unit_type = 'INDEX' AND move_status IN ('RELEASED', 'REBUILT', 'FAILED');
+        IF l_total = 0 THEN
+            add_check('R1', 'SKIP', r_title('R1'), 'no index released');
+        ELSE
+            l_total := 0;
+            l_ok := 0;
+            l_bad := 0;
+            l_gone := 0;
+            l_detail := NULL;
+            IF l_verified > 0 THEN
+                FOR i IN (SELECT x.owner, x.name, x.detail, x.detail_after, o.move_status
+                            FROM epf_object_baseline x
+                            LEFT JOIN epf_reclaim_object o
+                              ON o.run_id = x.run_id AND o.unit_type = 'INDEX' AND o.owner = x.owner
+                             AND o.object_name = x.name
+                           WHERE x.run_id = l_run AND x.object_type = 'INDEX'
+                           ORDER BY x.owner, x.name) LOOP
+                    l_total := l_total + 1;
+                    l_before := fp_value(i.detail, 'status');
+                    l_after := fp_value(i.detail_after, 'status');
+                    l_diff := attr_diff(i.detail, i.detail_after, p_skip => 'status');
+                    IF i.detail_after IS NULL THEN
+                        l_gone := l_gone + 1;
+                        l_detail := add_detail(l_detail, i.owner || '.' || i.name || ' no longer exists');
+                    ELSIF NVL(i.move_status, '-') = 'FAILED' OR l_diff IS NOT NULL
+                          OR (l_after <> 'VALID' AND NOT (NVL(i.move_status, '-') = 'KEPT' AND l_after = l_before)) THEN
+                        l_bad := l_bad + 1;
+                        l_detail := add_detail(l_detail, i.owner || '.' || i.name || ' '
+                                                         || NVL(l_diff, 'status ' || l_before || '->' || l_after));
+                    ELSE
+                        l_ok := l_ok + 1;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR i IN (SELECT o.owner, o.object_name, o.move_status, x.status AS live
+                            FROM epf_reclaim_object o
+                            LEFT JOIN dba_indexes x ON x.owner = o.owner AND x.index_name = o.object_name
+                           WHERE o.run_id = l_run AND o.unit_type = 'INDEX'
+                             AND o.move_status IN ('RELEASED', 'REBUILT', 'FAILED')
+                           ORDER BY o.owner, o.object_name) LOOP
+                    l_total := l_total + 1;
+                    IF i.live IS NULL THEN
+                        l_gone := l_gone + 1;
+                        l_detail := add_detail(l_detail, i.owner || '.' || i.object_name || ' no longer exists');
+                    ELSIF i.live <> 'VALID' THEN
+                        l_bad := l_bad + 1;
+                        l_detail := add_detail(l_detail, i.owner || '.' || i.object_name || ' ' || i.live);
+                    ELSE
+                        l_ok := l_ok + 1;
+                    END IF;
+                END LOOP;
+            END IF;
+            add_check('R1', CASE WHEN l_bad > 0 THEN 'FAIL' WHEN l_gone > 0 THEN 'WARN' ELSE 'PASS' END, r_title('R1'),
+                      l_ok || '/' || l_total || CASE WHEN l_verified > 0 THEN ' usable and identical' ELSE ' usable' END
+                      || CASE WHEN l_gone > 0 THEN ', ' || l_gone || ' no longer exist' END, l_detail);
+        END IF;
+
+        -- R2 constraints: status, validated, type and deferral identical.
+        IF NOT not_compared('R2') THEN
+            l_total := 0;
+            l_bad := 0;
+            l_detail := NULL;
+            FOR c IN (SELECT owner, name, table_name, detail, detail_after
+                        FROM epf_object_baseline
+                       WHERE run_id = l_run AND object_type = 'CONSTRAINT'
+                       ORDER BY owner, table_name, name) LOOP
+                l_total := l_total + 1;
+                l_diff := CASE WHEN c.detail_after IS NULL THEN 'no longer exists'
+                               ELSE attr_diff(c.detail, c.detail_after) END;
+                IF l_diff IS NOT NULL THEN
+                    l_bad := l_bad + 1;
+                    l_detail := add_detail(l_detail, c.owner || '.' || c.name || ' on ' || c.table_name || ' ' || l_diff);
+                END IF;
+            END LOOP;
+            add_check('R2', CASE WHEN l_bad > 0 THEN 'FAIL' ELSE 'PASS' END, r_title('R2'),
+                      (l_total - l_bad) || '/' || l_total || ' identical', l_detail);
+        END IF;
+
+        -- R3 objects invalid after the recompilation that were valid before.
+        IF NOT not_compared('R3') THEN
+            l_detail := NULL;
+            l_count := 0;
+            FOR o IN (SELECT owner, name, detail
+                        FROM epf_object_baseline
+                       WHERE run_id = l_run AND object_type = 'NEW_INVALID'
+                       ORDER BY owner, name) LOOP
+                l_count := l_count + 1;
+                l_detail := add_detail(l_detail, o.detail || ' ' || o.owner || '.' || o.name);
+            END LOOP;
+            add_check('R3', CASE WHEN l_count > 0 THEN 'FAIL' ELSE 'PASS' END, r_title('R3'),
+                      CASE WHEN l_count = 0 THEN 'none new' ELSE l_count || ' new invalid objects' END, l_detail);
+        END IF;
+
+        -- R4 row counts of the tables that move, before and after.
+        IF NOT not_compared('R4') THEN
+            SELECT COUNT(row_count),
+                   COUNT(CASE WHEN row_count = row_count_after THEN 1 END),
+                   COUNT(CASE WHEN row_count IS NOT NULL AND row_count_after IS NULL THEN 1 END)
+              INTO l_total, l_ok, l_gone
+              FROM epf_object_baseline
+             WHERE run_id = l_run AND object_type = 'TABLE';
+            IF l_total = 0 THEN
+                add_check('R4', 'SKIP', r_title('R4'), 'not counted (setting reclaim_row_counts)');
+            ELSE
+                l_detail := NULL;
+                FOR t IN (SELECT owner, name, row_count, row_count_after
+                            FROM epf_object_baseline
+                           WHERE run_id = l_run AND object_type = 'TABLE' AND row_count IS NOT NULL
+                             AND (row_count_after IS NULL OR row_count_after <> row_count)
+                           ORDER BY owner, name) LOOP
+                    l_detail := add_detail(l_detail, t.owner || '.' || t.name || ' ' || n(t.row_count) || ' -> '
+                                                     || NVL(n(t.row_count_after), 'not counted'));
+                END LOOP;
+                add_check('R4', CASE WHEN l_ok + l_gone < l_total THEN 'FAIL' WHEN l_gone > 0 THEN 'WARN'
+                                     ELSE 'PASS' END, r_title('R4'),
+                          l_ok || '/' || l_total || ' tables identical'
+                          || CASE WHEN l_gone > 0 THEN ', ' || l_gone || ' not counted after' END, l_detail);
+            END IF;
+        END IF;
+
+        -- R5 table and LOB attributes: a LOB stored as SECUREFILE instead of
+        -- BASICFILE (db_securefile), a new retention (undo_retention) or a new
+        -- segment name warn; any other difference fails.
+        IF NOT not_compared('R5') THEN
+            l_total := 0;
+            l_bad := 0;
+            l_soft := 0;
+            l_detail := NULL;
+            FOR t IN (SELECT object_type, owner, name, table_name, detail, detail_after
+                        FROM epf_object_baseline
+                       WHERE run_id = l_run AND object_type IN ('TABLE', 'LOB')
+                       ORDER BY owner, table_name, object_type DESC, name) LOOP
+                l_total := l_total + 1;
+                IF t.detail_after IS NULL THEN
+                    l_hard := 'no longer exists';
+                    l_light := NULL;
+                ELSIF t.object_type = 'LOB' THEN
+                    l_hard := attr_diff(t.detail, t.detail_after, p_skip => 'securefile,retention,segment');
+                    l_light := attr_diff(t.detail, t.detail_after, p_keys => 'securefile,retention,segment');
+                ELSE
+                    l_hard := attr_diff(t.detail, t.detail_after);
+                    l_light := NULL;
+                END IF;
+                IF l_hard IS NOT NULL THEN
+                    l_bad := l_bad + 1;
+                ELSIF l_light IS NOT NULL THEN
+                    l_soft := l_soft + 1;
+                END IF;
+                IF l_hard IS NOT NULL OR l_light IS NOT NULL THEN
+                    l_detail := add_detail(l_detail, t.owner || '.' || t.table_name
+                                                     || CASE WHEN t.object_type = 'LOB' THEN ' LOB ' || t.name END || ' '
+                                                     || l_hard || CASE WHEN l_hard IS NOT NULL AND l_light IS NOT NULL
+                                                                       THEN ', ' END || l_light);
+                END IF;
+            END LOOP;
+            add_check('R5', CASE WHEN l_bad > 0 THEN 'FAIL' WHEN l_soft > 0 THEN 'WARN' ELSE 'PASS' END, r_title('R5'),
+                      (l_total - l_bad - l_soft) || '/' || l_total || ' tables and LOB columns identical', l_detail);
+        END IF;
+
+        -- R6 datafiles: every growth setting the run changed restored and
+        -- equal to the baseline; each tablespace at most its start size at the
+        -- end, and at most its start size plus reclaim_growth_mb per datafile
+        -- at its peak (above it only for an index that did not fit, a
+        -- warning).
+        l_detail := NULL;
+        l_bad := 0;
+        l_soft := 0;
+        SELECT COUNT(*) INTO l_count
+          FROM epf_instance_change
+         WHERE item = 'RECLAIM_DATAFILE' AND restored_at IS NULL
+           AND (applied_run_id = l_run OR l_all = 'Y');
+        IF l_count > 0 THEN
+            l_bad := l_bad + l_count;
+            l_detail := add_detail(l_detail, l_count || ' datafile growth settings not restored (epf_purge.bat reclaim '
+                                             || '--restore)');
+        END IF;
+        IF l_restore THEN
+            add_check('R6', CASE WHEN l_bad > 0 THEN 'FAIL' ELSE 'PASS' END, r_title('R6'),
+                      CASE WHEN l_bad > 0 THEN l_bad || ' growth settings not restored'
+                           ELSE 'growth settings restored' END, l_detail);
+        ELSE
+            SELECT COUNT(*) INTO l_total FROM epf_file_snap WHERE run_id = l_run AND phase = 'BASELINE';
+            SELECT COUNT(*) INTO l_count FROM epf_file_snap WHERE run_id = l_run AND phase = 'POST_RECLAIM';
+            IF l_total = 0 AND l_bad = 0 THEN
+                add_check('R6', 'SKIP', r_title('R6'), 'nothing changed');
+            ELSIF l_count = 0 THEN
+                add_check('R6', CASE WHEN l_bad > 0 THEN 'FAIL' ELSE 'WARN' END, r_title('R6'),
+                          'not measured: the run ended before its end values', l_detail);
+            ELSE
+                FOR f IN (SELECT s.file_name, s.autoextensible, s.increment_by, s.maxbytes,
+                                 e.autoextensible AS auto_end, e.increment_by AS incr_end, e.maxbytes AS max_end
+                            FROM epf_file_snap s
+                            LEFT JOIN epf_file_snap e
+                              ON e.run_id = s.run_id AND e.phase = 'POST_RECLAIM' AND e.file_id = s.file_id
+                           WHERE s.run_id = l_run AND s.phase = 'BASELINE'
+                           ORDER BY s.file_id) LOOP
+                    IF f.auto_end IS NULL THEN
+                        l_soft := l_soft + 1;
+                        l_detail := add_detail(l_detail, f.file_name || ' no longer exists');
+                    ELSIF f.autoextensible <> f.auto_end
+                          OR (f.autoextensible = 'YES' AND (f.increment_by <> f.incr_end OR f.maxbytes <> f.max_end)) THEN
+                        l_bad := l_bad + 1;
+                        l_detail := add_detail(l_detail, f.file_name || ' autoextend ' || f.autoextensible
+                                                         || CASE WHEN f.autoextensible = 'YES' THEN ' next ' || b(f.increment_by)
+                                                                                                    || ' max ' || b(f.maxbytes) END
+                                                         || ' -> ' || f.auto_end
+                                                         || CASE WHEN f.auto_end = 'YES' THEN ' next ' || b(f.incr_end)
+                                                                                              || ' max ' || b(f.max_end) END);
+                    END IF;
+                END LOOP;
+                SELECT COUNT(*) INTO l_count
+                  FROM epf_event
+                 WHERE run_id = l_run AND event_code = 'INDEXES_NEED_GROWTH';
+                l_value := NULL;
+                FOR t IN (SELECT tablespace_name, start_bytes, end_bytes, peak_bytes,
+                                 start_bytes + NVL(growth_bytes, 0) * NVL(file_count, 1) AS limit_bytes
+                            FROM epf_reclaim_ts
+                           WHERE run_id = l_run
+                           ORDER BY tablespace_name) LOOP
+                    IF t.peak_bytes > t.limit_bytes THEN
+                        IF l_count > 0 THEN
+                            l_soft := l_soft + 1;
+                        ELSE
+                            l_bad := l_bad + 1;
+                        END IF;
+                        l_detail := add_detail(l_detail, t.tablespace_name || ' reached ' || b(t.peak_bytes) || ', above '
+                                                         || b(t.limit_bytes)
+                                                         || CASE WHEN l_count > 0 THEN ' (an index did not fit within it)'
+                                                            END);
+                    END IF;
+                    IF t.end_bytes > t.start_bytes THEN
+                        l_soft := l_soft + 1;
+                        l_detail := add_detail(l_detail, t.tablespace_name || ' ends at ' || b(t.end_bytes)
+                                                         || ', above its start size ' || b(t.start_bytes));
+                    END IF;
+                    IF l_value IS NULL OR LENGTH(l_value) < 150 THEN
+                        l_value := l_value || CASE WHEN l_value IS NOT NULL THEN ', ' END || t.tablespace_name || ' '
+                                   || b(t.start_bytes) || ' -> ' || NVL(b(t.end_bytes), '-');
+                    END IF;
+                END LOOP;
+                add_check('R6', CASE WHEN l_bad > 0 THEN 'FAIL' WHEN l_soft > 0 THEN 'WARN' ELSE 'PASS' END,
+                          r_title('R6'), l_value, l_detail);
+            END IF;
+        END IF;
+
+        -- R7 efficiency: each tablespace ends within max(1 %, 256 MB) of its
+        -- segments plus the margin of its datafiles; otherwise a warning that
+        -- names what stopped it.
+        IF l_restore THEN
+            add_check('R7', 'SKIP', r_title('R7'), 'restore only');
+        ELSE
+            l_total := 0;
+            l_soft := 0;
+            l_detail := NULL;
+            l_value := NULL;
+            FOR t IN (SELECT r.tablespace_name, r.end_bytes, r.end_segment_bytes, r.file_count, r.status,
+                             (SELECT MAX(i.owner || '.' || i.object_name || ' (' || i.blocker_reason || ')')
+                                     KEEP (DENSE_RANK LAST ORDER BY i.top_block)
+                                FROM epf_ts_inventory i
+                               WHERE i.run_id = r.run_id AND i.tablespace_name = r.tablespace_name
+                                 AND i.handler = 'PIN') AS top_pin
+                        FROM epf_reclaim_ts r
+                       WHERE r.run_id = l_run AND r.end_bytes IS NOT NULL
+                       ORDER BY r.tablespace_name) LOOP
+                l_total := l_total + 1;
+                IF t.end_bytes - t.end_segment_bytes - l_margin * NVL(t.file_count, 1)
+                   > GREATEST(t.end_segment_bytes * 0.01, 268435456) THEN
+                    l_soft := l_soft + 1;
+                    l_detail := add_detail(l_detail, t.tablespace_name || ' ' || b(t.end_bytes) || ' for '
+                                                     || b(t.end_segment_bytes) || ' of segments: '
+                                                     || CASE WHEN t.status = 'PARTIAL'
+                                                             THEN 'tables did not fit, failed or were not reached'
+                                                             WHEN t.top_pin IS NOT NULL
+                                                             THEN 'a segment that stays holds the top, ' || t.top_pin
+                                                             ELSE 'free space below the highest block' END);
+                END IF;
+                IF l_value IS NULL OR LENGTH(l_value) < 150 THEN
+                    l_value := l_value || CASE WHEN l_value IS NOT NULL THEN ', ' END || t.tablespace_name || ' '
+                               || b(t.end_bytes) || ' vs ' || b(t.end_segment_bytes) || ' of segments';
+                END IF;
+            END LOOP;
+            IF l_total = 0 THEN
+                add_check('R7', 'SKIP', r_title('R7'), 'not measured');
+            ELSE
+                add_check('R7', CASE WHEN l_soft > 0 THEN 'WARN' ELSE 'PASS' END, r_title('R7'), l_value, l_detail);
+            END IF;
+        END IF;
+
+        -- R8 tables: a move that failed fails; tables that did not fit, were
+        -- busy or were not reached warn.
+        SELECT COUNT(*),
+               COUNT(CASE WHEN move_status = 'MOVED' THEN 1 END),
+               COUNT(CASE WHEN move_status = 'FAILED' AND NVL(last_ora, 0) <> 54 THEN 1 END),
+               COUNT(CASE WHEN move_status IN ('NO_ROOM', 'SKIPPED') OR (move_status = 'FAILED' AND last_ora = 54)
+                          THEN 1 END)
+          INTO l_total, l_ok, l_bad, l_soft
+          FROM epf_reclaim_object
+         WHERE run_id = l_run AND unit_type IN ('TABLE', 'IOT');
+        IF l_total = 0 THEN
+            add_check('R8', 'SKIP', r_title('R8'), CASE WHEN l_restore THEN 'restore only' ELSE 'no table to move' END);
+        ELSIF l_started = 0 THEN
+            add_check('R8', 'SKIP', r_title('R8'), 'nothing moved');
+        ELSE
+            l_detail := NULL;
+            FOR t IN (SELECT owner, object_name, move_status, last_ora, detail
+                        FROM epf_reclaim_object
+                       WHERE run_id = l_run AND unit_type IN ('TABLE', 'IOT')
+                         AND move_status IN ('NO_ROOM', 'FAILED', 'SKIPPED')
+                       ORDER BY CASE move_status WHEN 'FAILED' THEN 1 WHEN 'NO_ROOM' THEN 2 ELSE 3 END, bytes DESC) LOOP
+                l_detail := add_detail(l_detail, t.owner || '.' || t.object_name || ' '
+                                                 || CASE WHEN t.move_status = 'FAILED' AND t.last_ora = 54 THEN 'busy'
+                                                         ELSE LOWER(REPLACE(t.move_status, '_', ' ')) END
+                                                 || CASE WHEN t.last_ora IS NOT NULL THEN ' (ORA-' || LPAD(t.last_ora, 5, '0')
+                                                                                         || ')' END);
+            END LOOP;
+            add_check('R8', CASE WHEN l_bad > 0 THEN 'FAIL' WHEN l_soft > 0 THEN 'WARN' ELSE 'PASS' END, r_title('R8'),
+                      l_ok || ' of ' || l_total || ' moved'
+                      || CASE WHEN l_total - l_ok - l_bad - l_soft > 0
+                              THEN ', ' || (l_total - l_ok - l_bad - l_soft) || ' below a segment that stays' END
+                      || CASE WHEN l_soft > 0 THEN ', ' || l_soft || ' not moved' END
+                      || CASE WHEN l_bad > 0 THEN ', ' || l_bad || ' failed' END, l_detail);
+        END IF;
+
+        -- R9 accounts: every account the run locked (a restore: any reclaim)
+        -- unlocked again; accounts locked before stay locked.
+        SELECT COUNT(CASE WHEN locked_at IS NOT NULL THEN 1 END),
+               COUNT(CASE WHEN locked_at IS NOT NULL AND unlocked_at IS NULL THEN 1 END),
+               COUNT(*)
+          INTO l_total, l_bad, l_count
+          FROM epf_account_action
+         WHERE run_id = l_run;
+        IF l_restore THEN
+            SELECT COUNT(*) INTO l_bad FROM epf_account_action WHERE locked_at IS NOT NULL AND unlocked_at IS NULL;
+            SELECT COUNT(*) INTO l_total FROM epf_event WHERE run_id = l_run AND event_code = 'ACCOUNT_UNLOCKED';
+        END IF;
+        l_detail := NULL;
+        FOR a IN (SELECT run_id, username, original_status
+                    FROM epf_account_action
+                   WHERE locked_at IS NOT NULL AND unlocked_at IS NULL AND (run_id = l_run OR l_all = 'Y')
+                   ORDER BY run_id, username) LOOP
+            l_detail := add_detail(l_detail, a.username || ' still locked by ' || epf_util.run_label(a.run_id)
+                                             || ' (originally ' || a.original_status || ')');
+        END LOOP;
+        IF l_count = 0 AND NOT l_restore THEN
+            add_check('R9', 'SKIP', r_title('R9'), 'no account in scope');
+        ELSE
+            add_check('R9', CASE WHEN l_bad > 0 THEN 'FAIL' ELSE 'PASS' END, r_title('R9'),
+                      CASE WHEN l_restore THEN l_total || ' unlocked, ' || l_bad || ' still locked'
+                           ELSE l_total || ' locked, ' || (l_total - l_bad) || ' restored' END, l_detail);
+        END IF;
+    END check_reclaim;
 
     PROCEDURE evaluate(p_run_id IN NUMBER, p_verdict OUT VARCHAR2, p_exit_code OUT NUMBER,
                        p_status IN VARCHAR2 DEFAULT NULL) IS
@@ -93,8 +583,6 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_by_fk     NUMBER;
         l_new       NUMBER;
         l_old       NUMBER;
-        l_errors    NUMBER;
-        l_warnings  NUMBER;
         l_phases    NUMBER;
         l_estimated NUMBER;
         l_lob_est   NUMBER;
@@ -110,6 +598,19 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         SELECT * INTO g_run FROM epf_run WHERE run_id = p_run_id;
         l_status := NVL(UPPER(p_status), g_run.status);
         DELETE FROM epf_check WHERE run_id = l_run;
+
+        IF g_run.action = 'RECLAIM' THEN
+            check_errors(l_status);
+            check_reclaim;
+            COMMIT;
+            SELECT COUNT(CASE WHEN status = 'FAIL' THEN 1 END), COUNT(CASE WHEN status = 'WARN' THEN 1 END)
+              INTO l_fail, l_warn
+              FROM epf_check
+             WHERE run_id = l_run;
+            p_verdict   := CASE WHEN l_fail > 0 THEN 'FAIL' WHEN l_warn > 0 THEN 'PASS WITH WARNINGS' ELSE 'PASS' END;
+            p_exit_code := CASE WHEN l_fail > 0 THEN 1 WHEN l_warn > 0 THEN 2 ELSE 0 END;
+            RETURN;
+        END IF;
 
         SELECT COUNT(*) INTO l_after FROM epf_table_stat WHERE run_id = l_run AND phase = 'AFTER';
         l_no_purge := g_run.action <> 'PURGE' OR g_run.dry_run = 'Y' OR l_after = 0;
@@ -241,23 +742,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END IF;
 
         -- P5 errors
-        SELECT COUNT(CASE WHEN severity = 'ERROR' THEN 1 END), COUNT(CASE WHEN severity = 'WARN' THEN 1 END)
-          INTO l_errors, l_warnings
-          FROM epf_event
-         WHERE run_id = l_run AND event_code <> 'RUN_END';
-        l_detail := NULL;
-        FOR t IN (SELECT event_code, severity, COUNT(*) AS cnt
-                    FROM epf_event
-                   WHERE run_id = l_run AND event_code <> 'RUN_END' AND severity IN ('ERROR', 'WARN')
-                   GROUP BY event_code, severity
-                   ORDER BY severity, event_code) LOOP
-            l_detail := add_detail(l_detail, t.event_code || ' x' || t.cnt);
-        END LOOP;
-        add_check('P5', CASE WHEN l_errors > 0 OR l_status = 'FAILED' THEN 'FAIL'
-                             WHEN l_warnings > 0 THEN 'WARN' ELSE 'PASS' END,
-                  'Errors during the run',
-                  l_errors || ' errors, ' || l_warnings || ' warnings'
-                  || CASE WHEN l_status = 'FAILED' THEN ', run FAILED' END, l_detail);
+        check_errors(l_status);
 
         -- P6 temporary indexes
         IF l_no_purge THEN
@@ -358,6 +843,12 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || CASE WHEN g_run.batch_rows IS NOT NULL THEN ' (at most ' || n(g_run.batch_rows) || ' rows)' END
                 || ', dry run ' || g_run.dry_run || ', compact ' || g_run.with_compact
                 || ', reclaim ' || g_run.with_reclaim);
+        ELSIF g_run.action = 'RECLAIM' THEN
+            put(' Parameters  ' || CASE g_run.reclaim_mode WHEN 'ASSESS' THEN 'assessment (dry run)'
+                                                           WHEN 'RESTORE' THEN 'restore of what reclaims left pending'
+                                                           ELSE 'compaction' END
+                || ', tablespaces ' || NVL(REPLACE(g_run.reclaim_scope, ',', ', '), 'every candidate')
+                || CASE WHEN g_run.confirmed_reqs IS NOT NULL THEN ', confirmed ' || g_run.confirmed_reqs END);
         END IF;
         put(' Time        started ' || NVL(TO_CHAR(g_run.started_at, 'YYYY-MM-DD HH24:MI:SS'), '-')
             || ', ended ' || NVL(TO_CHAR(g_run.ended_at, 'YYYY-MM-DD HH24:MI:SS'), '-')
@@ -641,6 +1132,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_block NUMBER;
         l_unmet VARCHAR2(400);
         l_slow  VARCHAR2(400);
+        -- A requirement that is not blocking makes a purge slower; for a
+        -- reclaim it is advice.
+        l_soft  VARCHAR2(20) := CASE WHEN g_run.action = 'RECLAIM' THEN 'advice' ELSE 'slower only' END;
     BEGIN
         SELECT COUNT(*),
                COUNT(CASE WHEN status <> 'NOT_MET' THEN 1 END),
@@ -653,15 +1147,17 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         IF l_count = 0 THEN
             RETURN;
         END IF;
-        title('REQUIREMENTS' || CASE WHEN g_run.action = 'PURGE' AND g_run.dry_run = 'N'
-                                     THEN ' (checked when the purge started)' END);
+        title('REQUIREMENTS' || CASE WHEN g_run.dry_run = 'N' AND g_run.action = 'PURGE'
+                                     THEN ' (checked when the purge started)'
+                                     WHEN g_run.dry_run = 'N' AND g_run.action = 'RECLAIM'
+                                     THEN ' (checked when the reclaim started)' END);
         FOR q IN (SELECT req_code, status, blocking, title, why, measured, met_by
                     FROM epf_requirement
                    WHERE run_id = l_run
                    ORDER BY seq) LOOP
             put('  ' || l(q.req_code, 12) || RPAD(q.title || ' ', 40, '.') || ' '
-                || CASE q.status WHEN 'MET' THEN 'MET' WHEN 'NOT_MET' THEN 'NOT MET' ELSE 'NOT MEASURED' END
-                || CASE WHEN q.status = 'NOT_MET' AND q.blocking = 'N' THEN ' (slower only)' END);
+                || CASE q.status WHEN 'MET' THEN 'MET' WHEN 'NOT_MET' THEN 'NOT MET' ELSE 'NOT APPLICABLE' END
+                || CASE WHEN q.status = 'NOT_MET' AND q.blocking = 'N' THEN ' (' || l_soft || ')' END);
             IF q.status = 'NOT_MET' THEN
                 put('      Why: ' || q.why);
             END IF;
@@ -685,7 +1181,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         put(' RESULT  ' || CASE WHEN l_block > 0 THEN 'NOT READY: ' || l_block || ' blocking requirement'
                                                     || CASE WHEN l_block > 1 THEN 's' END || ' not met (' || l_unmet || ')'
                                 ELSE 'READY: ' || l_met || ' of ' || l_count || ' met' END
-            || CASE WHEN l_slow IS NOT NULL THEN '; slower only: ' || l_slow END);
+            || CASE WHEN l_slow IS NOT NULL THEN '; ' || l_soft || ': ' || l_slow END);
         FOR q IN (SELECT req_code, status, blocking, met_by FROM epf_requirement WHERE run_id = l_run ORDER BY seq) LOOP
             put('EPF_REQ|' || l_label || '|' || q.req_code || '|' || q.status || '|' || q.blocking || '|' || q.met_by);
         END LOOP;
@@ -1330,6 +1826,272 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         print_plan_detail(l_plan);
     END print_plan;
 
+    -- ------------------------------------------------------------------
+    -- Reclaim
+    -- ------------------------------------------------------------------
+
+    -- Per tablespace of a reclaim run: sizes at the start, what moves and
+    -- what stays, the forecast and, after a compaction, the end values.
+    PROCEDURE print_reclaim_ts IS
+        l_label VARCHAR2(20) := epf_util.run_label(g_run.run_id);
+        l_count PLS_INTEGER := 0;
+        l_start NUMBER := 0;
+        l_end   NUMBER := 0;
+        l_fc    NUMBER := 0;
+        l_ended BOOLEAN := FALSE;
+    BEGIN
+        title('TABLESPACES (sizes of their datafiles; forecast: at the end of a compaction)');
+        put('  ' || l('Tablespace', 22) || r('Files', 6) || r('Start', 12) || r('Segments', 12) || r('Tables', 8)
+            || r('Indexes', 9) || r('Pins', 7) || r('Forecast', 12) || r('End', 12) || r('Peak', 12)
+            || r('Given back', 12) || '  Status');
+        FOR t IN (SELECT tablespace_name, file_count, start_bytes, segment_bytes, unit_count, index_count, pin_count,
+                         est_final_bytes, end_bytes, peak_bytes, status, detail, moved_count
+                    FROM epf_reclaim_ts
+                   WHERE run_id = g_run.run_id
+                   ORDER BY start_bytes DESC, tablespace_name) LOOP
+            l_count := l_count + 1;
+            l_start := l_start + NVL(t.start_bytes, 0);
+            l_end := l_end + NVL(t.end_bytes, t.start_bytes);
+            l_fc := l_fc + NVL(t.est_final_bytes, t.start_bytes);
+            l_ended := l_ended OR t.end_bytes IS NOT NULL;
+            put('  ' || l(t.tablespace_name, 22) || r(n(t.file_count), 6) || r(b(t.start_bytes), 12)
+                || r(b(t.segment_bytes), 12) || r(n(t.unit_count), 8) || r(n(t.index_count), 9) || r(n(t.pin_count), 7)
+                || r(b(t.est_final_bytes), 12) || r(b(t.end_bytes), 12) || r(b(t.peak_bytes), 12)
+                || r(CASE WHEN t.end_bytes IS NOT NULL THEN b(GREATEST(t.start_bytes - t.end_bytes, 0)) END, 12)
+                || '  ' || t.status);
+            IF t.detail IS NOT NULL THEN
+                put('    forecast: ' || t.detail);
+            END IF;
+        END LOOP;
+        IF l_count = 0 THEN
+            put('  No tablespace to reclaim.');
+            RETURN;
+        END IF;
+        IF l_count > 1 THEN
+            put('  ' || l('Total', 22) || r(' ', 6) || r(b(l_start), 12) || r(' ', 12) || r(' ', 8) || r(' ', 9)
+                || r(' ', 7) || r(b(l_fc), 12) || r(CASE WHEN l_ended THEN b(l_end) END, 12) || r(' ', 12)
+                || r(CASE WHEN l_ended THEN b(GREATEST(l_start - l_end, 0)) END, 12));
+        END IF;
+        put('  Tables: tables that move with their LOB segments; Indexes: released and rebuilt; Pins: segments that '
+            || 'stay (a datafile cannot shrink below the highest of them).');
+        FOR t IN (SELECT tablespace_name, status, start_bytes, end_bytes, peak_bytes, est_final_bytes, unit_count,
+                         index_count, moved_count, pin_count
+                    FROM epf_reclaim_ts
+                   WHERE run_id = g_run.run_id
+                   ORDER BY start_bytes DESC, tablespace_name) LOOP
+            put('EPF_RECLAIM_TS|' || l_label || '|' || t.tablespace_name || '|' || t.status || '|' || t.start_bytes
+                || '|' || t.end_bytes || '|' || t.peak_bytes || '|' || t.est_final_bytes || '|' || t.unit_count || '|'
+                || t.index_count || '|' || t.moved_count || '|' || t.pin_count);
+        END LOOP;
+    END print_reclaim_ts;
+
+    -- The tables of a reclaim run per tablespace: the ones that did not move
+    -- first, then the largest; at most 60 per tablespace.
+    PROCEDURE print_reclaim_tables IS
+        l_ts     VARCHAR2(128);
+        l_assess BOOLEAN := g_run.dry_run = 'Y';
+    BEGIN
+        FOR u IN (SELECT source_ts, owner, object_name, unit_type, bytes, est_bytes, after_bytes, attempts, move_status,
+                         detail, rn, cnt, ts_bytes
+                    FROM (SELECT source_ts, owner, object_name, unit_type, bytes, est_bytes, after_bytes, attempts,
+                                 move_status, detail,
+                                 ROW_NUMBER() OVER (PARTITION BY source_ts
+                                                    ORDER BY CASE move_status WHEN 'FAILED' THEN 1 WHEN 'NO_ROOM' THEN 2
+                                                                              WHEN 'SKIPPED' THEN 3 ELSE 4 END,
+                                                             bytes DESC, item_id) AS rn,
+                                 COUNT(*) OVER (PARTITION BY source_ts) AS cnt,
+                                 SUM(bytes) OVER (PARTITION BY source_ts) AS ts_bytes
+                            FROM epf_reclaim_object
+                           WHERE run_id = g_run.run_id AND unit_type IN ('TABLE', 'IOT'))
+                   WHERE rn <= 61
+                   ORDER BY source_ts, rn) LOOP
+            IF l_ts IS NULL THEN
+                title(CASE WHEN l_assess THEN 'TABLES TO MOVE (each within its tablespace, with its LOB segments; '
+                                              || 'estimate: allocated after the move)'
+                           ELSE 'TABLES (each moves within its tablespace, with its LOB segments)' END);
+                put('  ' || l('Table', 48) || r('Before', 12) || r('Estimate', 12) || r('After', 12) || r('Moves', 7)
+                    || '  ' || l('Status', 9) || 'Detail');
+            END IF;
+            IF l_ts IS NULL OR l_ts <> u.source_ts THEN
+                put('  ' || u.source_ts || ': ' || n(u.cnt) || ' tables, ' || b(u.ts_bytes));
+                l_ts := u.source_ts;
+            END IF;
+            IF u.rn <= 60 THEN
+                put('   ' || l(u.owner || '.' || u.object_name || CASE WHEN u.unit_type = 'IOT' THEN ' (IOT)' END, 47)
+                    || r(b(u.bytes), 12) || r(b(u.est_bytes), 12) || r(b(u.after_bytes), 12) || r(n(u.attempts), 7)
+                    || '  ' || l(CASE WHEN l_assess THEN 'TO MOVE' ELSE u.move_status END, 9) || SUBSTR(u.detail, 1, 200));
+            ELSE
+                put('   ... ' || n(u.cnt - 60) || ' more tables');
+            END IF;
+        END LOOP;
+    END print_reclaim_tables;
+
+    -- The indexes of a reclaim run: counts by outcome, the ones not usable
+    -- or left as found, and the largest.
+    PROCEDURE print_reclaim_indexes IS
+        l_assess  BOOLEAN := g_run.dry_run = 'Y';
+        l_total   NUMBER;
+        l_pending NUMBER;
+        l_rebuilt NUMBER;
+        l_failed  NUMBER;
+        l_kept    NUMBER;
+        l_left    NUMBER;
+        l_bytes   NUMBER;
+        l_after   NUMBER;
+        l_shown   PLS_INTEGER := 0;
+    BEGIN
+        SELECT COUNT(*),
+               COUNT(CASE WHEN move_status = 'PENDING' THEN 1 END),
+               COUNT(CASE WHEN move_status = 'REBUILT' THEN 1 END),
+               COUNT(CASE WHEN move_status = 'FAILED' THEN 1 END),
+               COUNT(CASE WHEN move_status = 'KEPT' THEN 1 END),
+               COUNT(CASE WHEN move_status = 'RELEASED' THEN 1 END),
+               SUM(CASE WHEN move_status <> 'KEPT' THEN bytes END),
+               SUM(CASE WHEN move_status = 'REBUILT' THEN after_bytes END)
+          INTO l_total, l_pending, l_rebuilt, l_failed, l_kept, l_left, l_bytes, l_after
+          FROM epf_reclaim_object
+         WHERE run_id = g_run.run_id AND unit_type = 'INDEX';
+        IF l_total = 0 THEN
+            RETURN;
+        END IF;
+        title('INDEXES (released before the tables move, rebuilt in their tablespace after)');
+        IF l_assess THEN
+            put('  ' || n(l_pending + l_left) || ' indexes to release and rebuild (' || b(l_bytes) || ')'
+                || CASE WHEN l_left > 0 THEN ', of which ' || n(l_left) || ' released by an earlier reclaim and still '
+                                             || 'unusable' END
+                || CASE WHEN l_kept > 0 THEN '; ' || n(l_kept) || ' unusable before, left as found' END);
+        ELSE
+            put('  ' || n(l_rebuilt) || ' rebuilt (' || b(l_bytes) || ' before, ' || b(l_after) || ' after)'
+                || CASE WHEN l_failed > 0 THEN ', ' || n(l_failed) || ' failed or no longer exist' END
+                || CASE WHEN l_left > 0 THEN ', ' || n(l_left) || ' still released (unusable)' END
+                || CASE WHEN l_pending > 0 THEN ', ' || n(l_pending) || ' not released' END
+                || CASE WHEN l_kept > 0 THEN ', ' || n(l_kept) || ' unusable before, left as found' END);
+        END IF;
+        FOR i IN (SELECT owner, object_name, table_owner, table_name, source_ts, move_status, detail, last_ora
+                    FROM epf_reclaim_object
+                   WHERE run_id = g_run.run_id AND unit_type = 'INDEX'
+                     AND (move_status IN ('FAILED', 'KEPT') OR (move_status = 'RELEASED' AND g_run.dry_run = 'N')
+                          OR detail IS NOT NULL)
+                   ORDER BY CASE move_status WHEN 'FAILED' THEN 1 WHEN 'RELEASED' THEN 2 ELSE 3 END, owner, object_name) LOOP
+            l_shown := l_shown + 1;
+            EXIT WHEN l_shown > 100;
+            put('   ' || l(i.owner || '.' || i.object_name, 47) || l(i.move_status, 10) || 'on ' || i.table_owner || '.'
+                || i.table_name || CASE WHEN i.detail IS NOT NULL THEN ': ' || SUBSTR(i.detail, 1, 200) END);
+        END LOOP;
+        put('  ' || CASE WHEN l_assess THEN 'Largest' ELSE 'Largest rebuilt' END || ':');
+        FOR i IN (SELECT owner, object_name, table_owner, table_name, source_ts, bytes, est_bytes, after_bytes
+                    FROM epf_reclaim_object
+                   WHERE run_id = g_run.run_id AND unit_type = 'INDEX' AND move_status <> 'KEPT'
+                     AND (g_run.dry_run = 'Y' OR move_status = 'REBUILT')
+                   ORDER BY bytes DESC, item_id
+                   FETCH FIRST 10 ROWS ONLY) LOOP
+            put('   ' || l(i.owner || '.' || i.object_name, 47) || r(b(i.bytes), 12)
+                || r(CASE WHEN g_run.dry_run = 'Y' THEN b(i.est_bytes) ELSE b(i.after_bytes) END, 12) || '  in '
+                || i.source_ts || ', on ' || i.table_owner || '.' || i.table_name);
+        END LOOP;
+    END print_reclaim_indexes;
+
+    -- Segments that stay, per tablespace, the highest first (a datafile
+    -- cannot shrink below them); at most 15 per tablespace.
+    PROCEDURE print_reclaim_pins IS
+        l_ts VARCHAR2(128);
+    BEGIN
+        FOR p IN (SELECT tablespace_name, owner, object_name, sub_name, segment_type, file_id, top_bytes, seg_bytes,
+                         reason, rn, cnt, all_bytes
+                    FROM (SELECT i.tablespace_name, i.owner, i.object_name, i.sub_name, i.segment_type, i.file_id,
+                                 (MAX(i.top_block) + 1) * MAX(t.block_size) AS top_bytes, SUM(i.bytes) AS seg_bytes,
+                                 MAX(i.blocker_reason) AS reason,
+                                 ROW_NUMBER() OVER (PARTITION BY i.tablespace_name ORDER BY MAX(i.top_block) DESC,
+                                                                                         i.owner, i.object_name) AS rn,
+                                 COUNT(*) OVER (PARTITION BY i.tablespace_name) AS cnt,
+                                 SUM(SUM(i.bytes)) OVER (PARTITION BY i.tablespace_name) AS all_bytes
+                            FROM epf_ts_inventory i
+                            JOIN epf_reclaim_ts t ON t.run_id = i.run_id AND t.tablespace_name = i.tablespace_name
+                           WHERE i.run_id = g_run.run_id AND i.handler = 'PIN'
+                           GROUP BY i.tablespace_name, i.owner, i.object_name, i.sub_name, i.segment_type, i.file_id)
+                   WHERE rn <= 16
+                   ORDER BY tablespace_name, rn) LOOP
+            IF l_ts IS NULL THEN
+                title('SEGMENTS THAT STAY (the highest first: a datafile cannot shrink below them)');
+                put('  ' || l('Segment', 52) || l('Type', 14) || r('Size', 11) || r('Up to', 11) || l('  File', 7)
+                    || '  Reason');
+            END IF;
+            IF l_ts IS NULL OR l_ts <> p.tablespace_name THEN
+                put('  ' || p.tablespace_name || ': ' || n(p.cnt) || ' segments, ' || b(p.all_bytes));
+                l_ts := p.tablespace_name;
+            END IF;
+            IF p.rn <= 15 THEN
+                put('   ' || l(p.owner || '.' || p.object_name || CASE WHEN p.sub_name IS NOT NULL
+                                                                         THEN ' (' || p.sub_name || ')' END, 51)
+                    || l(p.segment_type, 14) || r(b(p.seg_bytes), 11) || r(b(p.top_bytes), 11) || l('  ' || p.file_id, 7)
+                    || '  ' || p.reason);
+            ELSE
+                put('   ... ' || n(p.cnt - 15) || ' more segments, lower in their datafiles');
+            END IF;
+        END LOOP;
+    END print_reclaim_pins;
+
+    -- Accounts locked while the tables move, and the sessions found.
+    PROCEDURE print_reclaim_accounts IS
+        l_count PLS_INTEGER := 0;
+    BEGIN
+        FOR a IN (SELECT username, original_status, locked_at, unlocked_at, sessions_disconnected, detail
+                    FROM epf_account_action
+                   WHERE run_id = g_run.run_id
+                   ORDER BY username) LOOP
+            IF l_count = 0 THEN
+                title(CASE WHEN g_run.dry_run = 'Y'
+                           THEN 'ACCOUNTS (locked, and their sessions disconnected, while the tables move)'
+                           ELSE 'ACCOUNTS (locked, and their sessions disconnected, while the tables moved)' END);
+                put('  ' || l('Account', 26) || l('Status before', 18) || l('Locked', 10) || l('Unlocked', 10)
+                    || r('Sessions', 9) || '  In scope as');
+            END IF;
+            l_count := l_count + 1;
+            put('  ' || l(a.username, 26) || l(a.original_status, 18)
+                || l(CASE WHEN a.locked_at IS NOT NULL THEN TO_CHAR(a.locked_at, 'HH24:MI:SS')
+                          WHEN g_run.dry_run = 'N' AND INSTR(a.original_status, 'LOCKED') > 0 THEN 'already'
+                          ELSE '-' END, 10)
+                || l(NVL(TO_CHAR(a.unlocked_at, 'HH24:MI:SS'), '-'), 10) || r(n(a.sessions_disconnected), 9)
+                || '  ' || a.detail);
+        END LOOP;
+        FOR e IN (SELECT message
+                    FROM epf_event
+                   WHERE run_id = g_run.run_id AND event_code IN ('SESSION_FOUND', 'SESSION_DISCONNECT_IMMEDIATE')
+                   ORDER BY event_id) LOOP
+            IF l_count = 0 THEN
+                title('ACCOUNTS');
+                l_count := 1;
+            END IF;
+            put('  ' || e.message);
+        END LOOP;
+    END print_reclaim_accounts;
+
+    -- Datafiles of the run's tablespaces at the start and at the end.
+    PROCEDURE print_reclaim_files IS
+        l_count PLS_INTEGER := 0;
+    BEGIN
+        FOR f IN (SELECT NVL(s.file_name, e.file_name) AS file_name, s.bytes AS start_bytes, e.bytes AS end_bytes,
+                         e.hwm_bytes AS end_hwm, e.free_bytes AS end_free,
+                         s.autoextensible AS auto_start, s.maxbytes AS max_start,
+                         e.autoextensible AS auto_end, e.maxbytes AS max_end
+                    FROM (SELECT * FROM epf_file_snap WHERE run_id = g_run.run_id AND phase = 'BASELINE') s
+                    FULL JOIN (SELECT * FROM epf_file_snap WHERE run_id = g_run.run_id AND phase = 'POST_RECLAIM') e
+                      ON e.file_id = s.file_id
+                   ORDER BY NVL(s.tablespace_name, e.tablespace_name), NVL(s.file_id, e.file_id)) LOOP
+            IF l_count = 0 THEN
+                title('DATAFILES (at the start and at the end of the run)');
+                put('  ' || l('File', 58) || r('Start', 11) || r('End', 11) || r('HWM end', 11) || r('Free end', 11)
+                    || '  Autoextend (up to) start -> end');
+            END IF;
+            l_count := l_count + 1;
+            put('  ' || l(f.file_name, 58) || r(b(f.start_bytes), 11) || r(b(f.end_bytes), 11) || r(b(f.end_hwm), 11)
+                || r(b(f.end_free), 11) || '  '
+                || NVL(f.auto_start || CASE WHEN f.auto_start = 'YES' THEN ' (' || b(f.max_start) || ')' END, '-')
+                || ' -> '
+                || NVL(f.auto_end || CASE WHEN f.auto_end = 'YES' THEN ' (' || b(f.max_end) || ')' END, '-'));
+        END LOOP;
+    END print_reclaim_files;
+
     PROCEDURE print_report(p_run_id IN NUMBER) IS
         l_verdict VARCHAR2(30);
         l_exit    NUMBER;
@@ -1360,6 +2122,14 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             print_requirements;
             print_changes;
             print_run_plan;
+        ELSIF g_run.action = 'RECLAIM' THEN
+            print_reclaim_ts;
+            print_reclaim_tables;
+            print_reclaim_indexes;
+            print_reclaim_pins;
+            print_reclaim_accounts;
+            print_reclaim_files;
+            print_requirements;
         END IF;
         print_checks(l_verdict, l_exit);
     END print_report;
@@ -1386,7 +2156,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
           FROM epf_event
          WHERE run_id = p_run_id AND event_code = 'UNDO_ESTIMATE' AND severity = 'WARN';
         put('EPF_ADVICE|UNDO_WARN|' || CASE WHEN l_count > 0 THEN 'Y' ELSE 'N' END);
-        SELECT COUNT(*) INTO l_count FROM epf_instance_change WHERE restored_at IS NULL;
+        SELECT COUNT(*) INTO l_count FROM epf_instance_change WHERE restored_at IS NULL AND item LIKE 'UNDO%';
         put('EPF_ADVICE|UNDO_ACTIVE|' || CASE WHEN l_count > 0 THEN 'Y' ELSE 'N' END);
         SELECT COUNT(CASE WHEN severity = 'ERROR' THEN 1 END), COUNT(CASE WHEN severity = 'WARN' THEN 1 END)
           INTO l_errors, l_warnings
@@ -1498,11 +2268,34 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END LOOP;
         FOR c IN (SELECT item, target, original_value, applied_value, applied_at
                     FROM epf_instance_change
-                   WHERE restored_at IS NULL
+                   WHERE restored_at IS NULL AND item LIKE 'UNDO%'
                    ORDER BY change_id) LOOP
             l_count := l_count + 1;
             put('  undo tuning active: ' || c.item || ' ' || c.target || ' since '
                 || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || '; restore with run/undo.sql RESTORE as SYS');
+        END LOOP;
+        -- What a reclaim left pending: epf_purge.bat reclaim --restore
+        -- restores it (a new reclaim does too, before it starts).
+        FOR c IN (SELECT target, original_maxbytes, applied_at, applied_run_id
+                    FROM epf_instance_change
+                   WHERE restored_at IS NULL AND item = 'RECLAIM_DATAFILE'
+                   ORDER BY change_id) LOOP
+            l_count := l_count + 1;
+            put('  datafile growth stopped by ' || epf_util.run_label(c.applied_run_id) || ': ' || c.target
+                || ' (autoextend up to ' || b(c.original_maxbytes) || ') since '
+                || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || '; epf_purge.bat reclaim --restore restores it');
+        END LOOP;
+        FOR i IN (SELECT o.run_id, o.owner, o.object_name, o.table_owner, o.table_name
+                    FROM epf_reclaim_object o
+                   WHERE o.unit_type = 'INDEX' AND o.move_status IN ('RELEASED', 'FAILED')
+                     AND o.run_id IN (SELECT r.run_id FROM epf_run r WHERE r.reclaim_mode IN ('COMPACT', 'RESTORE'))
+                     AND EXISTS (SELECT 1 FROM dba_indexes x
+                                  WHERE x.owner = o.owner AND x.index_name = o.object_name AND x.status = 'UNUSABLE')
+                   ORDER BY o.run_id, o.owner, o.object_name) LOOP
+            l_count := l_count + 1;
+            put('  index released by ' || epf_util.run_label(i.run_id) || ' still unusable: ' || i.owner || '.'
+                || i.object_name || ' on ' || i.table_owner || '.' || i.table_name
+                || '; epf_purge.bat reclaim --restore rebuilds it');
         END LOOP;
         FOR a IN (SELECT username, original_status, locked_at, run_id
                     FROM epf_account_action
@@ -1510,10 +2303,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    ORDER BY run_id, username) LOOP
             l_count := l_count + 1;
             put('  account locked by ' || epf_util.run_label(a.run_id) || ': ' || a.username || ' (originally '
-                || a.original_status || ')');
+                || a.original_status || '); epf_purge.bat reclaim --restore unlocks it');
         END LOOP;
         IF l_count = 0 THEN
-            put('  no temporary index, undo tuning or locked account pending');
+            put('  no temporary index, undo tuning, reclaim change or locked account pending');
         END IF;
         FOR p IN (SELECT plan_id, status, cutoff_date, purge_mode, depth
                     FROM epf_plan

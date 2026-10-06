@@ -30,6 +30,39 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
 --   P8  Compaction (when requested): every candidate compacted PASS; skipped
 --       or failed tables WARN.
 -- Dry runs and runs without a purge: P1-P4, P6, P8 SKIP.
+--
+-- Reclaim runs: P5, and R1-R9 from the fingerprint the run took when the
+-- accounts were locked and again before unlocking them
+-- (EPF_OBJECT_BASELINE), its items (EPF_RECLAIM_OBJECT, EPF_RECLAIM_TS),
+-- datafile snapshots and account actions. An assessment (dry run) skips R1-R9; a restore run checks
+-- R1, R6 and R9 for what every reclaim left pending.
+--   R1  Indexes the run released: every attribute identical and usable
+--       again (one unusable before and left as found keeps its status).
+--       PASS; an index dropped meanwhile WARN; unusable or different FAIL.
+--   R2  Constraints of the tables in scope and foreign keys to the tables
+--       that move: status, validated, deferral identical. Else FAIL.
+--   R3  No object invalid after the recompilation that was valid before.
+--       Else FAIL.
+--   R4  Row counts of the tables that move identical (setting
+--       reclaim_row_counts). A table not counted after WARN; different FAIL.
+--   R5  Table and LOB attributes kept. A LOB stored as SECUREFILE, a new
+--       LOB retention or segment name WARN; any other difference FAIL.
+--   R6  Datafiles: growth settings restored as at the start; each tablespace
+--       at most its start size plus reclaim_growth_mb per datafile at its
+--       peak, and at most its start size at the end. Above the start size at
+--       the end, or at the peak for an index that did not fit, WARN; a
+--       setting not restored or any other excess FAIL.
+--   R7  Efficiency: each tablespace ends within max(1 %, 256 MB) of its
+--       segments plus reclaim_margin_mb per datafile. Else WARN, naming the
+--       segment that stays at the top.
+--   R8  Tables: every table above the highest segment that stays moved.
+--       Tables that did not fit, were busy or not reached WARN; a failed
+--       move FAIL.
+--   R9  Accounts the run locked unlocked again. Else FAIL.
+-- Without a baseline (nothing to move, or the run ended before the
+-- compaction), R2-R5 and R8 SKIP; when the run ended before it took the
+-- fingerprint again, R2-R5 WARN and R1 checks the indexes as they are now.
+--
 -- Verdict: FAIL when a check fails, PASS WITH WARNINGS when a check warns,
 -- otherwise PASS; exit code 1, 2, 0.
 -- ============================================================================
@@ -52,8 +85,11 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   purge     FORECAST AND RESULT (the latest forecast with the same
     --             cutoff against the result, per module), REQUIREMENTS
     --   preflight ESTIMATE, RETENTION OPTIONS, REQUIREMENTS
-    -- space inside segments, datafiles, redo and undo, checks, verdict, and
-    -- the machine-readable lines. Evaluates first.
+    --   reclaim   TABLESPACES (sizes, forecast, end values), TABLES,
+    --             INDEXES, SEGMENTS THAT STAY, ACCOUNTS, DATAFILES,
+    --             REQUIREMENTS
+    -- space inside segments, datafiles, redo and undo (purge), checks,
+    -- verdict, and the machine-readable lines. Evaluates first.
     --   EPF_CHECK|<run>|<check_id>|<status>|<value>|<title>
     --   EPF_STEP|<run>|<phase>|<step>|<scope>|<status>|<elapsed seconds>
     --   EPF_REQ|<run>|<requirement>|<MET|NOT_MET|NOT_APPLICABLE>|<blocking Y|N>|<met by>
@@ -63,6 +99,9 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --   EPF_PLAN|... and EPF_PLAN_STEP|... for the plan of the run (print_plan)
     --   EPF_PLAN_KEPT|<plan> when a preflight planned nothing: that plan of
     --                        another scope is in progress
+    --   EPF_RECLAIM_TS|<run>|<tablespace>|<status>|<start bytes>|<end bytes>|
+    --                  <peak bytes>|<forecast bytes>|<tables>|<indexes>|<moved>|
+    --                  <pins>
     PROCEDURE print_report(p_run_id IN NUMBER);
 
     -- Prints the preflight findings of run p_run_id as machine-readable lines
@@ -88,7 +127,8 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     -- Prints the other sessions of the tool schema (wait event, blocker,
     -- SQL_ID), then the state of the active run (or the latest one): status,
     -- steps not DONE, the last events, temporary indexes still present,
-    -- active undo tuning, accounts still locked by a reclaim.
+    -- active undo tuning, and what a reclaim left pending: datafile growth
+    -- settings, indexes still released (unusable), accounts still locked.
     PROCEDURE print_status;
 
     -- Prints a plan of smaller runs with its steps: the open plan (p_which

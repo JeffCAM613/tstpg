@@ -198,6 +198,7 @@ PROMPT == EPF install: packages
 @@epf_purge.pks
 @@epf_report.pks
 @@epf_tuning.pks
+@@epf_reclaim.pks
 @@epf_util.pkb
 @@epf_log.pkb
 @@epf_control.pkb
@@ -206,6 +207,7 @@ PROMPT == EPF install: packages
 @@epf_purge.pkb
 @@epf_report.pkb
 @@epf_tuning.pkb
+@@epf_reclaim.pkb
 
 ALTER SESSION SET CURRENT_SCHEMA = SYS;
 
@@ -213,7 +215,7 @@ PROMPT == EPF install: packages not part of this version
 DECLARE
     l_delivered SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST(
         'EPF_UTIL', 'EPF_LOG', 'EPF_CONTROL', 'EPF_REGISTRY', 'EPF_SPACE', 'EPF_PURGE', 'EPF_REPORT',
-        'EPF_TUNING');
+        'EPF_TUNING', 'EPF_RECLAIM');
 BEGIN
     FOR p IN (SELECT object_name
                 FROM dba_objects

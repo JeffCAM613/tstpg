@@ -39,9 +39,10 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- (PURGE: the caller applies it unless dry run; PREFLIGHT and dry runs
     -- check the requirements as if it were applied). p_backup_choice: CONFIRMED or NONE, how the
     -- operator meets the BACKUP requirement without a recent RMAN backup.
-    -- p_confirm: blocking requirements (ARCHIVE, UNDO, TEMP, separated by
-    -- commas) the operator confirms are handled although the preflight finds
-    -- them not met. p_with_redo_logs: the online redo logs are enlarged when
+    -- p_confirm: blocking requirements the operator confirms are handled
+    -- although the preflight finds them not met, separated by commas: ARCHIVE,
+    -- UNDO, TEMP for a purge or preflight; ARCHIVE, TEMP, RECYCLEBIN for a
+    -- reclaim (whose dry run is its assessment). p_with_redo_logs: the online redo logs are enlarged when
     -- the purge starts (the caller does it unless dry run; PREFLIGHT and dry
     -- runs check as if it were done). p_max_redo_bytes: the most redo one
     -- run of the plan may write (a preflight plans its steps with it).

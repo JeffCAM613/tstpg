@@ -106,16 +106,16 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
 
     -- Confirmed requirements: ARCHIVE, UNDO, TEMP, in that order, or NULL.
     FUNCTION norm_confirm(p_value IN VARCHAR2) RETURN VARCHAR2 IS
-        l_codes  SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST('ARCHIVE', 'UNDO', 'TEMP');
+        l_codes  SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST('ARCHIVE', 'UNDO', 'TEMP', 'RECYCLEBIN');
         l_result VARCHAR2(100);
     BEGIN
         IF TRIM(p_value) IS NULL THEN
             RETURN NULL;
         END IF;
         FOR i IN 1 .. REGEXP_COUNT(p_value, '[^,]+') LOOP
-            IF UPPER(TRIM(REGEXP_SUBSTR(p_value, '[^,]+', 1, i))) NOT IN ('ARCHIVE', 'UNDO', 'TEMP') THEN
-                RAISE_APPLICATION_ERROR(-20127, 'Requirements to confirm: ARCHIVE, UNDO, TEMP separated by '
-                                                || 'commas, got: ' || p_value);
+            IF UPPER(TRIM(REGEXP_SUBSTR(p_value, '[^,]+', 1, i))) NOT IN ('ARCHIVE', 'UNDO', 'TEMP', 'RECYCLEBIN') THEN
+                RAISE_APPLICATION_ERROR(-20127, 'Requirements to confirm: ARCHIVE, UNDO, TEMP (purge), RECYCLEBIN '
+                                                || '(reclaim) separated by commas, got: ' || p_value);
             END IF;
         END LOOP;
         FOR k IN 1 .. l_codes.COUNT LOOP
@@ -168,6 +168,16 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
     PROCEDURE prune_history IS
         l_cutoff TIMESTAMP := epf_util.now_ts
                               - NUMTODSINTERVAL(epf_util.setting_num('history_retention_days'), 'DAY');
+        -- Runs older than the history retention, except a run whose reclaim
+        -- left something pending (an account still locked, a released index
+        -- still unusable): the restore needs its records.
+        l_old    VARCHAR2(1000) :=
+            'SELECT r.run_id FROM epf_run r WHERE r.created_at < :1'
+            || ' AND NOT EXISTS (SELECT 1 FROM epf_account_action a WHERE a.run_id = r.run_id'
+            || ' AND a.locked_at IS NOT NULL AND a.unlocked_at IS NULL)'
+            || ' AND NOT EXISTS (SELECT 1 FROM epf_reclaim_object o JOIN dba_indexes i'
+            || ' ON i.owner = o.owner AND i.index_name = o.object_name WHERE o.run_id = r.run_id'
+            || ' AND o.unit_type = ''INDEX'' AND o.move_status IN (''RELEASED'', ''FAILED'') AND i.status = ''UNUSABLE'')';
     BEGIN
         DELETE FROM epf_plan_step
          WHERE plan_id IN (SELECT plan_id FROM epf_plan WHERE status IN ('DONE', 'CLOSED') AND closed_at < l_cutoff);
@@ -179,10 +189,10 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                      AND c.table_name <> 'EPF_RUN'
                    ORDER BY c.table_name) LOOP
             EXECUTE IMMEDIATE 'DELETE FROM ' || DBMS_ASSERT.ENQUOTE_NAME(t.table_name, FALSE)
-                           || ' WHERE run_id IN (SELECT run_id FROM epf_run WHERE created_at < :1)'
+                           || ' WHERE run_id IN (' || l_old || ')'
                 USING l_cutoff;
         END LOOP;
-        DELETE FROM epf_run WHERE created_at < l_cutoff;
+        EXECUTE IMMEDIATE 'DELETE FROM epf_run WHERE run_id IN (' || l_old || ')' USING l_cutoff;
     END prune_history;
 
     FUNCTION start_run(
@@ -242,6 +252,14 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         END IF;
         IF l_redo = 'Y' AND l_action NOT IN ('PURGE', 'PREFLIGHT') THEN
             RAISE_APPLICATION_ERROR(-20127, 'Redo log sizing (with_redo_logs=Y) applies to purge and preflight runs.');
+        END IF;
+        IF l_action = 'RECLAIM' AND INSTR(',' || l_confirm || ',', ',UNDO,') > 0 THEN
+            RAISE_APPLICATION_ERROR(-20127, 'UNDO is confirmed for a purge; a reclaim confirms ARCHIVE, TEMP or '
+                                            || 'RECYCLEBIN.');
+        END IF;
+        IF l_action <> 'RECLAIM' AND INSTR(',' || l_confirm || ',', ',RECYCLEBIN,') > 0 THEN
+            RAISE_APPLICATION_ERROR(-20127, 'RECYCLEBIN is confirmed for a reclaim; a purge confirms ARCHIVE, UNDO '
+                                            || 'or TEMP.');
         END IF;
         IF NOT lock_is_free THEN
             RAISE_APPLICATION_ERROR(-20122, 'Another run is active: '

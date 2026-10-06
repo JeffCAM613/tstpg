@@ -6,8 +6,10 @@
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/install/uninstall.sql
 -- Requires: SYS AS SYSDBA; in a multitenant database, the PDB service.
 -- Effects : Refuses while a run holds the run lock, while application
---           accounts locked by a reclaim are not yet restored, or while undo
---           tuning (EPF_INSTANCE_CHANGE) is not restored. Otherwise drops
+--           accounts locked by a reclaim are not yet restored, while indexes
+--           a reclaim released are still unusable, or while undo tuning or a
+--           reclaim's datafile settings (EPF_INSTANCE_CHANGE) are not
+--           restored. Otherwise drops
 --           user EPFPG CASCADE (temporary purge indexes are owned by EPFPG
 --           and are dropped with it), then
 --           drops EPFPG_DATA and its datafiles when nothing else references
@@ -57,7 +59,20 @@ BEGIN
                        || 'WHERE locked_at IS NOT NULL AND unlocked_at IS NULL' INTO l_count;
         IF l_count > 0 THEN
             RAISE_APPLICATION_ERROR(-20903, l_count || ' application accounts locked by a reclaim are not '
-                                            || 'restored yet. Run the reclaim resume first.');
+                                            || 'restored yet. Run epf_purge.bat reclaim --restore first.');
+        END IF;
+    END IF;
+
+    SELECT COUNT(*) INTO l_count FROM dba_tab_columns
+     WHERE owner = 'EPFPG' AND table_name = 'EPF_RECLAIM_OBJECT' AND column_name = 'ITEM_ID';
+    IF l_count > 0 THEN
+        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_reclaim_object o '
+                       || 'WHERE o.unit_type = ''INDEX'' AND o.move_status IN (''RELEASED'', ''FAILED'') '
+                       || 'AND EXISTS (SELECT 1 FROM dba_indexes i WHERE i.owner = o.owner '
+                       || 'AND i.index_name = o.object_name AND i.status = ''UNUSABLE'')' INTO l_count;
+        IF l_count > 0 THEN
+            RAISE_APPLICATION_ERROR(-20906, l_count || ' indexes released by a reclaim are still unusable. '
+                                            || 'Run epf_purge.bat reclaim --restore first.');
         END IF;
     END IF;
 
@@ -65,8 +80,9 @@ BEGIN
     IF l_count > 0 THEN
         EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL' INTO l_count;
         IF l_count > 0 THEN
-            RAISE_APPLICATION_ERROR(-20905, l_count || ' instance changes (undo tuning) are not restored yet. '
-                                            || 'Run src/sql/run/undo.sql RESTORE as SYS first.');
+            RAISE_APPLICATION_ERROR(-20905, l_count || ' instance changes are not restored yet: undo tuning '
+                                            || '(src/sql/run/undo.sql RESTORE as SYS) or datafile settings of a '
+                                            || 'reclaim (epf_purge.bat reclaim --restore). Restore them first.');
         END IF;
     END IF;
 

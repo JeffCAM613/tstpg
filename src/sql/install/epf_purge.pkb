@@ -2889,10 +2889,6 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Requirements and forecasts
     -- ------------------------------------------------------------------
 
-    -- Free space for archived logs: the smallest free space of the valid local
-    -- archive destinations (recovery area: limit - used + reclaimable; ASM
-    -- disk group: free). NULL when a destination cannot be measured from the
-    -- database (a directory); p_where describes every destination.
     PROCEDURE archive_room(p_room OUT NUMBER, p_where OUT VARCHAR2) IS
         TYPE t_dests IS TABLE OF VARCHAR2(4000);
         l_dests      t_dests;

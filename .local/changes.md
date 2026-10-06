@@ -2,6 +2,59 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-06 - Reclaim: compaction in place, with a hard limit on disk usage (0.7.0)
+
+Why: a purge frees space inside the tables, but the datafiles keep their size. The reclaim gives that space back to the disk, keeps disk usage under control the whole time, and leaves every object as it found it.
+
+Design decision: compaction in place replaces the tablespace swap of the plan (D3 revised; PLAN section 7).
+- The swap, with the original file shrinking as the new one grows, was assessed. The original file can only shrink below the highest extent still in it. After years of growth, most segments have an extent near the top, so the two files together approach the original size plus all live data before the original shrinks. It also needs the drop, rename and path restore steps, each with its own failure modes.
+- In place: the table holding the highest block of a datafile moves within its own tablespace into the free space below, the file is resized down to its new highest block, and so on down. A datafile never grows above its size at the start of the run (setting `reclaim_growth_mb`, default 0, allows a margin); there is no second tablespace, nothing to drop or rename.
+- When the table at the top does not fit, tables with free space inside them (purged tables) move first: each lands compact and frees its old extents (MAKING_ROOM). Only then may the file grow within its limit.
+- A segment that cannot move (LONG column, partitioned, cluster, queue or MV table, Oracle-maintained owner, recycle bin, disabled function-based index...) is a pin: the file cannot shrink below it, and the report names it with its position and reason.
+
+Engine (new package `epf_reclaim`, invoker rights, run by SYS through `src/sql/run/reclaim.sql`):
+- Modes ASSESS (a dry run: read-only), COMPACT, RESTORE.
+- COMPACT steps:
+  - PREPARE restores what earlier reclaims left: accounts, datafile growth settings.
+  - ASSESS: inventory of every segment from DBA_EXTENTS, units (a table with its LOB segments and IOT overflow), indexes, pins, forecast per tablespace (a simulation of the loop), accounts in scope, requirements.
+  - The requirements gate: RECYCLEBIN, ARCHIVE (ARCHIVELOG only), TEMP are blocking unless confirmed; BACKUP is advice. A gate not passed changes nothing.
+  - LOCK_ACCOUNTS: the owners of the tables in scope, accounts with DML on them (directly or through roles), owners of foreign keys to them, sessions holding locks on them. Sessions are disconnected POST_TRANSACTION, then IMMEDIATE after `disconnect_timeout_s`.
+  - BASELINE, once the accounts are locked (no write changes the counts after it): a fingerprint of indexes, constraints, tables, LOB columns, invalid objects and row counts, and the datafiles.
+  - RELEASE_INDEXES (UNUSABLE drops the segment), FREEZE_FILES (autoextend off for every target tablespace, recorded first), COMPACT per tablespace.
+  - Restore path, always: REBUILD_INDEXES while the datafiles are still frozen (within their room; an index that does not fit is rebuilt after the growth settings are restored, a warning), RESTORE_FILES, RESIZE (highest block plus `reclaim_margin_mb`), RECOMPILE, VERIFY (fingerprint and row counts again, before the accounts are unlocked), UNLOCK_ACCOUNTS.
+- Every change is recorded before it is made: EPF_INSTANCE_CHANGE (RECLAIM_DATAFILE), EPF_ACCOUNT_ACTION, EPF_RECLAIM_OBJECT. A stop is honored between tables; units not reached are SKIPPED.
+- RESTORE restores everything a reclaim left pending: indexes still released (adopted from the run that released them), datafile settings, accounts. The wrapper runs it in the same run when the worker session of a compaction ends without its end marker (killed, connection lost); `epf_purge.bat reclaim --restore` runs it in a new run.
+- Indexes rebuild with resumable space allocation only after the growth settings are restored (a frozen file would make a resumable rebuild wait for nothing).
+
+Report and checks (`epf_report`):
+- RECLAIM reports: TABLESPACES (start, segments, tables, indexes, pins, forecast, end, peak, given back, status), TABLES, INDEXES, SEGMENTS THAT STAY, ACCOUNTS, DATAFILES, REQUIREMENTS. Machine line EPF_RECLAIM_TS; manifest keys reclaim_mode, tablespaces, tablespace.<name>.
+- Checks R1-R9 replace the swap's: R1 indexes usable and identical, R2 constraints, R3 no new invalid objects, R4 row counts, R5 table and LOB attributes, R6 datafiles within their start size and growth settings restored, R7 efficiency, R8 tables moved, R9 accounts restored. An assessment skips them; a restore run checks R1, R6, R9.
+- `status` shows datafile growth stopped by a reclaim, indexes released and still unusable, and accounts still locked, each with `reclaim --restore`. Undo tuning counts only UNDO items now.
+- A requirement that is not blocking shows "(advice)" for a reclaim; NOT_APPLICABLE shows as NOT APPLICABLE (was NOT MEASURED).
+
+Wrapper:
+- New action `reclaim`, with `--tablespaces`, `--dry-run` (the assessment), `--restore`, `--confirm ARCHIVE,TEMP,RECYCLEBIN`, `--yes`, and config keys RECLAIM_TABLESPACES and RECLAIM_CONFIRM. SYS password required.
+- With prompts: the assessment first (its report), a question for each blocking requirement not met, the review, then "type yes".
+- Menu entry "Reclaim disk space". Help updated.
+- `--reclaim`, `--resume` and `--long-conversion` are still refused, each with its reason.
+
+Other:
+- History pruning keeps the runs whose reclaim left something pending: an account still locked, a released index still unusable. Before, it would have removed their records after `history_retention_days`.
+- Settings: `reclaim_growth_mb` 0, `reclaim_margin_mb` 64, `reclaim_unit_moves` 3, `reclaim_row_counts` Y. `parallel_min_mb` and `resize_every_mb` removed (swap only).
+- Tables: new EPF_RECLAIM_TS; EPF_RECLAIM_OBJECT, EPF_TS_INVENTORY and EPF_OBJECT_BASELINE extended (detail_after); EPF_RUN gains reclaim_mode and reclaim_scope.
+- Grants on DBA_ROLES, DBA_ROLE_PRIVS, DBA_OBJECT_TABLES, DBA_QUEUE_TABLES, DBA_MVIEWS, DBA_MVIEW_LOGS, DBA_FLASHBACK_ARCHIVE_TABLES. `epf_purge.archive_room` is public.
+- uninstall refuses while released indexes are still unusable (-20906); its messages point to `reclaim --restore`.
+- e2e suite:
+  - T18A-T18F on a scratch tablespace (`src/tests/verify/reclaim_lab.sql`): the assessment changes nothing; the requirement gate; the compaction with room making and R1-R9; a stop; a killed worker session restored in the same run, then `reclaim --restore`; the assessment of the application tablespaces (read-only); cleanup.
+  - T07: reclaim usage errors. T12: the new status wording.
+  - T19: no account left locked and no released index left unusable.
+- Checked here: every file is ASCII. Both PowerShell scripts parse. 22 offline checks of the wrapper's reclaim functions pass (options, tablespace lists, machine lines, confirmations, report sections). A scan of the three changed packages finds no package-private function and no BOOLEAN in a SQL statement. The SQL is not compiled here: T03 and T04 compile it.
+
+How to test (set R, on a refreshed copy; see the status page):
+- R1: `.\src\tests\e2e\run_tests.bat --only T03,T04,T07,T18A,T18B,T18C,T18D,T18E,T18F,T19` (T01 runs too). It compiles 0.7.0, then runs the lab tests: all pass.
+- R2: on the purged copy (after the full suite or the set R1 purges), `epf_purge.bat reclaim --dry-run`: read the TABLESPACES forecast, the pins and the accounts.
+- R3: `epf_purge.bat reclaim` (prompts): the assessment, the questions, type yes. Then the report: R1-R9, datafiles start vs end, and `status` shows nothing pending.
+
 ## 2026-10-05 - Plan of smaller runs and its lifecycle (0.6.0, D19/D20 round 2)
 
 Why: in ARCHIVELOG a purge whose redo does not fit the archive space cannot run at once. The preflight now plans it in smaller runs, and the purges carry out the plan step by step with the choices of its preflight.

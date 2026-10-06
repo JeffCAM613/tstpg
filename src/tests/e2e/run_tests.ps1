@@ -6,7 +6,7 @@
 #           the wrapper (wizard answers are piped, the graceful stop is
 #           requested with the stop action), purges of every module and mode,
 #           a plan of smaller runs, compaction, redo log sizing, undo tuning,
-#           reports. Everything is
+#           the reclaim on a scratch tablespace, reports. Everything is
 #           written to one log file with a check list and a summary.
 # Usage   : run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list]
 #             --config  test configuration (default src\tests\e2e\test.conf)
@@ -18,8 +18,11 @@
 # Effects : DESTRUCTIVE. Purges every module of the test database (rows older
 #           than RETENTION_DAYS), clears LOB values, compacts tables, enlarges
 #           the online redo logs to 4 x 1 GB (permanent), lowers and restores
-#           undo_retention. Refuses to start unless DESTRUCTIVE_OK=YES and the
-#           database name equals EXPECTED_DB.
+#           undo_retention, creates and removes the reclaim lab (tablespace
+#           EPF_RT_DATA, accounts EPF_RT, EPF_RT_APP, EPF_RT_APP2, role
+#           EPF_RT_WRITER; src/tests/verify/reclaim_lab.sql) and assesses the
+#           application tablespaces for a reclaim (read-only). Refuses to start
+#           unless DESTRUCTIVE_OK=YES and the database name equals EXPECTED_DB.
 # Output  : logs\tests\<yyyy-MM-dd_HHmmss>_<EXPECTED_DB>\test.log (all output),
 #           runs\ (the wrapper's run folders), epf_environment.txt (survey).
 # Exit    : 0 all tests passed, 1 a test failed, 4 configuration error.
@@ -369,6 +372,72 @@ function Assert-UndoLimits {
     }
 }
 
+# The reclaim lab (src/tests/verify/reclaim_lab.sql, SYS) in mode SETUP, CHECK
+# or CLEANUP.
+function Invoke-Lab {
+    param([string]$Mode, [int]$TimeoutMin = 15)
+    $path = Join-Path $script:VerifyDir 'reclaim_lab.sql'
+    return (Invoke-Sql 'SYS' @((Get-ScriptLine $path @($Mode))) -TimeoutMin $TimeoutMin)
+}
+
+# The state of the lab in the LAB| lines of reclaim_lab.sql: datafile size and
+# growth settings, index statuses, accounts, row counts, LOB attributes,
+# recycle-bin objects.
+function Read-Lab {
+    param($Result)
+    $lab = @{ FileBytes = [decimal]0; Growth = ''; Segments = [decimal]0; Indexes = @{}; Accounts = @{}; Rows = @{};
+              Lobs = @{}; RecycleBin = 0 }
+    foreach ($line in ($Result.Output -split "`n")) {
+        $text = $line.Trim()
+        if ($text -match '^LAB\|FILE\|(\d+)\|(\d+)\|([A-Z]+)\|(\d+)\|(\d+)\|') {
+            $lab.FileBytes = $lab.FileBytes + [decimal]$Matches[2]
+            $lab.Growth = $lab.Growth + 'file ' + $Matches[1] + ' autoextend ' + $Matches[3] + ' max ' + $Matches[4] +
+                          ' next ' + $Matches[5] + '; '
+        } elseif ($text -match '^LAB\|SEGMENTS\|(\d+)') {
+            $lab.Segments = [decimal]$Matches[1]
+        } elseif ($text -match '^LAB\|INDEX\|([^|]+)\|(.*)$') {
+            $lab.Indexes[$Matches[1]] = $Matches[2]
+        } elseif ($text -match '^LAB\|ACCOUNT\|([^|]+)\|(.*)$') {
+            $lab.Accounts[$Matches[1]] = $Matches[2]
+        } elseif ($text -match '^LAB\|ROWS\|([^|]+)\|(\d+)') {
+            $lab.Rows[$Matches[1]] = $Matches[2]
+        } elseif ($text -match '^LAB\|LOB\|([^|]+)\|(.*)$') {
+            $lab.Lobs[$Matches[1]] = $Matches[2]
+        } elseif ($text -match '^LAB\|RECYCLEBIN\|[A-Z]*\|(\d+)') {
+            $lab.RecycleBin = [int]$Matches[1]
+        }
+    }
+    return $lab
+}
+
+# Entries of hashtable $Before that differ in $After, as "key before->after".
+function Compare-LabMap {
+    param($Before, $After)
+    $diff = @()
+    foreach ($key in ($Before.Keys | Sort-Object)) {
+        if ([string]$After[$key] -ne [string]$Before[$key]) { $diff += ($key + ' ' + $Before[$key] + '->' + $After[$key]) }
+    }
+    return ,$diff
+}
+
+# The lab is as it was: datafile growth settings, index statuses, accounts,
+# row counts, LOB attributes; with -SameSize the datafile size too.
+function Assert-LabSame {
+    param($Before, $After, [switch]$SameSize)
+    Add-Check ($After.Growth -eq $Before.Growth) ('datafile growth settings as before (' + $Before.Growth.Trim() + ')')
+    if ($SameSize) {
+        Add-Check ($After.FileBytes -eq $Before.FileBytes) ('datafile size unchanged (' + $Before.FileBytes + ' -> ' +
+                                                             $After.FileBytes + ')')
+    }
+    foreach ($part in @(@('Indexes', 'index statuses'), @('Accounts', 'account statuses'), @('Rows', 'row counts'),
+                        @('Lobs', 'LOB attributes'))) {
+        $diff = Compare-LabMap $Before[$part[0]] $After[$part[0]]
+        Add-Check ($diff.Count -eq 0 -and $Before[$part[0]].Count -gt 0) ($part[1] + ' as before (' +
+                                                                         $Before[$part[0]].Count + ')' +
+                                                                         ($(if ($diff.Count -gt 0) { ': ' + ($diff -join ', ') } else { '' })))
+    }
+}
+
 # ----------------------------------------------------------------------------
 # Tests and checks
 # ----------------------------------------------------------------------------
@@ -501,6 +570,12 @@ $script:TestList = @(
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
     'T17  Reports through the wrapper: latest, and the stopped run',
     'T18  SQL entry scripts: report.sql, status.sql, advice.sql',
+    'T18A Reclaim lab: a scratch tablespace; its assessment (dry run) changes nothing',
+    'T18B Reclaim lab: compaction in place; requirement gate, room making, R1-R9, everything restored',
+    'T18C Reclaim lab: a stop during the compaction ends STOPPED with everything restored',
+    'T18D Reclaim lab: a worker session killed during the compaction is restored in the same run',
+    'T18E Reclaim: assessment of the application tablespaces (dry run, read-only)',
+    'T18F Reclaim lab removed',
     'T19  Final state: redo logs, undo_retention, pending changes, runs'
 )
 
@@ -602,7 +677,13 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T07' 'Usage errors: exit 4, nothing changed' {
-        foreach ($case in @(@('purge', '--bogus'), @('reclaim'), @('preflight', '--non-interactive', '--compact'),
+        foreach ($case in @(@('purge', '--bogus'), @('reclaim', '--non-interactive'),
+                            @('reclaim', '--non-interactive', '--dry-run', '--restore'),
+                            @('reclaim', '--non-interactive', '--dry-run', '--confirm', 'UNDO'),
+                            @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', 'A-B'),
+                            @('reclaim', '--non-interactive', '--dry-run', '--retention', '30'),
+                            @('preflight', '--non-interactive', '--tablespaces', 'USERS'),
+                            @('preflight', '--non-interactive', '--compact'),
                             @('plan', '--non-interactive', '--new'), @('status', '--non-interactive', '--close'),
                             @('purge', '--non-interactive', '--max-redo', '1G'),
                             @('preflight', '--non-interactive', '--max-redo', 'ten'),
@@ -814,7 +895,7 @@ function Invoke-Suite {
         $r = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $r @(0)
         Assert-Match $r 'status STOPPED'
-        Assert-Match $r 'no temporary index, undo tuning or locked account pending'
+        Assert-Match $r 'no temporary index, undo tuning, reclaim change or locked account pending'
     }
 
     Invoke-Test 'T12B' 'PAYMENTS dry run: the simulation T13 is compared with' {
@@ -1077,17 +1158,170 @@ function Invoke-Suite {
         }
     }
 
+    Invoke-Test 'T18A' 'Reclaim lab: a scratch tablespace; its assessment (dry run) changes nothing' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        Assert-Exit $lab @(0)
+        Assert-Match $lab 'LAB\|SETUP\|DONE'
+        $before = Read-Lab $lab
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', 'EPF_RT_DATA') -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^ASSESS$'
+        Assert-Manifest $run 'tablespace.EPF_RT_DATA' '^ASSESSED\|'
+        foreach ($k in 1..9) { Assert-Manifest $run ('check.R' + $k) '^SKIP' }
+        Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
+        # What moves, what stays and why, who is locked.
+        Assert-Match $r 'TS_ASSESSED'
+        Assert-Match $r 'SEGMENTS THAT STAY'
+        Assert-Match $r 'RT_LONG[^\n]*LONG column'
+        Assert-Match $r 'RT_PART[^\n]*partitioned'
+        Assert-Match $r 'EPF_RT\.RT_TOP'
+        foreach ($account in @('EPF_RT', 'EPF_RT_APP', 'EPF_RT_APP2')) { Assert-Match $r ('ACCOUNT_IN_SCOPE +' + $account + ' ') }
+        if ($before.RecycleBin -gt 0) {
+            Assert-Manifest $run 'req.RECYCLEBIN' '^NOT_MET\|Y\|'
+        } else {
+            Write-TestLog '  note the recycle bin is off: RT_BIN was dropped for good; RECYCLEBIN is met' 'Yellow'
+        }
+        $after = Read-Lab (Invoke-Lab 'CHECK')
+        Assert-LabSame $before $after -SameSize
+    }
+
+    Invoke-Test 'T18B' 'Reclaim lab: compaction in place; requirement gate, room making, R1-R9, everything restored' {
+        $before = Read-Lab (Invoke-Lab 'CHECK')
+        if ($before.RecycleBin -gt 0) {
+            # The recycle-bin object is not confirmed: nothing starts.
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA') -TimeoutMin 30
+            Assert-Exit $r @(1)
+            Assert-Match $r 'REQUIREMENTS_NOT_MET'
+            Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK')) -SameSize
+        }
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                            -TimeoutMin 60 -StopOnTimeout
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^COMPACT$'
+        Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
+        foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
+        foreach ($check in @('R5', 'R6', 'R7', 'R8', 'P5')) { Assert-Manifest $run ('check.' + $check) '^(PASS|WARN)' }
+        Assert-Manifest $run 'tablespace.EPF_RT_DATA' '^(COMPACTED|PARTIAL)\|'
+        # The lab is built so that RT_TOP does not fit at first (RT_FAT moves
+        # first), and the copy of a table that moves lands lower in the file.
+        Assert-Match $r 'MAKING_ROOM'
+        Assert-Match $r 'UNIT_MOVED +EPF_RT\.RT_TOP'
+        foreach ($step in @('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'REBUILD_INDEXES', 'RESTORE_FILES', 'RESIZE',
+                            'VERIFY', 'UNLOCK_ACCOUNTS')) {
+            Assert-Manifest $run ('step.RECLAIM.' + $step + '.-') '^DONE\|'
+        }
+        $after = Read-Lab (Invoke-Lab 'CHECK')
+        Assert-LabSame $before $after
+        Add-Check ($after.FileBytes -lt $before.FileBytes) ('EPF_RT_DATA datafile shrank: ' + $before.FileBytes + ' -> ' +
+                                                         $after.FileBytes + ' bytes (segments ' + $after.Segments + ')')
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Exit $s @(0)
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    Invoke-Test 'T18C' 'Reclaim lab: a stop during the compaction ends STOPPED with everything restored' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        $script:State.StopSent = $false
+        $onLine = {
+            param($line)
+            if (-not $script:State.StopSent -and $line -match 'UNIT_MOVED') {
+                $script:State.StopSent = $true
+                Write-TestLog '---- a table moved: requesting a graceful stop'
+                $s = Invoke-Wrapper @('stop', '--non-interactive')
+                Assert-Exit $s @(0)
+            }
+        }
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                            -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        Add-Check $script:State.StopSent 'stop requested after the first table moved'
+        Assert-Exit $r @(3)
+        Assert-Match $r 'STOP_HONORED'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'status' '^STOPPED$'
+        foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
+        Assert-Manifest $run 'check.R8' '^WARN'
+        Assert-Manifest $run 'tablespace.EPF_RT_DATA' '^PARTIAL\|'
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    Invoke-Test 'T18D' 'Reclaim lab: a worker session killed during the compaction is restored in the same run' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 30
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        $script:State.StopSent = $false
+        $onLine = {
+            param($line)
+            if (-not $script:State.StopSent -and $line -match 'UNIT_MOVED') {
+                $script:State.StopSent = $true
+                Write-TestLog '---- a table moved: killing the worker session (SYS)'
+                $k = Invoke-Sql 'SYS' @(
+                    'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON',
+                    "BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); END LOOP; END;",
+                    '/',
+                    'EXIT')
+                Assert-Match $k 'KILLED\|\d+'
+            }
+        }
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                            -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        Add-Check $script:State.StopSent 'worker session killed after the first table moved'
+        Assert-Exit $r @(1)
+        Assert-Match $r 'The worker session ended before the reclaim finished'
+        Assert-Match $r 'RECLAIM  RESTORE'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'status' '^FAILED$'
+        Assert-Manifest $run 'check.R1' '^PASS'
+        Assert-Manifest $run 'check.R9' '^PASS'
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
+        # Nothing is left for a restore run to do.
+        $r = Invoke-Wrapper @('reclaim', '--restore', '--non-interactive') -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^RESTORE$'
+        foreach ($check in @('R1', 'R6', 'R9')) { Assert-Manifest $run ('check.' + $check) '^(PASS|SKIP)' }
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    Invoke-Test 'T18E' 'Reclaim: assessment of the application tablespaces (dry run, read-only)' {
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--dry-run') -TimeoutMin 60
+        Assert-Exit $r @(0, 2)
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^ASSESS$'
+        if ($null -ne $run) {
+            $spaces = @($run.Keys | Where-Object { $_ -like 'tablespace.*' })
+            Add-Check ($spaces.Count -gt 0) ('tablespaces assessed: ' + ($spaces -join ', '))
+        }
+        Write-Note $r 'Next +epf_purge\.bat reclaim' 'the assessment finds the compaction ready'
+    }
+
+    Invoke-Test 'T18F' 'Reclaim lab removed' {
+        $lab = Invoke-Lab 'CLEANUP'
+        Assert-Exit $lab @(0)
+        Assert-Match $lab 'LAB\|CLEANUP\|DONE'
+    }
+
     Invoke-Test 'T19' 'Final state: redo logs, undo_retention, pending changes, runs' {
         $r = Invoke-Sql 'SYS' @(
             'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
             "SELECT 'REDO|group ' || group# || '|' || ROUND(bytes / 1048576) || ' MB|' || status FROM v`$log ORDER BY group#;",
             "SELECT 'UNDO|' || name || '=' || value FROM v`$parameter WHERE name IN ('undo_tablespace', 'undo_retention') ORDER BY name;",
-            "SELECT 'UNDO_ACTIVE|' || COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL;",
+            "SELECT 'INSTANCE_CHANGES_ACTIVE|' || COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL;",
+            "SELECT 'RECLAIM_ACCOUNTS_LOCKED|' || COUNT(*) FROM epfpg.epf_account_action WHERE locked_at IS NOT NULL AND unlocked_at IS NULL;",
+            "SELECT 'RECLAIM_INDEXES_UNUSABLE|' || COUNT(*) FROM epfpg.epf_reclaim_object o WHERE o.unit_type = 'INDEX' AND o.move_status IN ('RELEASED', 'FAILED') AND EXISTS (SELECT 1 FROM dba_indexes i WHERE i.owner = o.owner AND i.index_name = o.object_name AND i.status = 'UNUSABLE');",
             "SELECT 'TEMP_INDEX_LEFT|' || COUNT(*) FROM epfpg.epf_temp_index t WHERE t.dropped_at IS NULL AND EXISTS (SELECT 1 FROM dba_indexes i WHERE i.owner = t.owner AND i.index_name = t.index_name);",
             "SELECT 'RUN|' || run_id || '|' || action || '|' || purge_mode || '|' || depth || '|' || dry_run || '|' || status || '|' || verdict || '|exit ' || exit_code || '|' || TO_CHAR(started_at, 'HH24:MI:SS') || '-' || TO_CHAR(ended_at, 'HH24:MI:SS') FROM epfpg.epf_run ORDER BY run_id;",
             'EXIT')
         Assert-Exit $r @(0)
-        Assert-Match $r 'UNDO_ACTIVE\|0'
+        Assert-Match $r 'INSTANCE_CHANGES_ACTIVE\|0'
+        Assert-Match $r 'RECLAIM_ACCOUNTS_LOCKED\|0'
+        Assert-Match $r 'RECLAIM_INDEXES_UNUSABLE\|0'
         Assert-Match $r 'TEMP_INDEX_LEFT\|0'
         Assert-NoMatch $r 'RUN\|[^\n]*\|(RUNNING|CREATED)\|'
         if ($script:State.UndoRetention -ne '') { Assert-Match $r ('undo_retention=' + $script:State.UndoRetention) }
