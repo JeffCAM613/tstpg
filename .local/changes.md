@@ -16,6 +16,12 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
 
 How to test: H1 again (`git pull`, then `src\bin\epf_purge.bat install --tns $db`). The install is safe to re-run. Pass if it ends with `EPFPG objects valid, tool version 0.7.0`.
 
+H1 again: the body now parses, and the compile's semantic checks found one statement, in `report_ts` (the PIN events of the assessment).
+- ORA-00935 `group function is nested too deeply` at `ORDER BY MAX(top_block)`. In ORDER BY, Oracle takes `top_block` as the select-list alias `MAX(top_block) AS top_block`, so the expression became MAX(MAX(...)). PLS-00364 on the loop variable followed from it.
+- Fix: `ORDER BY top_block DESC, owner, object_name` (the alias).
+- A scan of every package body for an aggregate in ORDER BY or HAVING over a name that is also a select-list alias found no other case.
+- The compiler listed no other error in the body.
+
 ## 2026-10-06 - Reclaim: compaction in place, with a hard limit on disk usage (0.7.0)
 
 Why: a purge frees space inside the tables, but the datafiles keep their size. The reclaim gives that space back to the disk, keeps disk usage under control the whole time, and leaves every object as it found it.

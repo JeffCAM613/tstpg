@@ -1128,7 +1128,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     FROM epfpg.epf_ts_inventory
                    WHERE run_id = g_run.run_id AND tablespace_name = p_ts AND handler = 'PIN'
                    GROUP BY owner, object_name, sub_name, segment_type, file_id
-                   ORDER BY MAX(top_block) DESC) LOOP
+                   ORDER BY top_block DESC, owner, object_name) LOOP
             l_shown := l_shown + 1;
             EXIT WHEN l_shown > 20;
             say(epfpg.epf_log.c_info, 'PIN',
