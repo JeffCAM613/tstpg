@@ -746,6 +746,9 @@ function Invoke-Suite {
             "SELECT 'UNDO|' || name || '=' || value FROM v`$parameter WHERE name IN ('undo_tablespace', 'undo_retention') ORDER BY name;",
             "SELECT 'EPFPG_USER|' || COUNT(*) FROM dba_users WHERE username = 'EPFPG';",
             "SELECT 'STATS|' || owner || '.' || table_name || '|' || num_rows || ' rows|analyzed ' || TO_CHAR(last_analyzed, 'YYYY-MM-DD') FROM dba_tables WHERE (owner, table_name) IN (('OPPAYMENTS', 'BULK_PAYMENT'), ('OPPAYMENTS', 'FILE_INTEGRATION'), ('OPPAYMENTS', 'AUDIT_TRAIL'), ('OP', 'SPEC_TRT_LOG'), ('OPPAYMENTS', 'FILE_DISPATCHING')) ORDER BY 1;",
+            'SET SERVEROUTPUT ON',
+            "DECLARE l_v VARCHAR2(4000); BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; DBMS_OUTPUT.PUT_LINE('TOOL_VERSION|' || NVL(l_v, 'none')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('TOOL_VERSION|none'); END;",
+            '/',
             'EXIT')
         Assert-Exit $r @(0)
         $db = ''
@@ -753,6 +756,7 @@ function Invoke-Suite {
         $cdb = ''
         $logMode = ''
         $instances = ''
+        $installed = 'none'
         foreach ($line in ($r.Output -split "`n")) {
             if ($line -match '^DB\|([^|]*)\|([^|]*)\|([^|]*)\|') {
                 $db = $Matches[1].Trim()
@@ -762,11 +766,22 @@ function Invoke-Suite {
             if ($line -match '^CONTAINER\|(.*)$') { $container = $Matches[1].Trim() }
             if ($line -match '^INSTANCES\|(\d+)') { $instances = $Matches[1] }
             if ($line -match '^UNDO\|undo_retention=(\d+)') { $script:State.UndoRetention = $Matches[1] }
+            if ($line -match '^TOOL_VERSION\|(.*)$') { $installed = $Matches[1].Trim() }
         }
         $expected = $script:ExpectedDb.ToUpper()
         Add-Check ($db.ToUpper() -eq $expected -or $container.ToUpper() -eq $expected) ('database ' + $db + ' / container ' + $container + ' is EXPECTED_DB ' + $expected)
         Add-Check ($cdb -eq 'NO') ('non-CDB database (CDB=' + $cdb + '): redo log sizing and undo tuning need it')
         Add-Check ($instances -eq '1') ('single instance (' + $instances + ')')
+        # Without T03 (the install) in this session, the tests run the tool as
+        # installed: it must be the version of these scripts.
+        if (-not (Test-Selected 'T03')) {
+            $hint = ''
+            if ($installed -ne $script:Version) {
+                $hint = ': install it first (src\bin\epf_purge.bat install --tns ' + $script:Tns + '), or include T03'
+            }
+            Add-Check ($installed -eq $script:Version) ('installed tool version ' + $installed + ' is the version of these scripts, ' +
+                                                        $script:Version + $hint)
+        }
         if ($logMode -eq 'ARCHIVELOG') {
             Write-TestLog '  note ARCHIVELOG mode: the PAYMENTS purge writes about 90 GB of redo; the archive destination needs that space' 'Yellow'
         }

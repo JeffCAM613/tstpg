@@ -24,6 +24,8 @@ Changes:
 
 Version 0.7.2: the engine changed, so install again.
 
+Suite: T01 now also reads the installed tool version. When the session does not include T03 (the install), a version other than the scripts' fails T01, and the rest is skipped with the install command in the message. Found when R0 ran without its install: every wrapper command of T18C and T18D stopped with "The database has tool version 0.7.1 and these scripts are version 0.7.2" and "Aborted." (exit 3). Offline: the matching version passes; 0.7.1 fails T01 and skips the rest.
+
 How to test: pull, install 0.7.2 on EPFPG781, then `run_tests.bat --only T18C,T18D,T18F,T19`. These are the compaction start, the stop, and the kill with its restore, all through the new wait. Pass: 5 passed. Then set R.
 
 ## 2026-10-06 - Set H, H7 and H8: 0.7.1 on Oracle; a connection that never completes is retried (wrapper and suite)
