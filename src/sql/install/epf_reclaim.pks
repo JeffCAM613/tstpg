@@ -67,6 +67,8 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- Error codes
 --   ORA-20160  not SYS, CDB$ROOT, RAC, or the session is not bound to the run
 --   ORA-20161  invalid mode, or a tablespace that cannot be reclaimed
+--   ORA-20162  stop requested while another reclaim still runs (a worker
+--              whose client is gone); nothing was changed
 -- ============================================================================
 
     -- Runs reclaim run p_run_id (action RECLAIM) in this session:
@@ -84,6 +86,8 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
     --                   pending (indexes still released, datafile settings,
     --                   locked accounts), in a new run or in the run whose
     --                   worker session ended without it
+    -- COMPACT and RESTORE first wait while another reclaim still runs on the
+    -- database (a worker whose client is gone goes on until its call ends).
     -- p_tablespaces: tablespaces to compact, separated by commas; NULL for
     -- every candidate (permanent tablespaces holding segments of the
     -- app_schemas, except SYSTEM, SYSAUX and the tool's tablespace).

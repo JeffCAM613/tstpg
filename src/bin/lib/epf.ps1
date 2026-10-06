@@ -45,6 +45,10 @@ $script:Width = 80
 # prints once connected (Start-Session).
 $script:ConnectTimeoutS = 120
 $script:ReadyMarker = 'EPF_SESSION_READY'
+# Polls of the live view (about 2 s apart) without the worker of the run in
+# the database, while its sqlplus still waits, after which its connection
+# counts as lost (Invoke-SqlScript): about 10 minutes.
+$script:WorkerLostPolls = 300
 
 # sqlplus sessions read their standard input in the console code page. With a
 # UTF-8 console (code page 65001) .NET would begin every session's input with
@@ -642,9 +646,17 @@ function Format-Offset {
 # Runs one entry script in its own sqlplus session and waits for it. The
 # script is sent once the session has connected (Start-Session). With a run
 # state, the live view is refreshed every 2 seconds meanwhile and Ctrl+C
-# requests a graceful stop. The raw output goes to $LogName in the run folder.
+# requests a graceful stop; once the worker of the run has been in the
+# database, $script:WorkerLostPolls polls without it while sqlplus still
+# waits mean that its connection was lost: the database session has ended
+# (its call done), so sqlplus is ended too. The raw output goes to $LogName
+# in the run folder.
 function Invoke-SqlScript {
     param($Login, [string]$Script, [string[]]$Arguments = @(), $State = $null, [string]$LogName = '')
+    if ($null -ne $State) {
+        $State.WorkerSeen = $false
+        $State.PollsWithout = 0
+    }
     $session = Start-Session $Login $State
     $text = ($session.Lines -join "`r`n")
     if ($session.Ready) {
@@ -658,6 +670,12 @@ function Invoke-SqlScript {
             if ($null -ne $State) {
                 Test-StopKey $State
                 Update-LiveView $State
+                if ($State.PollsWithout -ge $script:WorkerLostPolls -and -not $process.HasExited) {
+                    Write-Out (' The worker session of ' + (Get-RunLabel $State.RunId) + ' is no longer in the database, ' +
+                               'but its sqlplus still waits: its connection was lost. Ending it.') 'Yellow'
+                    try { $process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
+                    $State.PollsWithout = 0
+                }
             }
         }
         $process.WaitForExit()
@@ -860,6 +878,14 @@ function Update-LiveView {
             Write-Out (' ..       monitor: ' + $line) 'Yellow'
         }
     }
+    # Whether the worker of the run is in the database: polls that answered
+    # without it, once it has been seen (Invoke-SqlScript).
+    if ($beats.Count -gt 0) {
+        $State.WorkerSeen = $true
+        $State.PollsWithout = 0
+    } elseif ($State.WorkerSeen) {
+        $State.PollsWithout = $State.PollsWithout + 1
+    }
     if ($beats.Count -gt 0 -and ((Get-Date) - $State.LastOutput).TotalSeconds -ge 15) {
         foreach ($beat in $beats) { Show-Heartbeat $beat }
         $State.LastOutput = Get-Date
@@ -1001,7 +1027,7 @@ function Invoke-ToolRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0
     }
     $dry = 'N'
     if ($Ctx.DryRun) { $dry = 'Y' }
@@ -2251,7 +2277,7 @@ function Invoke-ReclaimRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0
     }
     $confirmArg = '-'
     $scopeArg = '-'

@@ -2,6 +2,30 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-06 - H8 complete; a worker whose client is gone is waited for, or its sqlplus ended (0.7.2)
+
+The rerun of T18A and T18B (`--only T18A,T18B,T18F,T19`) passed: 5 of 5, and no connection hung this time. With the first H8 run, all 10 tests of H8 passed on 0.7.1.
+- R-000051 (T18A's assessment): PASS.
+- R-000052 (T18B's first reclaim): refused by the recycle-bin requirement, FAILED, exit 1, nothing changed.
+- R-000053 (T18B's compaction): SUCCESS, verdict PASS, exit 0. No warning: RT_TOP, which holds the top again after its move, no longer raises MOVE_NO_ROOM.
+
+Why more before set R: the compaction and its restore path are one database call, several hours on DATA. If the network drops the worker's connection, the call goes on in the database until it ends. Many firewalls drop a connection idle for an hour, and a worker's connection is idle during its call. Two cases:
+- The client is told (the connection is reset): sqlplus ends at once, and the wrapper ran its restore right away, beside the compaction still running in the database. The restore could unlock the accounts early, or mark an index rebuilt that a later move made unusable again.
+- The client is not told: sqlplus waits forever, so the wrapper never ends the run.
+
+Changes:
+- Engine (0.7.2): a COMPACT or RESTORE run first waits while another reclaim session is still active in the database: SYS, module EPF, a run's client identifier, status ACTIVE.
+  - Only a worker whose client is gone can be one: two runs cannot run together, and a killed session is not ACTIVE.
+  - Event WORKER_RUNNING (WARN) when found, then every 10 minutes; WORKER_ENDED when it ends.
+  - A stop request ends the wait with ORA-20162, before any change.
+- Wrapper: once the worker of a run has been seen in the heartbeat, 300 polls in a row (about 10 minutes) without it, while its sqlplus still waits, mean that its database call has ended. The wrapper ends that sqlplus with a message, and the run goes on as for a worker that ended early: a reclaim restores in the same run, a purge ends FAILED with undo tuning restored.
+- Offline, with the fake sqlplus extended: a worker that leaves the heartbeat while its sqlplus still waits is ended after the limit (3 polls in a test copy), and the run ends FAILED with exit 1. All earlier wrapper paths still pass (preflight questions, stopped preflight, connection retry, wizard purge). The engine scans find nothing.
+- PLAN 7.8 and 8.1. The DBA can also keep such connections alive with `SQLNET.EXPIRE_TIME` in the server's sqlnet.ora.
+
+Version 0.7.2: the engine changed, so install again.
+
+How to test: pull, install 0.7.2 on EPFPG781, then `run_tests.bat --only T18C,T18D,T18F,T19`. These are the compaction start, the stop, and the kill with its restore, all through the new wait. Pass: 5 passed. Then set R.
+
 ## 2026-10-06 - Set H, H7 and H8: 0.7.1 on Oracle; a connection that never completes is retried (wrapper and suite)
 
 H7 passed: 0.7.1 installed on EPFPG781 (the changed reclaim package compiled without error), `backup_max_age_h` back to 24.

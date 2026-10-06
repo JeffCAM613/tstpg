@@ -2574,6 +2574,52 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END;
     END restore_path;
 
+    -- Waits while another session still runs a reclaim on the database (SYS,
+    -- module EPF, a run's client identifier, ACTIVE). Only a worker whose
+    -- client is gone can be one: its call goes on until it ends, and a
+    -- restore or a new compaction beside it would undo or redo its work.
+    -- Reported when found and every 10 minutes; a stop request ends the wait
+    -- with ORA-20162, before any change.
+    PROCEDURE wait_for_workers IS
+        l_own    NUMBER := TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'));
+        l_found  BOOLEAN;
+        l_what   VARCHAR2(400);
+        l_waited NUMBER := 0;
+    BEGIN
+        LOOP
+            l_found := FALSE;
+            FOR s IN (SELECT sid, serial#, client_identifier, action
+                        FROM v$session
+                       WHERE sid <> l_own AND username = 'SYS' AND module = 'EPF'
+                         AND client_identifier LIKE 'EPF:%' AND status = 'ACTIVE'
+                       ORDER BY logon_time) LOOP
+                l_found := TRUE;
+                l_what := 'session ' || s.sid || ',' || s.serial# || ' (' || s.client_identifier || ', ' || s.action || ')';
+                EXIT;
+            END LOOP;
+            EXIT WHEN NOT l_found;
+            IF l_waited = 0 THEN
+                say(epfpg.epf_log.c_warn, 'WORKER_RUNNING',
+                    'Another reclaim still runs on the database, ' || l_what || ': its client is gone, but its call goes '
+                    || 'on. This ' || CASE g_mode WHEN 'COMPACT' THEN 'compaction' ELSE 'restore' END
+                    || ' waits for it to end; a stop request ends the wait.');
+            ELSIF MOD(l_waited, 600) = 0 THEN
+                say(epfpg.epf_log.c_info, 'WORKER_RUNNING', 'Still running after ' || (l_waited / 60) || ' min: ' || l_what);
+            END IF;
+            IF epfpg.epf_control.stop_requested(g_run.run_id) THEN
+                RAISE_APPLICATION_ERROR(-20162, 'Stop requested while another reclaim still runs (' || l_what
+                                                || '); nothing was changed. Once it has ended: epf_purge.bat reclaim '
+                                                || '--restore.');
+            END IF;
+            DBMS_LOCK.SLEEP(10);
+            l_waited := l_waited + 10;
+        END LOOP;
+        IF l_waited > 0 THEN
+            say(epfpg.epf_log.c_info, 'WORKER_ENDED', 'The other reclaim ended after about ' || CEIL(l_waited / 60)
+                                                      || ' min of waiting');
+        END IF;
+    END wait_for_workers;
+
     -- Restores what earlier reclaims left pending before a new compaction:
     -- locked accounts, datafile growth settings, indexes rebuilt outside the
     -- tool since (marked). Indexes still released are adopted by the
@@ -2765,6 +2811,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_trace   VARCHAR2(4000);
     BEGIN
         init(p_run_id, p_mode, p_tablespaces);
+        IF g_mode IN ('COMPACT', 'RESTORE') THEN
+            wait_for_workers;
+        END IF;
         IF g_mode = 'RESTORE' THEN
             -- Steps left running by a worker session that ended without them.
             UPDATE epfpg.epf_step
