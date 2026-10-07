@@ -2,6 +2,36 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R10: DATA 11.1 to 7.6 GB with 7.5 GB of segments; room making takes the smallest table that frees enough; index rebuilds grow a datafile once; a shorter digest (0.7.10)
+
+What R10 showed (6 of 6 passed; then the compaction of DATA, R-000176):
+- **Lab 1** (R-000173): 344 to 255 MB with 249.8 MB of segments.
+- **Lab 2** (R-000175): EPF_RT2_SIDE went from 56 to 26 MB with 21.3 MB of segments (R9: 42.9 MB). RT2_BLOB and RT2_IOT moved again, EPF_RT2_DATA growing 1 to 2 MB each time for their tables. EPF_RT2_DATA went from 88 to 44 MB. FILE_NO_GROWTH no longer fires there.
+- **Probes:** G gave 2 x 64 MB in the fresh datafile, and H gave 2 x 64 MB in EPF_RT2_SIDE.
+- **DATA** (R-000176, 54 min): 11.1 GB to 7.6 GB with 7.5 GB of segments (R7 PASS); 55 of 688 tables moved.
+  - DIRECTORY_DISPATCHING moved first as usual (its estimate was below 640 MB) to 6.1-6.8 GB. Once the datafile had shrunk to it, it moved again with 64 MB extents, to 2.1-4.1 GB.
+  - OP.HISTO_OPERATION (969 MB) ended at the top. It was moved to make room for AUDIT_ARCHIVE (448 KB) and came back. With 64 MB extents it took every whole stretch there was, the highest included, and came back again. The compaction stopped at 5.7 GB, and the index rebuilds took the datafile to 7.6 GB.
+- **Two inefficiencies:**
+  - The index rebuilds grew the datafile 250 times by about 1 MB each, one FILE_GROWN event each. Two indexes still did not fit (INDEXES_NEED_GROWTH: rebuilt after the growth settings were restored).
+  - Room making took the table that frees the most: OP.HISTO_OPERATION (969 MB) for 448 KB of room. Later, 7 tables in a row added no whole 64 MB stretch for OP.HISTO_OPERATION (about 6 minutes).
+
+Changes (0.7.10):
+- **Index rebuilds:** before them, each tablespace of the run grows once by what its rebuilds need beyond its free space, plus the largest of them (free space is scattered), within its room. Each rebuild still grows its tablespace when it is short.
+- **Room making for a given amount** (a table that does not fit; one that came back, as much as it needs once more) takes the smallest table that frees at least that much, else the one that frees the most.
+- **Room making for 64 MB stretches** stops after three moves in a row that add none.
+- **Digest:**
+  - a run of FILE_GROWN events of one datafile is one line (count, first and last size);
+  - a MAKING_ROOM said again is left out;
+  - consecutive moves of small tables of one tablespace are one line with their count, their sizes, the room makers and INITIAL resets among them, and the tablespace's size before and after (small: below 64 MB and 2 % of the tablespace, and not moved again, back at the top, moved with 64 MB extents or after a growth);
+  - a compaction that a passing test expected to stop at a requirement is left out, and so is RUN_END (the run's header line has it).
+  - R10's digest, pasted in seven parts, would now be about 30 lines.
+
+Checked offline: the package scans; T00 and T01 with the fake sqlplus (0.7.10); the wrapper checks (32); the digest on two built sets of logs (with R9's and R10's events): 34 lines and 2,500 characters, 28 lines and 3,100 characters.
+
+Version 0.7.10: install again.
+
+How to test (R11 on the status page): pull, install 0.7.10, run `--only T18A,T18B,T18F,T18G,T19` (6 passed; in T18B, RT_FAT still makes room for RT_TOP), then `--digest`. Each compaction's index rebuilds should show at most one FILE_GROWN line per datafile. DATA needs no further compaction (7.6 GB with 7.5 GB of segments); set I comes next.
+
 ## 2026-10-07 - Test digest: `run_tests.bat --digest`, what to send back instead of the logs
 
 Why: what the tester pasted back was too long. The section of T18G alone exceeded 50,000 characters and had to be split: every LAB| state printed four times, the full console and report of every run, the manifests, every passing check. Most of it repeats what the run folders keep on disk.

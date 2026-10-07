@@ -1698,6 +1698,24 @@ function Format-DigestText {
     return ($t -replace '\s{2,}', ' ').Trim()
 }
 
+# Bytes of a size as the tool prints it ("12.0 MB"); 0 when it is not one.
+function ConvertTo-Bytes {
+    param([string]$Text)
+    if ($Text -notmatch '^([\d.]+) (B|KB|MB|GB|TB)$') { return [double]0 }
+    $power = @{ 'B' = 0; 'KB' = 1; 'MB' = 2; 'GB' = 3; 'TB' = 4 }[$Matches[2]]
+    return [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) * [Math]::Pow(1024, $power)
+}
+
+# A size as the tool prints it.
+function Format-Size {
+    param([double]$Bytes)
+    foreach ($unit in @(@('TB', 4), @('GB', 3), @('MB', 2), @('KB', 1))) {
+        $value = $Bytes / [Math]::Pow(1024, $unit[1])
+        if ($value -ge 1) { return [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.0} {1}', $value, $unit[0]) }
+    }
+    return ([string][int64]$Bytes + ' B')
+}
+
 function Format-Extents {
     param([string]$Count, [string]$Min, [string]$Max)
     if ($Min -eq $Max) { return $Count + ' x ' + $Min }
@@ -1771,51 +1789,134 @@ function Add-DigestRun {
     if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
     $codes = $script:DigestCompact
     if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
-    $events = New-Object 'System.Collections.Generic.List[string]'
-    $isMove = New-Object 'System.Collections.Generic.List[bool]'
-    $pending = ''
+    # The key events as entries: a move with its placement; a run of growths
+    # of one datafile as one; a room making said again left out.
+    $entries = New-Object 'System.Collections.Generic.List[object]'
     $pendingUnit = ''
+    $lastRoom = ''
     foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
         if ($line -notmatch '^\s(\d\d:\d\d:\d\d) \[(.{4})\] (\S+)\s+(.*)$') { continue }
         $time = $Matches[1]
         $tag = $Matches[2]
         $code = $Matches[3]
         $text = Format-DigestText $Matches[4]
-        $keep = ($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $codes -contains $code)
+        # The end of the run is in its header line already.
+        $keep = (($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $codes -contains $code) -and $code -ne 'RUN_END')
         if (-not $keep -and $code -eq 'STEP_END' -and $text -match ' in (\d+):(\d\d):(\d\d)') {
             $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
         }
         if (-not $keep) { continue }
-        if ($code -eq 'MOVE_PLACEMENT' -and $pending -ne '' -and $text.StartsWith($pendingUnit + ' in ')) {
+        if ($code -eq 'MOVE_PLACEMENT' -and $pendingUnit -ne '' -and $text.StartsWith($pendingUnit + ' in ')) {
             $short = Format-Placement $text
             if ($null -eq $short) { $short = $text }
-            $events[$events.Count - 1] = $pending + ' | ' + $short
-            $pending = ''
+            $entries[$entries.Count - 1].Text = $entries[$entries.Count - 1].Text + ' | ' + $short
+            $pendingUnit = ''
             continue
         }
-        $pending = ''
-        $prefix = $time + ' '
-        if ($tag -eq 'WARN' -or $tag -eq 'FAIL') { $prefix = $prefix + $tag + ' ' }
-        $entry = $prefix + $code + ' ' + $text
-        if ($code -eq 'UNIT_MOVED') {
-            $entry = $prefix + 'MOVED ' + ($text -replace ' \(\d+:\d\d:\d\d\)$', '')
-            $pending = $entry
-            $pendingUnit = ($text -split ':')[0]
+        $pendingUnit = ''
+        if ($code -eq 'MAKING_ROOM') {
+            if ($text -eq $lastRoom) { continue }
+            $lastRoom = $text
         }
-        $events.Add($entry)
-        $isMove.Add(($code -eq 'UNIT_MOVED' -or $code -eq 'MOVE_PLACEMENT' -or $code -eq 'INITIAL_RESET' -or
-                     $code -eq 'INITIAL_KEPT'))
+        $e = New-Object psobject -Property @{ Time = $time; Last = $time; Tag = $tag; Code = $code; Text = $text;
+                                               Unit = ''; Small = $false; Absorbed = $false; Room = $false;
+                                               Init = 0; Ts = ''; From = ''; To = ''; Bytes = [double]0; Count = 1 }
+        if ($code -eq 'UNIT_MOVED') {
+            $e.Text = $text -replace ' \(\d+:\d\d:\d\d\)$', ''
+            $e.Unit = ($text -split ':')[0]
+            $pendingUnit = $e.Unit
+            if ($e.Text -match '^\S+: (\S+ \S+) -> (\S+ \S+); (\S+) (\S+ \S+) -> (\S+ \S+)(.*)$') {
+                $flags = $Matches[6]
+                $e.Ts = $Matches[3]
+                $e.From = $Matches[4]
+                $e.To = $Matches[5]
+                $e.Bytes = [Math]::Max((ConvertTo-Bytes $Matches[1]), (ConvertTo-Bytes $Matches[2]))
+                $e.Room = ($flags -match 'room maker')
+                # A small move: below 64 MB and 2 % of its tablespace, none of
+                # the marks of a move that matters on its own.
+                $e.Small = ($e.Bytes -lt 64MB -and $e.Bytes -lt 0.02 * (ConvertTo-Bytes $e.From) -and
+                            $flags -notmatch 'moved again|BACK AT THE TOP|with 64 MB extents|files grew')
+            }
+            if ($e.Small) {
+                # The INITIAL resets just before a small move go with it.
+                for ($k = $entries.Count - 1; $k -ge 0; $k--) {
+                    $p = $entries[$k]
+                    if ($p.Code -ne 'INITIAL_RESET' -or -not $p.Text.StartsWith($e.Unit + ' ')) { break }
+                    $p.Absorbed = $true
+                    $e.Init++
+                }
+            }
+        } elseif ($code -eq 'FILE_GROWN' -and $text -match '^(File \d+ of \S+): (\S+ \S+) -> (\S+ \S+)') {
+            $e.Unit = $Matches[1]
+            $e.From = $Matches[2]
+            $e.To = $Matches[3]
+            if ($entries.Count -gt 0 -and $entries[$entries.Count - 1].Code -eq 'FILE_GROWN' -and
+                $entries[$entries.Count - 1].Unit -eq $e.Unit) {
+                $prev = $entries[$entries.Count - 1]
+                $prev.Count++
+                $prev.To = $e.To
+                $prev.Last = $time
+                continue
+            }
+        }
+        $entries.Add($e)
+    }
+    # One line per entry; consecutive small moves of one tablespace as one.
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $isMove = New-Object 'System.Collections.Generic.List[bool]'
+    $i = 0
+    while ($i -lt $entries.Count) {
+        $e = $entries[$i]
+        if ($e.Absorbed) { $i++; continue }
+        if ($e.Small) {
+            $group = New-Object 'System.Collections.Generic.List[object]'
+            $j = $i
+            while ($j -lt $entries.Count -and ($entries[$j].Absorbed -or ($entries[$j].Small -and $entries[$j].Ts -eq $e.Ts))) {
+                if (-not $entries[$j].Absorbed) { $group.Add($entries[$j]) }
+                $j++
+            }
+            if ($group.Count -eq 1) {
+                $lines.Add($e.Time + ' MOVED ' + ($e.Text -replace ' \| .*$', ''))
+            } else {
+                $lastMove = $group[$group.Count - 1]
+                $text = $e.Time + '-' + $lastMove.Time + ' MOVED ' + $group.Count + ' small tables ('
+                $text = $text + (Format-Size ($group | Measure-Object -Property Bytes -Minimum).Minimum) + '..'
+                $text = $text + (Format-Size ($group | Measure-Object -Property Bytes -Maximum).Maximum) + ' each'
+                $rooms = @($group | Where-Object { $_.Room }).Count
+                if ($rooms -gt 0) { $text = $text + ', ' + $rooms + ' to make room' }
+                $inits = [int]($group | Measure-Object -Property Init -Sum).Sum
+                if ($inits -gt 0) { $text = $text + ', ' + $inits + ' INITIAL reset' }
+                $lines.Add($text + '): ' + $e.Ts + ' ' + $e.From + ' -> ' + $lastMove.To)
+            }
+            $isMove.Add($true)
+            $i = $j
+            continue
+        }
+        $prefix = $e.Time
+        if ($e.Count -gt 1) { $prefix = $e.Time + '-' + $e.Last }
+        $prefix = $prefix + ' '
+        if ($e.Tag -eq 'WARN' -or $e.Tag -eq 'FAIL') { $prefix = $prefix + $e.Tag + ' ' }
+        if ($e.Code -eq 'UNIT_MOVED') {
+            $lines.Add($prefix + 'MOVED ' + $e.Text)
+        } elseif ($e.Code -eq 'FILE_GROWN' -and $e.Count -gt 1) {
+            $grown = $prefix + 'FILE_GROWN x' + $e.Count + ' ' + $e.Unit + ': ' + $e.From + ' -> ' + $e.To + ' '
+            $lines.Add($grown + ($e.Text -replace '^File \d+ of \S+: \S+ \S+ -> \S+ \S+ ', ''))
+        } else {
+            $lines.Add($prefix + $e.Code + ' ' + $e.Text)
+        }
+        $isMove.Add(($e.Code -eq 'UNIT_MOVED' -or $e.Code -eq 'INITIAL_RESET' -or $e.Code -eq 'INITIAL_KEPT'))
+        $i++
     }
     $moves = @($isMove | Where-Object { $_ }).Count
     $seen = 0
     $skipped = 0
-    for ($i = 0; $i -lt $events.Count; $i++) {
+    for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($isMove[$i]) {
             $seen++
             if ($moves -gt 50 -and $seen -gt 10 -and $seen -le $moves - 40) { $skipped++; continue }
         }
         if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log'); $skipped = 0 }
-        $Out.Add(' ' + $events[$i])
+        $Out.Add(' ' + $lines[$i])
     }
     if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log') }
 }
@@ -1881,7 +1982,13 @@ function Invoke-Digest {
             foreach ($run in (Get-ChildItem -LiteralPath $runs -Directory | Where-Object { $_.Name -match '_R-\d+$' } | Sort-Object Name)) {
                 $test = [string]$runOf[$run.Name]
                 $compact = @(Get-FileLines (Join-Path $run.FullName 'manifest.txt') | Where-Object { $_ -eq 'reclaim_mode=COMPACT' }).Count -gt 0
-                if ($compact -or ($test -ne '' -and [string]$status[$test] -eq 'FAIL')) { Add-DigestRun $out $run.FullName $test }
+                $failed = ($test -ne '' -and [string]$status[$test] -eq 'FAIL')
+                if ($compact -and -not $failed) {
+                    # A compaction that a passing test expected to stop before any
+                    # change (a requirement not met) is left out.
+                    $compact = @(Get-FileLines (Join-Path $run.FullName 'console.log') | Where-Object { $_ -match 'RECLAIM_RESULT' }).Count -gt 0
+                }
+                if ($compact -or $failed) { Add-DigestRun $out $run.FullName $test }
             }
         }
     } else {

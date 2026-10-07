@@ -2243,10 +2243,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END LOOP;
     END pick;
 
-    -- The unit of p_ts whose move frees the most space and that fits in
-    -- p_free, other than p_top: a table not moved yet with at least 1 MB and
-    -- 10 % of its space free inside it (a purged table). NULL when none.
-    FUNCTION room_maker(p_ts IN VARCHAR2, p_free IN NUMBER, p_top IN NUMBER) RETURN NUMBER IS
+    -- The unit of p_ts to move first to make room, other than p_top, that
+    -- fits in p_free: a table not moved yet with at least 1 MB and 10 % of
+    -- its space free inside it (a purged table). With p_want, the smallest
+    -- whose move frees at least that much (the least to write again), else
+    -- the one that frees the most; without, the one that frees the most.
+    -- NULL when none.
+    FUNCTION room_maker(p_ts IN VARCHAR2, p_free IN NUMBER, p_top IN NUMBER, p_want IN NUMBER DEFAULT NULL)
+        RETURN NUMBER IS
     BEGIN
         FOR u IN (SELECT i.item_id, SUM(i.bytes) - SUM(i.est_bytes) AS gain
                     FROM epfpg.epf_ts_inventory i
@@ -2256,7 +2260,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                      AND o.attempts < g_moves AND o.item_id <> p_top
                    GROUP BY i.item_id
                   HAVING SUM(i.bytes) - SUM(i.est_bytes) >= GREATEST(c_mb, 0.1 * SUM(i.bytes))
-                   ORDER BY 2 DESC, 1) LOOP
+                   ORDER BY CASE WHEN SUM(i.bytes) - SUM(i.est_bytes) >= NVL(p_want, 1E38) THEN 0 ELSE 1 END,
+                            CASE WHEN SUM(i.bytes) - SUM(i.est_bytes) >= NVL(p_want, 1E38) THEN SUM(i.bytes) END,
+                            2 DESC, 1) LOOP
             IF need(u.item_id, p_ts) <= p_free THEN
                 RETURN u.item_id;
             END IF;
@@ -2694,8 +2700,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- wholly free stretches of that size, the lowest first: its segments
     -- large enough for them do (chunked; large_plan, fresh_bytes). For one
     -- that came back, the tables with free space inside them move first until
-    -- there are enough such stretches (their segments leave them); when there
-    -- are not, it stays where its move put it: its datafile is done. A table
+    -- there are enough such stretches (their segments leave them), three in a
+    -- row that add none ending it; when there are not, it stays where its
+    -- move put it: its datafile is done. Room made for a given amount takes
+    -- the smallest table that frees enough (room_maker, p_want). A table
     -- that came back with no segment large enough, or with uniform extents
     -- (no size to choose), first has room made for it, as much as it needs,
     -- then moves again when it fits in the free space as it is. A stop
@@ -2715,6 +2723,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_fit    BOOLEAN;
         l_large  BOOLEAN;
         l_target NUMBER;
+        l_stale  PLS_INTEGER;
+        l_last   NUMBER;
         l_system BOOLEAN;
         l_alloc  VARCHAR2(9);
         l_units  NUMBER;
@@ -2759,17 +2769,21 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             IF l_large THEN
                 l_fresh := fresh_bytes(p_ts);
                 IF l_was = 'MOVED' THEN
+                    -- Three moves in a row that add no whole stretch end it.
+                    l_stale := 0;
                     LOOP
-                        EXIT WHEN l_fresh >= l_chunks OR stop_now(p_ts);
+                        EXIT WHEN l_fresh >= l_chunks OR l_stale >= 3 OR stop_now(p_ts);
                         l_maker := room_maker(p_ts, l_free, l_item);
                         EXIT WHEN l_maker IS NULL;
                         say(epfpg.epf_log.c_info, 'MAKING_ROOM',
                             l_owner || '.' || l_name || ' came back to the top after its move; to move lower with 64 MB '
                             || 'extents it needs about ' || b(l_chunks) || ' in whole 64 MB stretches, and ' || p_ts
                             || ' has ' || b(l_fresh) || ': a table with free space inside it moves first');
+                        l_last := l_fresh;
                         move_unit(p_ts, l_maker, NULL);
                         l_free := free_bytes(p_ts);
                         l_fresh := fresh_bytes(p_ts);
+                        l_stale := CASE WHEN l_fresh > l_last THEN 0 ELSE l_stale + 1 END;
                     END LOOP;
                     EXIT WHEN g_stopped;
                 END IF;
@@ -2780,7 +2794,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 l_target := l_free + l_need;
                 LOOP
                     EXIT WHEN l_free >= l_target OR stop_now(p_ts);
-                    l_maker := room_maker(p_ts, l_free, l_item);
+                    l_maker := room_maker(p_ts, l_free, l_item, l_target - l_free);
                     EXIT WHEN l_maker IS NULL;
                     say(epfpg.epf_log.c_info, 'MAKING_ROOM',
                         l_owner || '.' || l_name || ' (about ' || b(l_need) || ') came back to the top after its move, '
@@ -2814,7 +2828,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             IF NOT l_large AND NVL(l_was, '-') <> 'MOVED' AND l_need > l_free THEN
                 LOOP
                     EXIT WHEN l_need <= l_free OR stop_now(p_ts);
-                    l_maker := room_maker(p_ts, l_free, l_item);
+                    l_maker := room_maker(p_ts, l_free, l_item, l_need - l_free);
                     EXIT WHEN l_maker IS NULL;
                     say(epfpg.epf_log.c_info, 'MAKING_ROOM',
                         l_owner || '.' || l_name || ' needs about ' || b(l_need) || ' and ' || p_ts || ' has ' || b(l_free)
@@ -2976,12 +2990,50 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN 'FAILED';
     END rebuild_index;
 
+    -- Before the rebuilds: each tablespace of the run whose free space is
+    -- short of what its rebuilds need (their estimates, each with the extent
+    -- it may need besides, plus the largest once more: the free space is
+    -- scattered, and a rebuild needs extents of its size) grows once, within
+    -- its room. A rebuild that still does not fit grows it again
+    -- (rebuild_index).
+    PROCEDURE grow_for_rebuilds IS
+        l_need  NUMBER;
+        l_large NUMBER;
+        l_count PLS_INTEGER;
+        l_free  NUMBER;
+        l_added NUMBER;
+    BEGIN
+        FOR t IN (SELECT r.tablespace_name, d.allocation_type, d.initial_extent
+                    FROM epfpg.epf_reclaim_ts r
+                    JOIN dba_tablespaces d ON d.tablespace_name = r.tablespace_name
+                   WHERE r.run_id = g_run.run_id
+                   ORDER BY r.tablespace_name) LOOP
+            l_need := 0;
+            l_large := 0;
+            l_count := 0;
+            FOR i IN (SELECT NVL(est_bytes, 0) AS est
+                        FROM epfpg.epf_reclaim_object
+                       WHERE run_id = g_run.run_id AND unit_type = 'INDEX' AND move_status IN ('RELEASED', 'FAILED')
+                         AND source_ts = t.tablespace_name) LOOP
+                l_need := l_need + i.est + extent_for(i.est, t.allocation_type, t.initial_extent);
+                l_large := GREATEST(l_large, i.est);
+                l_count := l_count + 1;
+            END LOOP;
+            l_free := free_bytes(t.tablespace_name);
+            IF l_count > 0 AND l_need + l_large > l_free THEN
+                l_added := grow_ts(t.tablespace_name, l_need + l_large - l_free,
+                                   'the ' || l_count || ' index rebuilds in it (about ' || b(l_need) || ')');
+            END IF;
+        END LOOP;
+    END grow_for_rebuilds;
+
     -- Rebuilds the indexes the run released or adopted (RELEASED, FAILED),
     -- the largest first, while the datafiles of the run cannot grow by
-    -- themselves (within their room, rebuild_index). The indexes that do not
-    -- fit are rebuilt after the growth settings are restored (restore_files),
-    -- with resumable space allocation (resumable_timeout_s): a rebuild then
-    -- waits for space instead of failing.
+    -- themselves (within their room: grow_for_rebuilds, then rebuild_index).
+    -- The indexes that do not fit are rebuilt after the growth settings are
+    -- restored (restore_files), with resumable space allocation
+    -- (resumable_timeout_s): a rebuild then waits for space instead of
+    -- failing.
     PROCEDURE rebuild_indexes(p_rebuilt OUT PLS_INTEGER, p_failed OUT PLS_INTEGER) IS
         TYPE t_ids IS TABLE OF NUMBER;
         l_ids     t_ids;
@@ -2997,6 +3049,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
           FROM epfpg.epf_reclaim_object
          WHERE run_id = g_run.run_id AND unit_type = 'INDEX' AND move_status IN ('RELEASED', 'FAILED')
          ORDER BY est_bytes DESC, item_id;
+        grow_for_rebuilds;
         FOR k IN 1 .. l_ids.COUNT LOOP
             l_result := rebuild_index(l_ids(k), TRUE);
             IF l_result = 'NO_ROOM' THEN
