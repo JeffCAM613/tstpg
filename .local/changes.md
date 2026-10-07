@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - Set I on EPFPG784: the suite passed 31 of 31; one reclaim took DATA from 41.7 to 14.2 GB (R7 WARN)
+
+What the runs showed (suite `logs/tests/2026-10-08_023528_EPFPG784`, then reclaim R-000038):
+- **Suite:** 31 of 31 in 2 h 34 min, the stopped PAYMENTS purge and the four tests after it included: EPFPG784 had not been purged before. The digest had no T01 notes, since 610f2ca was not pushed yet.
+- **Reclaim of DATA** (7 min 32 s, WARNING, exit 2): 41.7 GB to 14.2 GB, 27.5 GB given back, with 12.4 GB of segments. R7 WARN; R1 to R6, R8 (4 of 691 moved, 687 below where the datafile stopped) and R9 PASS. The warning is PUBLIC_DML: 15 grants to PUBLIC on the PowerBuilder catalog tables OP.PBCAT* (every account can write them; only the accounts listed are locked).
+- **Where it stopped:** OPPAYMENTS.TRANSMISSION_EXECUTION_AUDIT (2.2 GB, 1.8 to 2.0 GB of it the LOB MESSAGE) held the top. It moved 4 times, its LOB with 64 MB extents, and its copy held the top again after 3 of them (FILE_DONE at reclaim_unit_moves):
+  1. 39.7 to 30.8 GB: the copy took one stretch at 28.9 to 30.8 GB, in 36 extents, though the free space counted 11.2 GB in whole 64 MB stretches from 1.7 GB.
+  2. After DIRECTORY_DISPATCHING (10.3 GB to 192 KB) made room: 30.8 to 23.1 GB, the copy at 68 MB to 14.4 GB in 130 extents. FILE_DISPATCHING (4.3 GB to 192 KB) then held the top and moved: 14.4 GB.
+  3. After PAYMENT_ADDITIONAL_INFO (3.7 GB to 6 MB, its copy at 14.0 GB) made room, with 3.0 GB counted in whole 64 MB stretches for the 1.9 GB needed, the copy reached 14.4 GB again (72 extents), then 14.2 GB on the fourth move (65 extents).
+- The extent counts changed from move to move for about the same INITIAL, so Oracle did not always give the LOB whole 64 MB extents. The digest does not show which segment of the copy (the table, the LOB, the LOB's index) holds the top, nor the order Oracle placed its extents in.
+- The acceptance test of set I (R7 PASS in one pass) is not met. No error; nothing left pending.
+
+Next: step I5 on the status page, a read-only query of EPFPG784 as the reclaim left it: the extents of that table's segments (and of the three tables that made room) in the order Oracle allocated them, what holds the top of data.dbf, and whether the extents of 1, 8 and 64 MB start on boundaries of their size. The fix depends on it.
+
 ## 2026-10-08 - A second suite run on EPFPG783 (20 of 31): the copy no longer held the application's data; T01 now says what a copy holds
 
 What the run showed (log `logs/tests/2026-10-08_010517_EPFPG783`):
