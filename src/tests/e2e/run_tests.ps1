@@ -1661,21 +1661,24 @@ function Invoke-Suite {
 
 # ----------------------------------------------------------------------------
 # Digest (--digest): what to send back after a test session, instead of its
-# full log. The summary; the notes and failed checks of the reclaim tests and
-# of every test that failed, with the lines naming an error; then, for each
-# compaction of the session, each run of a test that failed and each run in
-# logs\ started after the session (a reclaim of an application tablespace):
-# its tablespaces, datafiles, the tables that moved or did not fit, its checks
-# and its key events (the moves and where each copy went, where each datafile
-# stopped, the steps that took 30 s or more, warnings and errors). Written to
-# logs\digest.txt and copied to the clipboard; the full logs stay as they are.
+# full log, in as few lines as a diagnosis needs. The summary; the notes and
+# failed checks of the reclaim tests and of every test that failed, with the
+# lines naming an error; then, for each compaction of the session, each run of
+# a test that failed and each run in logs\ started after the session (a
+# reclaim of an application tablespace): a line for the run, one for its
+# checks, and its key events, one line each (a move with where its copy went,
+# where each datafile stopped, the result per tablespace, steps of 30 s or
+# more, every warning and error). Written to logs\digest.txt and copied to the
+# clipboard; the full logs stay as they are.
 # ----------------------------------------------------------------------------
 
 # Event codes of a run's console.log that the digest keeps, besides every
-# warning and error.
-$script:DigestCodes = @('TS_ASSESSED', 'INITIAL_OVERSIZED', 'INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED',
-                        'MOVE_PLACEMENT', 'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE',
-                        'COMPACT_DONE', 'RECLAIM_RESULT', 'STOP_HONORED')
+# warning and error and the steps of 30 s or more: of an assessment, and of a
+# compaction.
+$script:DigestAssess = @('TS_ASSESSED', 'INITIAL_OVERSIZED')
+$script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED', 'MOVE_PLACEMENT',
+                          'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
+                          'STOP_HONORED')
 
 function Get-FileLines {
     param([string]$Path)
@@ -1683,98 +1686,127 @@ function Get-FileLines {
     return @(Get-Content -LiteralPath $Path)
 }
 
-# The lines of report section $Title (its title line is followed by a line of
-# dashes), up to the next empty line, without lines of dashes.
-function Get-ReportSection {
-    param([string[]]$Lines, [string]$Title)
-    $section = New-Object 'System.Collections.Generic.List[string]'
-    $in = $false
-    $pattern = '^ ' + [regex]::Escape($Title) + '(\s|$)'
-    for ($i = 0; $i -lt $Lines.Count; $i++) {
-        $line = $Lines[$i]
-        if (-not $in) {
-            if ($line -match $pattern -and $i + 1 -lt $Lines.Count -and $Lines[$i + 1].Trim().StartsWith('----')) {
-                $in = $true
-                $section.Add($line.TrimEnd())
-                $i++
-            }
-            continue
-        }
-        if ($line.Trim() -eq '') { break }
-        if ($line.Trim() -match '^-+$') { continue }
-        $section.Add($line.TrimEnd())
-    }
-    return ,$section.ToArray()
+# An event's text for the digest: datafile paths without their directory,
+# runs of spaces as one, and the wording of a move shortened.
+function Format-DigestText {
+    param([string]$Text)
+    $t = $Text -replace '(?:[A-Za-z]:)?[\\/][^\s:;,()]*[\\/]([^\\/\s:;,()]+)', '$1'
+    $t = $t -replace ' \(it made room for the table at the top\)', ' (room maker)'
+    $t = $t -replace ' \(its copy holds the top again\)', ' (BACK AT THE TOP)'
+    $t = $t -replace ' \(datafiles first grew by ([^)]+) to fit it\)', ' (files grew $1)'
+    $t = $t -replace '^(\S+): INITIAL larger than needed \((.*)\); the move set it to 64 KB$', '$1 INITIAL 64 KB (was: $2)'
+    return ($t -replace '\s{2,}', ' ').Trim()
 }
 
-# Adds run folder $Folder to the digest: a header from its manifest, the
-# sections TABLESPACES, DATAFILES, TABLES (without the tables that stayed,
-# but three of each tablespace) and CHECKS of its report, and its key events.
+function Format-Extents {
+    param([string]$Count, [string]$Min, [string]$Max)
+    if ($Min -eq $Max) { return $Count + ' x ' + $Min }
+    return $Count + ' x ' + $Min + '..' + $Max
+}
+
+# A move's placement (MOVE_PLACEMENT) in short: where its segments lay before
+# and after (extents), and the free space before the move. NULL when the
+# text has another form.
+function Format-Placement {
+    param([string]$Text)
+    $p = '^\S+ in \S+: was .+? in (\d+) extents of (.+?) to (.+?), from (.+?) to (.+?); now .+? in (\d+) extents of ' +
+         '(.+?) to (.+?), from (.+?) to (.+?); before the move (.+?) free, (.+?) of it in stretches of 8 MB or more' +
+         '(?: \(the lowest at (.+?)\))?, (.+?) in whole 64 MB stretches(?: \(the lowest at (.+?)\))?$'
+    if ($Text -notmatch $p) { return $null }
+    $m = $Matches
+    $low8 = ''
+    if ($m[13]) { $low8 = ' from ' + $m[13] }
+    $low64 = ''
+    if ($m[15]) { $low64 = ' from ' + $m[15] }
+    return ('was ' + $m[4] + '-' + $m[5] + ' (' + (Format-Extents $m[1] $m[2] $m[3]) + '), now ' + $m[9] + '-' + $m[10] +
+            ' (' + (Format-Extents $m[6] $m[7] $m[8]) + '); free before ' + $m[11] + ', 8M+ ' + $m[12] + $low8 +
+            ', 64M ' + $m[14] + $low64)
+}
+
+# Adds run folder $Folder to the digest: a line from its manifest (action,
+# mode, tablespaces, status, verdict, exit code, duration), its checks in one
+# line (the ones that did not pass, and R7 and R8, with their detail), and its
+# key events, one line each; a move (UNIT_MOVED) with its placement
+# (MOVE_PLACEMENT). Of the moves, the first 10 and the last 40 when there are
+# more.
 function Add-DigestRun {
     param($Out, [string]$Folder, [string]$Test)
     $manifest = @{}
+    $checks = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in (Get-FileLines (Join-Path $Folder 'manifest.txt'))) {
         $eq = $line.IndexOf('=')
-        if ($eq -gt 0) { $manifest[$line.Substring(0, $eq)] = $line.Substring($eq + 1) }
+        if ($eq -le 0) { continue }
+        $manifest[$line.Substring(0, $eq)] = $line.Substring($eq + 1)
+        if ($line.StartsWith('check.')) { $checks.Add($line.Substring(6)) }
     }
-    $report = Get-FileLines (Join-Path $Folder 'report.txt')
     $duration = ''
-    foreach ($line in $report) {
+    foreach ($line in (Get-FileLines (Join-Path $Folder 'report.txt'))) {
         if ($line -match 'duration (\d+:\d\d:\d\d)') { $duration = $Matches[1]; break }
     }
+    $mode = [string]$manifest['reclaim_mode'] + [string]$manifest['mode']
     $head = '-- ' + (Split-Path -Leaf $Folder)
     if ($Test -ne '') { $head = $head + ' (' + $Test + ')' }
-    $head = $head + ' ' + [string]$manifest['action'] + ' ' + [string]$manifest['reclaim_mode'] + [string]$manifest['mode']
+    $head = $head + ' ' + [string]$manifest['action'] + ' ' + $mode
     if ([string]$manifest['tablespaces'] -ne '') { $head = $head + ' ' + [string]$manifest['tablespaces'] }
     $head = $head + ': ' + [string]$manifest['status'] + ', ' + [string]$manifest['verdict'] + ', exit '
     $head = $head + [string]$manifest['exit_code'] + ', ' + $duration
     $Out.Add('')
     $Out.Add($head)
-    foreach ($title in @('TABLESPACES', 'DATAFILES')) {
-        foreach ($line in (Get-ReportSection $report $title)) {
-            if ($line -notmatch '^\s+Tables: tables that move') { $Out.Add($line) }
+    $detail = New-Object 'System.Collections.Generic.List[string]'
+    $plain = @{}
+    $statuses = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($c in $checks) {
+        if ($c -notmatch '^(\w+)=(\w+)\|?(.*)$') { continue }
+        $code = $Matches[1]
+        $status = $Matches[2]
+        $text = $Matches[3]
+        if (($status -eq 'PASS' -or $status -eq 'SKIP') -and $code -ne 'R7' -and $code -ne 'R8') {
+            if (-not $plain.ContainsKey($status)) { $plain[$status] = New-Object 'System.Collections.Generic.List[string]'; $statuses.Add($status) }
+            $plain[$status].Add($code)
+        } else {
+            $detail.Add($code + ' ' + $status + ' ' + $text)
         }
     }
-    $stayed = 0
-    $hidden = 0
-    foreach ($line in (Get-ReportSection $report 'TABLES')) {
-        if ($line -match '^\s{2}\S+: \S+ tables, ') { $stayed = 0 }
-        # A table's row: ... its moves, two spaces, its status.
-        if ($line -match '\s\d+\s{2}(STAYED|TO MOVE)(\s|$)') {
-            $stayed++
-            if ($stayed -gt 3) { $hidden++; continue }
-        }
-        if ($hidden -gt 0) { $Out.Add('   ... ' + $hidden + ' more not moved (or to move)'); $hidden = 0 }
-        $Out.Add($line)
-    }
-    if ($hidden -gt 0) { $Out.Add('   ... ' + $hidden + ' more not moved (or to move)') }
-    $checks = Get-ReportSection $report 'CHECKS'
-    foreach ($line in $checks) { $Out.Add($line) }
-    if (@($checks | Where-Object { $_ -match '^\s*VERDICT ' }).Count -eq 0) {
-        foreach ($line in $report) {
-            if ($line -match '^\s*VERDICT ') { $Out.Add($line.TrimEnd()); break }
-        }
-    }
-    # Every key event; of the moves (UNIT_MOVED, MOVE_PLACEMENT, INITIAL_*),
-    # the first 10 lines and the last 40 when there are more.
+    foreach ($status in $statuses) { $detail.Add($status + ' ' + ($plain[$status] -join ' ')) }
+    if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
+    $codes = $script:DigestCompact
+    if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
     $events = New-Object 'System.Collections.Generic.List[string]'
     $isMove = New-Object 'System.Collections.Generic.List[bool]'
+    $pending = ''
+    $pendingUnit = ''
     foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
-        if ($line -notmatch '^\s\d\d:\d\d:\d\d \[(.{4})\] (\S+)') { continue }
-        $tag = $Matches[1]
-        $code = $Matches[2]
-        $keep = ($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $script:DigestCodes -contains $code)
-        if (-not $keep -and $code -eq 'STEP_END' -and $line -match ' in (\d+):(\d\d):(\d\d)') {
+        if ($line -notmatch '^\s(\d\d:\d\d:\d\d) \[(.{4})\] (\S+)\s+(.*)$') { continue }
+        $time = $Matches[1]
+        $tag = $Matches[2]
+        $code = $Matches[3]
+        $text = Format-DigestText $Matches[4]
+        $keep = ($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $codes -contains $code)
+        if (-not $keep -and $code -eq 'STEP_END' -and $text -match ' in (\d+):(\d\d):(\d\d)') {
             $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
         }
-        if ($keep) {
-            $events.Add($line.TrimEnd())
-            $isMove.Add(($code -eq 'UNIT_MOVED' -or $code -eq 'MOVE_PLACEMENT' -or $code.StartsWith('INITIAL_R') -or
-                         $code -eq 'INITIAL_KEPT'))
+        if (-not $keep) { continue }
+        if ($code -eq 'MOVE_PLACEMENT' -and $pending -ne '' -and $text.StartsWith($pendingUnit + ' in ')) {
+            $short = Format-Placement $text
+            if ($null -eq $short) { $short = $text }
+            $events[$events.Count - 1] = $pending + ' | ' + $short
+            $pending = ''
+            continue
         }
+        $pending = ''
+        $prefix = $time + ' '
+        if ($tag -eq 'WARN' -or $tag -eq 'FAIL') { $prefix = $prefix + $tag + ' ' }
+        $entry = $prefix + $code + ' ' + $text
+        if ($code -eq 'UNIT_MOVED') {
+            $entry = $prefix + 'MOVED ' + ($text -replace ' \(\d+:\d\d:\d\d\)$', '')
+            $pending = $entry
+            $pendingUnit = ($text -split ':')[0]
+        }
+        $events.Add($entry)
+        $isMove.Add(($code -eq 'UNIT_MOVED' -or $code -eq 'MOVE_PLACEMENT' -or $code -eq 'INITIAL_RESET' -or
+                     $code -eq 'INITIAL_KEPT'))
     }
     $moves = @($isMove | Where-Object { $_ }).Count
-    if ($events.Count -gt 0) { $Out.Add(' events:') }
     $seen = 0
     $skipped = 0
     for ($i = 0; $i -lt $events.Count; $i++) {
@@ -1782,10 +1814,10 @@ function Add-DigestRun {
             $seen++
             if ($moves -gt 50 -and $seen -gt 10 -and $seen -le $moves - 40) { $skipped++; continue }
         }
-        if ($skipped -gt 0) { $Out.Add('   ... ' + $skipped + ' more lines of moves in console.log'); $skipped = 0 }
-        $Out.Add($events[$i])
+        if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log'); $skipped = 0 }
+        $Out.Add(' ' + $events[$i])
     }
-    if ($skipped -gt 0) { $Out.Add('   ... ' + $skipped + ' more lines of moves in console.log') }
+    if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log') }
 }
 
 function Invoke-Digest {
@@ -1828,8 +1860,9 @@ function Invoke-Digest {
             if (-not $failed -and -not $id.StartsWith('T18')) { continue }
             $kept = New-Object 'System.Collections.Generic.List[string]'
             foreach ($line in $lines[$id]) {
-                if ($line -match '^\s+note ' -or $line -match ': FAILED\s*$' -or
-                    ($failed -and $line -match 'ORA-\d{5}|SP2-\d{4}|PLS-\d{5}|\[FAIL\]|\[WARN\]|Suite error')) {
+                if (($line -match '^\s+note ' -and $line -notmatch '^\s+note probe [A-F]:') -or $line -match ': FAILED\s*$' -or
+                    ($failed -and $line -match 'ORA-\d{5}|SP2-\d{4}|PLS-\d{5}|Suite error' -and
+                     $line -notmatch '^\s\d\d:\d\d:\d\d \[')) {
                     $kept.Add($line)
                 }
             }
