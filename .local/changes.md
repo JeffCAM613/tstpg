@@ -2,6 +2,23 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R11: 6 of 6 on 0.7.10; the growth for the index rebuilds is given back; the digest is brief for passing tests (0.7.11)
+
+What R11 showed (6 of 6 passed):
+- **Lab 1** (R-000183): to make room for RT_TOP (88 MB needed, 57.5 MB free), RT_IOT moved first: the smallest table whose estimate freed enough. It freed 21 MB, and RT_FAT followed. 344 to 255 MB as in R10, with 226.7 MB of segments.
+- **Lab 2** (R-000185): EPF_RT2_DATA 88 to 44 MB and EPF_RT2_SIDE 56 to 26 MB, as in R10. EPF_RT2_INDX stayed at 16 MB (R10: 10.3 MB). It grew from 10.3 to 16 MB for its 6 index rebuilds, sized by their estimates (about 11 MB) plus the largest (8 MB, an INITIAL the rebuild resets), and the rebuilds took 1.5 MB. The final resize gives back only what lies more than reclaim_margin_mb above the highest extent.
+- **The digest** was one paste of about 7,500 characters, most of it the moves of the two lab compactions, which passed.
+
+Changes (0.7.11):
+- After the index rebuilds, each tablespace grown for them is resized to the end of its highest extent: what the estimates asked beyond the rebuilds is given back.
+- Digest: a run of a test that passed shows only its header, its checks, where each datafile stopped, the result per tablespace, a stop, and its warnings and errors. A failed test's runs and the runs after the session keep every key event. Growths of one datafile are folded only when they follow each other, with no resize down between them.
+
+Checked offline: the package scans; T00 and T01 with the fake sqlplus (0.7.11); the wrapper checks (32); the digest on the two built sets of logs (2,500 and 2,700 characters).
+
+Version 0.7.11: set I installs it (T03).
+
+How to test (set I on the status page): the full suite on EPFPG782, then one reclaim of its DATA, then the digest. In the digest, T18G's EPF_RT2_INDX should end near 10 MB.
+
 ## 2026-10-07 - R10: DATA 11.1 to 7.6 GB with 7.5 GB of segments; room making takes the smallest table that frees enough; index rebuilds grow a datafile once; a shorter digest (0.7.10)
 
 What R10 showed (6 of 6 passed; then the compaction of DATA, R-000176):

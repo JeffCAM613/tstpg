@@ -1746,9 +1746,10 @@ function Format-Placement {
 # line (the ones that did not pass, and R7 and R8, with their detail), and its
 # key events, one line each; a move (UNIT_MOVED) with its placement
 # (MOVE_PLACEMENT). Of the moves, the first 10 and the last 40 when there are
-# more.
+# more. $Brief (a run of a test that passed): of the events only where each
+# datafile stopped, the result per tablespace, a stop, warnings and errors.
 function Add-DigestRun {
-    param($Out, [string]$Folder, [string]$Test)
+    param($Out, [string]$Folder, [string]$Test, [bool]$Brief = $false)
     $manifest = @{}
     $checks = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in (Get-FileLines (Join-Path $Folder 'manifest.txt'))) {
@@ -1789,6 +1790,7 @@ function Add-DigestRun {
     if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
     $codes = $script:DigestCompact
     if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
+    if ($Brief) { $codes = @('FILE_DONE', 'RECLAIM_RESULT', 'STOP_HONORED') }
     # The key events as entries: a move with its placement; a run of growths
     # of one datafile as one; a room making said again left out.
     $entries = New-Object 'System.Collections.Generic.List[object]'
@@ -1802,7 +1804,7 @@ function Add-DigestRun {
         $text = Format-DigestText $Matches[4]
         # The end of the run is in its header line already.
         $keep = (($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $codes -contains $code) -and $code -ne 'RUN_END')
-        if (-not $keep -and $code -eq 'STEP_END' -and $text -match ' in (\d+):(\d\d):(\d\d)') {
+        if (-not $keep -and -not $Brief -and $code -eq 'STEP_END' -and $text -match ' in (\d+):(\d\d):(\d\d)') {
             $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
         }
         if (-not $keep) { continue }
@@ -1850,8 +1852,9 @@ function Add-DigestRun {
             $e.Unit = $Matches[1]
             $e.From = $Matches[2]
             $e.To = $Matches[3]
+            # Growths that continue each other (no resize down between them).
             if ($entries.Count -gt 0 -and $entries[$entries.Count - 1].Code -eq 'FILE_GROWN' -and
-                $entries[$entries.Count - 1].Unit -eq $e.Unit) {
+                $entries[$entries.Count - 1].Unit -eq $e.Unit -and $entries[$entries.Count - 1].To -eq $e.From) {
                 $prev = $entries[$entries.Count - 1]
                 $prev.Count++
                 $prev.To = $e.To
@@ -1988,7 +1991,7 @@ function Invoke-Digest {
                     # change (a requirement not met) is left out.
                     $compact = @(Get-FileLines (Join-Path $run.FullName 'console.log') | Where-Object { $_ -match 'RECLAIM_RESULT' }).Count -gt 0
                 }
-                if ($compact -or $failed) { Add-DigestRun $out $run.FullName $test }
+                if ($compact -or $failed) { Add-DigestRun $out $run.FullName $test (-not $failed) }
             }
         }
     } else {

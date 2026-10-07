@@ -2995,13 +2995,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- it may need besides, plus the largest once more: the free space is
     -- scattered, and a rebuild needs extents of its size) grows once, within
     -- its room. A rebuild that still does not fit grows it again
-    -- (rebuild_index).
-    PROCEDURE grow_for_rebuilds IS
+    -- (rebuild_index). Returns the tablespaces that grew.
+    FUNCTION grow_for_rebuilds RETURN SYS.ODCIVARCHAR2LIST IS
         l_need  NUMBER;
         l_large NUMBER;
         l_count PLS_INTEGER;
         l_free  NUMBER;
-        l_added NUMBER;
+        l_grown SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
     BEGIN
         FOR t IN (SELECT r.tablespace_name, d.allocation_type, d.initial_extent
                     FROM epfpg.epf_reclaim_ts r
@@ -3021,10 +3021,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             END LOOP;
             l_free := free_bytes(t.tablespace_name);
             IF l_count > 0 AND l_need + l_large > l_free THEN
-                l_added := grow_ts(t.tablespace_name, l_need + l_large - l_free,
-                                   'the ' || l_count || ' index rebuilds in it (about ' || b(l_need) || ')');
+                IF grow_ts(t.tablespace_name, l_need + l_large - l_free,
+                           'the ' || l_count || ' index rebuilds in it (about ' || b(l_need) || ')') > 0 THEN
+                    l_grown.EXTEND;
+                    l_grown(l_grown.COUNT) := t.tablespace_name;
+                END IF;
             END IF;
         END LOOP;
+        RETURN l_grown;
     END grow_for_rebuilds;
 
     -- Rebuilds the indexes the run released or adopted (RELEASED, FAILED),
@@ -3033,7 +3037,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- The indexes that do not fit are rebuilt after the growth settings are
     -- restored (restore_files), with resumable space allocation
     -- (resumable_timeout_s): a rebuild then waits for space instead of
-    -- failing.
+    -- failing. Then each tablespace grown for the rebuilds is resized to the
+    -- end of its highest extent: what the estimates asked beyond the rebuilds
+    -- is given back.
     PROCEDURE rebuild_indexes(p_rebuilt OUT PLS_INTEGER, p_failed OUT PLS_INTEGER) IS
         TYPE t_ids IS TABLE OF NUMBER;
         l_ids     t_ids;
@@ -3041,6 +3047,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_result  VARCHAR2(10);
         l_files   PLS_INTEGER;
         l_timeout NUMBER := NVL(epfpg.epf_util.setting_num('resumable_timeout_s'), 0);
+        l_grown   SYS.ODCIVARCHAR2LIST;
+        l_freed   NUMBER;
     BEGIN
         p_rebuilt := 0;
         p_failed := 0;
@@ -3049,7 +3057,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
           FROM epfpg.epf_reclaim_object
          WHERE run_id = g_run.run_id AND unit_type = 'INDEX' AND move_status IN ('RELEASED', 'FAILED')
          ORDER BY est_bytes DESC, item_id;
-        grow_for_rebuilds;
+        l_grown := grow_for_rebuilds;
         FOR k IN 1 .. l_ids.COUNT LOOP
             l_result := rebuild_index(l_ids(k), TRUE);
             IF l_result = 'NO_ROOM' THEN
@@ -3082,6 +3090,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 EXECUTE IMMEDIATE 'ALTER SESSION DISABLE RESUMABLE';
             END IF;
         END IF;
+        FOR k IN 1 .. l_grown.COUNT LOOP
+            l_freed := trim_ts(l_grown(k), 0, FALSE);
+        END LOOP;
     END rebuild_indexes;
 
     -- Final resize of the run's tablespaces (highest block plus
