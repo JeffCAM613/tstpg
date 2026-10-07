@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R7: room making freed 2.8 GB inside DATA, but the table at the top still comes back to the top
+
+R7 on EPFPG781 (0.7.6):
+- The suite (`--only T18A,T18B,T18F,T18G,T19`) passed: 6 of 6. Both labs pass with the room making on a return to the top.
+- The compaction R-000121, 9 min 28 s:
+  - DATA 11.5 GB to 11.1 GB: 421 MB given back. R1-R6, R8 and R9 PASS; R7 and P5 WARN. 969 indexes released (3.0 GB) and rebuilt. Assessment 1 min 19 s (20 s in R6, same code).
+  - The room making worked: OPPAYMENTS.PAYMENT moved first, from 2.1 GB to 3.0 MB. Three tables moved in all, and the segments of DATA went from 10.3 GB to 7.5 GB; 3.5 GB is free inside the file.
+  - The file still stopped at OPPAYMENTS.DIRECTORY_DISPATCHING, "moved 3 times; its copy held the top again after 3 of them". R7: 11.1 GB for 7.5 GB of segments.
+
+So the explanation of R6 does not hold, or not alone: after PAYMENT's 2.1 GB of large extents became free, the copy still went to the top. Oracle does not place a copy in the lowest free space that fits. Each of its moves gives back about 140 MB (R6 and R7 alike), as if each copy took the holes that the previous copy, or other segments, left near the top. About 3.5 GB is held by this one 688 MB table.
+
+Next: the MOVE_PLACEMENT lines of R-000121 give where each copy went against the free space it had, and a read-only query gives the layout of DATA now (the extents of DIRECTORY_DISPATCHING, the 30 highest extents, the free space per GB of the file in stretches of 8 MB and 64 MB). The fix follows from them. Two candidates:
+- Move a table that came back to the top with extents too large for the holes it left: STORAGE (INITIAL) at its size rounded up to 64 MB gives 64 MB extents, which only take 64 MB stretches.
+- Hold it outside the tablespace while the file shrinks under it.
+
 ## 2026-10-07 - R6: a second compaction of DATA stops at its first table; room made when a copy comes back to the top (0.7.6)
 
 R6 on EPFPG781 (0.7.5):
