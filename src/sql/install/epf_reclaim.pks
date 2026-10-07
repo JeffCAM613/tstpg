@@ -18,13 +18,19 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 --      tablespace (ALTER TABLE ... MOVE, with every LOB segment it keeps in a
 --      target tablespace): the copy takes free space below, which is all the
 --      free space the file has; the old segment is released; the file is
---      resized down to its new highest block. Repeated until the highest
---      block belongs to a segment that cannot move (a pin) or nothing is left
---      to move. A table whose copy holds the highest block again moves lower
---      only when it fits in the free space as it is; otherwise the file stops
---      there. A stop request is honored before every move. A segment whose
---      INITIAL is larger than it needs (an export artifact; listed by the
---      assessment) is moved or rebuilt with INITIAL 64 KB.
+--      resized down to the end of its new highest extent. Repeated until the
+--      highest block belongs to a segment that cannot move (a pin) or nothing
+--      is left to move. A table whose copy holds the highest block again
+--      moves lower only when it fits in the free space as it is; otherwise
+--      the file stops there. With system-allocated extents, such a table of
+--      at least about 51 MB, and one of 640 MB or more from its first move,
+--      moves with extents of 64 MB, which Oracle places only in wholly free
+--      stretches of 64 MB, the lowest first (smaller extents go first to
+--      partly used stretches, wherever they are, which brings a copy back to
+--      the top); a table that came back then needs enough such stretches. A
+--      stop request is honored before every move. A segment whose INITIAL is
+--      larger than it needs (an export artifact; listed by the assessment) is
+--      moved or rebuilt with INITIAL 64 KB.
 --   4. The released indexes are rebuilt in their tablespace, the growth
 --      settings of the datafiles restored, the datafiles resized to their
 --      highest block plus setting reclaim_margin_mb, objects invalidated by

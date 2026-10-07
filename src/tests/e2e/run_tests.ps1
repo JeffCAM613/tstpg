@@ -1573,6 +1573,9 @@ function Invoke-Suite {
         Assert-Manifest $run 'req.QUOTA' '^MET\|'
         foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         foreach ($check in @('R5', 'R6', 'R7', 'R8', 'P5')) { Assert-Manifest $run ('check.' + $check) '^(PASS|WARN)' }
+        # Every table of the lab moves (V15): none stays below where a
+        # datafile stopped.
+        Assert-Manifest $run 'check.R8' '^PASS\|5 of 5 moved$'
         Assert-Manifest $run 'tablespace.EPF_RT2_DATA' '^(COMPACTED|PARTIAL)\|'
         foreach ($step in @('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'REBUILD_INDEXES', 'RESTORE_FILES', 'RESIZE',
                             'VERIFY', 'UNLOCK_ACCOUNTS')) {

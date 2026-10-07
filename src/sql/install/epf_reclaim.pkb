@@ -13,7 +13,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     c_chunk  CONSTANT NUMBER       := 67108864;
     -- A table at least this large moves with extents of c_chunk from its
     -- first move (it wastes at most a tenth of its size); a smaller one only
-    -- after its copy came back to the top.
+    -- after its copy came back to the top, and only when it is large enough
+    -- for them (chunked).
     c_large  CONSTANT NUMBER       := 671088640;
 
     TYPE t_flags IS TABLE OF BOOLEAN INDEX BY PLS_INTEGER;
@@ -237,8 +238,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         COMMIT;
     END track_peak;
 
-    -- Resizes every datafile of p_ts down to its highest allocated block plus
-    -- p_margin bytes (at least 10 MB, rounded up to a MB) when that is smaller
+    -- Resizes every datafile of p_ts down to the end of its highest extent
+    -- (p_margin 0: no free space is left above it, where Oracle would place
+    -- the first extents of the next copy), or to that plus p_margin bytes
+    -- rounded up to a MB; never below 10 MB, and only when that is smaller
     -- than the file. A file that cannot shrink that far (ORA-03297, ORA-03214)
     -- keeps its size. p_report: an event per file. Returns the bytes given
     -- back.
@@ -252,8 +255,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     JOIN dba_tablespaces t ON t.tablespace_name = d.tablespace_name
                    WHERE d.tablespace_name = p_ts
                    ORDER BY d.file_id) LOOP
+            -- Blocks up to the end of the highest extent (block_id + blocks
+            -- is the block after it).
             SELECT NVL(MAX(block_id + blocks), 0) INTO l_hwm FROM dba_extents WHERE file_id = f.file_id;
-            l_target := GREATEST(CEIL(((l_hwm + 1) * f.block_size + p_margin) / c_mb) * c_mb, 10 * c_mb);
+            l_target := GREATEST(CASE WHEN NVL(p_margin, 0) > 0
+                                      THEN CEIL((l_hwm * f.block_size + p_margin) / c_mb) * c_mb
+                                      ELSE l_hwm * f.block_size END, 10 * c_mb);
             IF l_target < f.bytes THEN
                 BEGIN
                     EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || f.file_id || ' RESIZE ' || l_target;
@@ -498,6 +505,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                AND NOT (MOD(p_initial, c_chunk) = 0 AND p_initial < NVL(p_need, 0) + c_chunk
                         AND p_initial <= NVL(p_need, 0) * 1.25);
     END oversized;
+
+    -- A segment of p_est bytes can move with extents of c_chunk: its INITIAL
+    -- for that (large_initial) is not oversized, at most a quarter above its
+    -- size, so the segment has at least about 51 MB.
+    FUNCTION chunked(p_est IN NUMBER) RETURN BOOLEAN IS
+    BEGIN
+        RETURN NVL(p_est, 0) > 0 AND NOT oversized(large_initial(p_est), p_est);
+    END chunked;
 
     -- The tablespace of table p_owner.p_table: of its index segment for an
     -- index-organized table.
@@ -2041,8 +2056,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- (initial_clause); p_note lists them with their former INITIAL. An IOT
     -- overflow segment keeps its INITIAL: a MOVE ignores a STORAGE clause for
     -- it (lab probe, R6). p_large_ts: in that tablespace, the table or IOT
-    -- index, and each LOB segment of at least c_chunk, move with extents of
-    -- c_chunk (INITIAL large_initial); p_large lists them with that INITIAL.
+    -- index and each LOB segment move with extents of c_chunk (INITIAL
+    -- large_initial) when chunked; p_large lists them with that INITIAL.
     FUNCTION move_sql(p_owner IN VARCHAR2, p_table IN VARCHAR2, p_type IN VARCHAR2, p_large_ts IN VARCHAR2,
                       p_note OUT VARCHAR2, p_large OUT VARCHAR2) RETURN VARCHAR2 IS
         l_ts      VARCHAR2(128);
@@ -2090,10 +2105,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         IF p_type = 'IOT' THEN
             l_est := seg_est(p_owner, l_top, 'INDEX');
             l_sql := l_sql || clause(l_initial, initial_need(p_owner, l_top, 'INDEX', l_est), l_est, 'index', l_top,
-                                     l_ts = p_large_ts);
+                                     l_ts = p_large_ts AND chunked(l_est));
         ELSE
             l_est := seg_est(p_owner, p_table, 'TABLE');
-            l_sql := l_sql || clause(l_initial, l_est, l_est, 'table', p_table, l_ts = p_large_ts);
+            l_sql := l_sql || clause(l_initial, l_est, l_est, 'table', p_table, l_ts = p_large_ts AND chunked(l_est));
         END IF;
         IF l_ovf IS NOT NULL THEN
             l_sql := l_sql || ' OVERFLOW TABLESPACE ' || q(l_ovf);
@@ -2111,7 +2126,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                      || CASE l.securefile WHEN 'YES' THEN 'SECUREFILE' ELSE 'BASICFILE' END
                      || ' (TABLESPACE ' || q(l.tablespace_name)
                      || clause(l.initial_extent, l_est, l_est, 'LOB ' || l.column_name, l.segment_name,
-                               l.tablespace_name = p_large_ts AND l_est >= c_chunk) || ')';
+                               l.tablespace_name = p_large_ts AND chunked(l_est)) || ')';
         END LOOP;
         RETURN l_sql;
     END move_sql;
@@ -2329,24 +2344,35 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN l_bytes;
     END fresh_bytes;
 
-    -- Free space unit p_item needs in p_ts to move with extents of c_chunk:
-    -- its table or IOT segments, and each LOB segment of at least c_chunk, at
-    -- large_initial of their estimate; its other segments at their estimate
-    -- plus 1 MB.
-    FUNCTION large_need(p_item IN NUMBER, p_ts IN VARCHAR2) RETURN NUMBER IS
-        l_need NUMBER := 0;
+    -- How unit p_item moves in p_ts with extents of c_chunk, as move_sql
+    -- writes it: p_bytes, the estimate of its segments there that do (its
+    -- table or IOT index segment and its LOB segments, each when chunked; 0
+    -- when none does); p_chunks, their INITIAL (large_initial), which only
+    -- whole free stretches of c_chunk take; p_need, the free space the move
+    -- needs in all, its other segments at their estimate plus 1 MB.
+    PROCEDURE large_plan(p_item IN NUMBER, p_ts IN VARCHAR2, p_bytes OUT NUMBER, p_chunks OUT NUMBER,
+                         p_need OUT NUMBER) IS
     BEGIN
-        FOR s IN (SELECT segment_type, NVL(SUM(est_bytes), 0) AS est
-                    FROM epfpg.epf_ts_inventory
-                   WHERE run_id = g_run.run_id AND item_id = p_item AND tablespace_name = p_ts
-                   GROUP BY owner, object_name, sub_name, segment_type) LOOP
-            l_need := l_need + CASE WHEN s.segment_type IN ('TABLE', 'INDEX')
-                                         OR (s.segment_type = 'LOBSEGMENT' AND s.est >= c_chunk)
-                                    THEN large_initial(s.est)
-                                    ELSE s.est + c_mb END;
+        p_bytes := 0;
+        p_chunks := 0;
+        p_need := 0;
+        FOR s IN (SELECT NVL(SUM(i.est_bytes), 0) AS est,
+                         MAX(CASE WHEN i.segment_type IN ('INDEX', 'LOBSEGMENT')
+                                       OR (i.segment_type = 'TABLE' AND i.object_name = o.object_name)
+                                  THEN 'Y' ELSE 'N' END) AS main
+                    FROM epfpg.epf_ts_inventory i
+                    JOIN epfpg.epf_reclaim_object o ON o.run_id = i.run_id AND o.item_id = i.item_id
+                   WHERE i.run_id = g_run.run_id AND i.item_id = p_item AND i.tablespace_name = p_ts
+                   GROUP BY i.owner, i.object_name, i.sub_name, i.segment_type) LOOP
+            IF s.main = 'Y' AND chunked(s.est) THEN
+                p_bytes := p_bytes + s.est;
+                p_chunks := p_chunks + large_initial(s.est);
+            ELSE
+                p_need := p_need + s.est + c_mb;
+            END IF;
         END LOOP;
-        RETURN l_need;
-    END large_need;
+        p_need := p_need + p_chunks;
+    END large_plan;
 
     -- Where the segments of table p_owner.p_table lie in p_ts, as text
     -- (MOVE_PLACEMENT): their size, extents and extent sizes, and their
@@ -2657,18 +2683,19 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- then its datafile grows within its room. Oracle places the extents of a
     -- copy (64 KB, 1 MB, 8 MB) first in partly used stretches, wherever they
     -- are, and those near the top are the ones the table itself and the
-    -- released indexes leave: its copy comes back to the top (R6, R7). A
-    -- table that came back, and one of at least c_large, therefore moves with
-    -- extents of c_chunk, which take only wholly free stretches of that size,
-    -- the lowest first (large_need, fresh_bytes); for one that came back, the
-    -- tables with free space inside them move first until there are enough
-    -- (their segments leave such stretches). A table that came back and
-    -- cannot move that way stays where its move put it: its datafile is done.
-    -- With uniform extents (no size to choose), a table that came back first
-    -- has room made for it, as much as it needs, then moves again when it fits
-    -- in the free space as it is. A stop request is honored before every
-    -- move. Units not reached are STAYED (below a segment that stays), or
-    -- SKIPPED after a stop request.
+    -- released indexes leave: its copy comes back to the top (R6, R7). With
+    -- system-allocated extents, a table that came back, and one of at least
+    -- c_large, therefore moves with extents of c_chunk, which take only
+    -- wholly free stretches of that size, the lowest first: its segments
+    -- large enough for them do (chunked; large_plan, fresh_bytes). For one
+    -- that came back, the tables with free space inside them move first until
+    -- there are enough such stretches (their segments leave them); when there
+    -- are not, it stays where its move put it: its datafile is done. A table
+    -- that came back with no segment large enough, or with uniform extents
+    -- (no size to choose), first has room made for it, as much as it needs,
+    -- then moves again when it fits in the free space as it is. A stop
+    -- request is honored before every move. Units not reached are STAYED
+    -- (below a segment that stays), or SKIPPED after a stop request.
     PROCEDURE compact_ts(p_ts IN VARCHAR2) IS
         l_done   t_flags;
         l_item   NUMBER;
@@ -2677,8 +2704,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_need   NUMBER;
         l_free   NUMBER;
         l_main   NUMBER;
+        l_chunks NUMBER := 0;
         l_lneed  NUMBER := 0;
         l_fresh  NUMBER := 0;
+        l_fit    BOOLEAN;
         l_large  BOOLEAN;
         l_target NUMBER;
         l_system BOOLEAN;
@@ -2715,26 +2744,23 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
              WHERE run_id = g_run.run_id AND item_id = l_item;
             l_need := need(l_item, p_ts);
             l_free := free_bytes(p_ts);
-            -- With extents of c_chunk (system-allocated extents only): a unit
-            -- whose copy came back to the top, or one whose table segments are
-            -- at least c_large.
-            SELECT NVL(SUM(est_bytes), 0)
-              INTO l_main
-              FROM epfpg.epf_ts_inventory
-             WHERE run_id = g_run.run_id AND item_id = l_item AND tablespace_name = p_ts
-               AND segment_type IN ('TABLE', 'INDEX');
-            l_large := l_system AND (l_was = 'MOVED' OR l_main >= c_large);
+            -- With extents of c_chunk (system-allocated extents only, and only
+            -- its segments large enough for them, large_plan): a unit whose
+            -- copy came back to the top, or one with at least c_large of such
+            -- segments.
+            large_plan(l_item, p_ts, l_main, l_chunks, l_lneed);
+            l_fit := l_system AND l_main > 0;
+            l_large := l_fit AND (NVL(l_was, '-') = 'MOVED' OR l_main >= c_large);
             IF l_large THEN
-                l_lneed := large_need(l_item, p_ts);
                 l_fresh := fresh_bytes(p_ts);
                 IF l_was = 'MOVED' THEN
                     LOOP
-                        EXIT WHEN l_fresh >= l_lneed OR stop_now(p_ts);
+                        EXIT WHEN l_fresh >= l_chunks OR stop_now(p_ts);
                         l_maker := room_maker(p_ts, l_free, l_item);
                         EXIT WHEN l_maker IS NULL;
                         say(epfpg.epf_log.c_info, 'MAKING_ROOM',
                             l_owner || '.' || l_name || ' came back to the top after its move; to move lower with 64 MB '
-                            || 'extents it needs about ' || b(l_lneed) || ' in whole 64 MB stretches, and ' || p_ts
+                            || 'extents it needs about ' || b(l_chunks) || ' in whole 64 MB stretches, and ' || p_ts
                             || ' has ' || b(l_fresh) || ': a table with free space inside it moves first');
                         move_unit(p_ts, l_maker, NULL);
                         l_free := free_bytes(p_ts);
@@ -2742,9 +2768,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     END LOOP;
                     EXIT WHEN g_stopped;
                 END IF;
-                l_large := l_fresh >= l_lneed AND l_free >= l_lneed;
+                l_large := l_fresh >= l_chunks AND l_free >= l_lneed;
             ELSIF l_was = 'MOVED' THEN
-                -- Uniform extents: room as much as it needs once more.
+                -- Uniform extents, or no segment large enough for extents of
+                -- c_chunk: room as much as it needs once more.
                 l_target := l_free + l_need;
                 LOOP
                     EXIT WHEN l_free >= l_target OR stop_now(p_ts);
@@ -2761,10 +2788,15 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             -- A stop requested meanwhile (while tables moved to make room)
             -- ends the compaction before this move.
             EXIT WHEN stop_now(p_ts);
-            IF l_was = 'MOVED' AND NOT l_large AND (l_system OR l_need > l_free) THEN
-                l_why := CASE WHEN l_system
-                              THEN 'about ' || b(l_lneed) || ' in whole 64 MB stretches needed to move it lower with '
+            -- A unit that came back moves again with extents of c_chunk when it
+            -- can (l_fit), and as usual otherwise, when it fits.
+            IF l_was = 'MOVED' AND NOT l_large AND (l_fit OR l_need > l_free) THEN
+                l_why := CASE WHEN l_fit AND l_fresh < l_chunks
+                              THEN 'about ' || b(l_chunks) || ' in whole 64 MB stretches needed to move it lower with '
                                    || '64 MB extents, ' || b(l_fresh) || ' there'
+                              WHEN l_fit
+                              THEN 'about ' || b(l_lneed) || ' needed to move it lower with 64 MB extents, ' || b(l_free)
+                                   || ' free'
                               ELSE 'about ' || b(l_need) || ' needed to move it lower, ' || b(l_free) || ' free' END;
                 UPDATE epfpg.epf_reclaim_object
                    SET detail = 'holds the top again after its move: ' || l_why

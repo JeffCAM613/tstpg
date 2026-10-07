@@ -2,6 +2,26 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R8: T18G failed on 0.7.7; a table too small for 64 MB extents moves as before, and the compaction trims to the end of the highest extent (0.7.8)
+
+What R8's tests showed (5 passed, T18G failed):
+- **Probe G passed.** A table moved with INITIAL 128 MB got 2 extents of 64 MB, which the 64 MB path relies on.
+- **T18G failed.** RT2_IOT did not move (STAYED: below where both datafiles of EPF_RT2_DATA stopped), so its index kept INITIAL 8 MB and no INITIAL_RESET named it. R8 reported "4 of 5 moved".
+  - EPF_RT2_SIDE (system-allocated, 52 MB): RT2_BLOB (about 4 MB) came back to the top after its move. 0.7.7 sent every table that came back to the 64 MB path, which needs a wholly free 64 MB stretch, and a 52 MB file never has one. The file was done at 42.7 MB with 20.8 MB free; 0.7.6 would have moved it again.
+  - EPF_RT2_DATA (uniform 1 MB, two files): RT2_TOP's copy came back to the top of file 6 by taking its last free MB (47 to 48 MB). trim_ts resized a file to its highest block plus one block, rounded up to a MB. When the highest extent ends on a MB boundary, that keeps a free MB at the top of the file, and the next copy takes it (in a system-allocated file it is a partly used stretch, which Oracle fills first: SIDE stayed at 52 MB with its highest block at 51 MB). RT2_TOP also came out larger (16 to 22 MB), needed 23 MB with 21 MB free, and both files were done.
+  - Why 0.7.6 passed: RT2_IOT moved as a room maker. Its overflow was then estimated below its INITIAL, which showed free space inside it on paper. 0.7.7 corrected that estimate.
+
+Changes (0.7.8):
+- **Extents of 64 MB only for segments large enough for them (chunked).** The INITIAL for that (the size rounded up to 64 MB) must not be oversized: at most a quarter above the size, so from about 51 MB. A table that came back with no segment that large moves as in 0.7.6: room is made for it, and it moves again when it fits in the free space (at most reclaim_unit_moves returns). The same rule applies to each LOB segment (was: 64 MB or more). The check against the whole 64 MB stretches counts only the segments that move that way (large_plan).
+- **The compaction trims each datafile to the end of its highest extent** (FREEZE_FILES, after each move, other tablespaces of the run): no free space is left at the top for the next copy. The final RESIZE still adds reclaim_margin_mb, rounded up to a MB.
+- **T18G** checks that every table of the lab moved (R8 "5 of 5 moved", V15).
+
+Checked offline: the package scans; T00 and T01 with the fake sqlplus (0.7.8); the wrapper checks (32).
+
+Version 0.7.8: install again.
+
+How to test (R9 on the status page): pull, install 0.7.8, run `--only T18A,T18B,T18F,T18G,T19` (6 passed; in T18G, R8 "5 of 5 moved" and probe G ok). Then compact DATA a fourth time: DIRECTORY_DISPATCHING (688 MB) moves with 64 MB extents from its first move, and DATA should end well below 11.1 GB (its segments are 7.5 GB). Collect with R9's command.
+
 ## 2026-10-07 - R7's placement data: a copy fills partly used stretches first; tables that come back move with 64 MB extents (0.7.7)
 
 What R7's collect showed:
