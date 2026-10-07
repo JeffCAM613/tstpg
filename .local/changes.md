@@ -2,6 +2,32 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R6: a second compaction of DATA stops at its first table; room made when a copy comes back to the top (0.7.6)
+
+R6 on EPFPG781 (0.7.5):
+- The suite (`--only T18G,T19`) passed: 3 of 3. T18G now names the queue table as such.
+- The dry run R-000084: DATA 11.9 GB, 10.5 GB of segments, forecast 7.0 GB; 12 tables with free space inside them would move first to make room. The only pins are OP.WEB_RAPPORT and OP.PLAN_TABLE (LONG), low in the file.
+- The compaction R-000085, in 5 min 11 s:
+  - DATA 11.9 GB to 11.5 GB: 443 MB given back. R1-R6, R8 and R9 PASS. 969 indexes released and rebuilt; 5 accounts locked 4.5 minutes, then restored.
+  - R7 WARN: 11.5 GB for 10.3 GB of segments.
+  - The file stopped at its first table. OPPAYMENTS.DIRECTORY_DISPATCHING moved 3 times, and each copy came back to the top: "moved 3 times; its copy held the top again after 3 of them". The 12 tables of the forecast never moved.
+
+Why the copy comes back:
+- With system-allocated extents, a segment grows in 64 KB, then 1 MB, then 8 MB extents. Set R's copy of DIRECTORY_DISPATCHING was exactly 688 MB = 16 x 64 KB + 63 x 1 MB + 78 x 8 MB.
+- An 8 MB extent takes only a free stretch of 8 MB. Oracle does not use the smaller gaps for it (Jonathan Lewis, "Shrink Tablespace", 2014).
+- The released indexes and the earlier moves leave mostly small gaps low in the file. So 4.6 GB free below the top did not take a 688 MB copy lower: its extents went to the 8 MB stretches near the top.
+- The engine only moved tables with free space inside them first (room making) when the table at the top did not fit, counted in bytes; here it fitted.
+
+Changes (0.7.6):
+- **Room made when a copy comes back.** When the table at the top moved already and holds the top again, the tables with the most free space inside them move first, until the free space has grown by what the table needs; then it moves again. The segments those tables leave are 8 MB and 64 MB stretches, where such a copy can go. Each table moves at most once this way, and the limits stay: 3 returns to the top, 10 moves.
+- **MOVE_PLACEMENT**, one line per move in console.log. It gives where the unit's segments were and where the copy went (size, extents and their sizes, lowest and highest position), and the free space before the move: in all, in stretches of 8 MB or more, and where the lowest of those starts. The next compaction shows where Oracle put each copy instead of my inferring it.
+
+Checked offline: the package scans find nothing; T00 and T01 pass with the fake sqlplus (0.7.6); the wrapper checks pass (32).
+
+Version 0.7.6: install again.
+
+How to test (R7 on the status page): first collect R6's logs: the dry run, the compaction, and T18G's probe lines. Then pull, install 0.7.6, and run `--only T18A,T18B,T18F,T18G,T19` (6 passed) for the labs with the new room making. Then compact DATA a third time and collect: DIRECTORY_DISPATCHING is still at the top, so the run shows whether moving the tables with free space inside them first lets its copy go lower.
+
 ## 2026-10-07 - R5 suite on 0.7.4: 7 of 8; the queue table's reason and the IOT overflow's INITIAL (0.7.5)
 
 R5's suite on EPFPG781 (`--only T18A,T18B,T18C,T18D,T18F,T18G,T19`): 7 of 8 passed.

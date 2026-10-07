@@ -807,7 +807,7 @@ function Format-Seconds {
 # carries their substance.
 $script:DetailEvents = @('IDX_MISSING', 'REDO_ESTIMATE', 'UNDO_ESTIMATE', 'TABLE_ELIGIBLE', 'TEMP_INDEX_CREATED',
                          'TEMP_INDEX_DROPPED', 'PIN', 'UNIT_MOVED', 'INDEX_REBUILT', 'FILE_GROWTH_OFF', 'FILE_KEPT',
-                         'INITIAL_SEGMENT')
+                         'INITIAL_SEGMENT', 'MOVE_PLACEMENT')
 
 # EV|event_id|HH24:MI:SS|severity|phase|event_code|owner.object|message
 function Show-Event {

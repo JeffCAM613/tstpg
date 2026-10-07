@@ -2223,6 +2223,56 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN l_bytes;
     END other_ts;
 
+    -- The free space of p_ts as text (MOVE_PLACEMENT): in all, in stretches of
+    -- 8 MB or more, and where the lowest of those starts in its datafile.
+    -- NULL when it cannot be read: it only describes the move.
+    FUNCTION free_layout(p_ts IN VARCHAR2) RETURN VARCHAR2 IS
+        l_bs  NUMBER;
+        l_all NUMBER;
+        l_big NUMBER;
+        l_low NUMBER;
+    BEGIN
+        SELECT block_size INTO l_bs FROM dba_tablespaces WHERE tablespace_name = p_ts;
+        SELECT NVL(SUM(bytes), 0), NVL(SUM(CASE WHEN bytes >= 8 * c_mb THEN bytes END), 0),
+               MIN(CASE WHEN bytes >= 8 * c_mb THEN block_id END)
+          INTO l_all, l_big, l_low
+          FROM dba_free_space
+         WHERE tablespace_name = p_ts;
+        RETURN b(l_all) || ' free, ' || b(l_big) || ' of it in stretches of 8 MB or more'
+               || CASE WHEN l_low IS NOT NULL THEN ' (the lowest at ' || b(l_low * l_bs) || ')' END;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END free_layout;
+
+    -- Where the segments of table p_owner.p_table lie in p_ts, as text
+    -- (MOVE_PLACEMENT): their size, extents and extent sizes, and their
+    -- lowest and highest position in their datafile. NULL when it cannot be
+    -- read: it only describes the move.
+    FUNCTION unit_layout(p_ts IN VARCHAR2, p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
+        l_names SYS.ODCIVARCHAR2LIST;
+        l_bs    NUMBER;
+        l_count NUMBER;
+        l_bytes NUMBER;
+        l_small NUMBER;
+        l_large NUMBER;
+        l_low   NUMBER;
+        l_high  NUMBER;
+    BEGIN
+        l_names := unit_segments(p_owner, p_table);
+        SELECT block_size INTO l_bs FROM dba_tablespaces WHERE tablespace_name = p_ts;
+        SELECT COUNT(*), NVL(SUM(e.bytes), 0), MIN(e.bytes), MAX(e.bytes), MIN(e.block_id), MAX(e.block_id + e.blocks)
+          INTO l_count, l_bytes, l_small, l_large, l_low, l_high
+          FROM dba_extents e
+         WHERE e.owner = p_owner AND e.tablespace_name = p_ts
+           AND e.segment_type || '|' || e.segment_name IN (SELECT column_value FROM TABLE(l_names));
+        RETURN b(l_bytes) || ' in ' || l_count || ' extents of ' || b(l_small) || ' to ' || b(l_large) || ', from '
+               || b(l_low * l_bs) || ' to ' || b(l_high * l_bs);
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END unit_layout;
+
     -- Moves unit p_item within its tablespaces. p_file: the datafile of p_ts
     -- whose highest block the unit holds; a move that does not fit is tried
     -- once more after that file grew by all its room (grow_file), and a unit
@@ -2260,6 +2310,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_kept    VARCHAR2(1000);
         l_tops    NUMBER;
         l_again   BOOLEAN := FALSE;
+        l_from    VARCHAR2(400);
+        l_space   VARCHAR2(400);
     BEGIN
         SELECT owner, object_name, unit_type, move_status
           INTO l_owner, l_table, l_type, l_prior
@@ -2278,6 +2330,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         IF NVL(l_prior, '-') <> 'MOVED' THEN
             l_other := other_ts(p_item, p_ts, TRUE);
         END IF;
+        l_from := unit_layout(p_ts, l_owner, l_table);
+        l_space := free_layout(p_ts);
         FOR k IN 1 .. 2 LOOP
             BEGIN
                 ddl(l_sql);
@@ -2346,6 +2400,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                                                         || ' to fit it)' END
                 || ' (' || epfpg.epf_util.fmt_duration(epfpg.epf_util.elapsed_s(l_started)) || ')',
                 p_owner => l_owner, p_object => l_table, p_bytes => l_new);
+            -- Where the copy went, against the free space it had (console.log).
+            say(epfpg.epf_log.c_info, 'MOVE_PLACEMENT',
+                SUBSTR(l_owner || '.' || l_table || ' in ' || p_ts || ': was ' || NVL(l_from, '-') || '; now '
+                       || NVL(unit_layout(p_ts, l_owner, l_table), '-') || '; before the move ' || NVL(l_space, '-'),
+                       1, 2000),
+                p_owner => l_owner, p_object => l_table);
             test_pause;
             RETURN;
         END IF;
@@ -2474,11 +2534,15 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- or a stop is requested. When it does not fit in the free space, the
     -- tables with the most free space inside them move first (room_maker),
     -- then its datafile grows within its room. A table that moved already and
-    -- holds the top again moves lower only when it fits in the free space as
-    -- it is (the room a datafile would grow by lies above it); otherwise its
-    -- datafile is done. A stop request is honored before every move. Units
-    -- not reached are STAYED (below a segment that stays), or SKIPPED after
-    -- a stop request.
+    -- holds the top again first has room made for it once more, as much as it
+    -- needs: the free space below did not take its copy lower (a segment that
+    -- grows in 8 MB extents takes only free stretches of 8 MB), and the
+    -- segments of tables with free space inside them, once they moved, are
+    -- such stretches. It then moves lower only when it fits in the free space
+    -- as it is (the room a datafile would grow by lies above it); otherwise
+    -- its datafile is done. A stop request is honored before every move.
+    -- Units not reached are STAYED (below a segment that stays), or SKIPPED
+    -- after a stop request.
     PROCEDURE compact_ts(p_ts IN VARCHAR2) IS
         l_done   t_flags;
         l_item   NUMBER;
@@ -2486,6 +2550,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_maker  NUMBER;
         l_need   NUMBER;
         l_free   NUMBER;
+        l_target NUMBER;
         l_units  NUMBER;
         l_bytes  NUMBER;
         l_moved  NUMBER;
@@ -2516,14 +2581,21 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
              WHERE run_id = g_run.run_id AND item_id = l_item;
             l_need := need(l_item, p_ts);
             l_free := free_bytes(p_ts);
-            IF l_need > l_free THEN
+            -- Free space to reach before the move: the unit's need, or for a
+            -- unit whose copy came back to the top, its need once more.
+            l_target := CASE WHEN l_was = 'MOVED' THEN l_free + l_need ELSE l_need END;
+            IF l_target > l_free THEN
                 LOOP
-                    EXIT WHEN l_need <= l_free OR stop_now(p_ts);
+                    EXIT WHEN l_target <= l_free OR stop_now(p_ts);
                     l_maker := room_maker(p_ts, l_free, l_item);
                     EXIT WHEN l_maker IS NULL;
                     say(epfpg.epf_log.c_info, 'MAKING_ROOM',
-                        l_owner || '.' || l_name || ' needs about ' || b(l_need) || ' and ' || p_ts || ' has ' || b(l_free)
-                        || ' free: a table with free space inside it moves first');
+                        CASE WHEN l_was = 'MOVED'
+                             THEN l_owner || '.' || l_name || ' (about ' || b(l_need) || ') came back to the top after '
+                                  || 'its move, with ' || b(l_free) || ' free below'
+                             ELSE l_owner || '.' || l_name || ' needs about ' || b(l_need) || ' and ' || p_ts || ' has '
+                                  || b(l_free) || ' free' END
+                        || ': a table with free space inside it moves first');
                     move_unit(p_ts, l_maker, NULL);
                     l_free := free_bytes(p_ts);
                 END LOOP;
