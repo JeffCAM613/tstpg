@@ -768,6 +768,9 @@ function Invoke-Suite {
             'SET SERVEROUTPUT ON',
             "DECLARE l_v VARCHAR2(4000); BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; DBMS_OUTPUT.PUT_LINE('TOOL_VERSION|' || NVL(l_v, 'none')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('TOOL_VERSION|none'); END;",
             '/',
+            "SELECT 'APPDATA|' || owner || '|' || ROUND(SUM(bytes) / 1048576) || ' MB' FROM dba_segments WHERE owner IN ('OP', 'OPPAYMENTS', 'OPREPORTS') GROUP BY owner ORDER BY owner;",
+            "DECLARE l_n NUMBER; l_d VARCHAR2(10); BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*), TO_CHAR(MAX(started_at), ''YYYY-MM-DD'') FROM epfpg.epf_run WHERE action = ''PURGE'' AND dry_run = ''N'' AND status IN (''SUCCESS'', ''WARNING'', ''STOPPED'')' INTO l_n, l_d; DBMS_OUTPUT.PUT_LINE('PURGED|' || l_n || '|' || l_d); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('PURGED|0|'); END;",
+            '/',
             'EXIT')
         Assert-Exit $r @(0)
         $db = ''
@@ -776,7 +779,12 @@ function Invoke-Suite {
         $logMode = ''
         $instances = ''
         $installed = 'none'
+        $apps = New-Object 'System.Collections.Generic.List[string]'
+        $purged = 0
+        $purgedLast = ''
         foreach ($line in ($r.Output -split "`n")) {
+            if ($line -match '^APPDATA\|([^|]+)\|(.*)$') { $apps.Add($Matches[1].Trim() + ' ' + $Matches[2].Trim()) }
+            if ($line -match '^PURGED\|(\d+)\|(.*)$') { $purged = [int]$Matches[1]; $purgedLast = $Matches[2].Trim() }
             if ($line -match '^DB\|([^|]*)\|([^|]*)\|([^|]*)\|') {
                 $db = $Matches[1].Trim()
                 $cdb = $Matches[2].Trim()
@@ -803,6 +811,18 @@ function Invoke-Suite {
         }
         if ($logMode -eq 'ARCHIVELOG') {
             Write-TestLog '  note ARCHIVELOG mode: the PAYMENTS purge writes about 90 GB of redo; the archive destination needs that space' 'Yellow'
+        }
+        # Whether the copy suits the tests of the application's purge: it holds
+        # the application's data, and this tool has not purged it before
+        # (T11 to T13 and T17 stop a purge after its third batch).
+        if ($apps.Count -gt 0) {
+            Write-TestLog ('  note application data: ' + ($apps -join ', '))
+        } else {
+            Write-TestLog '  note application data: none (no segment of OP, OPPAYMENTS or OPREPORTS): the purge tests and T18E cannot pass on this copy' 'Yellow'
+        }
+        if ($purged -gt 0) {
+            Write-TestLog ('  note purges this tool already ran on this copy: ' + $purged + ', the last on ' + $purgedLast +
+                           ': the purge tests may find little or nothing to purge, and T11 to T13 and T17 need a copy never purged') 'Yellow'
         }
     }
 
@@ -1675,10 +1695,10 @@ function Invoke-Suite {
 # Event codes of a run's console.log that the digest keeps, besides every
 # warning and error and the steps of 30 s or more: of an assessment, and of a
 # compaction.
-$script:DigestAssess = @('TS_ASSESSED', 'INITIAL_OVERSIZED')
+$script:DigestAssess = @('TS_ASSESSED', 'INITIAL_OVERSIZED', 'NO_TARGET')
 $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED', 'MOVE_PLACEMENT',
                           'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
-                          'STOP_HONORED')
+                          'STOP_HONORED', 'NO_TARGET')
 
 function Get-FileLines {
     param([string]$Path)
@@ -1961,7 +1981,7 @@ function Invoke-Digest {
         }
         foreach ($id in $order) {
             $failed = ([string]$status[$id] -eq 'FAIL')
-            if (-not $failed -and -not $id.StartsWith('T18')) { continue }
+            if (-not $failed -and -not $id.StartsWith('T18') -and $id -ne 'T01') { continue }
             $kept = New-Object 'System.Collections.Generic.List[string]'
             foreach ($line in $lines[$id]) {
                 if (($line -match '^\s+note ' -and $line -notmatch '^\s+note probe [A-F]:') -or $line -match ': FAILED\s*$' -or

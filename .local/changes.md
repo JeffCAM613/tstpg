@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - A second suite run on EPFPG783 (20 of 31): the copy no longer held the application's data; T01 now says what a copy holds
+
+What the run showed (log `logs/tests/2026-10-08_010517_EPFPG783`):
+- The reclaim labs passed (T18A to T18D, T18F, T18G), and so did the installs, T09, T10B, T12B, T13B, T18 and T19.
+- Every purge found nothing ("check.P1=SKIP|no purge"): T08 and T10 saw no eligible roots and no retention options, and T11 to T17 failed for it.
+- T18E, the read-only assessment of the application tablespaces, found no tablespace: no segment of OP, OPPAYMENTS or OPREPORTS in any online application tablespace.
+- A purge only deletes rows; it never drops a table or its storage. The tool truncates only its own work table, and nothing in the suite changes setting app_schemas or a tablespace's status. So the copy changed outside the tests between the two runs (refreshed or emptied for another use, as EPFPG782 was). The suite now runs on EPFPG784.
+
+Change (suite only):
+- T01 notes the application's data on the copy (MB per schema of OP, OPPAYMENTS, OPREPORTS, or a warning when there is none) and the purges this tool already ran on it (a warning: the purge tests may find little or nothing to purge, and T11 to T13 and T17 need a copy never purged).
+- The digest shows T01's notes, and keeps the assessment's NO_TARGET event (no tablespace to reclaim, with the schemas it looked for).
+
+Checked offline: T00 and T01 with the fake sqlplus; the digest on the two built sets of logs.
+
+How to test: the next suite run. Its digest starts with T01's two notes.
+
 ## 2026-10-08 - Set I's suite on EPFPG783 (0.7.11): 26 of 31; every reclaim test passed
 
 Run on EPFPG783, since EPFPG782 is in use on another project. EPFPG783 is not a fresh copy: the first end-to-end runs, sets C and E and the parity test purged it, and the suite enlarged its redo logs (permanent).
