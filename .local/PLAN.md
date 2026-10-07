@@ -903,6 +903,8 @@ All of section 1 measured PASS on the matrix, and on one production-sized clone 
 
 One command runs every current test against one refreshed test database and writes a single log to review: `src\tests\e2e\run_tests.bat` (Windows PowerShell 5.1, the sqlplus client and tnsnames of the tester's machine). Configuration in `src/tests/e2e/test.conf` (git-ignored; from `test.conf.example`): TNS alias, expected database name (the suite refuses any other database), `DESTRUCTIVE_OK=YES`, passwords (or asked, masked, at start), retention, stop point.
 
+What the tester sends back is `run_tests.bat --digest` (no database, no configuration): the summary; the notes and failed checks of the reclaim tests and of every failed test, with the lines naming an error; and for each compaction of the session, each run of a failed test and each run in `logs\` after the session, its tablespaces, datafiles, the tables that moved or did not fit (three of those that stayed), its checks and its key events (the moves and where each copy went, where each datafile stopped, steps of 30 s or more, warnings and errors; of the moves, the first 10 lines and the last 40). It goes to `logs\digest.txt` and the clipboard, typically 10 to 20 thousand characters where the log of one reclaim test alone exceeded 50 thousand. The full logs stay on disk for anything the digest leaves out.
+
 | Test | Covers |
 |------|--------|
 | T00 | Static checks, no database: the wrapper and the suite parse, call only defined commands, and no `+` takes a list on its right (the comma binds tighter) |

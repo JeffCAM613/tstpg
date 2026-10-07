@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - Test digest: `run_tests.bat --digest`, what to send back instead of the logs
+
+Why: what the tester pasted back was too long. The section of T18G alone exceeded 50,000 characters and had to be split: every LAB| state printed four times, the full console and report of every run, the manifests, every passing check. Most of it repeats what the run folders keep on disk.
+
+Change (suite only, no database object; the tool version stays 0.7.9):
+- `run_tests.bat --digest` reads the latest test session and the run folders in `logs\` started after it, needs no database and no configuration, and prints:
+  - the summary of the session;
+  - for the reclaim tests (T18*) and every test that failed: its notes and failed checks; for a failed test also the lines naming an error (ORA-, SP2-, PLS-, a warning or failure of the wrapper);
+  - for each compaction of the session, each run of a failed test, and each run in `logs\` after the session (the reclaim of an application tablespace): a header from its manifest (action, mode, tablespaces, status, verdict, exit code, duration), the report sections TABLESPACES, DATAFILES, TABLES (the tables that moved or did not fit, and three of each tablespace that stayed) and CHECKS, and its key events from console.log: the moves and where each copy went, where each datafile stopped, the steps that took 30 s or more, every warning and error. Of the moves, the first 10 lines and the last 40. The 50 INITIAL_SEGMENT lines of an assessment and the PIN lines are left out.
+- It writes `logs\digest.txt` and copies it to the clipboard. On a test layout with a failed test, two lab runs and a DATA run of 80 moves: 145 lines, 12,800 characters.
+- The status page's steps ask for the digest instead of the collect commands. The snapshot of DATA those collected (with the EPFPG password) is no longer needed: MOVE_PLACEMENT gives where each copy went and the free space before it.
+
+Checked offline: the digest of a built set of logs (a failed T18G, the lab's dry run and compaction, a DATA run after the session and one before it, which is left out); T00 and T01 with the fake sqlplus.
+
+How to test: after R10's commands, run `.\src\tests\e2e\run_tests.bat --digest` and paste what it copies.
+
 ## 2026-10-07 - R9: lab 2 compacts fully; a moved table grows its other tablespaces again; a tablespace that cannot grow keeps its margin; probe G in a datafile of its own (0.7.9)
 
 What R9's tests showed (5 passed, T18G failed on probe G only):

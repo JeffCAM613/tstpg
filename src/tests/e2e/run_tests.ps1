@@ -8,11 +8,14 @@
 #           a plan of smaller runs, compaction, redo log sizing, undo tuning,
 #           the reclaim on a scratch tablespace, reports. Everything is
 #           written to one log file with a check list and a summary.
-# Usage   : run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list]
+# Usage   : run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest]
 #             --config  test configuration (default src\tests\e2e\test.conf)
 #             --only    run these tests (T01, the safety precheck, always runs)
 #             --from    run this test and the ones after it
 #             --list    print the tests and exit
+#             --digest  print the short digest of the latest test session and
+#                       of the runs in logs\ after it (logs\digest.txt, also
+#                       copied to the clipboard), and exit; no database needed
 # Requires: Windows PowerShell 5.1; sqlplus.exe in PATH or ORACLE_HOME\bin;
 #           the TNS alias of the test database; its SYS password.
 # Effects : DESTRUCTIVE. Purges every module of the test database (rows older
@@ -1657,6 +1660,223 @@ function Invoke-Suite {
 }
 
 # ----------------------------------------------------------------------------
+# Digest (--digest): what to send back after a test session, instead of its
+# full log. The summary; the notes and failed checks of the reclaim tests and
+# of every test that failed, with the lines naming an error; then, for each
+# compaction of the session, each run of a test that failed and each run in
+# logs\ started after the session (a reclaim of an application tablespace):
+# its tablespaces, datafiles, the tables that moved or did not fit, its checks
+# and its key events (the moves and where each copy went, where each datafile
+# stopped, the steps that took 30 s or more, warnings and errors). Written to
+# logs\digest.txt and copied to the clipboard; the full logs stay as they are.
+# ----------------------------------------------------------------------------
+
+# Event codes of a run's console.log that the digest keeps, besides every
+# warning and error.
+$script:DigestCodes = @('TS_ASSESSED', 'INITIAL_OVERSIZED', 'INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED',
+                        'MOVE_PLACEMENT', 'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE',
+                        'COMPACT_DONE', 'RECLAIM_RESULT', 'STOP_HONORED')
+
+function Get-FileLines {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path)
+}
+
+# The lines of report section $Title (its title line is followed by a line of
+# dashes), up to the next empty line, without lines of dashes.
+function Get-ReportSection {
+    param([string[]]$Lines, [string]$Title)
+    $section = New-Object 'System.Collections.Generic.List[string]'
+    $in = $false
+    $pattern = '^ ' + [regex]::Escape($Title) + '(\s|$)'
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        if (-not $in) {
+            if ($line -match $pattern -and $i + 1 -lt $Lines.Count -and $Lines[$i + 1].Trim().StartsWith('----')) {
+                $in = $true
+                $section.Add($line.TrimEnd())
+                $i++
+            }
+            continue
+        }
+        if ($line.Trim() -eq '') { break }
+        if ($line.Trim() -match '^-+$') { continue }
+        $section.Add($line.TrimEnd())
+    }
+    return ,$section.ToArray()
+}
+
+# Adds run folder $Folder to the digest: a header from its manifest, the
+# sections TABLESPACES, DATAFILES, TABLES (without the tables that stayed,
+# but three of each tablespace) and CHECKS of its report, and its key events.
+function Add-DigestRun {
+    param($Out, [string]$Folder, [string]$Test)
+    $manifest = @{}
+    foreach ($line in (Get-FileLines (Join-Path $Folder 'manifest.txt'))) {
+        $eq = $line.IndexOf('=')
+        if ($eq -gt 0) { $manifest[$line.Substring(0, $eq)] = $line.Substring($eq + 1) }
+    }
+    $report = Get-FileLines (Join-Path $Folder 'report.txt')
+    $duration = ''
+    foreach ($line in $report) {
+        if ($line -match 'duration (\d+:\d\d:\d\d)') { $duration = $Matches[1]; break }
+    }
+    $head = '-- ' + (Split-Path -Leaf $Folder)
+    if ($Test -ne '') { $head = $head + ' (' + $Test + ')' }
+    $head = $head + ' ' + [string]$manifest['action'] + ' ' + [string]$manifest['reclaim_mode'] + [string]$manifest['mode']
+    if ([string]$manifest['tablespaces'] -ne '') { $head = $head + ' ' + [string]$manifest['tablespaces'] }
+    $head = $head + ': ' + [string]$manifest['status'] + ', ' + [string]$manifest['verdict'] + ', exit '
+    $head = $head + [string]$manifest['exit_code'] + ', ' + $duration
+    $Out.Add('')
+    $Out.Add($head)
+    foreach ($title in @('TABLESPACES', 'DATAFILES')) {
+        foreach ($line in (Get-ReportSection $report $title)) {
+            if ($line -notmatch '^\s+Tables: tables that move') { $Out.Add($line) }
+        }
+    }
+    $stayed = 0
+    $hidden = 0
+    foreach ($line in (Get-ReportSection $report 'TABLES')) {
+        if ($line -match '^\s{2}\S+: \S+ tables, ') { $stayed = 0 }
+        # A table's row: ... its moves, two spaces, its status.
+        if ($line -match '\s\d+\s{2}(STAYED|TO MOVE)(\s|$)') {
+            $stayed++
+            if ($stayed -gt 3) { $hidden++; continue }
+        }
+        if ($hidden -gt 0) { $Out.Add('   ... ' + $hidden + ' more not moved (or to move)'); $hidden = 0 }
+        $Out.Add($line)
+    }
+    if ($hidden -gt 0) { $Out.Add('   ... ' + $hidden + ' more not moved (or to move)') }
+    $checks = Get-ReportSection $report 'CHECKS'
+    foreach ($line in $checks) { $Out.Add($line) }
+    if (@($checks | Where-Object { $_ -match '^\s*VERDICT ' }).Count -eq 0) {
+        foreach ($line in $report) {
+            if ($line -match '^\s*VERDICT ') { $Out.Add($line.TrimEnd()); break }
+        }
+    }
+    # Every key event; of the moves (UNIT_MOVED, MOVE_PLACEMENT, INITIAL_*),
+    # the first 10 lines and the last 40 when there are more.
+    $events = New-Object 'System.Collections.Generic.List[string]'
+    $isMove = New-Object 'System.Collections.Generic.List[bool]'
+    foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
+        if ($line -notmatch '^\s\d\d:\d\d:\d\d \[(.{4})\] (\S+)') { continue }
+        $tag = $Matches[1]
+        $code = $Matches[2]
+        $keep = ($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $script:DigestCodes -contains $code)
+        if (-not $keep -and $code -eq 'STEP_END' -and $line -match ' in (\d+):(\d\d):(\d\d)') {
+            $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
+        }
+        if ($keep) {
+            $events.Add($line.TrimEnd())
+            $isMove.Add(($code -eq 'UNIT_MOVED' -or $code -eq 'MOVE_PLACEMENT' -or $code.StartsWith('INITIAL_R') -or
+                         $code -eq 'INITIAL_KEPT'))
+        }
+    }
+    $moves = @($isMove | Where-Object { $_ }).Count
+    if ($events.Count -gt 0) { $Out.Add(' events:') }
+    $seen = 0
+    $skipped = 0
+    for ($i = 0; $i -lt $events.Count; $i++) {
+        if ($isMove[$i]) {
+            $seen++
+            if ($moves -gt 50 -and $seen -gt 10 -and $seen -le $moves - 40) { $skipped++; continue }
+        }
+        if ($skipped -gt 0) { $Out.Add('   ... ' + $skipped + ' more lines of moves in console.log'); $skipped = 0 }
+        $Out.Add($events[$i])
+    }
+    if ($skipped -gt 0) { $Out.Add('   ... ' + $skipped + ' more lines of moves in console.log') }
+}
+
+function Invoke-Digest {
+    $logs = Join-Path $script:RepoDir 'logs'
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $session = $null
+    if (Test-Path -LiteralPath (Join-Path $logs 'tests')) {
+        $session = Get-ChildItem -LiteralPath (Join-Path $logs 'tests') -Directory | Sort-Object Name | Select-Object -Last 1
+    }
+    $since = ''
+    if ($null -ne $session) {
+        $since = $session.Name.Substring(0, [Math]::Min(17, $session.Name.Length))
+        $out.Add('EPF digest of test session ' + $session.Name + ' (' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + ')')
+        $log = Get-FileLines (Join-Path $session.FullName 'test.log')
+        $current = ''
+        $order = New-Object 'System.Collections.Generic.List[string]'
+        $lines = @{}
+        $status = @{}
+        $runOf = @{}
+        $summary = $false
+        foreach ($line in $log) {
+            if ($line -match '^ SUMMARY\s*$') { $summary = $true; $current = ''; continue }
+            if ($summary) {
+                if ($line.Trim() -ne '' -and $line.Trim() -notmatch '^=+$') { $out.Add($line.TrimEnd()) }
+                continue
+            }
+            if ($line -match '^==== (T\w+) ') {
+                $current = $Matches[1]
+                $order.Add($current)
+                $lines[$current] = New-Object 'System.Collections.Generic.List[string]'
+                continue
+            }
+            if ($line -match '^---- (T\w+) (PASS|FAIL|SKIPPED)') { $status[$Matches[1]] = $Matches[2]; continue }
+            if ($current -eq '') { continue }
+            if ($line -match 'Run folder .*[\\/]([^\\/]+_R-\d+)\s*$') { $runOf[$Matches[1]] = $current }
+            $lines[$current].Add($line.TrimEnd())
+        }
+        foreach ($id in $order) {
+            $failed = ([string]$status[$id] -eq 'FAIL')
+            if (-not $failed -and -not $id.StartsWith('T18')) { continue }
+            $kept = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($line in $lines[$id]) {
+                if ($line -match '^\s+note ' -or $line -match ': FAILED\s*$' -or
+                    ($failed -and $line -match 'ORA-\d{5}|SP2-\d{4}|PLS-\d{5}|\[FAIL\]|\[WARN\]|Suite error')) {
+                    $kept.Add($line)
+                }
+            }
+            if ($kept.Count -eq 0) { continue }
+            $out.Add('')
+            $out.Add('-- ' + $id + ' ' + [string]$status[$id])
+            $shown = 0
+            foreach ($line in $kept) {
+                $shown++
+                if ($shown -gt 40) { $out.Add('   ... ' + ($kept.Count - 40) + ' more lines in test.log'); break }
+                $out.Add($line)
+            }
+        }
+        $runs = Join-Path $session.FullName 'runs'
+        if (Test-Path -LiteralPath $runs) {
+            foreach ($run in (Get-ChildItem -LiteralPath $runs -Directory | Where-Object { $_.Name -match '_R-\d+$' } | Sort-Object Name)) {
+                $test = [string]$runOf[$run.Name]
+                $compact = @(Get-FileLines (Join-Path $run.FullName 'manifest.txt') | Where-Object { $_ -eq 'reclaim_mode=COMPACT' }).Count -gt 0
+                if ($compact -or ($test -ne '' -and [string]$status[$test] -eq 'FAIL')) { Add-DigestRun $out $run.FullName $test }
+            }
+        }
+    } else {
+        $out.Add('EPF digest (' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + '): no test session in ' + (Join-Path $logs 'tests'))
+    }
+    $later = @()
+    if (Test-Path -LiteralPath $logs) {
+        $later = @(Get-ChildItem -LiteralPath $logs -Directory | Where-Object {
+                       $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_R-\d+$' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 } |
+                   Sort-Object Name)
+    }
+    foreach ($run in $later) { Add-DigestRun $out $run.FullName '' }
+    if ($later.Count -eq 0) {
+        $out.Add('')
+        $out.Add('-- no run in ' + $logs + ' started after the test session')
+    }
+    $text = $out -join "`r`n"
+    if (-not (Test-Path -LiteralPath $logs)) { New-Item -ItemType Directory -Path $logs -Force | Out-Null }
+    $path = Join-Path $logs 'digest.txt'
+    [System.IO.File]::WriteAllText($path, $text + "`r`n", [System.Text.Encoding]::ASCII)
+    Write-Host $text
+    $copied = ''
+    try { Set-Clipboard -Value $text; $copied = '; copied to the clipboard' } catch { $copied = '' }
+    Write-Host ''
+    Write-Host ('Digest: ' + $out.Count + ' lines, ' + $text.Length + ' characters, in ' + $path + $copied) -ForegroundColor Green
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -1670,7 +1890,8 @@ function Invoke-Main {
             '--only'   { $i++; $script:Only = @(([string]$script:CliArgs[$i]).ToUpper().Split(',') | ForEach-Object { $_.Trim() }) }
             '--from'   { $i++; $script:From = ([string]$script:CliArgs[$i]).ToUpper().Trim() }
             '--list'   { $script:TestList | ForEach-Object { Write-Host $_ }; exit 0 }
-            default    { Exit-Suite 4 ('Unknown argument ' + $arg + '. Usage: run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list]') }
+            '--digest' { Invoke-Digest; exit 0 }
+            default    { Exit-Suite 4 ('Unknown argument ' + $arg + '. Usage: run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest]') }
         }
         $i++
     }
