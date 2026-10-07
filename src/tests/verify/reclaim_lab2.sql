@@ -30,15 +30,17 @@
 --           (LAB|INITIAL) and the quotas (LAB|QUOTA). PROBE records what
 --           Oracle does with a STORAGE clause in a MOVE (LAB|PROBE): six forms
 --           on an IOT overflow segment (A to F), and a heap table moved with
---           INITIAL 128 MB (G). CLEANUP removes the queue table, the account,
---           the measurements and the tablespaces.
+--           INITIAL 128 MB, in EPF_RT2_PRB, created for it with a wholly free
+--           200 MB datafile that cannot grow (G), and in EPF_RT2_SIDE (H).
+--           CLEANUP removes the queue table, the account, the measurements and
+--           the tablespaces.
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/tests/verify/reclaim_lab2.sql SETUP|CHECK|QUOTA|PROBE|CLEANUP
 -- Requires: SYS AS SYSDBA, in the PDB in a multitenant database; about
---           400 MB of disk (db_create_file_dest, or the directory of the
+--           600 MB of disk (db_create_file_dest, or the directory of the
 --           SYSTEM datafile).
 -- Effects : SETUP removes an earlier second lab first. Nothing outside
---           EPF_RT2, EPF_RT2_DATA, EPF_RT2_INDX, EPF_RT2_SIDE and the
---           measurements of EPF_RT2 (run 0) is touched.
+--           EPF_RT2, EPF_RT2_DATA, EPF_RT2_INDX, EPF_RT2_SIDE, EPF_RT2_PRB
+--           and the measurements of EPF_RT2 (run 0) is touched.
 -- ============================================================================
 SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 400 TRIMSPOOL ON TRIMOUT ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
@@ -67,6 +69,17 @@ DECLARE
     BEGIN
         DBMS_OUTPUT.PUT_LINE(p_line);
     END put;
+
+    -- Where new datafiles go (file_spec): db_create_file_dest, or else the
+    -- directory of the SYSTEM datafile.
+    PROCEDURE find_dest IS
+    BEGIN
+        SELECT MAX(value) INTO l_dest FROM v$parameter WHERE name = 'db_create_file_dest';
+        IF l_dest IS NULL THEN
+            SELECT MIN(file_name) INTO l_file FROM dba_data_files WHERE tablespace_name = 'SYSTEM';
+            l_dir := SUBSTR(l_file, 1, GREATEST(INSTR(l_file, '/', -1), INSTR(l_file, '\', -1)));
+        END IF;
+    END find_dest;
 
     -- The datafile clause of a new datafile: its size only with Oracle
     -- Managed Files, otherwise its name in the directory of the SYSTEM
@@ -143,36 +156,67 @@ DECLARE
         run('DROP TABLE epf_rt2.rt2_probe PURGE');
     END probe;
 
-    -- PROBE G: a heap table in EPF_RT2_SIDE (system-allocated extents) moved
-    -- with STORAGE (INITIAL 128 MB): the extents it gets, which the reclaim
-    -- relies on to move a table with extents of 64 MB (LAB|PROBE|G).
-    PROCEDURE probe_large IS
+    -- PROBE G and H: a heap table RT2_PROBE_LARGE in tablespace p_ts
+    -- (system-allocated extents) moved with STORAGE (INITIAL 128 MB), which
+    -- the reclaim relies on to move a table with extents of 64 MB: its
+    -- extents by size, where they lie, and the size of the datafiles after
+    -- (LAB|PROBE|p_label). The table is dropped after.
+    PROCEDURE probe_large(p_label IN VARCHAR2, p_ts IN VARCHAR2) IS
         l_count  NUMBER;
-        l_min    NUMBER;
-        l_max    NUMBER;
+        l_sizes  VARCHAR2(4000);
+        l_low    NUMBER;
+        l_high   NUMBER;
+        l_files  NUMBER;
         l_result VARCHAR2(300) := 'ok';
     BEGIN
         FOR t IN (SELECT table_name FROM dba_tables WHERE owner = 'EPF_RT2' AND table_name = 'RT2_PROBE_LARGE') LOOP
             run('DROP TABLE epf_rt2.rt2_probe_large PURGE');
         END LOOP;
-        run('CREATE TABLE epf_rt2.rt2_probe_large (id NUMBER, pad VARCHAR2(100)) TABLESPACE epf_rt2_side');
+        run('CREATE TABLE epf_rt2.rt2_probe_large (id NUMBER, pad VARCHAR2(100)) TABLESPACE ' || p_ts);
         run('INSERT INTO epf_rt2.rt2_probe_large (id, pad) SELECT LEVEL, RPAD(''p'', 100, ''p'') FROM dual '
             || 'CONNECT BY LEVEL <= 1000');
         COMMIT;
         BEGIN
-            run('ALTER TABLE epf_rt2.rt2_probe_large MOVE TABLESPACE epf_rt2_side STORAGE (INITIAL 134217728)');
+            run('ALTER TABLE epf_rt2.rt2_probe_large MOVE TABLESPACE ' || p_ts || ' STORAGE (INITIAL 134217728)');
         EXCEPTION
             WHEN OTHERS THEN
                 l_result := SUBSTR(SQLERRM, 1, 300);
         END;
-        SELECT COUNT(*), MIN(bytes), MAX(bytes)
-          INTO l_count, l_min, l_max
-          FROM dba_extents
-         WHERE owner = 'EPF_RT2' AND segment_name = 'RT2_PROBE_LARGE';
-        put('LAB|PROBE|G|' || l_result || '|extents ' || l_count || ' of ' || l_min || ' to ' || l_max
-            || ' bytes|ALTER TABLE ... MOVE TABLESPACE epf_rt2_side STORAGE (INITIAL 134217728)');
+        SELECT COUNT(*), MIN(e.block_id) * MAX(t.block_size), MAX(e.block_id + e.blocks) * MAX(t.block_size)
+          INTO l_count, l_low, l_high
+          FROM dba_extents e
+          JOIN dba_tablespaces t ON t.tablespace_name = e.tablespace_name
+         WHERE e.owner = 'EPF_RT2' AND e.segment_name = 'RT2_PROBE_LARGE';
+        SELECT LISTAGG(n || ' x ' || CASE WHEN bytes >= 1048576 THEN (bytes / 1048576) || ' MB'
+                                          ELSE (bytes / 1024) || ' KB' END, ', ') WITHIN GROUP (ORDER BY bytes)
+          INTO l_sizes
+          FROM (SELECT bytes, COUNT(*) AS n
+                  FROM dba_extents
+                 WHERE owner = 'EPF_RT2' AND segment_name = 'RT2_PROBE_LARGE'
+                 GROUP BY bytes);
+        SELECT NVL(SUM(bytes), 0) INTO l_files FROM dba_data_files WHERE tablespace_name = p_ts;
+        put('LAB|PROBE|' || p_label || '|' || l_result || '|' || l_count || ' extents: ' || SUBSTR(l_sizes, 1, 200) || '|from '
+            || ROUND(l_low / 1048576, 2) || ' MB to ' || ROUND(l_high / 1048576, 2) || ' MB, datafiles '
+            || ROUND(l_files / 1048576, 2) || ' MB|ALTER TABLE ... MOVE TABLESPACE ' || LOWER(p_ts)
+            || ' STORAGE (INITIAL 134217728)');
         run('DROP TABLE epf_rt2.rt2_probe_large PURGE');
     END probe_large;
+
+    -- PROBE G: probe_large in EPF_RT2_PRB, created for it with one datafile of
+    -- 200 MB that cannot grow and is wholly free, as a datafile is while the
+    -- reclaim compacts; the tablespace is dropped after.
+    PROCEDURE probe_fresh IS
+    BEGIN
+        FOR t IN (SELECT tablespace_name FROM dba_tablespaces WHERE tablespace_name = 'EPF_RT2_PRB') LOOP
+            run('DROP TABLESPACE epf_rt2_prb INCLUDING CONTENTS AND DATAFILES');
+        END LOOP;
+        run('CREATE TABLESPACE epf_rt2_prb DATAFILE ' || file_spec('epf_rt2_prb01.dbf', '200M')
+            || ' AUTOEXTEND OFF EXTENT MANAGEMENT LOCAL AUTOALLOCATE SEGMENT SPACE MANAGEMENT AUTO');
+        run('ALTER USER epf_rt2 QUOTA UNLIMITED ON epf_rt2_prb');
+        probe_large('G', 'EPF_RT2_PRB');
+        run('ALTER USER epf_rt2 QUOTA 0 ON epf_rt2_prb');
+        run('DROP TABLESPACE epf_rt2_prb INCLUDING CONTENTS AND DATAFILES');
+    END probe_fresh;
 
     PROCEDURE drop_lab IS
     BEGIN
@@ -185,7 +229,7 @@ DECLARE
             put('LAB|DROPPED|USER|' || u.username);
         END LOOP;
         FOR t IN (SELECT tablespace_name FROM dba_tablespaces
-                   WHERE tablespace_name IN ('EPF_RT2_DATA', 'EPF_RT2_INDX', 'EPF_RT2_SIDE')
+                   WHERE tablespace_name IN ('EPF_RT2_DATA', 'EPF_RT2_INDX', 'EPF_RT2_SIDE', 'EPF_RT2_PRB')
                    ORDER BY tablespace_name) LOOP
             run('DROP TABLESPACE ' || t.tablespace_name || ' INCLUDING CONTENTS AND DATAFILES');
             put('LAB|DROPPED|TABLESPACE|' || t.tablespace_name);
@@ -214,13 +258,15 @@ BEGIN
     END IF;
 
     -- What Oracle does with a STORAGE clause in a MOVE: of an IOT overflow
-    -- segment (A to F), of a heap table given INITIAL 128 MB (G). Needs the
-    -- lab and an unlimited quota on EPF_RT2_DATA (after mode QUOTA).
+    -- segment (A to F), of a heap table given INITIAL 128 MB in a wholly free
+    -- datafile that cannot grow (G) and in EPF_RT2_SIDE (H). Needs the lab
+    -- and an unlimited quota on EPF_RT2_DATA (after mode QUOTA).
     IF l_mode = 'PROBE' THEN
         SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name IN ('EPF_RT2_DATA', 'EPF_RT2_SIDE');
         IF l_count < 2 THEN
             RAISE_APPLICATION_ERROR(-20000, 'The second lab is not set up (no EPF_RT2_DATA and EPF_RT2_SIDE).');
         END IF;
+        find_dest;
         probe('A', 'MOVE TABLESPACE epf_rt2_data STORAGE (INITIAL 65536) OVERFLOW TABLESPACE epf_rt2_side '
                    || 'STORAGE (INITIAL 65536)');
         probe('B', 'MOVE TABLESPACE epf_rt2_data OVERFLOW TABLESPACE epf_rt2_side STORAGE (INITIAL 65536)');
@@ -229,7 +275,8 @@ BEGIN
         probe('E', 'MOVE TABLESPACE epf_rt2_data OVERFLOW TABLESPACE epf_rt2_data STORAGE (INITIAL 65536)');
         probe('F', 'MOVE ONLINE TABLESPACE epf_rt2_data STORAGE (INITIAL 65536) OVERFLOW TABLESPACE epf_rt2_side '
                    || 'STORAGE (INITIAL 65536)');
-        probe_large;
+        probe_fresh;
+        probe_large('H', 'EPF_RT2_SIDE');
         put('LAB|PROBE|DONE');
         RETURN;
     END IF;
@@ -248,11 +295,7 @@ BEGIN
         -- Every table and index gets its segment when it is created, also the
         -- tables Oracle creates for the queue table.
         run('ALTER SESSION SET deferred_segment_creation = FALSE');
-        SELECT MAX(value) INTO l_dest FROM v$parameter WHERE name = 'db_create_file_dest';
-        IF l_dest IS NULL THEN
-            SELECT MIN(file_name) INTO l_file FROM dba_data_files WHERE tablespace_name = 'SYSTEM';
-            l_dir := SUBSTR(l_file, 1, GREATEST(INSTR(l_file, '/', -1), INSTR(l_file, '\', -1)));
-        END IF;
+        find_dest;
         run('CREATE TABLESPACE epf_rt2_data DATAFILE ' || file_spec('epf_rt2_data01.dbf', '16M')
             || ' AUTOEXTEND ON NEXT 4M MAXSIZE 1G EXTENT MANAGEMENT LOCAL UNIFORM SIZE 1M SEGMENT SPACE MANAGEMENT AUTO');
         run('ALTER TABLESPACE epf_rt2_data ADD DATAFILE ' || file_spec('epf_rt2_data02.dbf', '40M') || ' AUTOEXTEND OFF');

@@ -356,10 +356,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     END restore_files;
 
     -- Grows datafile p_file_id of p_ts by about p_bytes within its room: its
-    -- size at the start of the run plus reclaim_growth_mb, and no further than
-    -- its growth limit when it was autoextensible. Returns the bytes added;
-    -- 0 when there is no room or the file could not grow.
-    FUNCTION grow_file(p_ts IN VARCHAR2, p_file_id IN NUMBER, p_bytes IN NUMBER) RETURN NUMBER IS
+    -- size at the start of the run plus reclaim_growth_mb (p_growth instead
+    -- when given), and no further than its growth limit when it was
+    -- autoextensible. p_for: what for, in the event (FILE_GROWN). Returns the
+    -- bytes added; 0 when there is no room or the file could not grow.
+    FUNCTION grow_file(p_ts IN VARCHAR2, p_file_id IN NUMBER, p_bytes IN NUMBER,
+                       p_for IN VARCHAR2 DEFAULT 'a segment that does not fit in its free space',
+                       p_growth IN NUMBER DEFAULT NULL) RETURN NUMBER IS
         l_now    NUMBER;
         l_start  NUMBER;
         l_limit  NUMBER;
@@ -370,7 +373,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
           INTO l_start
           FROM epfpg.epf_file_snap
          WHERE run_id = g_run.run_id AND phase = 'BASELINE' AND file_id = p_file_id;
-        l_limit := NVL(l_start, l_now) + g_growth;
+        l_limit := NVL(l_start, l_now) + NVL(p_growth, g_growth);
         FOR c IN (SELECT original_maxbytes
                     FROM epfpg.epf_instance_change
                    WHERE item = c_change AND file_id = p_file_id AND restored_at IS NULL) LOOP
@@ -390,22 +393,24 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         END;
         track_peak(p_ts);
         say(epfpg.epf_log.c_info, 'FILE_GROWN', 'File ' || p_file_id || ' of ' || p_ts || ': ' || b(l_now) || ' -> '
-                                                || b(l_target) || ' for a segment that does not fit in its free space '
-                                                || '(never above ' || b(l_limit) || ')', p_bytes => l_target);
+                                                || b(l_target) || ' for ' || p_for || ' (never above ' || b(l_limit) || ')',
+            p_bytes => l_target);
         RETURN l_target - l_now;
     END grow_file;
 
     -- Grows the datafiles of p_ts that cannot grow by themselves by about
-    -- p_bytes in all, each within its room (grow_file). Returns the bytes
-    -- added.
-    FUNCTION grow_ts(p_ts IN VARCHAR2, p_bytes IN NUMBER) RETURN NUMBER IS
+    -- p_bytes in all, each within its room (grow_file, p_for, p_growth).
+    -- Returns the bytes added.
+    FUNCTION grow_ts(p_ts IN VARCHAR2, p_bytes IN NUMBER,
+                     p_for IN VARCHAR2 DEFAULT 'a segment that does not fit in its free space',
+                     p_growth IN NUMBER DEFAULT NULL) RETURN NUMBER IS
         l_added NUMBER := 0;
     BEGIN
         FOR f IN (SELECT file_id FROM dba_data_files
                    WHERE tablespace_name = p_ts AND autoextensible = 'NO'
                    ORDER BY file_id) LOOP
             EXIT WHEN l_added >= p_bytes;
-            l_added := l_added + grow_file(p_ts, f.file_id, p_bytes - l_added);
+            l_added := l_added + grow_file(p_ts, f.file_id, p_bytes - l_added, p_for, p_growth);
         END LOOP;
         RETURN l_added;
     END grow_ts;
@@ -2408,10 +2413,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- that still does not fit or exceeds its owner's quota (NO_ROOM), is in
     -- use (ORA-00054) or fails otherwise (FAILED, an error) stays where it
     -- was. The other tablespaces of the run where it has segments grow within
-    -- their room first when they are short (other_ts). A unit that moved
-    -- already (at the top again) is not tried after a growth, and when it
-    -- cannot move lower it keeps its move (MOVED, with the error in last_ora:
-    -- its datafile is then done). p_file NULL: a move that makes room for the
+    -- their room first when they are short (other_ts), also for a unit that
+    -- moved already: its segments there do not land in p_ts (a LOB tablespace
+    -- compacted after the tablespace of its tables, which its compaction left
+    -- full). A unit that moved already (at the top again) is not tried after
+    -- its datafile grew, and when it cannot move lower it keeps its move
+    -- (MOVED, with the error in last_ora: its datafile is then done). p_file NULL: a move that makes room for the
     -- unit at the top; when it does not fit, the unit keeps its status and is
     -- no longer a room maker. p_large: its segments in p_ts move with extents
     -- of c_chunk (move_sql); when that statement fails, a unit that moved
@@ -2462,9 +2469,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
            SET attempts = attempts + 1, started_at = NVL(started_at, l_started)
          WHERE run_id = g_run.run_id AND item_id = p_item;
         COMMIT;
-        IF NVL(l_prior, '-') <> 'MOVED' THEN
-            l_other := other_ts(p_item, p_ts, TRUE);
-        END IF;
+        l_other := other_ts(p_item, p_ts, TRUE);
         l_from := unit_layout(p_ts, l_owner, l_table);
         l_space := free_layout(p_ts);
         LOOP
@@ -3027,24 +3032,44 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     END rebuild_indexes;
 
     -- Final resize of the run's tablespaces (highest block plus
-    -- reclaim_margin_mb), and a warning for each datafile that cannot grow
-    -- by itself afterwards.
+    -- reclaim_margin_mb, when that is smaller). The compaction leaves no free
+    -- space above the highest extents, so a tablespace whose datafiles cannot
+    -- grow by themselves (none autoextensible) gets reclaim_margin_mb of free
+    -- space back, its datafiles growing up to their size at the start of the
+    -- run at most (R6); when that is not enough, a warning (FILE_NO_GROWTH):
+    -- the application needs room to grow.
     PROCEDURE resize_all(p_message OUT VARCHAR2) IS
         l_freed NUMBER := 0;
+        l_kept  NUMBER := 0;
+        l_auto  NUMBER;
+        l_free  NUMBER;
     BEGIN
         FOR t IN (SELECT tablespace_name FROM epfpg.epf_reclaim_ts WHERE run_id = g_run.run_id ORDER BY tablespace_name) LOOP
             l_freed := l_freed + trim_ts(t.tablespace_name, g_margin, TRUE);
-            FOR f IN (SELECT d.file_name, d.bytes,
-                             (SELECT NVL(SUM(fs.bytes), 0) FROM dba_free_space fs WHERE fs.file_id = d.file_id) AS free_bytes
-                        FROM dba_data_files d
-                       WHERE d.tablespace_name = t.tablespace_name AND d.autoextensible = 'NO'
-                       ORDER BY d.file_id) LOOP
-                say(epfpg.epf_log.c_warn, 'FILE_NO_GROWTH',
-                    f.file_name || ' is not autoextensible and has ' || b(f.free_bytes) || ' free of ' || b(f.bytes)
-                    || ' after the reclaim: the application needs room to grow (resize it or turn autoextend on)');
-            END LOOP;
+            SELECT COUNT(CASE WHEN autoextensible = 'YES' THEN 1 END)
+              INTO l_auto
+              FROM dba_data_files
+             WHERE tablespace_name = t.tablespace_name;
+            IF l_auto = 0 THEN
+                l_free := free_bytes(t.tablespace_name);
+                IF l_free < g_margin THEN
+                    l_kept := l_kept + grow_ts(t.tablespace_name, g_margin - l_free,
+                                               'free space for the application (setting reclaim_margin_mb; no datafile '
+                                               || 'of ' || t.tablespace_name || ' grows by itself)', 0);
+                    l_free := free_bytes(t.tablespace_name);
+                END IF;
+                IF l_free < g_margin THEN
+                    say(epfpg.epf_log.c_warn, 'FILE_NO_GROWTH',
+                        t.tablespace_name || ': no datafile grows by itself, and ' || b(l_free) || ' is free after '
+                        || 'the reclaim, less than setting reclaim_margin_mb (' || b(g_margin) || ') even at the size '
+                        || 'the datafiles had at the start: the application needs room to grow (add a datafile, resize '
+                        || 'one or turn autoextend on)');
+                END IF;
+            END IF;
         END LOOP;
-        p_message := b(l_freed) || ' given back';
+        p_message := b(GREATEST(l_freed - l_kept, 0)) || ' given back'
+                     || CASE WHEN l_kept > 0 THEN ' (' || b(l_kept) || ' kept free in tablespaces that cannot grow by '
+                                                  || 'themselves)' END;
     END resize_all;
 
     -- Recompiles, per owner, the objects invalid now that were valid in the

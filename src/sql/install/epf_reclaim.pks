@@ -33,17 +33,20 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 --      moved or rebuilt with INITIAL 64 KB.
 --   4. The released indexes are rebuilt in their tablespace, the growth
 --      settings of the datafiles restored, the datafiles resized to their
---      highest block plus setting reclaim_margin_mb, objects invalidated by
---      the run recompiled; the fingerprint of the objects and the row counts
---      taken when the accounts were locked are taken again (compared by the
---      report).
+--      highest block plus setting reclaim_margin_mb (a tablespace none of
+--      whose datafiles grows by itself gets that much free space back, within
+--      its size at the start), objects invalidated by the run recompiled; the
+--      fingerprint of the objects and the row counts taken when the accounts
+--      were locked are taken again (compared by the report).
 --
 -- Disk usage: a datafile never grows above its size at the start of the run,
 -- plus setting reclaim_growth_mb (default 0): a table or an index that does
 -- not fit in the free space may use the room the file has given back so far
 -- (a table lands higher, then moves down again when it is at the top and
 -- fits below; a LOB or overflow segment stored in another target tablespace
--- likewise). Every datafile only shrinks otherwise. No second tablespace, no
+-- likewise, also when the table moves again), and a tablespace none of whose
+-- datafiles grows by itself gets reclaim_margin_mb of free space back at the
+-- end. Every datafile only shrinks otherwise. No second tablespace, no
 -- copy of a datafile. One exception, reported as a warning: an index that
 -- does not fit within that room is rebuilt after the growth settings are
 -- restored, since an index left unusable stops the application. Requirement

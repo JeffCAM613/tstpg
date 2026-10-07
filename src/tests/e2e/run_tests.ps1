@@ -1618,15 +1618,17 @@ function Invoke-Suite {
         Assert-Exit $s @(0)
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
         # What Oracle does with STORAGE in a MOVE (recorded): A to F, an IOT
-        # overflow; G, a heap table given INITIAL 128 MB, which must come out
-        # as two extents of 64 MB (the reclaim moves a table that came back to
-        # the top with extents of 64 MB).
+        # overflow; G, a heap table given INITIAL 128 MB in a wholly free
+        # datafile that cannot grow, as while the reclaim compacts, which must
+        # come out as two extents of 64 MB (the reclaim moves a large table, and
+        # one that came back to the top, with extents of 64 MB); H, the same
+        # in EPF_RT2_SIDE as the compaction left it (recorded only).
         $p = Invoke-Lab 'PROBE' -Layout 2
         Assert-Exit $p @(0)
         foreach ($line in ($p.Output -split "`n")) {
             if ($line.Trim() -match '^LAB\|PROBE\|([A-Z])\|(.*)$') { Write-TestLog ('  note probe ' + $Matches[1] + ': ' + $Matches[2]) }
         }
-        Assert-Match $p 'LAB\|PROBE\|G\|ok\|extents 2 of 67108864 to 67108864 bytes'
+        Assert-Match $p 'LAB\|PROBE\|G\|ok\|2 extents: 2 x 64 MB\|'
         $lab = Invoke-Lab 'CLEANUP' -Layout 2
         Assert-Exit $lab @(0)
         Assert-Match $lab 'LAB\|CLEANUP\|DONE'

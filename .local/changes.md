@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R9: lab 2 compacts fully; a moved table grows its other tablespaces again; a tablespace that cannot grow keeps its margin; probe G in a datafile of its own (0.7.9)
+
+What R9's tests showed (5 passed, T18G failed on probe G only):
+- **The compaction of lab 2 works.** All 5 tables moved (R8 "5 of 5 moved"), each kind of INITIAL was reset, and R1 to R9 passed. EPF_RT2_DATA went from 88 MB to 43 MB with 41 MB of segments, so no free space was left. EPF_RT2_INDX went from 16 MB to 10.3 MB.
+- **EPF_RT2_SIDE stopped at 42.9 MB with 21.3 MB of segments.** RT2_BLOB's LOB held its top after the compaction of EPF_RT2_DATA had moved the table. Moving it again also writes its table into EPF_RT2_DATA, which had no free space left. A table that had moved already did not grow its other tablespaces, so the move failed with ORA-01658 (no room for the table's first extent in EPF_RT2_DATA) and the file was done.
+- **Probe G** gave 3 extents (1 MB to 64 MB) for the INITIAL of 128 MB, where R8 gave 2 of 64 MB. The probe ran in EPF_RT2_SIDE as the compaction left it: autoextensible again, 20.7 MB free in holes, its datafile ending exactly at its last extent. What Oracle does there depends on that state, which is not the state during a compaction.
+
+Changes (0.7.9):
+- **A table that moved already grows its other tablespaces too** when they are short (within their room, never above their start size), as on its first move. Its segments there do not land in the tablespace being compacted. So a LOB tablespace compacted after the tablespace of its tables, which that compaction left full, can still have its segments moved lower. The other tablespace then ends larger by up to the size of those table segments.
+- **A tablespace none of whose datafiles grows by itself keeps reclaim_margin_mb free.** The compaction trims each datafile to the end of its last extent, so such a tablespace would be left with no free space, and the application's next insert there would fail. At RESIZE its datafiles grow back by up to that margin, never above their size at the start of the run (R6). FILE_NO_GROWTH is now one warning per such tablespace that still has less than the margin. Before, it warned for every datafile that is not autoextensible, also where another datafile of the tablespace can grow.
+- **Lab 2, probe G** runs in tablespace EPF_RT2_PRB, created for it: one 200 MB datafile, wholly free, that cannot grow, as during a compaction. T18G requires "2 extents: 2 x 64 MB" there. **Probe H** repeats the move in EPF_RT2_SIDE and is recorded only. Both report the extents by size, where they lie, and the size of the datafiles.
+
+Checked offline: the package scans; T00 and T01 with the fake sqlplus (0.7.9); the wrapper checks (32).
+
+Version 0.7.9: install again.
+
+How to test (R10 on the status page): pull, install 0.7.9, run `--only T18A,T18B,T18F,T18G,T19` (6 passed; in T18G, R8 "5 of 5 moved", probe G "2 extents: 2 x 64 MB", and the note of probe H). EPF_RT2_SIDE should end lower than 42.9 MB, and EPF_RT2_DATA a little above 43 MB. Then compact DATA a fourth time, as in R9 (nothing changed for DATA since 0.7.8), and collect with R10's command.
+
 ## 2026-10-07 - R8: T18G failed on 0.7.7; a table too small for 64 MB extents moves as before, and the compaction trims to the end of the highest extent (0.7.8)
 
 What R8's tests showed (5 passed, T18G failed):
