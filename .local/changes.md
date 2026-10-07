@@ -2,6 +2,37 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R7's placement data: a copy fills partly used stretches first; tables that come back move with 64 MB extents (0.7.7)
+
+What R7's collect showed:
+- **AUDIT_ARCHIVE confirmed.** The dry run R-000084 listed it with INITIAL 783 MB and about 0 B needed. It also listed AUDIT_ARCHIVE_PK (152 MB) and 6 small segments, 950 MB in all. R-000085's rebuild reset the indexes. In R-000121 AUDIT_ARCHIVE moved first to make room, its INITIAL was reset, and it went from 783.2 MB to 256 KB.
+- **The IOT overflow probe (A to F).** Every form recreated the overflow segment, and none changed its INITIAL: a MOVE ignores STORAGE for the overflow. The reclaim no longer asks for it, and plans the overflow's copy at its INITIAL; the assessment no longer lists it.
+- **Where the copies of DIRECTORY_DISPATCHING went (MOVE_PLACEMENT):**
+  - Move 1: the table was at 10.0-11.5 GB; its copy spread from 3.3 GB (the lowest free stretch) to 11.5 GB.
+  - Move 2: the copy went entirely to 10.0-11.1 GB, the holes its first copy left, although 6.2 GB were free and the lowest stretch was at 3.7 GB.
+  - Move 3: from 1.7 GB (the lowest) to 11.1 GB again.
+  - Now: 16 x 64 KB at 10.0 GB, 64 x 1 MB at 10.1-11.1 GB, 76 x 8 MB from 1.7 to 11.35 GB. The free space (3.6 GB) lies between 6 and 10 GB, 3.3 GB of it in stretches of 64 MB or more.
+- **Conclusion.** Oracle places the extents of a growing segment (64 KB, 1 MB, 8 MB) in partly used stretches first, wherever they are, and breaks a wholly free stretch, the lowest, only when there is none. Near the top, the table's own extents and the released indexes leave partly used stretches, so each copy comes back. An extent of 64 MB fits only a wholly free stretch, and Oracle takes the lowest.
+
+Changes (0.7.7):
+- **A table whose copy came back to the top moves again with extents of 64 MB:** STORAGE (INITIAL <its size rounded up to 64 MB>). Oracle creates a segment with such an INITIAL as extents of 64 MB (documented; verified by the lab's probe G). The tables with free space inside them move first, until whole 64 MB stretches cover it. Otherwise its datafile is done there: no more ordinary moves that come back.
+- **A table of 640 MB or more moves that way from its first move**, since it wastes at most a tenth. When the 64 MB stretches are short, or the statement fails, it moves as usual.
+- Only for system-allocated extents. With uniform extents there is no size to choose, and the behavior is as in 0.7.6.
+- An INITIAL that is a table's size rounded up to whole 64 MB extents (at most a quarter more) is not reported as oversized.
+- MOVE_PLACEMENT also gives the free space in whole 64 MB stretches.
+- The assessment's INITIAL query now reads DBA_SEGMENTS for the run's tablespaces first. R7's assessment took 1 min 19 s instead of 20 s, and the join with the whole inventory is the likely cause.
+- **Lab 2:**
+  - Probe G: a heap table moved with INITIAL 128 MB must come out as 2 extents of 64 MB; T18G checks it.
+  - T18G no longer expects the IOT overflow's INITIAL to be reset.
+
+Checked offline:
+- The package scans found a PL/SQL BOOLEAN inside an UPDATE, which Oracle 19c would not compile; it is fixed.
+- T00 and T01 pass with the fake sqlplus (0.7.7), and the wrapper checks pass.
+
+Version 0.7.7: install again.
+
+How to test (R8 on the status page): pull, install 0.7.7, run `--only T18A,T18B,T18F,T18G,T19` (6 passed; T18G's probe G: 2 extents of 64 MB). Then compact DATA a fourth time. DIRECTORY_DISPATCHING (688 MB) moves with 64 MB extents from its first move: its MOVE_PLACEMENT line should show extents of 64 MB, low in the file, and DATA should end well below 11.1 GB, since its segments are 7.5 GB. Collect with R8's command.
+
 ## 2026-10-07 - R7: room making freed 2.8 GB inside DATA, but the table at the top still comes back to the top
 
 R7 on EPFPG781 (0.7.6):

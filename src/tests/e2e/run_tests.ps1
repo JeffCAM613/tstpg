@@ -1580,7 +1580,7 @@ function Invoke-Suite {
         }
         # Each kind of segment: its move or rebuild set INITIAL 64 KB.
         Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_HEAP:[^\n]*table '
-        Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_IOT:[^\n]*index [^\n]*overflow '
+        Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_IOT:[^\n]*index '
         Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_BLOB:[^\n]*LOB B '
         if ($initial -contains 'RT2_SLOB.C') {
             Assert-Match $r 'INITIAL_RESET +EPF_RT2\.RT2_SLOB:[^\n]*LOB C '
@@ -1593,10 +1593,11 @@ function Invoke-Suite {
             if ($line.Trim() -match '^LAB\|INITIAL\|([^|]+)\|') { $left += $Matches[1] }
         }
         # A segment whose INITIAL Oracle kept passes only when the run says so
-        # (INITIAL_KEPT, with the part of its table).
+        # (INITIAL_KEPT, with the part of its table). The IOT overflow keeps
+        # its INITIAL: a MOVE ignores STORAGE for it (probes A to F), so the
+        # reclaim does not ask.
         $parts = @{ 'RT2_HEAP' = 'RT2_HEAP:[^\n]*table'; 'RT2_HEAP_PK' = 'RT2_HEAP_PK:'; 'RT2_IOT_PK' = 'RT2_IOT:[^\n]*index';
-                    'RT2_IOT.OVERFLOW' = 'RT2_IOT:[^\n]*overflow'; 'RT2_BLOB.B' = 'RT2_BLOB:[^\n]*LOB B';
-                    'RT2_SLOB.C' = 'RT2_SLOB:[^\n]*LOB C' }
+                    'RT2_BLOB.B' = 'RT2_BLOB:[^\n]*LOB B'; 'RT2_SLOB.C' = 'RT2_SLOB:[^\n]*LOB C' }
         $reset = @($initial | Where-Object { $parts.ContainsKey($_) })
         $done = @($reset | Where-Object { $left -notcontains $_ })
         Add-Check ($reset.Count -gt 0) ('segments with an oversized INITIAL before the compaction: ' + ($reset -join ', '))
@@ -1613,13 +1614,16 @@ function Invoke-Suite {
         $s = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $s @(0)
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
-        # Which forms of MOVE give an IOT overflow segment INITIAL 64 KB
-        # (recorded for the engine, not a pass condition).
+        # What Oracle does with STORAGE in a MOVE (recorded): A to F, an IOT
+        # overflow; G, a heap table given INITIAL 128 MB, which must come out
+        # as two extents of 64 MB (the reclaim moves a table that came back to
+        # the top with extents of 64 MB).
         $p = Invoke-Lab 'PROBE' -Layout 2
         Assert-Exit $p @(0)
         foreach ($line in ($p.Output -split "`n")) {
             if ($line.Trim() -match '^LAB\|PROBE\|([A-Z])\|(.*)$') { Write-TestLog ('  note probe ' + $Matches[1] + ': ' + $Matches[2]) }
         }
+        Assert-Match $p 'LAB\|PROBE\|G\|ok\|extents 2 of 67108864 to 67108864 bytes'
         $lab = Invoke-Lab 'CLEANUP' -Layout 2
         Assert-Exit $lab @(0)
         Assert-Match $lab 'LAB\|CLEANUP\|DONE'

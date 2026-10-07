@@ -27,11 +27,14 @@
 --           an unlimited quota.
 --           CHECK prints the state the tests compare (LAB| lines, as
 --           reclaim_lab.sql), the segments with an INITIAL above 1 MB
---           (LAB|INITIAL) and the quotas (LAB|QUOTA). CLEANUP removes the
---           queue table, the account, the measurements and the tablespaces.
--- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/tests/verify/reclaim_lab2.sql SETUP|CHECK|QUOTA|CLEANUP
+--           (LAB|INITIAL) and the quotas (LAB|QUOTA). PROBE records what
+--           Oracle does with a STORAGE clause in a MOVE (LAB|PROBE): six forms
+--           on an IOT overflow segment (A to F), and a heap table moved with
+--           INITIAL 128 MB (G). CLEANUP removes the queue table, the account,
+--           the measurements and the tablespaces.
+-- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/tests/verify/reclaim_lab2.sql SETUP|CHECK|QUOTA|PROBE|CLEANUP
 -- Requires: SYS AS SYSDBA, in the PDB in a multitenant database; about
---           250 MB of disk (db_create_file_dest, or the directory of the
+--           400 MB of disk (db_create_file_dest, or the directory of the
 --           SYSTEM datafile).
 -- Effects : SETUP removes an earlier second lab first. Nothing outside
 --           EPF_RT2, EPF_RT2_DATA, EPF_RT2_INDX, EPF_RT2_SIDE and the
@@ -140,6 +143,37 @@ DECLARE
         run('DROP TABLE epf_rt2.rt2_probe PURGE');
     END probe;
 
+    -- PROBE G: a heap table in EPF_RT2_SIDE (system-allocated extents) moved
+    -- with STORAGE (INITIAL 128 MB): the extents it gets, which the reclaim
+    -- relies on to move a table with extents of 64 MB (LAB|PROBE|G).
+    PROCEDURE probe_large IS
+        l_count  NUMBER;
+        l_min    NUMBER;
+        l_max    NUMBER;
+        l_result VARCHAR2(300) := 'ok';
+    BEGIN
+        FOR t IN (SELECT table_name FROM dba_tables WHERE owner = 'EPF_RT2' AND table_name = 'RT2_PROBE_LARGE') LOOP
+            run('DROP TABLE epf_rt2.rt2_probe_large PURGE');
+        END LOOP;
+        run('CREATE TABLE epf_rt2.rt2_probe_large (id NUMBER, pad VARCHAR2(100)) TABLESPACE epf_rt2_side');
+        run('INSERT INTO epf_rt2.rt2_probe_large (id, pad) SELECT LEVEL, RPAD(''p'', 100, ''p'') FROM dual '
+            || 'CONNECT BY LEVEL <= 1000');
+        COMMIT;
+        BEGIN
+            run('ALTER TABLE epf_rt2.rt2_probe_large MOVE TABLESPACE epf_rt2_side STORAGE (INITIAL 134217728)');
+        EXCEPTION
+            WHEN OTHERS THEN
+                l_result := SUBSTR(SQLERRM, 1, 300);
+        END;
+        SELECT COUNT(*), MIN(bytes), MAX(bytes)
+          INTO l_count, l_min, l_max
+          FROM dba_extents
+         WHERE owner = 'EPF_RT2' AND segment_name = 'RT2_PROBE_LARGE';
+        put('LAB|PROBE|G|' || l_result || '|extents ' || l_count || ' of ' || l_min || ' to ' || l_max
+            || ' bytes|ALTER TABLE ... MOVE TABLESPACE epf_rt2_side STORAGE (INITIAL 134217728)');
+        run('DROP TABLE epf_rt2.rt2_probe_large PURGE');
+    END probe_large;
+
     PROCEDURE drop_lab IS
     BEGIN
         FOR q IN (SELECT owner, queue_table FROM dba_queue_tables WHERE owner = 'EPF_RT2' ORDER BY queue_table) LOOP
@@ -179,9 +213,9 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Which forms of ALTER TABLE ... MOVE create an IOT overflow segment
-    -- again with INITIAL 64 KB (needs the lab and an unlimited quota on
-    -- EPF_RT2_DATA: after mode QUOTA).
+    -- What Oracle does with a STORAGE clause in a MOVE: of an IOT overflow
+    -- segment (A to F), of a heap table given INITIAL 128 MB (G). Needs the
+    -- lab and an unlimited quota on EPF_RT2_DATA (after mode QUOTA).
     IF l_mode = 'PROBE' THEN
         SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name IN ('EPF_RT2_DATA', 'EPF_RT2_SIDE');
         IF l_count < 2 THEN
@@ -195,6 +229,7 @@ BEGIN
         probe('E', 'MOVE TABLESPACE epf_rt2_data OVERFLOW TABLESPACE epf_rt2_data STORAGE (INITIAL 65536)');
         probe('F', 'MOVE ONLINE TABLESPACE epf_rt2_data STORAGE (INITIAL 65536) OVERFLOW TABLESPACE epf_rt2_side '
                    || 'STORAGE (INITIAL 65536)');
+        probe_large;
         put('LAB|PROBE|DONE');
         RETURN;
     END IF;
