@@ -2,6 +2,15 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - Set I's suite on EPFPG783 (0.7.11): 26 of 31; every reclaim test passed
+
+Run on EPFPG783, since EPFPG782 is in use on another project. EPFPG783 is not a fresh copy: the first end-to-end runs, sets C and E and the parity test purged it, and the suite enlarged its redo logs (permanent).
+- Passed: every reclaim test (T18A to T18G: the labs, a stop, a lost session, the read-only assessment of the application tablespaces), the installs, the preflights and dry runs, T13B to T16 (LOGS in steps, LOGS with compaction, BANK_STATEMENTS LOB clearing and purge), the reports and T19.
+- Failed: T11, and T12, T12B, T13 and T17 with it. T11 stops a PAYMENTS purge after its third batch and checks the wizard's offer to enlarge the redo logs ("Recommended batch size with 1 GB online logs", printed only when it offers that; "READY with these choices", only when the answers change something). On EPFPG783 the purge ended within its first batches (status SUCCESS, exit 0, its one-step plan done), so no stop was requested, and the logs were already 1 GB. T12, T12B, T13 and T17 work on the stopped run and its plan, which did not exist.
+- Not a regression: epf_purge has not changed since set H passed these tests (0.7.1), the wrapper's display of BATCH_PROGRESS is unchanged, and the purges of T13B to T16 went through the same path. They run again on the next copy never purged.
+
+Next: set I's I3, one reclaim of EPFPG783's DATA (purged, never compacted), judged by R7.
+
 ## 2026-10-07 - R11: 6 of 6 on 0.7.10; the growth for the index rebuilds is given back; the digest is brief for passing tests (0.7.11)
 
 What R11 showed (6 of 6 passed):
