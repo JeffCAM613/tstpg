@@ -2,6 +2,29 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-07 - R5 suite on 0.7.4: 7 of 8; the queue table's reason and the IOT overflow's INITIAL (0.7.5)
+
+R5's suite on EPFPG781 (`--only T18A,T18B,T18C,T18D,T18F,T18G,T19`): 7 of 8 passed.
+- 0.7.4 compiled. The first lab passed unchanged on it: T18A to T18D, T18F and T19.
+- T18G, the second lab, failed 2 of its checks. Everything else in it held on Oracle:
+  - QUOTA was not met in the dry run while the owner was above its quota, and was met once it was raised.
+  - The compaction moved tables across three tablespaces and two datafiles with uniform extents, the compressed table included.
+  - INITIAL 64 KB was set for the table, the IOT's index, the SECUREFILE LOB (so Oracle creates a SECUREFILE segment with its INITIAL), the BASICFILE LOB and the rebuilt index.
+  - R1-R4 and R9 PASS, the lab as before, the datafiles smaller.
+
+The two failures:
+- **The queue table's reason.** RT2_QT stayed where it was, but its reason was "object-type column": a queue table has a SYS.ANYDATA column (USER_PROP), and that check came first. Fix: a table an Oracle feature maintains is named as such first.
+- **The IOT overflow kept its INITIAL of 8 MB.** The move's statement asked for it: INITIAL_RESET named "overflow 8 MB", so `OVERFLOW TABLESPACE ... STORAGE (INITIAL 65536)` was in it, and Oracle ran it without error. Two explanations fit: Oracle ignores STORAGE in the OVERFLOW part of a MOVE, or the overflow segment was not created again.
+  - The engine now checks, after every move and rebuild, the INITIAL of each segment it asked 64 KB for. When Oracle kept one, it says so (event INITIAL_KEPT, and in the table's Detail) instead of implying it was set.
+  - The second lab has a new mode PROBE, run by T18G after its compaction. It tries six forms of ALTER TABLE ... MOVE on a small IOT with INITIAL 4 MB on both segments. For each, it records whether the statement ran, whether the overflow segment was created again (its data object id), and the INITIAL of both segments before and after. The engine will use the form that works, if one does.
+  - T18G now passes a segment that kept its INITIAL only when the run reported it (INITIAL_KEPT). It logs the probe's results as notes.
+
+Checked offline: the package scans find nothing; T00 and T01 pass with the fake sqlplus (0.7.5); the wrapper checks pass (32).
+
+Version 0.7.5: install again.
+
+How to test: on EPFPG781, pull, then `src\bin\epf_purge.bat install --tns EPFPG781`, then `src\tests\e2e\run_tests.bat --only T18G,T19`. Expect 3 passed (T01 always runs); send the `note probe` lines of T18G. Then R5's dry run and compaction of DATA as before, if not run yet.
+
 ## 2026-10-07 - Reclaim hardened for other databases; second lab layout (0.7.4)
 
 Why: every reclaim so far ran on one layout. That is EPFPG781 and a lab built like it: one bigfile tablespace, autoallocate extents, indexes and LOBs beside their tables. The next source is the same Oracle version and the same application (an older version, fewer tables), from another client whose DBA may have laid it out differently. I audited the whole reclaim engine for anything that worked only because of this layout and found six gaps. None of them occurred on EPFPG781.

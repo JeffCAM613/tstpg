@@ -29,6 +29,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- tables, D when it has domain indexes, '-' otherwise, in that order.
     TYPE t_flag_text IS TABLE OF VARCHAR2(2) INDEX BY VARCHAR2(128);
     g_features t_flag_text;
+    -- The segments the statement being built asks INITIAL 64 KB for, as
+    -- "what|segment" (initial_clause; read once it ran by initial_kept).
+    g_reset    SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
 
     -- Fingerprints of the objects a compaction may affect, read once the
     -- accounts are locked and before any object changes (baseline), and again
@@ -652,11 +655,17 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN l_id;
     END index_item;
 
-    -- Why table p_owner.p_table cannot move, NULL when it can.
+    -- Why table p_owner.p_table cannot move, NULL when it can. A table an
+    -- Oracle feature maintains is named as such first (a queue table also
+    -- has object-type columns).
     FUNCTION unit_blocker(p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
         l_count  NUMBER;
         l_reason VARCHAR2(400);
     BEGIN
+        l_reason := internal_reason(p_owner, p_table);
+        IF l_reason IS NOT NULL THEN
+            RETURN l_reason;
+        END IF;
         SELECT COUNT(*) INTO l_count FROM dba_tab_columns
          WHERE owner = p_owner AND table_name = p_table AND data_type IN ('LONG', 'LONG RAW');
         IF l_count > 0 THEN
@@ -691,10 +700,6 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
          WHERE table_owner = p_owner AND table_name = p_table AND funcidx_status = 'DISABLED';
         IF l_count > 0 THEN
             RETURN 'disabled function-based index (it could not be rebuilt after the move)';
-        END IF;
-        l_reason := internal_reason(p_owner, p_table);
-        IF l_reason IS NOT NULL THEN
-            RETURN l_reason;
         END IF;
         SELECT COUNT(*) INTO l_count FROM dba_mviews WHERE owner = p_owner AND container_name = p_table;
         IF l_count > 0 THEN
@@ -1950,17 +1955,39 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- storage, all allocated at once. An INITIAL larger than the segment needs
     -- (above p_est, its initial_need, and 1 MB; typically the size of the
     -- segment when it was exported) is set to 64 KB instead: returns the
-    -- STORAGE clause, and adds p_what with the former INITIAL to p_note.
-    -- Otherwise NULL.
-    FUNCTION initial_clause(p_initial IN NUMBER, p_est IN NUMBER, p_what IN VARCHAR2, p_note IN OUT NOCOPY VARCHAR2)
-        RETURN VARCHAR2 IS
+    -- STORAGE clause, adds p_what with the former INITIAL to p_note, and
+    -- segment p_segment to g_reset. Otherwise NULL.
+    FUNCTION initial_clause(p_initial IN NUMBER, p_est IN NUMBER, p_what IN VARCHAR2, p_segment IN VARCHAR2,
+                            p_note IN OUT NOCOPY VARCHAR2) RETURN VARCHAR2 IS
     BEGIN
         IF NVL(p_initial, 0) > GREATEST(NVL(p_est, 0), c_mb) THEN
             p_note := SUBSTR(p_note || CASE WHEN p_note IS NOT NULL THEN ', ' END || p_what || ' ' || b(p_initial), 1, 1000);
+            g_reset.EXTEND;
+            g_reset(g_reset.COUNT) := p_what || '|' || p_segment;
             RETURN ' STORAGE (INITIAL 65536)';
         END IF;
         RETURN NULL;
     END initial_clause;
+
+    -- Once the statement ran: the segments of p_owner it asked INITIAL 64 KB
+    -- for (g_reset) whose INITIAL Oracle kept above 1 MB, as "what size", NULL
+    -- when none. Such a segment holds at least that INITIAL.
+    FUNCTION initial_kept(p_owner IN VARCHAR2) RETURN VARCHAR2 IS
+        l_initial NUMBER;
+        l_list    VARCHAR2(1000);
+    BEGIN
+        FOR i IN 1 .. g_reset.COUNT LOOP
+            SELECT MAX(initial_extent)
+              INTO l_initial
+              FROM dba_segments
+             WHERE owner = p_owner AND segment_name = SUBSTR(g_reset(i), INSTR(g_reset(i), '|') + 1);
+            IF l_initial > c_mb THEN
+                l_list := SUBSTR(l_list || CASE WHEN l_list IS NOT NULL THEN ', ' END
+                                 || SUBSTR(g_reset(i), 1, INSTR(g_reset(i), '|') - 1) || ' ' || b(l_initial), 1, 1000);
+            END IF;
+        END LOOP;
+        RETURN l_list;
+    END initial_kept;
 
     -- The statement that moves a table within its tablespaces: the table (an
     -- IOT with its overflow), and every LOB segment kept in one of the run's
@@ -1978,6 +2005,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_sql     VARCHAR2(32767);
     BEGIN
         p_note := NULL;
+        g_reset := SYS.ODCIVARCHAR2LIST();
         IF p_type = 'IOT' THEN
             SELECT MAX(tablespace_name), MAX(index_name), MAX(initial_extent)
               INTO l_ts, l_top, l_initial
@@ -1999,11 +2027,11 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_sql := 'ALTER TABLE ' || qn(p_owner, p_table) || ' MOVE TABLESPACE ' || q(l_ts)
                  || CASE WHEN p_type = 'IOT'
                          THEN initial_clause(l_initial, initial_need(p_owner, l_top, 'INDEX', seg_est(p_owner, l_top, 'INDEX')),
-                                             'index', p_note)
-                         ELSE initial_clause(l_initial, seg_est(p_owner, p_table, 'TABLE'), 'table', p_note) END;
+                                             'index', l_top, p_note)
+                         ELSE initial_clause(l_initial, seg_est(p_owner, p_table, 'TABLE'), 'table', p_table, p_note) END;
         IF l_ovf IS NOT NULL THEN
             l_sql := l_sql || ' OVERFLOW TABLESPACE ' || q(l_ovf)
-                     || initial_clause(l_ovfinit, seg_est(p_owner, l_ovfname, 'TABLE'), 'overflow', p_note);
+                     || initial_clause(l_ovfinit, seg_est(p_owner, l_ovfname, 'TABLE'), 'overflow', l_ovfname, p_note);
         END IF;
         FOR l IN (SELECT lb.column_name, lb.tablespace_name, lb.securefile, lb.segment_name,
                          (SELECT MAX(s.initial_extent) FROM dba_segments s
@@ -2017,7 +2045,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                      || CASE l.securefile WHEN 'YES' THEN 'SECUREFILE' ELSE 'BASICFILE' END
                      || ' (TABLESPACE ' || q(l.tablespace_name)
                      || initial_clause(l.initial_extent, seg_est(p_owner, l.segment_name, 'LOBSEGMENT'),
-                                       'LOB ' || l.column_name, p_note) || ')';
+                                       'LOB ' || l.column_name, l.segment_name, p_note) || ')';
         END LOOP;
         RETURN l_sql;
     END move_sql;
@@ -2229,6 +2257,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_grown   NUMBER := 0;
         l_other   NUMBER := 0;
         l_note    VARCHAR2(1000);
+        l_kept    VARCHAR2(1000);
         l_tops    NUMBER;
         l_again   BOOLEAN := FALSE;
     BEGIN
@@ -2270,6 +2299,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
              WHERE run_id = g_run.run_id AND item_id = p_item AND file_id = p_file;
             l_freed := trim_ts(p_ts, 0, FALSE) + other_ts(p_item, p_ts, FALSE);
             l_after := ts_bytes(p_ts);
+            l_kept := CASE WHEN l_note IS NOT NULL THEN initial_kept(l_owner) END;
             -- A unit at the top whose copy holds the top of a datafile of p_ts
             -- again, this one or another (counted for pick).
             IF p_file IS NOT NULL THEN
@@ -2289,12 +2319,21 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                SET move_status = 'MOVED', after_bytes = l_new, after_top_block = l_top, last_ora = NULL,
                    ended_at = epfpg.epf_util.now_ts,
                    detail = CASE WHEN l_note IS NOT NULL
-                                 THEN SUBSTR('INITIAL set to 64 KB (it was: ' || l_note || ')', 1, 4000) ELSE detail END
+                                 THEN SUBSTR('INITIAL set to 64 KB (it was: ' || l_note || ')'
+                                             || CASE WHEN l_kept IS NOT NULL THEN '; Oracle kept the INITIAL of ' || l_kept END,
+                                             1, 4000)
+                                 ELSE detail END
              WHERE run_id = g_run.run_id AND item_id = p_item;
             COMMIT;
             IF l_note IS NOT NULL THEN
                 say(epfpg.epf_log.c_info, 'INITIAL_RESET',
                     l_owner || '.' || l_table || ': INITIAL larger than needed (' || l_note || '); the move set it to 64 KB',
+                    p_owner => l_owner, p_object => l_table);
+            END IF;
+            IF l_kept IS NOT NULL THEN
+                say(epfpg.epf_log.c_info, 'INITIAL_KEPT',
+                    l_owner || '.' || l_table || ': the move asked for INITIAL 64 KB, but Oracle kept the INITIAL of '
+                    || l_kept || '; such a segment holds at least its INITIAL',
                     p_owner => l_owner, p_object => l_table);
             END IF;
             say(CASE WHEN l_bytes >= c_big THEN epfpg.epf_log.c_ok ELSE epfpg.epf_log.c_info END, 'UNIT_MOVED',
@@ -2559,6 +2598,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_msg     VARCHAR2(4000);
         l_initial NUMBER;
         l_note    VARCHAR2(1000);
+        l_kept    VARCHAR2(1000);
         l_clause  VARCHAR2(100);
     BEGIN
         SELECT owner, object_name, source_ts, NVL(est_bytes, 0)
@@ -2600,7 +2640,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             END IF;
         END IF;
         BEGIN
-            l_clause := initial_clause(l_initial, initial_need(l_owner, l_name, 'INDEX', l_est), 'INITIAL', l_note);
+            g_reset := SYS.ODCIVARCHAR2LIST();
+            l_clause := initial_clause(l_initial, initial_need(l_owner, l_name, 'INDEX', l_est), 'INITIAL', l_name, l_note);
             ddl('ALTER INDEX ' || qn(l_owner, l_name) || ' REBUILD TABLESPACE ' || q(l_ts) || l_clause);
         EXCEPTION
             WHEN OTHERS THEN
@@ -2612,10 +2653,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
               INTO l_bytes
               FROM dba_segments
              WHERE owner = l_owner AND segment_name = l_name AND segment_type = 'INDEX';
+            l_kept := CASE WHEN l_note IS NOT NULL THEN initial_kept(l_owner) END;
             UPDATE epfpg.epf_reclaim_object
                SET move_status = 'REBUILT', after_bytes = l_bytes, last_ora = NULL, ended_at = epfpg.epf_util.now_ts,
                    detail = CASE WHEN l_note IS NOT NULL
-                                 THEN SUBSTR(NVL2(detail, detail || '; ', NULL) || l_note || ' set to 64 KB', 1, 4000)
+                                 THEN SUBSTR(NVL2(detail, detail || '; ', NULL) || l_note || ' set to 64 KB'
+                                             || CASE WHEN l_kept IS NOT NULL THEN '; Oracle kept ' || l_kept END, 1, 4000)
                                  ELSE detail END
              WHERE run_id = g_run.run_id AND item_id = p_item;
             COMMIT;
@@ -2626,6 +2669,11 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                                                        || CASE WHEN l_note IS NOT NULL THEN ' (' || l_note
                                                                                        || ' set to 64 KB)' END,
                 p_owner => l_owner, p_object => l_name, p_bytes => l_bytes);
+            IF l_kept IS NOT NULL THEN
+                say(epfpg.epf_log.c_info, 'INITIAL_KEPT',
+                    l_owner || '.' || l_name || ': the rebuild asked for INITIAL 64 KB, but Oracle kept ' || l_kept,
+                    p_owner => l_owner, p_object => l_name);
+            END IF;
             RETURN 'REBUILT';
         ELSIF p_frozen AND is_space_error(l_code) THEN
             say(epfpg.epf_log.c_info, 'INDEX_NO_ROOM',

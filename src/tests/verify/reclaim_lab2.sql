@@ -88,6 +88,58 @@ DECLARE
         put('LAB|MEASURED|' || p_segment || '|' || p_used);
     END measure;
 
+    -- PROBE: an index-organized table RT2_PROBE with an INITIAL of 4 MB on its
+    -- index and on its overflow segment, a few rows, then ALTER TABLE
+    -- RT2_PROBE <p_clause>; prints whether the statement ran, whether the
+    -- overflow segment was created again (its data object id changed), and
+    -- the INITIAL of both segments (DBA_SEGMENTS) and of the overflow table
+    -- (DBA_TABLES) before and after (LAB|PROBE). The table is dropped after.
+    PROCEDURE probe(p_label IN VARCHAR2, p_clause IN VARCHAR2) IS
+        l_ovf    VARCHAR2(128);
+        l_obj0   NUMBER;
+        l_obj1   NUMBER;
+        l_ovf0   NUMBER;
+        l_ovf1   NUMBER;
+        l_tab0   NUMBER;
+        l_tab1   NUMBER;
+        l_top0   NUMBER;
+        l_top1   NUMBER;
+        l_result VARCHAR2(300) := 'ok';
+    BEGIN
+        FOR t IN (SELECT table_name FROM dba_tables WHERE owner = 'EPF_RT2' AND table_name = 'RT2_PROBE') LOOP
+            run('DROP TABLE epf_rt2.rt2_probe PURGE');
+        END LOOP;
+        run('CREATE TABLE epf_rt2.rt2_probe (id NUMBER, v VARCHAR2(10), big VARCHAR2(600), '
+            || 'CONSTRAINT rt2_probe_pk PRIMARY KEY (id)) ORGANIZATION INDEX TABLESPACE epf_rt2_data '
+            || 'STORAGE (INITIAL 4M) INCLUDING v OVERFLOW TABLESPACE epf_rt2_side STORAGE (INITIAL 4M)');
+        run('INSERT INTO epf_rt2.rt2_probe (id, v, big) SELECT LEVEL, ''v'', RPAD(''o'', 500, ''o'') FROM dual '
+            || 'CONNECT BY LEVEL <= 100');
+        COMMIT;
+        SELECT MAX(table_name), MAX(initial_extent) INTO l_ovf, l_tab0
+          FROM dba_tables WHERE owner = 'EPF_RT2' AND iot_name = 'RT2_PROBE' AND iot_type = 'IOT_OVERFLOW';
+        SELECT MAX(data_object_id) INTO l_obj0 FROM dba_objects
+         WHERE owner = 'EPF_RT2' AND object_name = l_ovf AND object_type = 'TABLE';
+        SELECT MAX(initial_extent) INTO l_ovf0 FROM dba_segments WHERE owner = 'EPF_RT2' AND segment_name = l_ovf;
+        SELECT MAX(initial_extent) INTO l_top0 FROM dba_segments WHERE owner = 'EPF_RT2' AND segment_name = 'RT2_PROBE_PK';
+        BEGIN
+            run('ALTER TABLE epf_rt2.rt2_probe ' || p_clause);
+        EXCEPTION
+            WHEN OTHERS THEN
+                l_result := SUBSTR(SQLERRM, 1, 300);
+        END;
+        SELECT MAX(initial_extent) INTO l_tab1
+          FROM dba_tables WHERE owner = 'EPF_RT2' AND iot_name = 'RT2_PROBE' AND iot_type = 'IOT_OVERFLOW';
+        SELECT MAX(data_object_id) INTO l_obj1 FROM dba_objects
+         WHERE owner = 'EPF_RT2' AND object_name = l_ovf AND object_type = 'TABLE';
+        SELECT MAX(initial_extent) INTO l_ovf1 FROM dba_segments WHERE owner = 'EPF_RT2' AND segment_name = l_ovf;
+        SELECT MAX(initial_extent) INTO l_top1 FROM dba_segments WHERE owner = 'EPF_RT2' AND segment_name = 'RT2_PROBE_PK';
+        put('LAB|PROBE|' || p_label || '|' || l_result || '|overflow created again: '
+            || CASE WHEN l_obj1 <> l_obj0 THEN 'yes' ELSE 'no' END || '|overflow segment INITIAL ' || l_ovf0 || ' -> '
+            || l_ovf1 || ', table ' || l_tab0 || ' -> ' || l_tab1 || '|index INITIAL ' || l_top0 || ' -> ' || l_top1
+            || '|ALTER TABLE ... ' || p_clause);
+        run('DROP TABLE epf_rt2.rt2_probe PURGE');
+    END probe;
+
     PROCEDURE drop_lab IS
     BEGIN
         FOR q IN (SELECT owner, queue_table FROM dba_queue_tables WHERE owner = 'EPF_RT2' ORDER BY queue_table) LOOP
@@ -116,14 +168,34 @@ BEGIN
     IF SYS_CONTEXT('USERENV', 'SESSION_USER') <> 'SYS' THEN
         RAISE_APPLICATION_ERROR(-20000, 'Run reclaim_lab2.sql as SYS AS SYSDBA.');
     END IF;
-    IF l_mode NOT IN ('SETUP', 'CHECK', 'QUOTA', 'CLEANUP') THEN
-        RAISE_APPLICATION_ERROR(-20000, 'Mode must be SETUP, CHECK, QUOTA or CLEANUP, got: ' || l_mode);
+    IF l_mode NOT IN ('SETUP', 'CHECK', 'QUOTA', 'PROBE', 'CLEANUP') THEN
+        RAISE_APPLICATION_ERROR(-20000, 'Mode must be SETUP, CHECK, QUOTA, PROBE or CLEANUP, got: ' || l_mode);
     END IF;
     SELECT COUNT(*) INTO l_tool FROM dba_tables WHERE owner = 'EPFPG' AND table_name = 'EPF_SPACE_USAGE';
 
     IF l_mode = 'CLEANUP' THEN
         drop_lab;
         put('LAB|CLEANUP|DONE');
+        RETURN;
+    END IF;
+
+    -- Which forms of ALTER TABLE ... MOVE create an IOT overflow segment
+    -- again with INITIAL 64 KB (needs the lab and an unlimited quota on
+    -- EPF_RT2_DATA: after mode QUOTA).
+    IF l_mode = 'PROBE' THEN
+        SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name IN ('EPF_RT2_DATA', 'EPF_RT2_SIDE');
+        IF l_count < 2 THEN
+            RAISE_APPLICATION_ERROR(-20000, 'The second lab is not set up (no EPF_RT2_DATA and EPF_RT2_SIDE).');
+        END IF;
+        probe('A', 'MOVE TABLESPACE epf_rt2_data STORAGE (INITIAL 65536) OVERFLOW TABLESPACE epf_rt2_side '
+                   || 'STORAGE (INITIAL 65536)');
+        probe('B', 'MOVE TABLESPACE epf_rt2_data OVERFLOW TABLESPACE epf_rt2_side STORAGE (INITIAL 65536)');
+        probe('C', 'MOVE TABLESPACE epf_rt2_data OVERFLOW STORAGE (INITIAL 65536) TABLESPACE epf_rt2_side');
+        probe('D', 'MOVE OVERFLOW TABLESPACE epf_rt2_side STORAGE (INITIAL 65536)');
+        probe('E', 'MOVE TABLESPACE epf_rt2_data OVERFLOW TABLESPACE epf_rt2_data STORAGE (INITIAL 65536)');
+        probe('F', 'MOVE ONLINE TABLESPACE epf_rt2_data STORAGE (INITIAL 65536) OVERFLOW TABLESPACE epf_rt2_side '
+                   || 'STORAGE (INITIAL 65536)');
+        put('LAB|PROBE|DONE');
         RETURN;
     END IF;
 

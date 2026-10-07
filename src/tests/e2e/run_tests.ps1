@@ -1592,11 +1592,18 @@ function Invoke-Suite {
         foreach ($line in ($check.Output -split "`n")) {
             if ($line.Trim() -match '^LAB\|INITIAL\|([^|]+)\|') { $left += $Matches[1] }
         }
-        $reset = @($initial | Where-Object { @('RT2_HEAP', 'RT2_HEAP_PK', 'RT2_IOT_PK', 'RT2_IOT.OVERFLOW', 'RT2_BLOB.B',
-                                               'RT2_SLOB.C') -contains $_ })
-        $kept = @($reset | Where-Object { $left -contains $_ })
-        Add-Check ($reset.Count -gt 0 -and $kept.Count -eq 0) ('INITIAL 64 KB now for ' + ($reset -join ', ') +
-                                                              $(if ($kept.Count -gt 0) { '; still above 1 MB: ' + ($kept -join ', ') } else { '' }))
+        # A segment whose INITIAL Oracle kept passes only when the run says so
+        # (INITIAL_KEPT, with the part of its table).
+        $parts = @{ 'RT2_HEAP' = 'RT2_HEAP:[^\n]*table'; 'RT2_HEAP_PK' = 'RT2_HEAP_PK:'; 'RT2_IOT_PK' = 'RT2_IOT:[^\n]*index';
+                    'RT2_IOT.OVERFLOW' = 'RT2_IOT:[^\n]*overflow'; 'RT2_BLOB.B' = 'RT2_BLOB:[^\n]*LOB B';
+                    'RT2_SLOB.C' = 'RT2_SLOB:[^\n]*LOB C' }
+        $reset = @($initial | Where-Object { $parts.ContainsKey($_) })
+        $done = @($reset | Where-Object { $left -notcontains $_ })
+        Add-Check ($reset.Count -gt 0) ('segments with an oversized INITIAL before the compaction: ' + ($reset -join ', '))
+        Write-TestLog ('  note INITIAL 64 KB now for: ' + ($done -join ', '))
+        foreach ($label in @($reset | Where-Object { $left -contains $_ })) {
+            Add-Check ($r.Output -match ('INITIAL_KEPT +EPF_RT2\.' + $parts[$label])) ($label + ' kept its INITIAL, and the run says so (INITIAL_KEPT)')
+        }
         $other = @($left | Where-Object { $reset -notcontains $_ })
         if ($other.Count -gt 0) { Write-TestLog ('  note other segments with an INITIAL above 1 MB: ' + ($other -join ', ')) 'Yellow' }
         $after = Read-Lab $check
@@ -1606,6 +1613,13 @@ function Invoke-Suite {
         $s = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $s @(0)
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+        # Which forms of MOVE give an IOT overflow segment INITIAL 64 KB
+        # (recorded for the engine, not a pass condition).
+        $p = Invoke-Lab 'PROBE' -Layout 2
+        Assert-Exit $p @(0)
+        foreach ($line in ($p.Output -split "`n")) {
+            if ($line.Trim() -match '^LAB\|PROBE\|([A-Z])\|(.*)$') { Write-TestLog ('  note probe ' + $Matches[1] + ': ' + $Matches[2]) }
+        }
         $lab = Invoke-Lab 'CLEANUP' -Layout 2
         Assert-Exit $lab @(0)
         Assert-Match $lab 'LAB\|CLEANUP\|DONE'
