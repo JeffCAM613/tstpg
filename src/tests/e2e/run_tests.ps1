@@ -1826,6 +1826,10 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
                           'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW', 'RETURN_FAILED',
                           'SCRATCH_DROPPED', 'SCRATCH_KEPT')
+# The wrapper's lines that say why a run failed (Add-DigestRun): errors of
+# its sessions, lost connections, the monitor, an early end and its restore.
+$script:DigestTrouble = 'ORA-\d{5}|TNS-\d{5}|SP2-\d{4}|did not answer|did not finish|ended before|could not|' +
+                        'no longer in the database|monitor|SUSPENDED|attach:|NOT restored'
 
 function Get-FileLines {
     param([string]$Path)
@@ -1935,6 +1939,26 @@ function Add-DigestRun {
     }
     foreach ($status in $statuses) { $detail.Add($status + ' ' + ($plain[$status] -join ' ')) }
     if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
+    # A run that failed: the wrapper's own messages while it was shown and the
+    # errors of its sqlplus sessions (a lost connection shows there, not in
+    # the events).
+    if ([string]$manifest['status'] -eq 'FAILED') {
+        $said = @{}
+        foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
+            if ($line -match '^ REPORT +\d\d:\d\d:\d\d$') { break }
+            if ($line -match '^\s\d\d:\d\d:\d\d \[' -or $line -notmatch $script:DigestTrouble) { continue }
+            $text = Format-DigestText $line
+            if ($said.ContainsKey($text)) { continue }
+            $said[$text] = $true
+            $Out.Add(' wrapper: ' + $text)
+        }
+        foreach ($file in @(Get-ChildItem -LiteralPath $Folder -Filter 'sqlplus_*.log' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $errors = @(Get-FileLines $file.FullName | Where-Object { $_ -match 'ORA-\d{5}|TNS-\d{5}|SP2-\d{4}' } |
+                        ForEach-Object { Format-DigestText $_ } | Select-Object -Unique)
+            foreach ($text in ($errors | Select-Object -First 8)) { $Out.Add(' ' + $file.Name + ': ' + $text) }
+            if ($errors.Count -gt 8) { $Out.Add(' ' + $file.Name + ': ... ' + ($errors.Count - 8) + ' more error lines') }
+        }
+    }
     $codes = $script:DigestCompact
     if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
     if ($Brief) {

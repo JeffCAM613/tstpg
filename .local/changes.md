@@ -2,6 +2,14 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Set J on EPFPG784: J1 to J3 good; J4's reclaim of DATA failed when the network dropped; the digest shows why a run failed
+
+J4 (R-000051, 0.8.0, `--scratch 3G`) ended FAILED after 01:40:16, the user reports through network instability. Its checks: R1 FAIL 0/972 indexes usable; R2-R5 not verified (the run ended before VERIFY); R6 FAIL (DATA's growth setting not restored, scratch tablespace EPF_PARK_51 not dropped); R8 FAIL 43 of 691 moved, 568 below where the datafile stopped, 80 still parked; R9 FAIL 6 accounts still locked (ANON_META, KDCM, OP, OPPAYMENTS, OPREPORTS, SUPER). So neither the restore path of the worker nor the wrapper's restore in the same run ran to its end. The worker's call may have gone on inside the database after its client was gone; `reclaim --restore` waits for such a worker (WORKER_RUNNING) and then restores: the parked tables come back to DATA, the indexes are rebuilt, the growth setting is restored, EPF_PARK_51 is dropped, the accounts are unlocked. 80 parked tables within 3 GB fits a DATA that the earlier reclaim left nearly full (14.2 GB, 13.1 GB of segments): almost nothing fits below the top, so the compaction parks it.
+
+Change (src/tests/e2e/run_tests.ps1, digest): for a run that failed, the digest adds the wrapper's own lines up to the report (errors, lost connections, the monitor, the worker's early end and the restore in the same run: `$script:DigestTrouble`), and the ORA-, TNS- and SP2- lines of its sqlplus logs (8 per file at most, each once). A lost connection shows there, not in the events. Checked on a fake failed reclaim and a passing restore (digrepo3): the error lines for the first, none for the second; nothing from the report part.
+
+How to test: `reclaim --restore` on EPFPG784, then the digest (status page, set J).
+
 ## 2026-10-09 - Output: a lighter view by default; --verbose shows everything (wrapper only; the database stays 0.8.0)
 
 Why: the user found the output of a run too much to follow live. The details stay: with `--verbose`, and always in console.log.
