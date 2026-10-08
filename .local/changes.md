@@ -2,6 +2,19 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - I6: a new table takes the lowest free space; there is no "last position" to reset
+
+A test on EPFPG784 as SYS, with empty tables of its own (SYS.EPF_X_*, dropped at the end), in DATA's free space: all 1,742 MB of it from 12,078 MB up, since the index rebuilds after the compaction filled every gap below. (First try: ORA-00922, SEGMENT CREATION written after TABLESPACE in the script; nothing created.)
+- A 64 MB table (P0) went to the lowest free space, 12,087 to 12,213 MB, in a 12 MB piece and 52 pieces of 1 MB.
+- A table taking the 16 MB left there and 64 MB more (UP) went on to 12,288 and 12,496 MB. Both dropped.
+- The next 64 MB table (M1) went back to exactly P0's pieces, below UP's: Oracle keeps no last position for a new table here.
+- A table taking the free space from 12,288 MB to the end and 16 MB more (P1) started with the lowest free piece (12,179 MB) too. Its last 8 MB, more than Oracle could use of the free space, went to the end of the file, which grew by 100 MB through autoextend (14,635 MB, highest block still 14,535 MB; the next reclaim trims it).
+- Moving the 64 MB table (M2) also took the lowest free space (12,179 MB, then 12,288 MB up).
+
+So the reset proposed after I5 cannot work and is not needed for such tables. A new segment takes the lowest free space here, as the index rebuilds did. TRANSMISSION_EXECUTION_AUDIT's LOB is the exception: 3 of its 4 copies started high with free space below, for a reason these tests do not show, and its placement cannot be steered.
+
+Next: a decision for the user. With temporary scratch space (about the size of the tables whose copy comes back, 2.1 GB on EPFPG784, confirmed by the DBA), such a table would wait in a scratch tablespace of the run while the rest is compacted, and come back last, filling the gaps left; the 64 MB extents would go. Without it, the reclaim stays best effort.
+
 ## 2026-10-08 - I5: Oracle's search for free space starts where it last allocated, not at the start of the file
 
 What the read-only query of EPFPG784 showed (DATA as R-000038 left it):
