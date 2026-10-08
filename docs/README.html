@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EPF Data Purge</title>
+<!-- Generated from README.md by .local/gen_readme_html.js: change the README, then run it again. -->
+<style>
+:root {
+  --bg: #f7f8fa; --surface: #ffffff; --fg: #1d2530; --muted: #5a6675; --line: #dde2e8;
+  --accent: #0b6e8a; --accent-soft: #e3f1f5; --code-bg: #f1f3f6; --code-fg: #1d2530;
+  --pre-bg: #17202b; --pre-fg: #e6edf3; --th-bg: #eef1f5; --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f141a; --surface: #151c24; --fg: #dfe6ee; --muted: #93a1b1; --line: #29333f;
+    --accent: #5cc3dd; --accent-soft: #15303a; --code-bg: #1d2630; --code-fg: #dfe6ee;
+    --pre-bg: #0b1016; --pre-fg: #e6edf3; --th-bg: #1b242e; --shadow: none;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 16px; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+.layout { max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 40px; }
+header.top { grid-column: 1 / -1; border-bottom: 1px solid var(--line); padding-bottom: 20px; }
+header.top h1 { margin: 0 0 6px; font-size: 2rem; line-height: 1.2; letter-spacing: -0.01em; text-wrap: balance; }
+header.top .kicker { margin: 0 0 8px; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+header.top p.intro { margin: 0; max-width: 72ch; color: var(--muted); font-size: 1.05rem; }
+.toc { position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow-y: auto; font-size: 0.92rem; }
+.toc .toc-title { margin: 0 0 8px; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; }
+.toc ol ol { padding-left: 12px; margin: 2px 0 6px; font-size: 0.88rem; }
+.toc a { display: block; padding: 3px 10px; border-left: 2px solid transparent; color: var(--muted); text-decoration: none; border-radius: 0 4px 4px 0; }
+.toc a:hover { color: var(--fg); background: var(--accent-soft); }
+.toc a.active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
+main { min-width: 0; }
+main > :first-child { margin-top: 0; }
+h2 { font-size: 1.45rem; line-height: 1.3; margin: 2.4em 0 0.6em; padding-top: 0.2em; text-wrap: balance; }
+h3 { font-size: 1.12rem; margin: 1.8em 0 0.5em; text-wrap: balance; }
+h2, h3 { position: relative; }
+.anchor { margin-left: 8px; color: var(--line); text-decoration: none; font-weight: 400; opacity: 0; }
+h2:hover .anchor, h3:hover .anchor, .anchor:focus { opacity: 1; color: var(--muted); }
+p, ul, ol { max-width: 75ch; }
+main ul, main ol { padding-left: 1.4em; }
+li { margin: 0.3em 0; }
+a { color: var(--accent); }
+strong { font-weight: 650; }
+code { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 0.88em; background: var(--code-bg); color: var(--code-fg); padding: 0.1em 0.35em; border-radius: 4px; white-space: nowrap; }
+.code { margin: 1em 0 1.2em; }
+.code-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--pre-bg); color: #93a4b5;
+  border-radius: 8px 8px 0 0; padding: 6px 8px 6px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.75rem; letter-spacing: 0.04em;
+}
+pre { margin: 0; background: var(--pre-bg); color: var(--pre-fg); padding: 12px 16px 14px; border-radius: 0 0 8px 8px; overflow-x: auto; line-height: 1.5; }
+pre.plain { border-radius: 8px; }
+pre code { background: none; color: inherit; padding: 0; font-size: 0.86rem; white-space: pre; }
+.copy {
+  font: 600 0.75rem/1 "Segoe UI", system-ui, sans-serif; letter-spacing: 0.02em;
+  color: #c9d4df; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 5px;
+  padding: 5px 9px; cursor: pointer;
+}
+.copy:hover { background: rgba(255, 255, 255, 0.16); }
+.copy.done { color: #8fe3a5; border-color: rgba(143, 227, 165, 0.5); }
+.table-wrap { overflow-x: auto; margin: 1em 0 1.4em; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+th { background: var(--th-bg); font-weight: 600; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: none; }
+footer { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 16px; color: var(--muted); font-size: 0.85rem; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 24px; padding: 24px 16px 48px; }
+  .toc { position: static; max-height: none; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); }
+}
+@media (max-width: 640px) {
+  table, tbody, tr, td { display: block; width: 100%; }
+  thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  tr { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  tbody tr:last-child { border-bottom: none; }
+  td { border: none; padding: 2px 0; overflow-wrap: anywhere; }
+  td::before { content: attr(data-label); display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-top: 4px; }
+  td:first-child::before { margin-top: 0; }
+  code { white-space: normal; overflow-wrap: anywhere; }
+}
+@media print {
+  body { background: #fff; color: #000; }
+  .toc, .copy, .anchor { display: none; }
+  .layout { display: block; max-width: none; padding: 0; }
+  .code-head { background: #e8e8e8; color: #333; border: 1px solid #ccc; border-bottom: none; }
+  pre { background: #f4f4f4; color: #000; border: 1px solid #ccc; }
+  pre code { white-space: pre-wrap; }
+  .table-wrap { box-shadow: none; }
+  a { color: #000; }
+  h2 { break-after: avoid; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<header class="top">
+<p class="kicker">User guide</p>
+<h1>EPF Data Purge</h1>
+<p class="intro">EPF Data Purge removes old data from the EPF application's schemas (OP, OPPAYMENTS and OPREPORTS), and can give the disk space it frees back to the disk. It checks the database before it changes anything, can simulate a purge first, splits a large purge into smaller runs, and records every run with a report and a verdict.</p>
+</header>
+<nav class="toc" aria-label="Contents"><p class="toc-title">Contents</p><ol><li><a href="#what-it-does">What it does</a></li><li><a href="#requirements">Requirements</a></li><li><a href="#install">Install</a></li><li><a href="#configure">Configure</a><ol><li><a href="#passwords">Passwords</a></li></ol></li><li><a href="#run-it">Run it</a></li><li><a href="#purge">Purge</a><ol><li><a href="#1-preflight-read-only">1. Preflight (read-only)</a></li><li><a href="#2-dry-run">2. Dry run</a></li><li><a href="#3-purge">3. Purge</a></li></ol></li><li><a href="#large-purges-a-plan-of-smaller-runs">Large purges: a plan of smaller runs</a></li><li><a href="#reclaim-disk-space">Reclaim disk space</a></li><li><a href="#stop-a-run">Stop a run</a></li><li><a href="#runs-reports-and-logs">Runs, reports and logs</a></li><li><a href="#status-and-recovery">Status and recovery</a></li><li><a href="#settings">Settings</a></li><li><a href="#sqlplus-scripts">SQL*Plus scripts</a></li><li><a href="#command-reference">Command reference</a></li><li><a href="#repository-layout">Repository layout</a></li><li><a href="#testing">Testing</a></li></ol></nav>
+<main>
+<h2 id="what-it-does">What it does<a class="anchor" href="#what-it-does" aria-label="Link to this section">#</a></h2>
+<p>The data is grouped in three modules. Each module has root tables with a date column. A root row is eligible when its date is before the cutoff, and its whole tree of dependent rows goes with it.</p>
+<div class="table-wrap"><table><thead><tr><th>Module</th><th>What it holds</th><th>Root tables (date column)</th></tr></thead><tbody><tr><td data-label="Module">PAYMENTS</td><td data-label="What it holds">Bulk payments with all their dependent records, and file integrations</td><td data-label="Root tables (date column)">OPPAYMENTS.BULK_PAYMENT (VALUE_DATE), OPPAYMENTS.FILE_INTEGRATION (INTEGRATION_DATE)</td></tr><tr><td data-label="Module">LOGS</td><td data-label="What it holds">Functional audit trail and technical logs</td><td data-label="Root tables (date column)">OPPAYMENTS.AUDIT_TRAIL (AUDIT_TIMESTAMP), OP.SPEC_TRT_LOG (DTLOG)</td></tr><tr><td data-label="Module">BANK_STATEMENTS</td><td data-label="What it holds">Bank statement dispatching</td><td data-label="Root tables (date column)">OPPAYMENTS.FILE_DISPATCHING (DATE_RECEPTION)</td></tr></tbody></table></div>
+<p>The cutoff is today minus the retention (<code>--retention DAYS</code>, 30 by default), or a date given with <code>--cutoff YYYY-MM-DD</code>. A root that a kept row still references is left, with its tree, for a later run.</p>
+<p>The mode decides what happens to the eligible rows:</p>
+<div class="table-wrap"><table><thead><tr><th>Mode</th><th>Effect</th></tr></thead><tbody><tr><td data-label="Mode">FULL</td><td data-label="Effect">Deletes the eligible rows of the modules chosen with <code>--depth</code> (ALL by default).</td></tr><tr><td data-label="Mode">CLOB</td><td data-label="Effect">Keeps the rows and empties their large text and binary values (LOB columns).</td></tr><tr><td data-label="Mode">LOGS</td><td data-label="Effect">Deletes the eligible rows of the LOGS module only.</td></tr><tr><td data-label="Mode">CLOB_N_LOGS</td><td data-label="Effect">Deletes the eligible rows of the LOGS module, and empties the LOB values of the other modules.</td></tr></tbody></table></div>
+<p>A purge works in batches: each batch is one transaction, committed before the next one starts. It does not lock the application's accounts.</p>
+<p>The space a purge frees stays inside the tables: the datafiles keep their size. The <a href="#reclaim-disk-space">reclaim</a> gives that space back to the disk.</p>
+<h2 id="requirements">Requirements<a class="anchor" href="#requirements" aria-label="Link to this section">#</a></h2>
+<ul><li>A Windows machine with Windows PowerShell 5.1 and an Oracle client: <code>sqlplus.exe</code> in the PATH or in <code>%ORACLE_HOME%\bin</code>, and a TNS alias or an EZConnect string for the database.</li><li>Oracle Database 12.2 or later (developed on 19c). In a multitenant database, connect to the PDB service.</li><li>The SYS password (AS SYSDBA) to install, upgrade and uninstall, to reclaim, and for <code>--redo-logs</code> and <code>--undo-tuning</code>. Everything else uses the tool's own account, EPFPG, which the install creates.</li><li>For a reclaim: a single-instance database (not RAC).</li></ul>
+<h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<p>From the tool's folder:</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat install --tns EPFPDB</code></pre></div>
+<p>It asks for the SYS password, and for the EPFPG password to set (twice), unless EPF_SYS_PASSWORD and EPF_PASSWORD are set (see <a href="#passwords">Passwords</a>). It creates the EPFPG user and its tablespace EPFPG_DATA (next to the application's data), then the tool's tables and packages, and ends with:</p>
+<div class="code"><pre class="plain"><code>  EPFPG objects valid, tool version &lt;version&gt;</code></pre></div>
+<p>Running the install again upgrades the tool in place: the run history and the settings you changed are kept.</p>
+<p>To remove the tool: <code>src\bin\epf_purge.bat uninstall</code> drops the EPFPG user and the EPFPG_DATA tablespace.</p>
+<h2 id="configure">Configure<a class="anchor" href="#configure" aria-label="Link to this section">#</a></h2>
+<p>Copy <code>src\config\epf_purge.conf.example</code> to <code>src\config\epf_purge.conf</code> and set at least <code>TNS</code>. The example file describes every key. Another file can be given with <code>--config FILE</code>.</p>
+<p>Command-line options override the file. In the wizard, a value in the file is the default answer of its question; with <code>--non-interactive</code>, it is the answer.</p>
+<div class="table-wrap"><table><thead><tr><th>Key</th><th>Option</th><th>Meaning</th></tr></thead><tbody><tr><td data-label="Key">TNS</td><td data-label="Option"><code>--tns</code></td><td data-label="Meaning">TNS alias or EZConnect string</td></tr><tr><td data-label="Key">RETENTION_DAYS</td><td data-label="Option"><code>--retention</code></td><td data-label="Meaning">Days of data to keep (30 by default)</td></tr><tr><td data-label="Key">CUTOFF</td><td data-label="Option"><code>--cutoff</code></td><td data-label="Meaning">Instead of the retention: purge rows dated before this day</td></tr><tr><td data-label="Key">MODE</td><td data-label="Option"><code>--mode</code></td><td data-label="Meaning">FULL, CLOB, LOGS or CLOB_N_LOGS</td></tr><tr><td data-label="Key">DEPTH</td><td data-label="Option"><code>--depth</code></td><td data-label="Meaning">ALL, or modules separated by commas</td></tr><tr><td data-label="Key">BATCH_SIZE</td><td data-label="Option"><code>--batch-size</code></td><td data-label="Meaning">Root rows per transaction, 100 to 100000</td></tr><tr><td data-label="Key">DRY_RUN</td><td data-label="Option"><code>--dry-run</code></td><td data-label="Meaning">Y: simulate only</td></tr><tr><td data-label="Key">COMPACT</td><td data-label="Option"><code>--compact</code></td><td data-label="Meaning">Y: shrink the purged tables afterwards</td></tr><tr><td data-label="Key">REDO_LOGS</td><td data-label="Option"><code>--redo-logs</code></td><td data-label="Meaning">Y: enlarge the online redo logs to 4 x 1 GB first (permanent; SYS)</td></tr><tr><td data-label="Key">UNDO_TUNING</td><td data-label="Option"><code>--undo-tuning</code></td><td data-label="Meaning">Y: lower undo_retention and limit the undo growth for the purge, restored at the end (SYS)</td></tr><tr><td data-label="Key">BACKUP</td><td data-label="Option"><code>--backup</code></td><td data-label="Meaning">Without a recent RMAN backup: CONFIRMED (a backup was made another way) or NONE</td></tr><tr><td data-label="Key">CONFIRM</td><td data-label="Option"><code>--confirm</code></td><td data-label="Meaning">Requirements the DBA confirms are handled: ARCHIVE, UNDO, TEMP</td></tr><tr><td data-label="Key">MAX_REDO</td><td data-label="Option"><code>--max-redo</code></td><td data-label="Meaning">The most redo one run may write, such as 20G: the purge is split into runs</td></tr><tr><td data-label="Key">RECLAIM_TABLESPACES</td><td data-label="Option"><code>--tablespaces</code></td><td data-label="Meaning">Reclaim: the tablespaces to compact</td></tr><tr><td data-label="Key">RECLAIM_CONFIRM</td><td data-label="Option"><code>--confirm</code></td><td data-label="Meaning">Reclaim: ARCHIVE, TEMP, RECYCLEBIN</td></tr><tr><td data-label="Key">RECLAIM_SCRATCH</td><td data-label="Option"><code>--scratch</code></td><td data-label="Meaning">Reclaim: scratch space for the tables that cannot move lower, such as 3G</td></tr><tr><td data-label="Key">LOG_DIR</td><td data-label="Option"><code>--log-dir</code></td><td data-label="Meaning">Where the run folders go (<code>logs</code> by default)</td></tr><tr><td data-label="Key">NO_COLOR</td><td data-label="Option"><code>--no-color</code></td><td data-label="Meaning">Y: plain output</td></tr></tbody></table></div>
+<h3 id="passwords">Passwords<a class="anchor" href="#passwords" aria-label="Link to this section">#</a></h3>
+<p>The tool never places a password on a command line or in a file it writes. It reads the passwords from the environment variables EPF_PASSWORD (EPFPG) and EPF_SYS_PASSWORD (SYS), or asks for them without showing them. The configuration file may hold them too, which is discouraged: the file is then as sensitive as the passwords.</p>
+<p>With <code>--non-interactive</code> the tool cannot ask. Set both variables first, once per PowerShell window. This line asks for both passwords without showing them; the command history keeps only the line:</p>
+<div class="code"><div class="code-head"><span>PowerShell</span><button class="copy" type="button">Copy</button></div><pre><code>$env:EPF_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'EPFPG password' -AsSecureString)).Password; $env:EPF_SYS_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'SYS password' -AsSecureString)).Password</code></pre></div>
+<p>When you are done (closing the window does the same):</p>
+<div class="code"><div class="code-head"><span>PowerShell</span><button class="copy" type="button">Copy</button></div><pre><code>Remove-Item Env:EPF_PASSWORD, Env:EPF_SYS_PASSWORD</code></pre></div>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<p>There are two ways to use the tool.</p>
+<ul><li><strong>The wizard.</strong> <code>src\bin\epf_purge.bat</code> without an action opens a menu: purge, preflight only, reclaim disk space, report of a run, status, install or upgrade, uninstall. While a plan is open, it shows the plan and offers to continue it, check it again, rehearse its next step or start over. It asks every question before the first change.</li><li><strong>Commands.</strong> <code>src\bin\epf_purge.bat &lt;action&gt; [options]</code>, for example from a scheduled task with <code>--non-interactive</code>. <code>src\bin\epf_purge.bat --help</code> lists every action and option.</li></ul>
+<p>While a run is shown, its steps and progress are updated live. Ctrl+C asks for a graceful stop (see <a href="#stop-a-run">Stop a run</a>).</p>
+<h2 id="purge">Purge<a class="anchor" href="#purge" aria-label="Link to this section">#</a></h2>
+<h3 id="1-preflight-read-only">1. Preflight (read-only)<a class="anchor" href="#1-preflight-read-only" aria-label="Link to this section">#</a></h3>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat preflight --retention 365</code></pre></div>
+<p>The preflight validates the tool's table registry against the database, counts the eligible rows, estimates the redo, undo and time of the purge, checks six requirements, and plans the purge. It changes nothing.</p>
+<p>Without <code>--non-interactive</code> it asks, for each requirement not met, how to meet it, then the batch size, and checks again. The answers are saved with the plan, and the purges of the plan follow them.</p>
+<div class="table-wrap"><table><thead><tr><th>Requirement</th><th>Blocking</th><th>What it checks</th><th>How to meet it</th></tr></thead><tbody><tr><td data-label="Requirement">ARCHIVE</td><td data-label="Blocking">yes</td><td data-label="What it checks">In ARCHIVELOG mode, the archive destination has room for the purge's redo, plus 20 %</td><td data-label="How to meet it">Free archive space; a <a href="#large-purges-a-plan-of-smaller-runs">plan of smaller runs</a>; or <code>--confirm ARCHIVE</code> when the database cannot measure the destination</td></tr><tr><td data-label="Requirement">UNDO</td><td data-label="Blocking">yes</td><td data-label="What it checks">The undo tablespace holds four batches and the undo kept for undo_retention</td><td data-label="How to meet it"><code>--undo-tuning</code>, a smaller batch size, or <code>--confirm UNDO</code></td></tr><tr><td data-label="Requirement">TEMP</td><td data-label="Blocking">yes</td><td data-label="What it checks">The temporary tablespace holds the purge's work keys</td><td data-label="How to meet it">Room in TEMP, or <code>--confirm TEMP</code></td></tr><tr><td data-label="Requirement">BACKUP</td><td data-label="Blocking">yes</td><td data-label="What it checks">An RMAN database backup newer than 24 hours</td><td data-label="How to meet it">A backup; or <code>--backup confirmed</code> (made another way) or <code>--backup none</code></td></tr><tr><td data-label="Requirement">INDEX_SPACE</td><td data-label="Blocking">no</td><td data-label="What it checks">EPFPG_DATA holds the temporary indexes the purge creates</td><td data-label="How to meet it">Room in EPFPG_DATA</td></tr><tr><td data-label="Requirement">REDO_LOGS</td><td data-label="Blocking">no</td><td data-label="What it checks">One batch fits in an online redo log (otherwise the purge is only slower)</td><td data-label="How to meet it"><code>--redo-logs</code>, or a smaller batch size</td></tr></tbody></table></div>
+<p>A purge does not start while a blocking requirement is not met.</p>
+<h3 id="2-dry-run">2. Dry run<a class="anchor" href="#2-dry-run" aria-label="Link to this section">#</a></h3>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat purge --dry-run</code></pre></div>
+<p>A dry run simulates the purge: the exact counts, the forecast and the expected outcome. It deletes nothing. While a plan is open, it rehearses the plan's next step.</p>
+<h3 id="3-purge">3. Purge<a class="anchor" href="#3-purge" aria-label="Link to this section">#</a></h3>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat purge</code></pre></div>
+<p>With prompts, the purge runs a preflight first, asks how to meet any requirement not met, shows what it will do and asks you to confirm. It then deletes in batches and ends with its report. While a plan is open, <code>purge</code> without <code>--retention</code>, <code>--cutoff</code>, <code>--mode</code> or <code>--depth</code> carries out the plan's next step with its choices.</p>
+<p>Unattended, every answer comes from the options or the configuration file, and <code>--yes</code> replaces the confirmation:</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat purge --non-interactive --yes --retention 365 --mode FULL --backup confirmed</code></pre></div>
+<p>More options for the purge:</p>
+<ul><li><code>--compact</code> shrinks the purged tables afterwards (tables with at least 20 % free inside them).</li><li><code>--undo-tuning</code> lowers undo_retention and limits the growth of the undo tablespace (4 GB by default) for the purge, then restores both (SYS).</li><li><code>--redo-logs</code> enlarges the online redo logs to 4 x 1 GB first. This change is permanent (SYS).</li></ul>
+<p>With a preflight or a dry run, <code>--undo-tuning</code> and <code>--redo-logs</code> are checked as planned; nothing is changed.</p>
+<h2 id="large-purges-a-plan-of-smaller-runs">Large purges: a plan of smaller runs<a class="anchor" href="#large-purges-a-plan-of-smaller-runs" aria-label="Link to this section">#</a></h2>
+<p>When the archive destination (ARCHIVELOG mode) cannot take the whole purge's redo at once, or when <code>--max-redo SIZE</code> limits it, the preflight plans several runs, older data first.</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat preflight --retention 365 --max-redo 20G
+src\bin\epf_purge.bat plan
+src\bin\epf_purge.bat purge</code></pre></div>
+<ul><li><code>purge</code>, without scope options, carries out the next step of the open plan; <code>purge --dry-run</code> rehearses it.</li><li><code>preflight</code> checks the plan again; the wizard does so itself when the last check is older than 8 hours or found requirements not met.</li><li>In ARCHIVELOG mode, back up and delete the archived logs between runs.</li><li>While a plan is in progress, a purge with other options is refused; <code>--new</code> starts over (the steps already done stay done). <code>plan --close</code> closes the plan.</li></ul>
+<h2 id="reclaim-disk-space">Reclaim disk space<a class="anchor" href="#reclaim-disk-space" aria-label="Link to this section">#</a></h2>
+<p>A purge frees space inside the tables, but the datafiles keep their size. The reclaim compacts the application's tablespaces in place and shrinks their datafiles:</p>
+<ol><li>It locks the application's accounts and disconnects their sessions. <strong>The application is unavailable until the end of the run.</strong></li><li>It records the row counts and a fingerprint of the objects, releases the indexes of the tables that will move (they are rebuilt at the end), and stops the datafiles from growing.</li><li>Repeatedly, the table holding the highest block of a datafile moves into free space lower down, and the datafile is cut down to its new end.</li><li>It rebuilds the indexes, restores the datafiles' growth settings, resizes each datafile to its highest block plus 64 MB of free space, recompiles what became invalid, counts the rows again and unlocks the accounts.</li></ol>
+<p>The reclaim changes no row of the application, and no datafile grows above its size at the start (two rare exceptions are reported as warnings).</p>
+<p>Assess first, then compact:</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat reclaim --dry-run
+src\bin\epf_purge.bat reclaim</code></pre></div>
+<p>The dry run is read-only. It lists the tablespaces, what moves and what stays, the forecast, the accounts that will be locked, and the requirements. With prompts, the reclaim shows the same assessment and asks before anything moves. Unattended: <code>reclaim --non-interactive --yes</code>.</p>
+<p>Options:</p>
+<ul><li><code>--tablespaces DATA,INDX</code> limits the reclaim to those tablespaces. By default it takes every tablespace holding segments of the application's schemas.</li><li><code>--confirm RECYCLEBIN</code> lets it purge the recycle bin of those tablespaces first; without it, recycle-bin objects stop the reclaim before any change. <code>--confirm ARCHIVE</code> and <code>--confirm TEMP</code> work as for a purge.</li><li><code>--scratch SIZE</code>, such as <code>--scratch 3G</code>, allows a scratch tablespace. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. The dry run shows where the scratch datafile would go and suggests a size.</li></ul>
+<p>The assessment checks these requirements: RECYCLEBIN, ARCHIVE, TEMP and QUOTA block the reclaim when not met (QUOTA cannot be confirmed: the owners need a space quota where their tables are written again); BACKUP and SCRATCH are advice.</p>
+<p>Some segments cannot move: partitioned tables, queue tables, tables with a LONG column, and a few other kinds. They stay where they are, the assessment lists them, and a datafile cannot shrink below the highest of them.</p>
+<p>If a reclaim is interrupted, what it changed is undone: at once after Ctrl+C or <code>stop</code>; in the same run when its session is lost; otherwise by <code>src\bin\epf_purge.bat reclaim --restore</code>. <code>status</code> shows anything left pending.</p>
+<h2 id="stop-a-run">Stop a run<a class="anchor" href="#stop-a-run" aria-label="Link to this section">#</a></h2>
+<p>Press Ctrl+C in the window that shows the run, or, from another window:</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat stop</code></pre></div>
+<p>A purge stops after its current batch, a reclaim after its current table. The run then ends with its report, with status STOPPED and exit code 3. Run the purge again to continue: the rows already deleted stay deleted.</p>
+<h2 id="runs-reports-and-logs">Runs, reports and logs<a class="anchor" href="#runs-reports-and-logs" aria-label="Link to this section">#</a></h2>
+<p>Every action that works on the database creates a run, such as R-000123, recorded in the EPFPG tables, and a folder <code>logs\&lt;date&gt;_&lt;time&gt;_R-000123</code>:</p>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Content</th></tr></thead><tbody><tr><td data-label="File">console.log</td><td data-label="Content">What the console showed, with every event of the run</td></tr><tr><td data-label="File">report.txt</td><td data-label="Content">The run's report: parameters, steps, results, checks and verdict</td></tr><tr><td data-label="File">manifest.txt</td><td data-label="Content">A key=value summary: status, verdict, exit code, checks</td></tr><tr><td data-label="File">requirements.txt, plan.txt</td><td data-label="Content">The requirements and the plan, when the run has them</td></tr><tr><td data-label="File">sqlplus_*.log</td><td data-label="Content">The output of the SQL*Plus sessions</td></tr></tbody></table></div>
+<p>Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat report
+src\bin\epf_purge.bat report --run 123</code></pre></div>
+<p>The first shows the latest run. Runs older than 180 days (setting history_retention_days) are removed from the database when a new run starts; the run folders stay until you delete them.</p>
+<div class="table-wrap"><table><thead><tr><th>Exit code</th><th>Meaning</th></tr></thead><tbody><tr><td data-label="Exit code">0</td><td data-label="Meaning">PASS</td></tr><tr><td data-label="Exit code">1</td><td data-label="Meaning">FAIL</td></tr><tr><td data-label="Exit code">2</td><td data-label="Meaning">PASS WITH WARNINGS</td></tr><tr><td data-label="Exit code">3</td><td data-label="Meaning">Aborted or stopped</td></tr><tr><td data-label="Exit code">4</td><td data-label="Meaning">Usage or configuration error (nothing was changed)</td></tr></tbody></table></div>
+<h2 id="status-and-recovery">Status and recovery<a class="anchor" href="#status-and-recovery" aria-label="Link to this section">#</a></h2>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat status</code></pre></div>
+<p>The status shows the active run, or the latest one, with its steps and last events, and anything left pending:</p>
+<div class="table-wrap"><table><thead><tr><th>Left pending</th><th>Cleared by</th></tr></thead><tbody><tr><td data-label="Left pending">Temporary indexes of an interrupted purge</td><td data-label="Cleared by">The next purge drops them.</td></tr><tr><td data-label="Left pending">Undo tuning still active</td><td data-label="Cleared by">The purge restores it at its end; otherwise <code>src/sql/run/undo.sql RESTORE</code> as SYS (see <a href="#sqlplus-scripts">SQL*Plus scripts</a>).</td></tr><tr><td data-label="Left pending">Reclaim changes: datafile growth stopped, indexes still unusable, accounts still locked, tables still parked, a scratch tablespace</td><td data-label="Cleared by"><code>src\bin\epf_purge.bat reclaim --restore</code>; a new reclaim restores them too.</td></tr></tbody></table></div>
+<h2 id="settings">Settings<a class="anchor" href="#settings" aria-label="Link to this section">#</a></h2>
+<p>The tunables are rows of the table EPFPG.EPF_SETTING. An upgrade keeps the values you changed. The ones most often changed:</p>
+<div class="table-wrap"><table><thead><tr><th>Setting</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td data-label="Setting">app_schemas</td><td data-label="Default">OP,OPPAYMENTS,OPREPORTS</td><td data-label="Meaning">The application's schemas; the tablespaces they use are reclaim candidates</td></tr><tr><td data-label="Setting">retention_days_default</td><td data-label="Default">30</td><td data-label="Meaning">Retention in days when none is given</td></tr><tr><td data-label="Setting">batch_size_default</td><td data-label="Default">1000</td><td data-label="Meaning">Root rows per batch when none is given</td></tr><tr><td data-label="Setting">history_retention_days</td><td data-label="Default">180</td><td data-label="Meaning">Runs older than this are removed when a new run starts</td></tr><tr><td data-label="Setting">backup_max_age_h</td><td data-label="Default">24</td><td data-label="Meaning">An RMAN backup newer than this meets BACKUP</td></tr><tr><td data-label="Setting">archive_margin_pct</td><td data-label="Default">20</td><td data-label="Meaning">Margin added to the redo estimate for ARCHIVE</td></tr><tr><td data-label="Setting">undo_cap_mb</td><td data-label="Default">4096</td><td data-label="Meaning">Undo growth limit with undo tuning</td></tr><tr><td data-label="Setting">compact_min_free_pct</td><td data-label="Default">20</td><td data-label="Meaning"><code>--compact</code> shrinks the tables with at least this share free</td></tr><tr><td data-label="Setting">reclaim_margin_mb</td><td data-label="Default">64</td><td data-label="Meaning">Free space a reclaim leaves at the end of each datafile</td></tr><tr><td data-label="Setting">reclaim_growth_mb</td><td data-label="Default">0</td><td data-label="Meaning">How far a reclaim may grow a datafile above its size at the start</td></tr><tr><td data-label="Setting">disconnect_timeout_s</td><td data-label="Default">300</td><td data-label="Meaning">Seconds a reclaim waits for sessions to end before it disconnects them at once</td></tr></tbody></table></div>
+<p>To change one, connected as EPFPG:</p>
+<div class="code"><div class="code-head"><span>SQL</span><button class="copy" type="button">Copy</button></div><pre><code>UPDATE epfpg.epf_setting SET value = '365' WHERE name = 'retention_days_default';
+COMMIT;</code></pre></div>
+<h2 id="sqlplus-scripts">SQL*Plus scripts<a class="anchor" href="#sqlplus-scripts" aria-label="Link to this section">#</a></h2>
+<p>The tool runs the scripts of <code>src\sql\run</code>. Some of them can be run directly in SQL*Plus, from the tool's folder:</p>
+<div class="table-wrap"><table><thead><tr><th>Script</th><th>Connect as</th><th>Purpose</th></tr></thead><tbody><tr><td data-label="Script"><code>report.sql &lt;run_id or LATEST&gt;</code></td><td data-label="Connect as">EPFPG</td><td data-label="Purpose">The report of a run</td></tr><tr><td data-label="Script"><code>status.sql</code></td><td data-label="Connect as">EPFPG</td><td data-label="Purpose">The status, as <code>epf_purge.bat status</code></td></tr><tr><td data-label="Script"><code>stop.sql &lt;run_id or ACTIVE&gt;</code></td><td data-label="Connect as">EPFPG</td><td data-label="Purpose">A graceful stop</td></tr><tr><td data-label="Script"><code>preflight.sql NEW</code></td><td data-label="Connect as">EPFPG</td><td data-label="Purpose">A standalone preflight with the default parameters</td></tr><tr><td data-label="Script"><code>undo.sql APPLY, RESTORE or STATUS</code></td><td data-label="Connect as">SYS AS SYSDBA</td><td data-label="Purpose">Undo tuning by hand</td></tr></tbody></table></div>
+<p>For example (SQL*Plus asks for the password):</p>
+<div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>sqlplus -L -S &quot;epfpg@EPFPDB&quot; @src/sql/run/report.sql LATEST
+sqlplus -L &quot;sys@EPFPDB AS SYSDBA&quot; @src/sql/run/undo.sql RESTORE</code></pre></div>
+<h2 id="command-reference">Command reference<a class="anchor" href="#command-reference" aria-label="Link to this section">#</a></h2>
+<p><code>src\bin\epf_purge.bat --help</code> prints the complete reference.</p>
+<div class="table-wrap"><table><thead><tr><th>Action</th><th>What it does</th></tr></thead><tbody><tr><td data-label="Action">(none)</td><td data-label="What it does">The wizard</td></tr><tr><td data-label="Action"><code>preflight</code></td><td data-label="What it does">Read-only checks, estimates and the plan of the purge</td></tr><tr><td data-label="Action"><code>purge</code></td><td data-label="What it does">Preflight, purge and report; <code>--dry-run</code> simulates</td></tr><tr><td data-label="Action"><code>plan</code></td><td data-label="What it does">The open plan with its steps; <code>--close</code> closes it</td></tr><tr><td data-label="Action"><code>report</code></td><td data-label="What it does">The report of a run: <code>--run ID</code>, the latest by default</td></tr><tr><td data-label="Action"><code>status</code></td><td data-label="What it does">The state of the active or latest run, and anything left pending</td></tr><tr><td data-label="Action"><code>stop</code></td><td data-label="What it does">A graceful stop of the active run</td></tr><tr><td data-label="Action"><code>reclaim</code></td><td data-label="What it does">Gives the freed space back to the disk; <code>--dry-run</code> assesses, <code>--restore</code> restores what a reclaim left pending</td></tr><tr><td data-label="Action"><code>install</code></td><td data-label="What it does">Installs or upgrades the database objects (SYS)</td></tr><tr><td data-label="Action"><code>uninstall</code></td><td data-label="What it does">Removes them (SYS)</td></tr></tbody></table></div>
+<p>General options: <code>--config FILE</code>, <code>--tns NAME</code>, <code>--yes</code> (required with <code>--non-interactive</code> for a purge that deletes, a reclaim and an uninstall), <code>--non-interactive</code>, <code>--log-dir DIR</code>, <code>--no-color</code>, <code>--help</code>.</p>
+<h2 id="repository-layout">Repository layout<a class="anchor" href="#repository-layout" aria-label="Link to this section">#</a></h2>
+<div class="code"><pre class="plain"><code>src\bin\epf_purge.bat    the tool (its code is in src\bin\lib\epf.ps1)
+src\config\              the configuration example
+src\sql\install\         installer, tables and packages of the EPFPG schema
+src\sql\run\             the SQL*Plus scripts the tool runs
+src\tests\               end-to-end tests, test labs and the parity check
+docs\README.html         this guide as a web page
+legacy\                  the previous tool, kept for reference
+logs\                    run folders (not part of the repository)</code></pre></div>
+<h2 id="testing">Testing<a class="anchor" href="#testing" aria-label="Link to this section">#</a></h2>
+<p>The end-to-end test suite runs every feature against a test database, and changes it: it purges every module, clears LOB values, compacts tables, enlarges the online redo logs to 4 x 1 GB (permanent) and changes undo_retention during the purges. Its reclaim tests work on tablespaces they create and remove. Run it only on a copy that can be discarded.</p>
+<ol><li>Copy <code>src\tests\e2e\test.conf.example</code> to <code>src\tests\e2e\test.conf</code>, and set TNS, EXPECTED_DB and DESTRUCTIVE_OK=YES.</li><li>Run <code>src\tests\e2e\run_tests.bat</code> for the whole suite (about 3 hours), or a part of it, such as <code>src\tests\e2e\run_tests.bat --only T18A,T18B</code>.</li><li><code>src\tests\e2e\run_tests.bat --digest</code> writes a short summary of the last test session to <code>logs\digest.txt</code> and copies it to the clipboard.</li></ol>
+</main>
+<footer>This page is the HTML version of README.md in the tool's folder.</footer>
+</div>
+<script>
+document.querySelectorAll('.copy').forEach(function (button) {
+  button.addEventListener('click', function () {
+    var block = button.parentNode.parentNode.querySelector('code');
+    var text = block.textContent;
+    function done() {
+      button.textContent = 'Copied';
+      button.classList.add('done');
+      setTimeout(function () { button.textContent = 'Copy'; button.classList.remove('done'); }, 1500);
+    }
+    function fallback() {
+      var range = document.createRange();
+      range.selectNodeContents(block);
+      var selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      try { document.execCommand('copy'); done(); } catch (e) { button.textContent = 'Press Ctrl+C'; }
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  });
+});
+(function () {
+  var links = {};
+  document.querySelectorAll('.toc a').forEach(function (a) { links[a.getAttribute('href').slice(1)] = a; });
+  var heads = document.querySelectorAll('main h2[id], main h3[id]');
+  if (!('IntersectionObserver' in window) || !heads.length) { return; }
+  var current = null;
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (entry.isIntersecting && links[entry.target.id]) {
+        if (current) { current.classList.remove('active'); }
+        current = links[entry.target.id];
+        current.classList.add('active');
+      }
+    });
+  }, { rootMargin: '0px 0px -75% 0px' });
+  heads.forEach(function (h) { observer.observe(h); });
+})();
+</script>
+</body>
+</html>

@@ -2,6 +2,17 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - README: how to use the tool; docs/README.html, its HTML version
+
+Why: the README held a placeholder; the user asked for a guide to the tool and an HTML version of it.
+
+Changes (documentation only):
+- **README.md** rewritten for those who install and run the tool: what it does (modules, modes), requirements, install, configure (every key with its option), passwords (a PowerShell one-liner that keeps them off the command line), run it, purge (preflight, dry run, purge), large purges, reclaim (with `--scratch`), stop a run, runs, reports and logs (files, exit codes), status and recovery, settings, the SQL*Plus scripts, the command reference, the repository layout, testing (which warns that the suite changes the database).
+- **docs/README.html**: the same guide as one self-contained page (nothing loaded from elsewhere, works offline): a contents sidebar that follows the reading, a Copy button on each command, tables as cards on a phone, dark mode, print styles.
+- **.local/gen_readme_html.js** builds the page from README.md, which stays the source: change the README, then run `node .local\gen_readme_html.js`. It stops on non-ASCII and on a link to a section that does not exist (the README's contents list included).
+
+Checked: headless Edge from 360 to 1370 px wide: no table or command wider than its frame, no sideways scroll; light and dark.
+
 ## 2026-10-08 - Reclaim: parking in a scratch tablespace (--scratch) replaces the 64 MB extents (0.8.0)
 
 Why: I5 and I6 showed that Oracle chooses where the copy of a moved table goes, and that for a table like TRANSMISSION_EXECUTION_AUDIT (a BASICFILE LOB) it may start at the top of the file although there is free space below; nothing the tool does steers it. The user chose to allow temporary disk for such tables.
