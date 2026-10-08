@@ -98,6 +98,7 @@ Command-line options override the file. In the wizard, a value in the file is th
 | RECLAIM_CONFIRM | `--confirm` | Reclaim: ARCHIVE, TEMP, RECYCLEBIN |
 | RECLAIM_SCRATCH | `--scratch` | Reclaim: scratch space for the tables that cannot move lower, such as 3G |
 | LOG_DIR | `--log-dir` | Where the run folders go (`logs` by default) |
+| VERBOSE | `--verbose` | Y: every event and the whole report on the console |
 | NO_COLOR | `--no-color` | Y: plain output |
 
 ### Passwords
@@ -123,7 +124,7 @@ There are two ways to use the tool.
 - **The wizard.** `src\bin\epf_purge.bat` without an action opens a menu: purge, preflight only, reclaim disk space, report of a run, status, install or upgrade, uninstall. While a plan is open, it shows the plan and offers to continue it, check it again, rehearse its next step or start over. It asks every question before the first change.
 - **Commands.** `src\bin\epf_purge.bat <action> [options]`, for example from a scheduled task with `--non-interactive`. `src\bin\epf_purge.bat --help` lists every action and option.
 
-While a run is shown, its steps and progress are updated live. Ctrl+C asks for a graceful stop (see [Stop a run](#stop-a-run)).
+While a run is shown, the console shows the end of each step, the progress, warnings, errors and milestones such as the rows deleted per module or the size of each tablespace after a reclaim. A status line at the bottom shows what runs now. At the end comes a summary of the report: the estimate or the simulation, the requirements, the tablespaces, the checks that did not pass and the verdict. `--verbose` shows every event and the whole report instead. Either way, console.log in the run folder has every line (see [Runs, reports and logs](#runs-reports-and-logs)). Ctrl+C asks for a graceful stop (see [Stop a run](#stop-a-run)).
 
 ## Purge
 
@@ -241,7 +242,7 @@ Every action that works on the database creates a run, such as R-000123, recorde
 
 | File | Content |
 |---|---|
-| console.log | What the console showed, with every event of the run |
+| console.log | Every line of the run as `--verbose` shows it: every event and the whole report |
 | report.txt | The run's report: parameters, steps, results, checks and verdict |
 | manifest.txt | A key=value summary: status, verdict, exit code, checks |
 | requirements.txt, plan.txt | The requirements and the plan, when the run has them |
@@ -339,7 +340,7 @@ sqlplus -L "sys@EPFPDB AS SYSDBA" @src/sql/run/undo.sql RESTORE
 | `install` | Installs or upgrades the database objects (SYS) |
 | `uninstall` | Removes them (SYS) |
 
-General options: `--config FILE`, `--tns NAME`, `--yes` (required with `--non-interactive` for a purge that deletes, a reclaim and an uninstall), `--non-interactive`, `--log-dir DIR`, `--no-color`, `--help`.
+General options: `--config FILE`, `--tns NAME`, `--yes` (required with `--non-interactive` for a purge that deletes, a reclaim and an uninstall), `--non-interactive`, `--log-dir DIR`, `--verbose`, `--no-color`, `--help`.
 
 ## Repository layout
 

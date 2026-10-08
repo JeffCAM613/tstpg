@@ -2,6 +2,25 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Output: a lighter view by default; --verbose shows everything (wrapper only; the database stays 0.8.0)
+
+Why: the user found the output of a run too much to follow live. The details stay: with `--verbose`, and always in console.log.
+
+Changes (src/bin/lib/epf.ps1):
+- **`--verbose`** (or `VERBOSE=Y` in the configuration file) shows the output as before: every event but the detail events, a heartbeat line every 15 s, the whole report.
+- **By default**, while a run is shown: the end of each step, progress (BATCH_PROGRESS), warnings, errors and the milestones of a run (`$script:MilestoneEvents`: scope, plan, requirements, forecast, module and purge end, the tuning changes, tablespaces assessed, accounts locked and unlocked, indexes released, parking and return, compaction end, where each datafile stopped, files resized, the reclaim result). Every other event, the start of each step among them, goes to console.log only.
+- **A status line** at the bottom says what runs now: the database clock, the running step with its units done of those planned (the `ST|` lines of the poll, unused until now), the worker's wait, blocker and progress %. It is rewritten in place every 2 s, cleared before the next line and before a prompt, and never logged. When the output is not a console window (a file or a pipe), a line after 60 s without one replaces it. A statement suspended for space gets a line of its own (logged), at most once a minute.
+- **At the end, a summary** instead of the whole report: the estimate (preflight) or the simulation and expected outcome (dry run); for a reclaim each tablespace in one line, and for an assessment the accounts a compaction locks; the requirements, each with what was measured, and why and how to meet the ones not met (not shown when a purge or compaction found them all met); the checks that did not pass, and P7 and R7, with their details, the others in one line; the verdict. It is built from the report's sections and EPF_ lines; report.txt and console.log have the whole report.
+- **console.log is the same at both levels**: every line `--verbose` shows. The heartbeat lines are left out at both levels, as before.
+- "(see the report above)" in three messages is now "(see above)".
+- Help, README and docs/README.html, the configuration example (`VERBOSE`), PLAN.md (G8, 8.2, 8.3, D21).
+
+Tests: the suite passes `--verbose` to every wrapper call (Invoke-Wrapper; `-Brief` leaves it out), so its checks and the digest see what they saw before. T08 now checks the default output of a preflight: the summary (ESTIMATE, REQUIREMENTS, its RESULT line, VERDICT), and none of ROOTS_ELIGIBLE, STEP_START, RETENTION OPTIONS, STEPS; its console.log has all of those and not the summary.
+
+Checked offline: 61 checks of the summary, the events shown and the status text, on reports laid out as epf_report prints them. A dry run and a compaction replayed by the fake sqlplus at both levels: 87 and 55 lines on the console by default, 157 and 108 with `--verbose`, the same console.log at both levels. The status line in a real console window: rewritten in place, nothing left behind. T00, T01, T06, T07 and the new T08 against the fake.
+
+How to test (set J on the status page): J2 includes T08; J3 and J4 run without `--verbose`. During J4, watch the bottom line and the SUMMARY at the end. The digest reads console.log as before.
+
 ## 2026-10-09 - README: how to use the tool; docs/README.html, its HTML version
 
 Why: the README held a placeholder; the user asked for a guide to the tool and an HTML version of it.

@@ -23,8 +23,15 @@ $script:RunSqlDir   = Join-Path $script:SrcDir 'sql\run'
 $script:InstallDir  = Join-Path $script:SrcDir 'sql\install'
 $script:UseColor    = $true
 $script:Interactive = $true
+$script:Verbose     = $false
 $script:LogFile     = $null
 $script:Buffered    = New-Object 'System.Collections.Generic.List[string]'
+# Without --verbose, on a console: the status line of the live view
+# (Show-Status), whether it is on the screen, and when a line was last
+# written to the console.
+$script:StatusLine  = $false
+$script:StatusShown = $false
+$script:LastConsole = Get-Date
 $script:SqlPlus     = $null
 $script:Cli         = $null
 $script:Config      = @{}
@@ -78,36 +85,68 @@ function Write-Log {
 }
 
 # Writes a line to the console (in colour unless --no-color) and to the log.
+# -Detail: on the console only with --verbose; the log has it either way.
 function Write-Out {
-    param([string]$Text = '', [string]$Color = '', [switch]$NoLog)
-    if ($script:UseColor -and $Color -ne '') {
-        Write-Host $Text -ForegroundColor $Color
-    } else {
-        Write-Host $Text
+    param([string]$Text = '', [string]$Color = '', [switch]$NoLog, [switch]$Detail)
+    if ($script:Verbose -or -not $Detail) {
+        Clear-Status
+        if ($script:UseColor -and $Color -ne '') {
+            Write-Host $Text -ForegroundColor $Color
+        } else {
+            Write-Host $Text
+        }
+        $script:LastConsole = Get-Date
     }
     if (-not $NoLog) { Write-Log $Text }
 }
 
+# The status line of the live view: one line rewritten in place on the
+# console, cleared before the next line is written (Write-Out); never logged.
+function Show-Status {
+    param([string]$Text)
+    $width = 0
+    try { $width = [Console]::WindowWidth - 1 } catch { $width = 0 }
+    if ($width -lt 20) { return }
+    if ($Text.Length -gt $width) { $Text = $Text.Substring(0, $width - 3) + '...' }
+    $previous = [Console]::ForegroundColor
+    if ($script:UseColor) { [Console]::ForegroundColor = [ConsoleColor]::DarkGray }
+    try {
+        [Console]::Write("`r" + $Text.PadRight($width) + "`r")
+    } finally {
+        [Console]::ForegroundColor = $previous
+    }
+    $script:StatusShown = $true
+}
+
+function Clear-Status {
+    if (-not $script:StatusShown) { return }
+    $script:StatusShown = $false
+    $width = 79
+    try { $width = [Console]::WindowWidth - 1 } catch { $width = 79 }
+    [Console]::Write("`r" + (' ' * $width) + "`r")
+}
+
 # Section header with the database clock (the clock of the event times).
 function Write-Section {
-    param([string]$Title)
+    param([string]$Title, [switch]$Detail, [switch]$NoLog)
     $clock = (Get-Date).Add($script:ClockOffset).ToString('HH:mm:ss')
-    Write-Out ''
-    Write-Out (' ' + $Title.PadRight($script:Width - $clock.Length - 1) + $clock) 'White'
+    Write-Out '' -Detail:$Detail -NoLog:$NoLog
+    Write-Out (' ' + $Title.PadRight($script:Width - $clock.Length - 1) + $clock) 'White' -Detail:$Detail -NoLog:$NoLog
 }
 
 # Writes script output line by line without its trailing blank lines; errors
 # in red, warnings in yellow, a passing verdict in green. -HideMachine leaves
 # the machine-readable EPF_ lines out of the console (the log keeps them).
+# -Detail and -NoLog as for Write-Out.
 function Show-Lines {
-    param([string]$Text, [switch]$Indent, [switch]$HideMachine)
+    param([string]$Text, [switch]$Indent, [switch]$HideMachine, [switch]$Detail, [switch]$NoLog)
     $lines = @($Text -split "`r?`n")
     $last = $lines.Count - 1
     while ($last -ge 0 -and $lines[$last].Trim() -eq '') { $last-- }
     for ($i = 0; $i -le $last; $i++) {
         $line = $lines[$i].TrimEnd()
         if ($HideMachine -and $line -match '^EPF_[A-Z_]+\|') {
-            Write-Log $line
+            if (-not $NoLog) { Write-Log $line }
             continue
         }
         if ($Indent) { $line = '  ' + $line }
@@ -115,7 +154,7 @@ function Show-Lines {
         if ($line -match 'ORA-\d{5}|SP2-\d{4}|\[FAIL\]| FAIL |VERDICT  FAIL') { $color = 'Red' }
         elseif ($line -match '\[WARN\]| WARN |PASS WITH WARNINGS') { $color = 'Yellow' }
         elseif ($line -match 'VERDICT  PASS') { $color = 'Green' }
-        Write-Out $line $color
+        Write-Out $line $color -Detail:$Detail -NoLog:$NoLog
     }
 }
 
@@ -203,6 +242,9 @@ Options
                        and uninstall)
   --non-interactive    never prompt; missing input is an error (exit 4)
   --log-dir DIR        run folders (default: logs in the tool folder)
+  --verbose            show every event, the sessions' waits and the whole
+                       report while a run is shown (console.log in the run
+                       folder has them either way)
   --no-color           plain output
   --help
 
@@ -255,6 +297,16 @@ While a run is shown, Ctrl+C requests a graceful stop: the purge stops after
 its current batch (a reclaim after its current table) and the run ends with
 its report.
 
+Output
+  A run shows the end of each step, its progress, warnings, errors and its
+  milestones (modules purged, tablespaces assessed or compacted), a status
+  line with what runs now, and at the end a summary of its report: the
+  estimate or the simulation, the requirements, the tablespaces, the checks
+  that did not pass and the verdict. --verbose (VERBOSE=Y in the
+  configuration file) shows every event and the whole report instead.
+  console.log in the run folder always has every line, and report.txt the
+  whole report.
+
 Exit codes: 0 PASS, 1 FAIL, 2 PASS WITH WARNINGS, 3 aborted or stopped,
 4 usage or configuration error.
 '@
@@ -271,7 +323,7 @@ function Read-Arguments {
     $valueOptions = @('config', 'tns', 'retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup', 'confirm',
                       'log-dir', 'run', 'tablespaces', 'long-conversion', 'max-redo', 'scratch')
     $flagOptions = @('dry-run', 'compact', 'redo-logs', 'undo-tuning', 'yes', 'non-interactive', 'no-color',
-                     'help', 'reclaim', 'resume', 'new', 'close', 'restore')
+                     'help', 'reclaim', 'resume', 'new', 'close', 'restore', 'verbose')
     $i = 0
     while ($i -lt $List.Count) {
         $arg = [string]$List[$i]
@@ -378,6 +430,7 @@ function Read-Value {
     $label = $Prompt
     if ($Default -ne '') { $label = $label + ' [' + $Default + ']' }
     while ($true) {
+        Clear-Status
         $answer = Read-Host -Prompt (' ' + $label)
         if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
         $value = Test-Value $answer $Allowed $Min $Max $Pattern
@@ -447,6 +500,7 @@ function Read-Secret {
         Exit-Tool $script:ExitUsage ('Missing ' + $Prompt + ': set ' + $EnvName + ' (non-interactive).')
     }
     while ($true) {
+        Clear-Status
         $first = Read-Host -Prompt (' ' + $Prompt) -AsSecureString
         if ($first.Length -eq 0) { Write-Out '   a value is required' 'Yellow' -NoLog; continue }
         if (-not $Twice) { return $first }
@@ -463,6 +517,7 @@ function Read-Typed {
     if (-not $script:Interactive) {
         Exit-Tool $script:ExitUsage ($Prompt + ': --yes is required with --non-interactive.')
     }
+    Clear-Status
     $answer = Read-Host -Prompt (' ' + $Prompt + '. Type yes to proceed')
     Write-Log (' ' + $Prompt + '. Type yes to proceed: ' + $answer)
     if ($answer -ne 'yes') { Exit-Tool $script:ExitAborted 'Aborted.' }
@@ -818,6 +873,17 @@ $script:DetailEvents = @('IDX_MISSING', 'REDO_ESTIMATE', 'UNDO_ESTIMATE', 'TABLE
                          'TEMP_INDEX_DROPPED', 'PIN', 'UNIT_MOVED', 'INDEX_REBUILT', 'FILE_GROWTH_OFF', 'FILE_KEPT',
                          'INITIAL_SEGMENT', 'MOVE_PLACEMENT')
 
+# Without --verbose, the events of these codes are shown besides the
+# warnings, errors, progress and the end of each step: the milestones of a
+# run. The other events, the start of each step among them (the status line
+# shows the running step), go to console.log only.
+$script:MilestoneEvents = @('PURGE_SCOPE', 'PLAN', 'PLAN_STEP', 'REQUIREMENTS', 'FORECAST', 'MODULE_END', 'PURGE_END',
+                            'REDO_ENLARGED', 'REDO_UNCHANGED', 'UNDO_RETENTION_SET', 'UNDO_GROWTH_LIMITED',
+                            'UNDO_RETENTION_RESTORED', 'UNDO_GROWTH_RESTORED', 'TS_ASSESSED', 'NO_TARGET',
+                            'ACCOUNT_LOCKED', 'ACCOUNT_UNLOCKED', 'INDEXES_RELEASED', 'RECYCLEBIN_PURGED',
+                            'SCRATCH_CREATED', 'SCRATCH_DROPPED', 'UNIT_PARKED', 'UNIT_RETURNED', 'COMPACT_DONE',
+                            'FILE_DONE', 'FILE_RESIZED', 'RECLAIM_RESULT', 'WORKER_RUNNING', 'WORKER_ENDED')
+
 # EV|event_id|HH24:MI:SS|severity|phase|event_code|owner.object|message
 function Show-Event {
     param([string[]]$Field)
@@ -835,7 +901,10 @@ function Show-Event {
         Write-Log $text
         return
     }
-    Write-Out $text $color
+    $code = $Field[5]
+    $shown = $script:Verbose -or $code -eq 'STEP_END' -or $script:MilestoneEvents -contains $code -or
+             @('INFO', 'OK') -notcontains $Field[3]
+    Write-Out $text $color -Detail:(-not $shown)
 }
 
 # HB|sid|status|action|event|seconds|wait_class|blocking_sid|blocker|sql_id|pct|left|operation|suspended
@@ -872,6 +941,7 @@ function Update-LiveView {
         return
     }
     $beats = New-Object 'System.Collections.Generic.List[object]'
+    $steps = New-Object 'System.Collections.Generic.List[object]'
     foreach ($line in $lines) {
         if ($line.StartsWith('EV|')) {
             $field = $line.Split([char[]]@('|'), 8)
@@ -882,6 +952,9 @@ function Update-LiveView {
         } elseif ($line.StartsWith('HB|')) {
             $field = $line.Split([char[]]@('|'), 14)
             if ($field.Count -eq 14) { $beats.Add($field) }
+        } elseif ($line.StartsWith('ST|')) {
+            $field = $line.Split([char[]]@('|'), 7)
+            if ($field.Count -eq 7) { $steps.Add($field) }
         } elseif ($line.StartsWith('RUN|')) {
             $State.RunStatus = $line.Split('|')[1]
         } elseif ($line -match 'ORA-\d{5}|SP2-\d{4}') {
@@ -896,10 +969,58 @@ function Update-LiveView {
     } elseif ($State.WorkerSeen) {
         $State.PollsWithout = $State.PollsWithout + 1
     }
-    if ($beats.Count -gt 0 -and ((Get-Date) - $State.LastOutput).TotalSeconds -ge 15) {
+    if (-not $script:Verbose) {
+        Show-Progress $State $beats $steps
+    } elseif ($beats.Count -gt 0 -and ((Get-Date) - $State.LastOutput).TotalSeconds -ge 15) {
         foreach ($beat in $beats) { Show-Heartbeat $beat }
         $State.LastOutput = Get-Date
     }
+}
+
+# Without --verbose: what runs now, from the running step (ST) and the
+# worker session (HB): the status line on a console, otherwise a line after
+# 60 seconds without one. A session suspended for space gets a line of its
+# own, at most once a minute.
+function Show-Progress {
+    param($State, $Beats, $Steps)
+    foreach ($beat in $Beats) {
+        if ($beat[13] -ne '' -and ((Get-Date) - $State.LastSuspended).TotalSeconds -ge 60) {
+            Write-Out (' ..       ' + $beat[3] + ' . SUSPENDED: ' + $beat[13]) 'Yellow'
+            $State.LastSuspended = Get-Date
+        }
+    }
+    $text = Get-StatusText $Beats $Steps
+    if ($text -eq '') {
+        Clear-Status
+    } elseif ($script:StatusLine) {
+        Show-Status $text
+    } elseif (((Get-Date) - $script:LastConsole).TotalSeconds -ge 60) {
+        Write-Out $text 'DarkGray' -NoLog
+    }
+}
+
+# What runs now, in one line: the database clock, the running step with its
+# progress (units done of the units planned) and the wait of the worker
+# session; empty when nothing runs.
+# ST|phase|step|scope|units_done|units_total|bytes_done
+function Get-StatusText {
+    param($Beats, $Steps)
+    $what = ''
+    if ($Steps.Count -gt 0) {
+        $s = $Steps[$Steps.Count - 1]
+        $what = $s[1] + ' ' + $s[2]
+        if ($s[3] -ne '' -and $s[3] -ne '-') { $what = $what + ' ' + $s[3] }
+        if ($s[4] -ne '' -and $s[5] -ne '') { $what = $what + ' ' + $s[4] + '/' + $s[5] }
+    }
+    if ($Beats.Count -gt 0) {
+        $b = $Beats[0]
+        if ($what -eq '') { $what = $b[3] }
+        $what = $what + ' . ' + $b[4] + ' ' + $b[5] + 's'
+        if ($b[7] -ne '') { $what = $what + ' . blocked by session ' + $b[7] + ' (' + $b[8] + ')' }
+        if ($b[10] -ne '') { $what = $what + ' . ' + $b[12] + ' ' + $b[10] + '% (' + (Format-Seconds $b[11]) + ' left)' }
+    }
+    if ($what.Trim() -eq '') { return '' }
+    return (' ..  ' + (Get-Date).Add($script:ClockOffset).ToString('HH:mm:ss') + '  ' + $what)
 }
 
 # Ctrl+C while a run is shown: requests a graceful stop (stop.sql in its own
@@ -1023,6 +1144,7 @@ function Close-Run {
     } catch {
         Write-Out (' The run could not be ended: ' + $_.Exception.Message) 'Red'
     }
+    Clear-Status
     Close-Monitor $State.Monitor
     return $closeCode
 }
@@ -1037,7 +1159,7 @@ function Invoke-ToolRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false; WorkerSeen = $false; PollsWithout = 0
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue
     }
     $dry = 'N'
     if ($Ctx.DryRun) { $dry = 'Y' }
@@ -1222,10 +1344,13 @@ function Invoke-ToolRun {
         $closeCode = Close-Run $state $status
     }
 
-    Write-Section 'REPORT'
+    Write-Section 'REPORT' -Detail
     $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId)
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
-    Show-Lines $report.Output -HideMachine
+    Show-Lines $report.Output -HideMachine -Detail
+    $mode = ''
+    if ($Ctx.DryRun) { $mode = 'DRY_RUN' }
+    if (-not $script:Verbose) { Show-Summary $Action $mode $report.Output }
     # The requirements and the plan of the run, each in its own file.
     foreach ($part in @(@('REQUIREMENTS', 'requirements.txt'), @('PLAN', 'plan.txt'))) {
         $text = Get-ReportSection $report.Output $part[0]
@@ -1698,7 +1823,7 @@ function Invoke-PlanCheck {
     $advice = Get-Advice $check
     if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
     if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
-        Exit-Tool $script:ExitFail ('The preflight ' + (Get-RunLabel $advice.Run.RunId) + ' found errors (see the report above); nothing was changed.')
+        Exit-Tool $script:ExitFail ('The preflight ' + (Get-RunLabel $advice.Run.RunId) + ' found errors (see above); nothing was changed.')
     }
     $unmet = Get-Unmet $advice
     if ($unmet.Count -gt 0 -and -not $Ctx.DryRun) {
@@ -1729,6 +1854,187 @@ function Get-ReportSection {
     }
     if ($out.Count -eq 0) { return '' }
     return (($out.ToArray()) -join "`r`n") + "`r`n"
+}
+
+# ----------------------------------------------------------------------------
+# Summary of a report (without --verbose)
+# ----------------------------------------------------------------------------
+
+# The end of a run on the console without --verbose: the parts of its report
+# that matter for the action (console.log and report.txt have the whole
+# report). A preflight: the estimate per module; a dry run: the simulation
+# per module and the expected outcome; a reclaim: each tablespace in one line
+# and, for an assessment, the accounts a compaction locks. Then the
+# requirements, unless a purge or compaction found them all met; then the
+# checks in short and the verdict. Not logged.
+function Show-Summary {
+    param([string]$Action, [string]$Mode, [string]$Report)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    if ($Action -eq 'PREFLIGHT') {
+        Add-Lines $lines (Get-TableLines $Report 'ESTIMATE')
+    } elseif ($Action -eq 'PURGE' -and $Mode -eq 'DRY_RUN') {
+        Add-Lines $lines (Get-TableLines $Report 'SIMULATION')
+        Add-Lines $lines (Get-ExpectedLines $Report)
+    } elseif ($Action -eq 'RECLAIM') {
+        Add-Lines $lines (Get-ReclaimLines $Report $Mode)
+        if ($Mode -eq 'ASSESS') { Add-Lines $lines (Get-TableLines $Report 'ACCOUNTS') }
+    }
+    $requirements = Get-RequirementLines $Report
+    $notReady = (($requirements -join "`n") -match '(?m)^ RESULT  NOT READY')
+    if ($Action -eq 'PREFLIGHT' -or $Mode -eq 'DRY_RUN' -or $Mode -eq 'ASSESS' -or $notReady) {
+        Add-Lines $lines $requirements
+    }
+    Add-Lines $lines (Get-CheckLines $Report)
+    if ($lines.Count -eq 0) { return }
+    Write-Section 'SUMMARY' -NoLog
+    foreach ($line in $lines) {
+        $color = ''
+        if ($line -match '\[FAIL\]| FAIL |VERDICT  FAIL|WOULD FAIL') { $color = 'Red' }
+        elseif ($line -match ' WARN |NOT MET|NOT READY|MAY FAIL|PASS WITH WARNINGS') { $color = 'Yellow' }
+        elseif ($line -match 'VERDICT  PASS') { $color = 'Green' }
+        Write-Out $line $color -NoLog
+    }
+}
+
+# Adds $Lines to $List, after a blank line when $List has lines already.
+function Add-Lines {
+    param($List, [string[]]$Lines)
+    if ($null -eq $Lines -or $Lines.Count -eq 0) { return }
+    if ($List.Count -gt 0) { $List.Add('') }
+    foreach ($line in $Lines) { $List.Add($line) }
+}
+
+# A table section of the report (ESTIMATE, SIMULATION, ACCOUNTS) without its
+# rule and without the lines on how the estimates were made.
+function Get-TableLines {
+    param([string]$Report, [string]$Title)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in ((Get-ReportSection $Report $Title) -split "`r?`n")) {
+        if ($line.Trim() -eq '' -or $line -match '^ -{20,}' -or $line -match '^  (Redo and undo |Deleting time: )') { continue }
+        $out.Add($line.TrimEnd())
+    }
+    return ,$out.ToArray()
+}
+
+# The expected outcome of a dry run and its notes.
+function Get-ExpectedLines {
+    param([string]$Report)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $lines = @($Report -split "`r?`n")
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^ EXPECTED  ') { continue }
+        $out.Add($lines[$i].TrimEnd())
+        for ($j = $i + 1; $j -lt $lines.Count -and $lines[$j] -match '^ {11}\S'; $j++) { $out.Add($lines[$j].TrimEnd()) }
+        break
+    }
+    return ,$out.ToArray()
+}
+
+# The requirements in short: each one with what was measured; for one not met
+# also why it matters and the ways to meet it; the result line.
+function Get-RequirementLines {
+    param([string]$Report)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $lines = @($Report -split "`r?`n")
+    $i = 0
+    while ($i -lt $lines.Count -and $lines[$i] -notmatch '^ REQUIREMENTS(\s|$)') { $i++ }
+    if ($i -ge $lines.Count) { return ,$out.ToArray() }
+    $out.Add($lines[$i].TrimEnd())
+    $unmet = $false
+    $measured = $false
+    for ($i++; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i].TrimEnd()
+        if ($line -match '^ RESULT  ') {
+            $out.Add($line)
+            break
+        }
+        if ($line -eq '' -or $line -match '^ -{20,}') { continue }
+        if ($line -match '^  \S') {
+            $out.Add($line)
+            $unmet = ($line -match 'NOT MET')
+            $measured = $false
+        } elseif ($line -match '^      \S') {
+            if ($unmet) {
+                $out.Add($line)
+            } elseif (-not $measured -and $line -notmatch '^      \[') {
+                $out.Add($line)
+                $measured = $true
+            }
+        } else {
+            break
+        }
+    }
+    return ,$out.ToArray()
+}
+
+# The checks in short: the ones that did not pass, and P7 and R7 unless
+# skipped (the space a purge freed, where a reclaim's datafiles ended), with
+# their details; the others by status in one line; the verdict.
+function Get-CheckLines {
+    param([string]$Report)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $lines = @($Report -split "`r?`n")
+    $status = @{}
+    $order = New-Object 'System.Collections.Generic.List[string]'
+    $verdict = ''
+    foreach ($line in $lines) {
+        if ($line -match '^EPF_CHECK\|[^|]*\|([^|]*)\|([^|]*)\|') {
+            $status[$Matches[1]] = $Matches[2]
+            $order.Add($Matches[1])
+        } elseif ($line -match '^ VERDICT  ') {
+            $verdict = $line.TrimEnd()
+        }
+    }
+    if ($order.Count -eq 0) { return ,$out.ToArray() }
+    $always = @('P7', 'R7')
+    $out.Add(' CHECKS')
+    $shown = $false
+    foreach ($line in $lines) {
+        if ($line -match '^ (\w+) ' -and $status.ContainsKey($Matches[1])) {
+            $id = $Matches[1]
+            $shown = (@('PASS', 'SKIP') -notcontains $status[$id]) -or ($always -contains $id -and $status[$id] -ne 'SKIP')
+            if ($shown) { $out.Add($line.TrimEnd()) }
+        } elseif ($shown -and $line -match '^      \S') {
+            $out.Add($line.TrimEnd())
+        } else {
+            $shown = $false
+        }
+    }
+    $rest = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($s in @('PASS', 'SKIP')) {
+        $ids = @($order | Where-Object { $status[$_] -eq $s -and ($s -eq 'SKIP' -or $always -notcontains $_) })
+        if ($ids.Count -gt 0) { $rest.Add($s + ' ' + ($ids -join ' ')) }
+    }
+    if ($rest.Count -gt 0) { $out.Add('  ' + ($rest -join '; ')) }
+    if ($verdict -ne '') { $out.Add($verdict) }
+    return ,$out.ToArray()
+}
+
+# Each tablespace of a reclaim in one line (EPF_RECLAIM_TS lines): its end
+# size and what moved after a compaction, its forecast after an assessment.
+function Get-ReclaimLines {
+    param([string]$Report, [string]$Mode)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $spaces = Read-ReclaimTs $Report
+    if ($Mode -eq 'RESTORE' -and $spaces.Count -eq 0) { return ,$out.ToArray() }
+    $out.Add(' TABLESPACES')
+    if ($spaces.Count -eq 0) {
+        $out.Add('  No tablespace to reclaim.')
+        return ,$out.ToArray()
+    }
+    foreach ($t in $spaces) {
+        $line = '  ' + $t.Name.PadRight(22) + ' ' + $t.Status.PadRight(11) + ' '
+        if ($t.End -gt 0) {
+            $line = $line + (Format-Bytes $t.Start) + ' -> ' + (Format-Bytes $t.End) + ' (' +
+                    (Format-Bytes ([Math]::Max($t.Start - $t.End, 0))) + ' given back); ' + $t.Moved + ' of ' +
+                    $t.Tables + ' tables moved'
+        } else {
+            $line = $line + (Format-Bytes $t.Start) + ' now, forecast ' + (Format-Bytes $t.Forecast) + '; ' + $t.Tables +
+                    ' tables move, ' + $t.Indexes + ' indexes rebuilt, ' + $t.Pins + ' segments stay'
+        }
+        $out.Add($line)
+    }
+    return ,$out.ToArray()
 }
 
 # plan: the open plan (or the latest), or --close.
@@ -2155,7 +2461,7 @@ function Invoke-PurgeAction {
         $ctx.NewPlan = $false
         if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
         if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
-            Exit-Tool $script:ExitFail ('The preflight ' + $ctx.PreflightRun + ' found errors (see the report above); nothing was changed.')
+            Exit-Tool $script:ExitFail ('The preflight ' + $ctx.PreflightRun + ' found errors (see above); nothing was changed.')
         }
         $unmet = Get-Unmet $advice
         if ($unmet.Count -gt 0 -and -not $ctx.DryRun) {
@@ -2303,7 +2609,7 @@ function Invoke-ReclaimRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false; WorkerSeen = $false; PollsWithout = 0
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue
     }
     $confirmArg = '-'
     $scopeArg = '-'
@@ -2380,10 +2686,11 @@ function Invoke-ReclaimRun {
         $closeCode = Close-Run $state $status
     }
 
-    Write-Section 'REPORT'
+    Write-Section 'REPORT' -Detail
     $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId)
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
-    Show-Lines $report.Output -HideMachine
+    Show-Lines $report.Output -HideMachine -Detail
+    if (-not $script:Verbose) { Show-Summary 'RECLAIM' $Mode $report.Output }
     $text = Get-ReportSection $report.Output 'REQUIREMENTS'
     if ($text -ne '') {
         [System.IO.File]::WriteAllText((Join-Path $state.Folder 'requirements.txt'), $text, [System.Text.Encoding]::ASCII)
@@ -2549,6 +2856,7 @@ function Invoke-ReclaimAction {
     if ($ctx.Mode -ne 'RESTORE' -and $ctx.Tablespaces -eq '' -and $script:Interactive -and -not $confirmed -and
         -not $script:Cli.Options.ContainsKey('tablespaces')) {
         while ($true) {
+            Clear-Status
             $answer = (Read-Host -Prompt ' Tablespaces to reclaim, separated by commas (Enter: every candidate)').Trim()
             Write-Log (' Tablespaces to reclaim: ' + $answer)
             if ($answer -eq '') { break }
@@ -2584,7 +2892,7 @@ function Invoke-ReclaimAction {
         $ctx.AssessRun = Get-RunLabel $assess.RunId
         if ($assess.Status -eq 'STOPPED') { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
         if ($assess.Status -eq 'FAILED') {
-            Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see the report above); nothing was changed.')
+            Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see above); nothing was changed.')
         }
         $spaces = Read-ReclaimTs $assess.Report
         if ($spaces.Count -eq 0) { Exit-Tool $script:ExitPass 'No tablespace to reclaim; nothing was changed.' }
@@ -2724,6 +3032,16 @@ function Invoke-Main {
     }
     if (Test-Path -LiteralPath $configPath) { $script:Config = Read-ConfigFile $configPath }
     if (Test-ConfigYes 'NO_COLOR') { $script:UseColor = $false }
+    if ($script:Cli.Flags.ContainsKey('verbose') -or (Test-ConfigYes 'VERBOSE')) { $script:Verbose = $true }
+    # The status line needs a console window: none with --verbose, or when
+    # the output goes to a file or a pipe (a line is written instead).
+    if (-not $script:Verbose) {
+        try {
+            $script:StatusLine = (-not [Console]::IsOutputRedirected) -and [Console]::WindowWidth -ge 40
+        } catch {
+            $script:StatusLine = $false
+        }
+    }
     $timeout = Get-Option 'connect-timeout' 'CONNECT_TIMEOUT_S' ''
     if ($timeout -ne '') {
         $seconds = Test-Value $timeout -Min 10 -Max 3600

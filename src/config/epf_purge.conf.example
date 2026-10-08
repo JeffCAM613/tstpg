@@ -67,8 +67,12 @@ UNDO_TUNING=N
 # none, and such a table stops its datafile there.
 #RECLAIM_SCRATCH=2G
 
-# Output.
+# Output. A run shows the end of each step, its progress, warnings, errors,
+# milestones and a status line, then a summary of its report; VERBOSE=Y (or
+# --verbose) shows every event and the whole report instead. console.log in
+# the run folder has every line either way.
 #LOG_DIR=D:\epf\logs
+VERBOSE=N
 NO_COLOR=N
 
 # Passwords are read from the environment (EPF_PASSWORD, EPF_SYS_PASSWORD) or

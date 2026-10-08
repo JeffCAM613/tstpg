@@ -378,10 +378,13 @@ function Read-Manifest {
 # Runs epf_purge.bat with the test database, the session's run folder and an
 # empty wrapper configuration (so a local epf_purge.conf cannot change the
 # prompts); returns the result with the manifests of the runs it created.
+# With --verbose (every event and the whole report in the output), unless
+# -Brief: the output a run shows by default.
 function Invoke-Wrapper {
     param([string[]]$Arguments, [string[]]$Answers = @(), [int]$TimeoutMin = 15, [scriptblock]$OnLine = $null,
-          [switch]$StopOnTimeout)
+          [switch]$StopOnTimeout, [switch]$Brief)
     $list = @($Arguments) + @('--tns', $script:Tns, '--config', $script:WrapperConf, '--log-dir', $script:RunsDir, '--no-color')
+    if (-not $Brief) { $list += '--verbose' }
     $before = Get-RunFolders
     $onTimeout = $null
     if ($StopOnTimeout) { $onTimeout = { $null = Invoke-Wrapper @('stop', '--non-interactive') } }
@@ -743,7 +746,7 @@ $script:TestList = @(
     'T05  Undo tuning left from earlier work restored; undo datafile limits recorded',
     'T06  Wrapper basics: --help, status, stop without an active run',
     'T07  Usage errors: exit 4, nothing changed',
-    'T08  Preflight through the wrapper',
+    'T08  Preflight through the wrapper: the output by default, every line in console.log',
     'T08B Preflight with questions: choices saved, a dry run follows them',
     'T09  preflight.sql NEW',
     'T10  Dry run of all modules through the wrapper: simulation and expected outcome',
@@ -935,19 +938,33 @@ function Invoke-Suite {
         Assert-Match $r '--yes is required with --non-interactive'
     }
 
-    Invoke-Test 'T08' 'Preflight through the wrapper' {
-        $r = Invoke-Wrapper @('preflight', '--non-interactive', '--retention', $script:Retention) -TimeoutMin 30
+    Invoke-Test 'T08' 'Preflight through the wrapper: the output by default, every line in console.log' {
+        $r = Invoke-Wrapper @('preflight', '--non-interactive', '--retention', $script:Retention) -TimeoutMin 30 -Brief
         Assert-Exit $r @(0, 2)
-        Assert-Match $r 'ROOTS_ELIGIBLE'
         Assert-Match $r 'REDO_LOGS'
         Assert-Match $r 'PREFLIGHT UNDO DONE'
+        Assert-Match $r '(?m)^ SUMMARY +\d\d:\d\d:\d\d'
         Assert-Match $r 'ESTIMATE \(rows before the cutoff'
-        Assert-Match $r 'RETENTION OPTIONS'
         Assert-Match $r 'REQUIREMENTS'
         Assert-Match $r ' RESULT  (READY|NOT READY)'
+        Assert-Match $r '(?m)^ VERDICT  '
+        Assert-NoMatch $r 'ROOTS_ELIGIBLE'
+        Assert-NoMatch $r 'STEP_START'
+        Assert-NoMatch $r 'RETENTION OPTIONS'
+        Assert-NoMatch $r '(?m)^ STEPS'
         Assert-NoMatch $r '(?m)^EPF_REQ\|'
         Assert-NoMatch $r $script:ChoicesSection
         $run = Get-Run $r 'PREFLIGHT'
+        if ($null -ne $run) {
+            $log = Join-Path (Join-Path $script:RunsDir $run['folder']) 'console.log'
+            $text = ''
+            if (Test-Path -LiteralPath $log) { $text = [System.IO.File]::ReadAllText($log) }
+            foreach ($pattern in @('ROOTS_ELIGIBLE', 'STEP_START', '(?m)^ REPORT +\d\d:\d\d:\d\d', 'RETENTION OPTIONS', '(?m)^ STEPS',
+                                   ' RESULT  (READY|NOT READY)')) {
+                Add-Check ($text -match $pattern) ('console.log contains /' + $pattern + '/')
+            }
+            Add-Check ($text -notmatch '(?m)^ SUMMARY ') 'console.log does not contain the summary'
+        }
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
         Assert-Manifest $run 'requirements_ready' '^(Y|N)$'
         foreach ($code in @('ARCHIVE', 'UNDO', 'TEMP', 'INDEX_SPACE', 'REDO_LOGS', 'BACKUP')) {

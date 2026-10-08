@@ -45,7 +45,7 @@ Every goal has a check the tool itself performs, so "did the run happen 100% as 
 | G5 | Reclaim reaches the achievable minimum | Per tablespace: final size <= segment bytes + `reclaim_margin_mb` per datafile + max(1 %, 256 MB), unless a segment that cannot move holds the top: it is named with its position and reason (R7). |
 | G6 | Zero schema drift | After reclaim: same indexes (VALID/USABLE, same degree/logging), same constraints (status/validated), no new invalid objects, row counts unchanged, tablespace name unchanged, accounts back to their original status. The only permitted change is each LONG column you approved for conversion, reported individually. |
 | G7 | Always recoverable | Any interruption (error, stop, kill, instance restart) leaves a state that the wrapper restores at once, or that the next `reclaim` (or `reclaim --restore`) restores before anything else. No separate recovery scripts. |
-| G8 | Always visible | Live events within ~2 s; a heartbeat line at least every 15 s while a single statement runs (progress %, wait event, blocking session). |
+| G8 | Always visible | Live events within ~2 s; while a single statement runs, a status line updated every 2 s (running step and its units, wait event, blocking session, progress %), or with `--verbose` a heartbeat line at least every 15 s. |
 | G9 | Machine-checkable output | Each run folder contains a human log, a report, and stable `EPF_CHECK|...` lines plus a `manifest.txt` that can be pasted back for review. |
 | G10 | One place per fact | Table list, module membership and relationships exist once (registry). Numbers in reports come from structured columns, never parsed from message text. |
 
@@ -658,7 +658,8 @@ Only one process writes the console log file (no file-sharing workarounds, no pe
 Rules:
 
 - Fixed columns: time, phase, subject, metrics; widths stable so logs diff cleanly.
-- Status tags: `[ OK ]`, `[INFO]`, `[WARN]`, `[FAIL]`; heartbeat lines start with `..` and are shown on the console at most every 15 s while no event arrives (not written to the log unless they carry a WARN).
+- Two levels (D21). By default the console shows the end of each step, progress, warnings, errors and the milestones of a run (`$script:MilestoneEvents`: scope, plan, requirements, forecast, module and purge end, tuning changes, tablespaces assessed, accounts locked and unlocked, indexes released, parking, compaction end, where each datafile stopped, reclaim result); a status line at the bottom says what runs now (database clock, running step with units done of units planned from `ST|`, the worker's wait from `HB|`), rewritten in place every 2 s and never logged; without a console window (output to a file or pipe) it is a line after 60 s without one. At the end a summary of the report: the estimate (preflight) or simulation and expected outcome (dry run), each tablespace in one line and the accounts an assessment would lock (reclaim), the requirements (each with what was measured; why and how to meet the ones not met) unless a purge or compaction found them all met, the checks that did not pass (and P7, R7) with the verdict. `--verbose` (`VERBOSE=Y`) shows every event but the detail events, the heartbeat lines and the whole report, as the first versions did.
+- Status tags: `[ OK ]`, `[INFO]`, `[WARN]`, `[FAIL]`; with `--verbose`, heartbeat lines start with `..` and are shown on the console at most every 15 s while no event arrives (not written to the log unless they carry a WARN).
 - Colors via `Write-Host -ForegroundColor` (no ANSI dependency); `--no-color` for plain output. ASCII only.
 - Section headers per phase with elapsed time.
 
@@ -666,7 +667,7 @@ Rules:
 
 ```
 logs/2026-09-28_104200_R-000124/
-  console.log        everything shown on screen (without colors)
+  console.log        every line of the output as --verbose shows it (without colors), at either level
   report.txt         integrity and results report (section 9)
   manifest.txt       key=value summary: run_id, parameters, step statuses, check results, exit code
   sqlplus_*.log      raw worker/report session output (evidence)
@@ -781,6 +782,7 @@ Options
                           deletes, a reclaim and uninstall
   --non-interactive       never prompt; missing input is an error (exit 4)
   --log-dir DIR           default logs\ in the tool folder
+  --verbose               every event and the whole report on the console (8.2)
   --no-color
   --help
 
@@ -1008,6 +1010,7 @@ Each phase is one reviewable pull request on this branch lineage.
 | D18 | Undo growth during a purge | Opt-in: `epf_tuning.undo_apply` (SYS, `run/undo.sql APPLY`) lowers `undo_retention` to 60 s (SCOPE=MEMORY) and limits the growth of the undo datafiles to the largest of their current size, 4 GB (`undo_cap_mb`) and 4 x the undo of one batch, for the purge; nothing is shrunk (revised 2026-09-30 after retention alone let UNDOTBS1 grow to 27.6 GB). `undo_restore` puts back the recorded original values (`EPF_INSTANCE_CHANGE`), on every exit path of the wrapper; the end-to-end suite checks the original growth limits after every run. Preflight reports undo size, undo per batch and the undo kept by retention at the measured rate (6.9). Side effect while applied: long queries of other sessions can hit ORA-01555 |
 | D19 | Requirements before a purge, and how the purge follows the preflight | The preflight measures six requirements (ARCHIVE, UNDO, TEMP, INDEX_SPACE, REDO_LOGS, BACKUP), each with its reason and the ways to meet it. The user's choices and a purge plan (smaller runs by retention steps and modules) are stored with the preflight run in the database. `purge` runs the next step of the latest valid preflight (8 h) with its choices, and measures the space requirements again at start. The tool never changes the log mode. Backup can be met by a detected RMAN backup, a confirmed backup made another way, or a confirmed purge without a backup (6.10). Decided 2026-10-02 |
 | D20 | Dry run | A simulation of the plan: exact counts, forecasts of time, redo, undo and space, a retention table and a predicted outcome (WOULD COMPLETE, or WOULD FAIL with where and why). It counts as a preflight (6.10). Decided 2026-10-02 |
+| D21 | Console output | Two levels: by default the end of each step, progress, warnings, errors, milestones, a status line and a summary of the report; `--verbose` shows every event and the whole report. console.log has every line either way. The test suite runs the tool with `--verbose` (T08 checks the default). Decided 2026-10-09 |
 
 Also settled:
 
