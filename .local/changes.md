@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - I5: Oracle's search for free space starts where it last allocated, not at the start of the file
+
+What the read-only query of EPFPG784 showed (DATA as R-000038 left it):
+- DATA is a bigfile tablespace (one datafile, 14,535 MB, 8 KB blocks, system-allocated extents, ASSM).
+- TRANSMISSION_EXECUTION_AUDIT: its own segment is 64 KB; its LOB MESSAGE (BASICFILE) is 2,103 MB in 54 extents, INITIAL 2,048 MB as the last move set it.
+- **The LOB's extents in the order Oracle allocated them:** 0 and 1 (64 MB each) at the very top of the file, 14,407 and 14,471 MB; 2 to 5 (8 MB) just below, 14,336 to 14,387 MB; then from 1,707 MB upward to 9,988 MB. The file is searched in stretches of 2 GB (pieces end and start exactly at multiples of 2,048 MB). In each stretch the copy takes the whole 64 MB holes first, lowest first, then every smaller piece left there, highest first, and then goes on to the next stretch. After the last stretch it goes on from the start of the file.
+- So the copy started in the stretch where the last allocation had been, at the top. The free space below the top was enough; it was used only after the top.
+- The LOB's index (SYS_IL...) took INITIAL 102.4 MB, 5 % of the LOB's INITIAL, in 10 extents around 10 GB.
+- The 1 MB extents all start on whole MBs; the 64 MB extents too, but only 5 of 86 on a multiple of 64 MB. So the count of whole 64 MB stretches (fresh_bytes) was right; the order is what failed.
+- The copies of the three tables moved to make room went to 68 MB (DIRECTORY_DISPATCHING, 64 KB), 10,433 MB (FILE_DISPATCHING, 64 KB) and 14,344 MB (PAYMENT_ADDITIONAL_INFO, 6 MB, in the top stretch).
+
+This explains the instability seen since the first compactions: a copy lands where Oracle's search is, and the search moves up the file as copies are placed and goes back to the start only after the end of the file. Space freed below it (by the tables that made room) is not used before then.
+
+Next: step I6 on the status page tests a reset on EPFPG784 with empty tables of its own (SYS.EPF_X_*): one table takes the free space from the search position to the end of the file and a little more, which can only come from the start of the file; once it is dropped, a table that moves should land near the start. If it does, the compaction makes that reset before each move: no extra disk. If not, a table that keeps coming back waits in a scratch tablespace and comes back last.
+
 ## 2026-10-08 - Set I on EPFPG784: the suite passed 31 of 31; one reclaim took DATA from 41.7 to 14.2 GB (R7 WARN)
 
 What the runs showed (suite `logs/tests/2026-10-08_023528_EPFPG784`, then reclaim R-000038):
