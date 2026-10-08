@@ -16,26 +16,30 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 --      restored) and are resized to their highest allocated block.
 --   3. The table holding the highest block of a datafile moves within its
 --      tablespace (ALTER TABLE ... MOVE, with every LOB segment it keeps in a
---      target tablespace): the copy takes free space below, which is all the
---      free space the file has; the old segment is released; the file is
---      resized down to the end of its new highest extent. Repeated until the
---      highest block belongs to a segment that cannot move (a pin) or nothing
---      is left to move. A table whose copy holds the highest block again
---      moves lower only when it fits in the free space as it is; otherwise
---      the file stops there. With system-allocated extents, such a table of
---      at least about 51 MB, and one of 640 MB or more from its first move,
---      moves with extents of 64 MB, which Oracle places only in wholly free
---      stretches of 64 MB, the lowest first (smaller extents go first to
---      partly used stretches, wherever they are, which brings a copy back to
---      the top); a table that came back then needs enough such stretches. A
---      stop request is honored before every move. A segment whose INITIAL is
+--      target tablespace): the copy takes free space; the old segment is
+--      released; the file is resized down to the end of its new highest
+--      extent. Repeated until the highest block belongs to a segment that
+--      cannot move (a pin) or nothing is left to move. When a table does not
+--      fit in the free space, the tables with free space inside them move
+--      first. Oracle chooses where a copy goes, and may put it at the top of
+--      the file again although there is free space below. With scratch space
+--      (--scratch SIZE), a table whose copy comes back to the top, or that
+--      still does not fit, is parked: it moves, with its LOB segments, to a
+--      scratch tablespace the run creates (EPF_PARK_<run>, next to the first
+--      datafile of its tablespace), and the compaction goes on without it.
+--      Without scratch space, such a table moves again only when it fits in
+--      the free space as it is; otherwise the file stops there. A stop
+--      request is honored before every move. A segment whose INITIAL is
 --      larger than it needs (an export artifact; listed by the assessment) is
 --      moved or rebuilt with INITIAL 64 KB.
---   4. The released indexes are rebuilt in their tablespace, the growth
---      settings of the datafiles restored, the datafiles resized to their
---      highest block plus setting reclaim_margin_mb (a tablespace none of
---      whose datafiles grows by itself gets that much free space back, within
---      its size at the start), objects invalidated by the run recompiled; the
+--   4. The parked tables move back, each segment to the tablespace it came
+--      from: into the free space the compaction left, the datafiles growing
+--      only for the rest; then the scratch tablespace is dropped. The
+--      released indexes are rebuilt in their tablespace, the growth settings
+--      of the datafiles restored, the datafiles resized to their highest
+--      block plus setting reclaim_margin_mb (a tablespace none of whose
+--      datafiles grows by itself gets that much free space back, within its
+--      size at the start), objects invalidated by the run recompiled; the
 --      fingerprint of the objects and the row counts taken when the accounts
 --      were locked are taken again (compared by the report).
 --
@@ -46,12 +50,15 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- fits below; a LOB or overflow segment stored in another target tablespace
 -- likewise, also when the table moves again), and a tablespace none of whose
 -- datafiles grows by itself gets reclaim_margin_mb of free space back at the
--- end. Every datafile only shrinks otherwise. No second tablespace, no
--- copy of a datafile. One exception, reported as a warning: an index that
--- does not fit within that room is rebuilt after the growth settings are
--- restored, since an index left unusable stops the application. Requirement
--- QUOTA (not confirmable) keeps the compaction from starting when an owner
--- has no space quota where its segments are written again, or is above it.
+-- end. Every datafile only shrinks otherwise. The scratch tablespace is the
+-- only other disk the run uses: none without --scratch, at most the size
+-- given, and only while tables are parked. Two exceptions, reported as
+-- warnings: an index that does not fit within that room is rebuilt after the
+-- growth settings are restored, since an index left unusable stops the
+-- application; a parked table that does not fit within that room grows its
+-- datafiles as much as it needs, since it must come back. Requirement QUOTA
+-- (not confirmable) keeps the compaction from starting when an owner has no
+-- space quota where its segments are written again, or is above it.
 --
 -- Data safety: a MOVE is atomic (the table stays where it was when it
 -- fails); constraints are never dropped; while a unique index is released,
@@ -59,8 +66,10 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- owning or writing the tables that move are locked and their sessions
 -- disconnected while the compaction runs (D10, D15). Every change outside the
 -- data is recorded before it is made (EPF_INSTANCE_CHANGE, EPF_ACCOUNT_ACTION,
--- EPF_RECLAIM_OBJECT) and undone on every exit path: after a failure, a stop
--- request, and in a later run when the session was lost.
+-- EPF_RECLAIM_OBJECT, EPF_RECLAIM_PARK) and undone on every exit path: after
+-- a failure, a stop request, and in a later run when the session was lost.
+-- A parked table is usable where it is; one that cannot move back stays
+-- there, reported, until a restore moves it back.
 --
 -- Not moved (pins, reported with their position and reason): partitioned
 -- tables and indexes, clusters, nested tables, queue tables and the tables
@@ -72,8 +81,10 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
 -- datafile cannot shrink below a pin.
 --
 -- Tests only: setting reclaim_test_pause_s makes the next compaction pause
--- after each table that moves (a known point to stop it or end its session);
--- the compaction sets it back to 0 when it reads it.
+-- after each table that moves or is parked (a known point to stop it or end
+-- its session); the compaction sets it back to 0 when it reads it. Setting
+-- reclaim_test_park Y makes the next compaction park the first table it
+-- picks, when scratch space is allowed; it is set back to N when read.
 --
 -- Invoker rights: called as SYS (the DDL runs with the caller's rights),
 -- through run/reclaim.sql, in a session bound to the run
@@ -94,23 +105,29 @@ CREATE OR REPLACE PACKAGE epf_reclaim AUTHID CURRENT_USER AS
     --          COMPACT  restores what an earlier reclaim left pending, assesses,
     --                   locks the accounts, records the baseline, releases the
     --                   indexes, stops the datafiles growing, compacts each
-    --                   tablespace, then always runs the restore path: index
+    --                   tablespace, then always runs the restore path: parked
+    --                   tables back and scratch tablespace dropped, index
     --                   rebuilds, datafile growth settings, final resize,
     --                   recompilation, state after (fingerprint, row
     --                   counts), accounts
     --          RESTORE  the restore path only, for everything a reclaim left
-    --                   pending (indexes still released, datafile settings,
-    --                   locked accounts), in a new run or in the run whose
-    --                   worker session ended without it
+    --                   pending (tables still parked, indexes still released,
+    --                   datafile settings, locked accounts), in a new run or
+    --                   in the run whose worker session ended without it
     -- COMPACT and RESTORE first wait while another reclaim still runs on the
     -- database (a worker whose client is gone goes on until its call ends).
     -- p_tablespaces: tablespaces to compact, separated by commas; NULL for
     -- every candidate (permanent tablespaces holding segments of the
-    -- app_schemas, except SYSTEM, SYSAUX and the tool's tablespace).
+    -- app_schemas, except SYSTEM, SYSAUX, the tool's tablespace and the
+    -- scratch tablespaces of reclaims).
     -- Blocking requirements not met and not confirmed (EPF_RUN.confirmed_reqs)
     -- stop a COMPACT run before any change.
+    -- p_scratch_bytes: the most space the run may use in a scratch
+    -- tablespace of its own for the tables it parks (--scratch); NULL for
+    -- none. Not for RESTORE.
     -- p_status returns SUCCESS, WARNING, FAILED or STOPPED.
-    PROCEDURE run(p_run_id IN NUMBER, p_mode IN VARCHAR2, p_tablespaces IN VARCHAR2, p_status OUT VARCHAR2);
+    PROCEDURE run(p_run_id IN NUMBER, p_mode IN VARCHAR2, p_tablespaces IN VARCHAR2, p_status OUT VARCHAR2,
+                  p_scratch_bytes IN NUMBER DEFAULT NULL);
 
 END epf_reclaim;
 /

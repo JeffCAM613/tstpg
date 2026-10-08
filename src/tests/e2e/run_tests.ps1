@@ -508,6 +508,26 @@ function Get-TestPause {
     return ''
 }
 
+# Setting reclaim_test_park: Y makes the next compaction park the first table
+# it picks (with --scratch), and it sets it back to N when it reads it.
+function Set-TestPark {
+    param([string]$Value)
+    $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                              ("UPDATE epf_setting SET value = '" + $Value + "' WHERE name = 'reclaim_test_park';"),
+                              'COMMIT;', "SELECT 'PARK|' || value FROM epf_setting WHERE name = 'reclaim_test_park';",
+                              'EXIT')
+    Assert-Exit $r @(0)
+    Assert-Match $r ('(?m)^PARK\|' + $Value + '\s*$')
+}
+
+# The value of setting reclaim_test_park, '' when it cannot be read.
+function Get-TestPark {
+    $r = Invoke-Sql 'EPFPG' @('SET HEADING OFF FEEDBACK OFF PAGESIZE 0',
+                              "SELECT 'PARK|' || value FROM epf_setting WHERE name = 'reclaim_test_park';", 'EXIT')
+    if ($r.Output -match '(?m)^PARK\|([YN])') { return $Matches[1] }
+    return ''
+}
+
 # Static checks of a PowerShell script: it parses, every command it calls is
 # defined in it or known to PowerShell, and no "+" takes a list as its right
 # operand ("a" + $x, 'b' is one string: the comma binds tighter than +).
@@ -742,6 +762,8 @@ $script:TestList = @(
     'T18B Reclaim lab: compaction in place; requirement gate, room making, R1-R9, everything restored',
     'T18C Reclaim lab: a stop during the compaction ends STOPPED with everything restored',
     'T18D Reclaim lab: a worker session killed during the compaction is restored in the same run',
+    'T18H Reclaim lab: parking (--scratch): a table waits in a scratch tablespace and comes back; nothing left behind',
+    'T18I Reclaim lab: a worker session killed while a table is parked: the table comes back in the same run',
     'T18E Reclaim: assessment of the application tablespaces (dry run, read-only)',
     'T18F Reclaim lab removed',
     'T18G Reclaim lab 2: two datafiles, index and LOB tablespaces, a queue table, INITIAL of each kind, quota gate',
@@ -890,6 +912,9 @@ function Invoke-Suite {
                             @('reclaim', '--non-interactive', '--dry-run', '--restore'),
                             @('reclaim', '--non-interactive', '--dry-run', '--confirm', 'UNDO'),
                             @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', 'A-B'),
+                            @('reclaim', '--non-interactive', '--dry-run', '--scratch', 'lots'),
+                            @('reclaim', '--non-interactive', '--restore', '--scratch', '1G'),
+                            @('preflight', '--non-interactive', '--scratch', '1G'),
                             @('reclaim', '--non-interactive', '--dry-run', '--retention', '30'),
                             @('preflight', '--non-interactive', '--tablespaces', 'USERS'),
                             @('preflight', '--non-interactive', '--compact'),
@@ -1526,6 +1551,89 @@ function Invoke-Suite {
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
     }
 
+    # T18H and T18I: parking (--scratch). Setting reclaim_test_park makes the
+    # compaction park the first table it picks, RT_TOP (it holds the top of
+    # the lab's datafile), whatever Oracle does with the copies.
+    Invoke-Test 'T18H' 'Reclaim lab: parking (--scratch): a table waits in a scratch tablespace and comes back; nothing left behind' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        # The assessment with scratch space: requirement SCRATCH met.
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', 'EPF_RT_DATA', '--scratch', '512M') `
+                            -TimeoutMin 30
+        Assert-Exit $r @(0, 2)
+        Assert-Manifest (Get-Run $r 'RECLAIM') 'req.SCRATCH' '^MET\|N\|'
+        try {
+            Set-TestPark 'Y'
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', '512M') -TimeoutMin 60 -StopOnTimeout
+            Add-Check ((Get-TestPark) -eq 'N') 'the compaction set reclaim_test_park back to N'
+        } finally {
+            Set-TestPark 'N'
+        }
+        Assert-Exit $r @(0, 2)
+        Assert-Match $r 'SCRATCH_CREATED +EPF_PARK_\d+'
+        Assert-Match $r 'UNIT_PARKED +EPF_RT\.RT_TOP'
+        Assert-Match $r 'UNIT_RETURNED +EPF_RT\.RT_TOP'
+        Assert-Match $r 'SCRATCH_DROPPED +EPF_PARK_\d+'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
+        foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
+        foreach ($check in @('R5', 'R6', 'R7', 'R8', 'P5')) { Assert-Manifest $run ('check.' + $check) '^(PASS|WARN)' }
+        Assert-Manifest $run 'step.RECLAIM.RETURN_PARKED.-' '^DONE\|'
+        $after = Read-Lab (Invoke-Lab 'CHECK')
+        Assert-LabSame $before $after
+        Add-Check ($after.FileBytes -lt $before.FileBytes) ('EPF_RT_DATA datafile shrank: ' + $before.FileBytes + ' -> ' +
+                                                         $after.FileBytes + ' bytes (segments ' + $after.Segments + ')')
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Exit $s @(0)
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    Invoke-Test 'T18I' 'Reclaim lab: a worker session killed while a table is parked: the table comes back in the same run' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        $script:State.StopSent = $false
+        $onLine = {
+            param($line)
+            if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
+                $script:State.StopSent = $true
+                Write-TestLog '---- the first table is parked and the compaction pauses: killing the worker session (SYS)'
+                $k = Invoke-Sql 'SYS' @(
+                    'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON',
+                    "BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); END LOOP; END;",
+                    '/',
+                    'EXIT')
+                Assert-Match $k 'KILLED\|\d+'
+            }
+        }
+        try {
+            Set-TestPark 'Y'
+            Set-TestPause 120
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', '512M') -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        } finally {
+            Set-TestPause 0
+            Set-TestPark 'N'
+        }
+        Add-Check $script:State.StopSent 'worker session killed while the first table was parked'
+        Assert-Exit $r @(1)
+        Assert-Match $r 'UNIT_PARKED +EPF_RT\.RT_TOP'
+        Assert-Match $r 'The worker session ended before the reclaim finished'
+        Assert-Match $r 'RECLAIM  RESTORE'
+        Assert-Match $r 'UNIT_RETURNED +EPF_RT\.RT_TOP'
+        Assert-Match $r 'SCRATCH_DROPPED +EPF_PARK_\d+'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'status' '^FAILED$'
+        Assert-Manifest $run 'check.R1' '^PASS'
+        Assert-Manifest $run 'check.R6' '^(PASS|WARN)'
+        Assert-Manifest $run 'check.R9' '^PASS'
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
     Invoke-Test 'T18E' 'Reclaim: assessment of the application tablespaces (dry run, read-only)' {
         $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--dry-run') -TimeoutMin 60
         Assert-Exit $r @(0, 2)
@@ -1698,7 +1806,9 @@ function Invoke-Suite {
 $script:DigestAssess = @('TS_ASSESSED', 'INITIAL_OVERSIZED', 'NO_TARGET')
 $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED', 'MOVE_PLACEMENT',
                           'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
-                          'STOP_HONORED', 'NO_TARGET')
+                          'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
+                          'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW', 'RETURN_FAILED',
+                          'SCRATCH_DROPPED', 'SCRATCH_KEPT')
 
 function Get-FileLines {
     param([string]$Path)
@@ -1810,7 +1920,10 @@ function Add-DigestRun {
     if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
     $codes = $script:DigestCompact
     if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
-    if ($Brief) { $codes = @('FILE_DONE', 'RECLAIM_RESULT', 'STOP_HONORED') }
+    if ($Brief) {
+        $codes = @('FILE_DONE', 'RECLAIM_RESULT', 'STOP_HONORED', 'UNIT_PARKED', 'UNIT_RETURNED', 'PARK_FAILED',
+                   'PARK_UNAVAILABLE', 'RETURN_GREW', 'RETURN_FAILED', 'SCRATCH_KEPT')
+    }
     # The key events as entries: a move with its placement; a run of growths
     # of one datafile as one; a room making said again left out.
     $entries = New-Object 'System.Collections.Generic.List[object]'

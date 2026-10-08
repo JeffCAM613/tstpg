@@ -170,14 +170,16 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
                               - NUMTODSINTERVAL(epf_util.setting_num('history_retention_days'), 'DAY');
         -- Runs older than the history retention, except a run whose reclaim
         -- left something pending (an account still locked, a released index
-        -- still unusable): the restore needs its records.
+        -- still unusable, a table still parked): the restore needs its
+        -- records.
         l_old    VARCHAR2(1000) :=
             'SELECT r.run_id FROM epf_run r WHERE r.created_at < :1'
             || ' AND NOT EXISTS (SELECT 1 FROM epf_account_action a WHERE a.run_id = r.run_id'
             || ' AND a.locked_at IS NOT NULL AND a.unlocked_at IS NULL)'
             || ' AND NOT EXISTS (SELECT 1 FROM epf_reclaim_object o JOIN dba_indexes i'
             || ' ON i.owner = o.owner AND i.index_name = o.object_name WHERE o.run_id = r.run_id'
-            || ' AND o.unit_type = ''INDEX'' AND o.move_status IN (''RELEASED'', ''FAILED'') AND i.status = ''UNUSABLE'')';
+            || ' AND o.unit_type = ''INDEX'' AND o.move_status IN (''RELEASED'', ''FAILED'') AND i.status = ''UNUSABLE'')'
+            || ' AND NOT EXISTS (SELECT 1 FROM epf_reclaim_park p WHERE p.run_id = r.run_id AND p.returned_at IS NULL)';
     BEGIN
         DELETE FROM epf_plan_step
          WHERE plan_id IN (SELECT plan_id FROM epf_plan WHERE status IN ('DONE', 'CLOSED') AND closed_at < l_cutoff);

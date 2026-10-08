@@ -60,6 +60,12 @@ UNDO_TUNING=N
 # assessment finds them not met: ARCHIVE, TEMP, RECYCLEBIN (the compaction
 # then purges the recycle-bin objects of its tablespaces first).
 #RECLAIM_CONFIRM=TEMP
+# Scratch space a reclaim may use, such as 2G, for the tables that cannot move
+# lower (their copy lands back at the top, or they do not fit below): they
+# wait in a tablespace the reclaim creates next to their tablespace's first
+# datafile, and come back at the end; the tablespace is then dropped. Unset:
+# none, and such a table stops its datafile there.
+#RECLAIM_SCRATCH=2G
 
 # Output.
 #LOG_DIR=D:\epf\logs

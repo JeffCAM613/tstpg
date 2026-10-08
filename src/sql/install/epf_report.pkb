@@ -373,10 +373,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END IF;
 
         -- R6 datafiles: every growth setting the run changed restored and
-        -- equal to the baseline; each tablespace at most its start size at the
-        -- end, and at most its start size plus reclaim_growth_mb per datafile
-        -- at its peak (above it only for an index that did not fit, a
-        -- warning).
+        -- equal to the baseline, its scratch tablespace dropped; each
+        -- tablespace at most its start size at the end, and at most its start
+        -- size plus reclaim_growth_mb per datafile at its peak (above it only
+        -- for an index or a parked table that did not fit, a warning).
         l_detail := NULL;
         l_bad := 0;
         l_soft := 0;
@@ -389,6 +389,15 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             l_detail := add_detail(l_detail, l_count || ' datafile growth settings not restored (epf_purge.bat reclaim '
                                              || '--restore)');
         END IF;
+        FOR c IN (SELECT target
+                    FROM epf_instance_change
+                   WHERE item = 'RECLAIM_SCRATCH' AND restored_at IS NULL
+                     AND (applied_run_id = l_run OR l_all = 'Y')
+                   ORDER BY change_id) LOOP
+            l_bad := l_bad + 1;
+            l_detail := add_detail(l_detail, 'scratch tablespace ' || c.target || ' not dropped (epf_purge.bat reclaim '
+                                             || '--restore)');
+        END LOOP;
         IF l_restore THEN
             add_check('R6', CASE WHEN l_bad > 0 THEN 'FAIL' ELSE 'PASS' END, r_title('R6'),
                       CASE WHEN l_bad > 0 THEN l_bad || ' growth settings not restored'
@@ -425,7 +434,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 END LOOP;
                 SELECT COUNT(*) INTO l_count
                   FROM epf_event
-                 WHERE run_id = l_run AND event_code = 'INDEXES_NEED_GROWTH';
+                 WHERE run_id = l_run AND event_code IN ('INDEXES_NEED_GROWTH', 'RETURN_GREW');
                 l_value := NULL;
                 FOR t IN (SELECT tablespace_name, start_bytes, end_bytes, peak_bytes,
                                  start_bytes + NVL(growth_bytes, 0) * NVL(file_count, 1) AS limit_bytes
@@ -440,7 +449,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                         END IF;
                         l_detail := add_detail(l_detail, t.tablespace_name || ' reached ' || b(t.peak_bytes) || ', above '
                                                          || b(t.limit_bytes)
-                                                         || CASE WHEN l_count > 0 THEN ' (an index did not fit within it)'
+                                                         || CASE WHEN l_count > 0
+                                                                 THEN ' (an index or a parked table did not fit within it)'
                                                             END);
                     END IF;
                     IF t.end_bytes > t.start_bytes THEN
@@ -502,11 +512,11 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             END IF;
         END IF;
 
-        -- R8 tables: a move that failed fails; tables that did not fit, were
-        -- busy or were not reached warn.
+        -- R8 tables: a move that failed fails, and so does a table still
+        -- parked; tables that did not fit, were busy or were not reached warn.
         SELECT COUNT(*),
                COUNT(CASE WHEN move_status = 'MOVED' THEN 1 END),
-               COUNT(CASE WHEN move_status = 'FAILED' AND NVL(last_ora, 0) <> 54 THEN 1 END),
+               COUNT(CASE WHEN (move_status = 'FAILED' AND NVL(last_ora, 0) <> 54) OR move_status = 'PARKED' THEN 1 END),
                COUNT(CASE WHEN move_status IN ('NO_ROOM', 'SKIPPED') OR (move_status = 'FAILED' AND last_ora = 54)
                           THEN 1 END)
           INTO l_total, l_ok, l_bad, l_soft
@@ -521,10 +531,12 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             FOR t IN (SELECT owner, object_name, move_status, last_ora, detail
                         FROM epf_reclaim_object
                        WHERE run_id = l_run AND unit_type IN ('TABLE', 'IOT')
-                         AND move_status IN ('NO_ROOM', 'FAILED', 'SKIPPED')
-                       ORDER BY CASE move_status WHEN 'FAILED' THEN 1 WHEN 'NO_ROOM' THEN 2 ELSE 3 END, bytes DESC) LOOP
+                         AND move_status IN ('NO_ROOM', 'FAILED', 'SKIPPED', 'PARKED')
+                       ORDER BY CASE move_status WHEN 'PARKED' THEN 0 WHEN 'FAILED' THEN 1 WHEN 'NO_ROOM' THEN 2 ELSE 3 END,
+                                bytes DESC) LOOP
                 l_detail := add_detail(l_detail, t.owner || '.' || t.object_name || ' '
                                                  || CASE WHEN t.move_status = 'FAILED' AND t.last_ora = 54 THEN 'busy'
+                                                         WHEN t.move_status = 'PARKED' THEN 'still parked'
                                                          ELSE LOWER(REPLACE(t.move_status, '_', ' ')) END
                                                  || CASE WHEN t.last_ora IS NOT NULL THEN ' (ORA-' || LPAD(t.last_ora, 5, '0')
                                                                                          || ')' END);
@@ -534,7 +546,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                       || CASE WHEN l_total - l_ok - l_bad - l_soft > 0
                               THEN ', ' || (l_total - l_ok - l_bad - l_soft) || ' below where the datafile stopped' END
                       || CASE WHEN l_soft > 0 THEN ', ' || l_soft || ' not moved' END
-                      || CASE WHEN l_bad > 0 THEN ', ' || l_bad || ' failed' END, l_detail);
+                      || CASE WHEN l_bad > 0 THEN ', ' || l_bad || ' failed or still parked' END, l_detail);
         END IF;
 
         -- R9 accounts: every account the run locked (a restore: any reclaim)
@@ -849,6 +861,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                                                            WHEN 'RESTORE' THEN 'restore of what reclaims left pending'
                                                            ELSE 'compaction' END
                 || ', tablespaces ' || NVL(REPLACE(g_run.reclaim_scope, ',', ', '), 'every candidate')
+                || CASE WHEN g_run.reclaim_scratch_bytes IS NOT NULL
+                        THEN ', scratch space up to ' || b(g_run.reclaim_scratch_bytes) END
                 || CASE WHEN g_run.confirmed_reqs IS NOT NULL THEN ', confirmed ' || g_run.confirmed_reqs END);
         END IF;
         put(' Time        started ' || NVL(TO_CHAR(g_run.started_at, 'YYYY-MM-DD HH24:MI:SS'), '-')
@@ -1900,8 +1914,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                     FROM (SELECT source_ts, owner, object_name, unit_type, bytes, est_bytes, after_bytes, attempts,
                                  move_status, detail,
                                  ROW_NUMBER() OVER (PARTITION BY source_ts
-                                                    ORDER BY CASE move_status WHEN 'FAILED' THEN 1 WHEN 'NO_ROOM' THEN 2
-                                                                              WHEN 'SKIPPED' THEN 3 ELSE 4 END,
+                                                    ORDER BY CASE move_status WHEN 'PARKED' THEN 0 WHEN 'FAILED' THEN 1
+                                                                              WHEN 'NO_ROOM' THEN 2 WHEN 'SKIPPED' THEN 3
+                                                                              ELSE 4 END,
                                                              bytes DESC, item_id) AS rn,
                                  COUNT(*) OVER (PARTITION BY source_ts) AS cnt,
                                  SUM(bytes) OVER (PARTITION BY source_ts) AS ts_bytes
@@ -2288,6 +2303,24 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             put('  datafile growth stopped by ' || epf_util.run_label(c.applied_run_id) || ': ' || c.target
                 || ' (autoextend up to ' || b(c.original_maxbytes) || ') since '
                 || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || '; epf_purge.bat reclaim --restore restores it');
+        END LOOP;
+        FOR p IN (SELECT run_id, owner, table_name, MAX(park_ts) AS park_ts
+                    FROM epf_reclaim_park
+                   WHERE returned_at IS NULL
+                   GROUP BY run_id, item_id, owner, table_name
+                   ORDER BY run_id, owner, table_name) LOOP
+            l_count := l_count + 1;
+            put('  table parked by ' || epf_util.run_label(p.run_id) || ': ' || p.owner || '.' || p.table_name || ' in '
+                || p.park_ts || ' (usable there); epf_purge.bat reclaim --restore moves it back');
+        END LOOP;
+        FOR c IN (SELECT target, applied_at, applied_run_id
+                    FROM epf_instance_change
+                   WHERE restored_at IS NULL AND item = 'RECLAIM_SCRATCH'
+                   ORDER BY change_id) LOOP
+            l_count := l_count + 1;
+            put('  scratch tablespace of ' || epf_util.run_label(c.applied_run_id) || ' still there: ' || c.target
+                || ' since ' || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS')
+                || '; epf_purge.bat reclaim --restore drops it once it is empty');
         END LOOP;
         FOR i IN (SELECT o.run_id, o.owner, o.object_name, o.table_owner, o.table_name
                     FROM epf_reclaim_object o

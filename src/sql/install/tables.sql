@@ -208,9 +208,12 @@ BEGIN
     -- Reclaim runs (epf_reclaim): reclaim_mode ASSESS (read-only assessment,
     -- also a dry run), COMPACT (compaction in place) or RESTORE (completes an
     -- interrupted reclaim); reclaim_scope the tablespaces requested, NULL for
-    -- every candidate.
+    -- every candidate; reclaim_scratch_bytes the most space the run may use
+    -- in a scratch tablespace of its own for the tables it parks (--scratch),
+    -- NULL for none.
     add_column('EPF_RUN', 'RECLAIM_MODE', q'[VARCHAR2(10) CHECK (reclaim_mode IN ('ASSESS', 'COMPACT', 'RESTORE'))]');
     add_column('EPF_RUN', 'RECLAIM_SCOPE', 'VARCHAR2(4000)');
+    add_column('EPF_RUN', 'RECLAIM_SCRATCH_BYTES', 'NUMBER');
 
     -- Step checklist and state of each run. scope is '-' when not applicable.
     create_table('EPF_STEP', q'[
@@ -518,7 +521,9 @@ BEGIN
     --                           move_status PENDING, MOVED, STAYED (the
     --                           datafile stopped above it), NO_ROOM, FAILED,
     --                           SKIPPED (not reached: stop request, error or
-    --                           interruption)
+    --                           interruption), PARKED (in the run's scratch
+    --                           tablespace until the restore path moves it
+    --                           back: EPF_RECLAIM_PARK)
     --   unit_type INDEX         an index released (UNUSABLE, segment dropped)
     --                           and rebuilt; move_status PENDING, RELEASED,
     --                           REBUILT, FAILED, KEPT (unusable before: left as
@@ -558,6 +563,28 @@ BEGIN
         'CREATE INDEX epf_reclaim_object_ix ON epf_reclaim_object (run_id, move_status)');
     create_index('EPF_RECLAIM_OBJECT_ITEM_IX',
         'CREATE INDEX epf_reclaim_object_item_ix ON epf_reclaim_object (run_id, item_id)');
+
+    -- Segments a reclaim parked in its scratch tablespace: a table that could
+    -- not move lower waits there, with its LOB segments, while the rest of
+    -- its tablespaces is compacted, then moves back. One row per segment of
+    -- the table (kind TABLE, OVERFLOW, or LOB with its column): the
+    -- tablespace it came from and goes back to; returned_at once it is back.
+    create_table('EPF_RECLAIM_PARK', q'[
+        CREATE TABLE epf_reclaim_park (
+            run_id       NUMBER          NOT NULL,
+            item_id      NUMBER          NOT NULL,
+            owner        VARCHAR2(128)   NOT NULL,
+            table_name   VARCHAR2(128)   NOT NULL,
+            kind         VARCHAR2(10)    NOT NULL,
+            column_name  VARCHAR2(4000),
+            from_ts      VARCHAR2(128)   NOT NULL,
+            park_ts      VARCHAR2(128)   NOT NULL,
+            parked_at    TIMESTAMP       NOT NULL,
+            returned_at  TIMESTAMP,
+            CONSTRAINT epf_reclaim_park_ck CHECK (kind IN ('TABLE', 'OVERFLOW', 'LOB'))
+        )]');
+    create_index('EPF_RECLAIM_PARK_IX',
+        'CREATE INDEX epf_reclaim_park_ix ON epf_reclaim_park (run_id, item_id)');
 
     -- Per reclaim run and tablespace: the assessment (sizes, items, forecast)
     -- and the result. Sizes are totals over the tablespace's datafiles.
@@ -651,10 +678,12 @@ BEGIN
 
     -- Instance changes made for the duration of a run, with the original
     -- values needed to restore them (restored_at NULL while active): undo
-    -- tuning for a purge (epf_tuning; UNDO_RETENTION, UNDO_DATAFILE) and the
+    -- tuning for a purge (epf_tuning; UNDO_RETENTION, UNDO_DATAFILE), the
     -- growth of the datafiles a reclaim compacts (epf_reclaim;
-    -- RECLAIM_DATAFILE). Kept outside history pruning: applied_run_id is not
-    -- RUN_ID.
+    -- RECLAIM_DATAFILE) and the scratch tablespace a reclaim creates for the
+    -- tables it parks (epf_reclaim; RECLAIM_SCRATCH, target its name,
+    -- applied_value the space allowed; restored once it is dropped). Kept
+    -- outside history pruning: applied_run_id is not RUN_ID.
     create_table('EPF_INSTANCE_CHANGE', q'[
         CREATE TABLE epf_instance_change (
             change_id            NUMBER GENERATED ALWAYS AS IDENTITY NOT NULL,
@@ -670,10 +699,11 @@ BEGIN
             restored_at          TIMESTAMP,
             applied_run_id       NUMBER,
             CONSTRAINT epf_instance_change_pk PRIMARY KEY (change_id),
-            CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE'))
+            CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE',
+                                                              'RECLAIM_SCRATCH'))
         )]');
     set_check('EPF_INSTANCE_CHANGE', 'EPF_INSTANCE_CHANGE_CK',
-              q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE')]');
+              q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE', 'RECLAIM_SCRATCH')]');
 
     -- Per root tree of a preflight: eligible roots, rows per root (all the
     -- tables of the tree), and the redo and undo per root with their basis

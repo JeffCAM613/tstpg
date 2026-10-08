@@ -173,9 +173,14 @@ Options
                        separated by commas (reclaim: ARCHIVE, TEMP, RECYCLEBIN)
   --tablespaces LIST   reclaim: tablespaces separated by commas (default: every
                        tablespace holding segments of the application schemas)
-  --restore            reclaim: rebuild the indexes, restore the datafile
-                       growth settings and unlock the accounts a reclaim that
-                       did not finish left pending
+  --scratch SIZE       reclaim: temporary space, such as 2G, for the tables
+                       that cannot move lower: they wait in a tablespace the
+                       reclaim creates next to their tablespace's first
+                       datafile, and come back at the end (default: none)
+  --restore            reclaim: move back the parked tables, rebuild the
+                       indexes, restore the datafile growth settings and
+                       unlock the accounts a reclaim that did not finish left
+                       pending
   --compact            shrink the purged tables afterwards (purge only)
   --redo-logs          enlarge the online redo logs first (4 x 1 GB,
                        permanent; SYS)
@@ -232,7 +237,11 @@ Reclaim
   block of a datafile moves into the free space below it and the file is
   resized down, until a segment that cannot move (listed in the report) holds
   the top; then the indexes are rebuilt, the growth settings restored and the
-  accounts unlocked. No datafile grows above its size at the start. With
+  accounts unlocked. No datafile grows above its size at the start. Oracle
+  chooses where a copy goes, and may put it at the top again: with
+  --scratch, such a table, or one that does not fit below, waits in a
+  scratch tablespace while the rest is compacted, then comes back into what
+  is left free; without it, the datafile stops shrinking there. With
   prompts, the reclaim shows its assessment and asks before anything moves.
   Ctrl+C stops after the current table; what was changed is restored either
   way, and a later reclaim continues from there.
@@ -260,7 +269,7 @@ function Read-Arguments {
     param([object[]]$List)
     $result = @{ Action = $null; Options = @{}; Flags = @{} }
     $valueOptions = @('config', 'tns', 'retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup', 'confirm',
-                      'log-dir', 'run', 'tablespaces', 'long-conversion', 'max-redo')
+                      'log-dir', 'run', 'tablespaces', 'long-conversion', 'max-redo', 'scratch')
     $flagOptions = @('dry-run', 'compact', 'redo-logs', 'undo-tuning', 'yes', 'non-interactive', 'no-color',
                      'help', 'reclaim', 'resume', 'new', 'close', 'restore')
     $i = 0
@@ -2184,8 +2193,9 @@ function Invoke-PurgeAction {
 
 # Options of reclaim, checked before any connection or prompt: the mode
 # (ASSESS with --dry-run, RESTORE with --restore, otherwise COMPACT), the
-# tablespaces and the requirements the DBA confirms (RECLAIM_TABLESPACES and
-# RECLAIM_CONFIRM in the configuration file).
+# tablespaces, the requirements the DBA confirms and the scratch space for
+# parked tables (RECLAIM_TABLESPACES, RECLAIM_CONFIRM and RECLAIM_SCRATCH in
+# the configuration file).
 function Read-ReclaimOptions {
     foreach ($name in @('retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup')) {
         if ($script:Cli.Options.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
@@ -2193,12 +2203,13 @@ function Read-ReclaimOptions {
     foreach ($name in @('compact', 'redo-logs', 'undo-tuning')) {
         if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
     }
-    $ctx = [pscustomobject]@{ Cred = $null; SysCred = $null; Mode = 'COMPACT'; Tablespaces = ''; Confirm = ''; AssessRun = '' }
+    $ctx = [pscustomobject]@{ Cred = $null; SysCred = $null; Mode = 'COMPACT'; Tablespaces = ''; Confirm = ''; Scratch = '';
+                              AssessRun = '' }
     $dry = $script:Cli.Flags.ContainsKey('dry-run')
     $restore = $script:Cli.Flags.ContainsKey('restore')
     if ($dry -and $restore) { Exit-Tool $script:ExitUsage '--dry-run and --restore cannot be combined.' }
     if ($restore) {
-        foreach ($name in @('tablespaces', 'confirm')) {
+        foreach ($name in @('tablespaces', 'confirm', 'scratch')) {
             if ($script:Cli.Options.ContainsKey($name)) {
                 Exit-Tool $script:ExitUsage ('--' + $name + ' does not apply to --restore, which restores everything a reclaim left pending.')
             }
@@ -2222,7 +2233,21 @@ function Read-ReclaimOptions {
         }
         $ctx.Confirm = (@(@('ARCHIVE', 'TEMP', 'RECYCLEBIN') | Where-Object { $codes -contains $_ }) -join ',')
     }
+    $scratch = Get-Option 'scratch' 'RECLAIM_SCRATCH' ''
+    if ($scratch -ne '') {
+        $bytes = ConvertTo-Bytes $scratch
+        if ($null -eq $bytes) { Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, got ' + $scratch + '.') }
+        $ctx.Scratch = ([long]$bytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
     return $ctx
+}
+
+# The scratch space of $Ctx as an option, such as ' --scratch 2048M'; empty
+# when none.
+function Format-ScratchOption {
+    param($Ctx)
+    if ($Ctx.Scratch -eq '') { return '' }
+    return (' --scratch ' + [string][long][Math]::Ceiling([double]$Ctx.Scratch / 1048576) + 'M')
 }
 
 # Tablespace names separated by commas, in capitals without duplicates; $null
@@ -2282,9 +2307,11 @@ function Invoke-ReclaimRun {
     }
     $confirmArg = '-'
     $scopeArg = '-'
+    $scratchArg = '-'
     if ($Mode -ne 'RESTORE') {
         if ($Ctx.Confirm -ne '') { $confirmArg = $Ctx.Confirm }
         if ($Ctx.Tablespaces -ne '') { $scopeArg = $Ctx.Tablespaces }
+        if ($Ctx.Scratch -ne '') { $scratchArg = $Ctx.Scratch }
     }
     Open-Run $state @('RECLAIM', '-', '-', '-', '-', (Get-YN ($Mode -eq 'ASSESS')), 'N', 'N', 'N', '-', '-', $confirmArg,
                       'N', '-', 'N', '-', '-')
@@ -2310,6 +2337,9 @@ function Invoke-ReclaimRun {
         Write-Out (' Reclaim    ' + $what + ', tablespaces ' + ($Ctx.Tablespaces -replace ',', ', '))
     }
     if ($confirmArg -ne '-') { Write-Out (' Choices    confirmed by the DBA: ' + $Ctx.Confirm) }
+    if ($scratchArg -ne '-') {
+        Write-Out (' Scratch    up to ' + (Format-Bytes ([double]$Ctx.Scratch)) + ' for the tables parked while the rest is compacted')
+    }
     if ($Mode -eq 'COMPACT' -and $Ctx.AssessRun -ne '') { Write-Out (' Assessed   ' + $Ctx.AssessRun) }
 
     $status = 'FAILED'
@@ -2320,7 +2350,7 @@ function Invoke-ReclaimRun {
     }
     try {
         Write-Section ('RECLAIM  ' + $what.ToUpper())
-        $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, $Mode, $scopeArg) $state 'sqlplus_reclaim.log'
+        $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, $Mode, $scopeArg, $scratchArg) $state 'sqlplus_reclaim.log'
         Update-LiveView $state
         switch ($result.ExitCode) {
             0       { $status = 'SUCCESS' }
@@ -2335,7 +2365,7 @@ function Invoke-ReclaimRun {
             $status = 'FAILED'
             Write-Out ' The worker session ended before the reclaim finished: what it changed is restored now (SYS).' 'Red'
             Write-Section 'RECLAIM  RESTORE'
-            $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, 'RESTORE', '-') $state 'sqlplus_reclaim_restore.log'
+            $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, 'RESTORE', '-', '-') $state 'sqlplus_reclaim_restore.log'
             Update-LiveView $state
             if ($restore.Output -notmatch 'EPF_RECLAIM_STATUS=') {
                 Show-Lines $restore.Output -Indent
@@ -2390,7 +2420,18 @@ function Invoke-ReclaimChoices {
         Write-Out ''
         Write-Out (' ' + $code.PadRight(12) + $item.Title + '  ' + $label) 'Yellow'
         if ($item.Measured -ne '') { Write-Out ('   ' + $item.Measured) }
-        if ($item.Blocking -ne 'Y') { continue }
+        if ($item.Blocking -ne 'Y') {
+            # Scratch space: the size the assessment suggests, or none.
+            if ($code -eq 'SCRATCH' -and $Ctx.Scratch -eq '' -and [string]$Advice.Details['SCRATCH.SIZE'] -match '--scratch (\d+)M') {
+                $size = $Matches[1] + 'M'
+                $answer = Read-Option @('Allow up to ' + $size + ' of scratch space for them (--scratch ' + $size + ')') `
+                                      'Go on without scratch space' 'S'
+                if ($answer -eq '1') {
+                    $Ctx.Scratch = ([long](ConvertTo-Bytes $size)).ToString([Globalization.CultureInfo]::InvariantCulture)
+                }
+            }
+            continue
+        }
         $option = ''
         $stop = 'the requirement is not met'
         switch ($code) {
@@ -2449,6 +2490,12 @@ function Show-ReclaimReview {
     Write-Out ('  Work          ' + $tables + ' tables move, ' + $indexes + ' indexes are released and rebuilt')
     Write-Out '  Accounts      the accounts in ACCOUNTS above are locked, and their sessions disconnected, until the end'
     Write-Out '  Disk          no datafile grows above its size at the start (setting reclaim_growth_mb)'
+    if ($Ctx.Scratch -ne '') {
+        Write-Out ('  Scratch       up to ' + (Format-Bytes ([double]$Ctx.Scratch)) + ' for the tables that cannot move lower: ' +
+                   'they wait in a scratch tablespace, then come back')
+    } else {
+        Write-Out '  Scratch       none: a table that cannot move lower stops its datafile there (--scratch allows parking it)'
+    }
     if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the assessment finds them not met)') }
     Write-Out ('  Assessment    ' + $Ctx.AssessRun)
 }
@@ -2467,6 +2514,7 @@ function Show-ReclaimNext {
         if ($Ctx.Tablespaces -ne '') { $scope = ' --tablespaces ' + $Ctx.Tablespaces }
         $confirm = ''
         if ($Ctx.Confirm -ne '') { $confirm = ' --confirm ' + $Ctx.Confirm }
+        $confirm = $confirm + (Format-ScratchOption $Ctx)
         if ((Read-ReclaimTs $Run.Report).Count -eq 0) {
             Write-Out ' Next    nothing to reclaim.'
         } elseif ($unmet.Count -gt 0) {
@@ -2516,7 +2564,7 @@ function Invoke-ReclaimAction {
         if ($script:Interactive -and -not $confirmed) {
             $pending = Invoke-SqlScript $login (Join-Path $script:RunSqlDir 'status.sql') @()
             Show-Lines $pending.Output -Indent
-            if (-not (Read-YesNo 'Restore what reclaims left pending (indexes, datafile growth settings, accounts)' $true)) {
+            if (-not (Read-YesNo 'Restore what reclaims left pending (parked tables, indexes, datafile growth settings, accounts)' $true)) {
                 Exit-Tool $script:ExitAborted 'Nothing was changed.'
             }
         }
@@ -2701,6 +2749,10 @@ function Invoke-Main {
     if ($null -ne $action -and $action -ne 'reclaim') {
         if ($script:Cli.Options.ContainsKey('tablespaces')) { Exit-Tool $script:ExitUsage '--tablespaces applies to reclaim.' }
         if ($script:Cli.Flags.ContainsKey('restore')) { Exit-Tool $script:ExitUsage '--restore applies to reclaim.' }
+        if ($script:Cli.Options.ContainsKey('scratch')) { Exit-Tool $script:ExitUsage '--scratch applies to reclaim.' }
+    }
+    if ($script:Cli.Options.ContainsKey('scratch') -and $null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['scratch']))) {
+        Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, got ' + $script:Cli.Options['scratch'] + '.')
     }
     if ($script:Cli.Flags.ContainsKey('new') -and @('purge', 'preflight') -notcontains $action) {
         Exit-Tool $script:ExitUsage '--new applies to purge and preflight (the wizard''s menu offers to start over).'

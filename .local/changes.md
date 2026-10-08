@@ -2,6 +2,26 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-08 - Reclaim: parking in a scratch tablespace (--scratch) replaces the 64 MB extents (0.8.0)
+
+Why: I5 and I6 showed that Oracle chooses where the copy of a moved table goes, and that for a table like TRANSMISSION_EXECUTION_AUDIT (a BASICFILE LOB) it may start at the top of the file although there is free space below; nothing the tool does steers it. The user chose to allow temporary disk for such tables.
+
+Changes (reclaim):
+- **Parking.** With `reclaim --scratch SIZE` (or RECLAIM_SCRATCH in the configuration file), a table whose copy comes back to the top, or that still does not fit below after room making, is parked: every segment of it in the run's tablespaces moves to a scratch tablespace the run creates at the first parking (EPF_PARK_<run>: bigfile, the block size of its tablespace, next to that tablespace's first datafile, or OMF, or the ASM disk group; growing up to SIZE). The compaction goes on without it. The restore path's new first step RETURN_PARKED moves each segment back to the tablespace it came from: each first grows within its room by what the part lacks there, so the copy takes the free space the compaction left and the file grows only for the rest. Its indexes the move left unusable are rebuilt next; then the scratch tablespace is dropped with its datafile. Every exit path does this (failure, stop, lost session: RESTORE in the same run, or `reclaim --restore`).
+- Recorded before it is made: the scratch tablespace (EPF_INSTANCE_CHANGE item RECLAIM_SCRATCH), each parked segment (new table EPF_RECLAIM_PARK: kind, LOB column, from and scratch tablespace, returned_at), the unit's status PARKED. The owner gets a quota on the scratch tablespace (removed before the drop). Parking is refused for an encrypted tablespace and beyond the space allowed (PARK_SKIPPED); a park that fails leaves the table where it was (PARK_FAILED). A table that cannot move back even after its datafiles grew stays parked and usable (RETURN_FAILED, an error); status lists it, and history pruning keeps its run.
+- Without `--scratch`, nothing changes except the 64 MB extents: a table that comes back has room made for it once more and moves again only when it fits as it is, as before.
+- **The 64 MB extents are gone** (c_chunk, c_large, large_plan, fresh_bytes, chunked): they relied on "lowest first", which I5 disproved, and they gave TRANSMISSION_EXECUTION_AUDIT's LOB index an INITIAL of 102.4 MB. An INITIAL left by them is now oversized like any other and set to 64 KB by the next move.
+- Assessment: requirement SCRATCH (advice), with the space allowed, where the scratch datafile would go, the largest table that moves and a suggested size; the forecast counts the tables that do not fit as parked and coming back at the end; the ARCHIVE estimate adds the redo of parking (twice the space allowed at most). Candidates exclude EPF_PARK_* tablespaces.
+- Report: the parameters show the scratch space; R6 fails for a scratch tablespace not dropped; R8 fails for a table still parked; TABLES lists parked tables first; status lists parked tables and scratch tablespaces left.
+- Wrapper: `--scratch SIZE` (reclaim only; not with `--restore`), the run header and the review before a compaction show it; with prompts, the assessment's SCRATCH advice offers the suggested size; the Next line keeps it; help and the configuration example describe it. reclaim.sql takes the scratch size as a fourth argument.
+- Tests only: setting reclaim_test_park (Y: the next compaction parks the first table it picks, then sets it back to N).
+
+Tests: T07 has three more usage errors (`--scratch lots`, `--restore --scratch`, `preflight --scratch`). New T18H (lab 1 with `--scratch 512M` and reclaim_test_park: SCRATCH met in the dry run; RT_TOP parked, moved back, scratch tablespace dropped; R1-R4 and R9 PASS; the lab as before; nothing pending) and T18I (the worker session killed while RT_TOP is parked: the restore in the same run moves it back and drops the scratch tablespace). The digest keeps the parking events.
+
+Checked offline: the package scans (declarations, order, private functions in SQL); the wrapper and the suite parse; T00, T01 and T07 with the fake sqlplus (0.8.0); the digest on a built set of logs. Not compiled here: T03 installs it.
+
+How to test (set J on the status page): pull, install 0.8.0 on EPFPG784, run the labs with the two new tests, then one reclaim of EPFPG784's DATA with `--scratch 3G` (TRANSMISSION_EXECUTION_AUDIT still holds the top there), then the digest.
+
 ## 2026-10-08 - I6: a new table takes the lowest free space; there is no "last position" to reset
 
 A test on EPFPG784 as SYS, with empty tables of its own (SYS.EPF_X_*, dropped at the end), in DATA's free space: all 1,742 MB of it from 12,078 MB up, since the index rebuilds after the compaction filled every gap below. (First try: ORA-00922, SEGMENT CREATION written after TABLESPACE in the script; nothing created.)
