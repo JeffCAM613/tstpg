@@ -2,6 +2,15 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Sets M and N planned: a third source (CLUBMEDEPF, TANM7884); the reclaim after a light purge (SONEPARUAT, EPFPG782)
+
+The user runs set L from the remote server, close to the databases, and asked for two more sets:
+- **Set M**, TANM7884, a dump of CLUBMEDEPF: set K's steps (the precheck, the suite with RETENTION_DAYS=30, a dry run, one reclaim with the scratch size suggested, the digest), for the comparison per source (PLAN.md 12.7 gets a CLUBMEDEPF column).
+- **Set N**, EPFPG782, a fresh SONEPARUAT dump: the user's concern is that with less purged, less free space is left in the datafile for the rearrangement. No suite (it purges everything). A light purge instead: `preflight --retention 30 --max-redo 8G` plans runs of at most 8 GB of redo, older data first; only the first runs, then `plan --close`. A full purge deletes about 96 million rows (parity, set C) with 60 GB or more of redo (sets E and G, 84.7 million PAYMENTS rows at 2023-09-28 alone), so the first run is the oldest tenth or so. Then the reclaim twice: in place only (no `--scratch`: room making by purged tables, then a datafile stops at the first table that cannot move lower), then with the scratch size suggested (or what the disk allows: with most of the data left, the suggestion can be large). Expected: less given back than after a full purge, no error, nothing left, never above the start size.
+- One set at a time per clone: a digest covers the latest test session and the runs after it, whatever their database.
+
+How to test: sets M and N on the status page, after set L.
+
 ## 2026-10-09 - K7 and K8 on TANM7883 (0.8.1): DATA down to its segments; RETURN_GREW a warning only above the start size (0.8.2)
 
 K7 (0.8.1 installed, `--only T18A,T18B,T18H,T18G,T18K,T18F`): 7 of 7 in 5 min 49 s. The runs ran on 0.8.1, so it compiled. T18K took 1 min 14 s, against 23 min 57 s on 0.8.0: the later restore asked the worker whose client was gone to stop, the worker put RT_TOP back itself (noted: waited yes, RT_TOP moved back by the restore no). The placement lines (`| was ... now ...; free before ...`) read from the inventory have the form the digest expects.
