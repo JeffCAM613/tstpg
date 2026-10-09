@@ -52,6 +52,18 @@ $script:Width = 80
 # prints once connected (Start-Session).
 $script:ConnectTimeoutS = 120
 $script:ReadyMarker = 'EPF_SESSION_READY'
+# Seconds a session a run depends on (a worker, a restore, a SYS step, the
+# report, the monitor attached again) keeps trying to connect while the
+# network, the listener or the database does not answer (configuration key
+# RECONNECT_S); other sessions try for 60 s.
+$script:ReconnectS = 600
+# Errors of a CONNECT that failed for good: credentials, an unknown alias or
+# service name, a locked or expired account, a missing privilege. Any other
+# error before the ready marker is tried again (Start-Session). The
+# warnings of a CONNECT that succeeded (a password about to expire) are no
+# error.
+$script:FinalConnectErrors = 'ORA-01005|ORA-01017|ORA-01031|ORA-01045|ORA-12154|ORA-12162|ORA-28000|ORA-28001|ORA-28009|SP2-\d{4}'
+$script:ConnectWarnings = 'ORA-28002|ORA-28011'
 # Polls of the live view (about 2 s apart) without the worker of the run in
 # the database, while its sqlplus still waits, after which its connection
 # counts as lost (Invoke-SqlScript): about 10 minutes.
@@ -594,7 +606,30 @@ function Get-ScriptLine {
 
 function Test-SessionFailure {
     param([string]$Text)
-    return ($Text -match 'SP2-0640|SP2-0310|ORA-01017|ORA-12154|ORA-12514|ORA-12541|ORA-12170|ORA-28000|ORA-01045|ORA-01034')
+    return ($Text -match ('SP2-0640|SP2-0310|ORA-01017|ORA-12154|ORA-12514|ORA-12541|ORA-12170|ORA-28000|ORA-01045|' +
+                          'ORA-01034|ORA-03113|ORA-03114|ORA-03135|ORA-12537|ORA-12543|ORA-12545|ORA-12547|ORA-12560'))
+}
+
+# The error a CONNECT printed before the ready marker, '' when it connected.
+function Get-ConnectError {
+    param($Lines)
+    foreach ($line in $Lines) {
+        if ($line -match '(ORA-\d{5}|SP2-\d{4}).*' -and $line -notmatch $script:ConnectWarnings) { return $Matches[0].Trim() }
+    }
+    return ''
+}
+
+# Waits $Seconds; with a run state the live view goes on meanwhile.
+function Wait-Pause {
+    param([int]$Seconds, $State = $null)
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) {
+        Start-Sleep -Seconds ([Math]::Max(1, [Math]::Min(2, [int][Math]::Ceiling(($end - (Get-Date)).TotalSeconds))))
+        if ($null -ne $State) {
+            Test-StopKey $State
+            Update-LiveView $State
+        }
+    }
 }
 
 # A sqlplus session for $Login. Only the CONNECT line goes first, with a
@@ -602,13 +637,20 @@ function Test-SessionFailure {
 # whether it succeeded or not. A session whose marker does not come within
 # $script:ConnectTimeoutS seconds hangs in the connection; nothing else has
 # been sent to it, so it is ended and a new one started, 3 attempts in all.
-# With a run state the live view goes on meanwhile. Returns Process, Errors
-# (standard error, being read), Lines (printed before the marker, such as a
-# connection error), Ready and TimedOut.
+# A CONNECT that printed an error before the marker is ended too; it is
+# tried again, after a pause of 10 s growing to 30 s, while $PatienceS
+# seconds have not passed, unless the error is final ($script:
+# FinalConnectErrors). With a run state the live view goes on meanwhile.
+# Returns Process (none for a CONNECT that failed), Errors (standard error,
+# being read), Lines (printed before the marker, such as a connection
+# error), Ready and TimedOut.
 function Start-Session {
-    param($Login, $State = $null)
+    param($Login, $State = $null, [int]$PatienceS = 60)
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $until = (Get-Date).AddSeconds($PatienceS)
+    $hangs = 0
+    $failures = 0
+    while ($true) {
         $process = Start-SqlProcess
         $errors = $process.StandardError.ReadToEndAsync()
         $process.StandardInput.WriteLine((Get-ConnectLine $Login))
@@ -617,6 +659,7 @@ function Start-Session {
         $lines.Clear()
         $deadline = (Get-Date).AddSeconds($script:ConnectTimeoutS)
         $pending = $null
+        $failure = ''
         while ($true) {
             if ($null -eq $pending) { $pending = $process.StandardOutput.ReadLineAsync() }
             if ($pending.Wait(1000)) {
@@ -628,8 +671,12 @@ function Start-Session {
                                               TimedOut = $false }
                 }
                 if ($line -eq $script:ReadyMarker) {
-                    return [pscustomobject]@{ Process = $process; Errors = $errors; Lines = $lines; Ready = $true;
-                                              TimedOut = $false }
+                    $failure = Get-ConnectError $lines
+                    if ($failure -eq '') {
+                        return [pscustomobject]@{ Process = $process; Errors = $errors; Lines = $lines; Ready = $true;
+                                                  TimedOut = $false }
+                    }
+                    break
                 }
                 $lines.Add($line)
                 continue
@@ -645,10 +692,25 @@ function Start-Session {
         } catch {
             Write-Out (' ' + $_.Exception.Message) 'Yellow'
         }
-        Write-Out (' No answer from ' + $Login.Tns + ' as ' + $Login.User + ' within ' + $script:ConnectTimeoutS +
-                   ' s (connection attempt ' + $attempt + ' of 3).') 'Yellow'
+        if ($failure -eq '') {
+            $hangs++
+            Write-Out (' No answer from ' + $Login.Tns + ' as ' + $Login.User + ' within ' + $script:ConnectTimeoutS +
+                       ' s (connection attempt ' + $hangs + ' of 3).') 'Yellow'
+            if ($hangs -ge 3) {
+                return [pscustomobject]@{ Process = $null; Errors = $null; Lines = $lines; Ready = $false; TimedOut = $true }
+            }
+            continue
+        }
+        $failures++
+        $left = [int]($until - (Get-Date)).TotalSeconds
+        if ($failure -match $script:FinalConnectErrors -or $left -le 0) {
+            return [pscustomobject]@{ Process = $null; Errors = $null; Lines = $lines; Ready = $false; TimedOut = $false }
+        }
+        $pause = [Math]::Min([Math]::Min(10 * $failures, 30), $left)
+        Write-Out (' The connection to ' + $Login.Tns + ' as ' + $Login.User + ' failed: ' + $failure + '. Trying again in ' +
+                   $pause + ' s (for ' + [Math]::Ceiling($left / 60) + ' more min at most).') 'Yellow'
+        Wait-Pause $pause $State
     }
-    return [pscustomobject]@{ Process = $null; Errors = $null; Lines = $lines; Ready = $false; TimedOut = $true }
 }
 
 # Connection test (the only statement the wrapper sends itself): container
@@ -714,14 +776,18 @@ function Format-Offset {
 # database, $script:WorkerLostPolls polls without it while sqlplus still
 # waits mean that its connection was lost: the database session has ended
 # (its call done), so sqlplus is ended too. The raw output goes to $LogName
-# in the run folder.
+# in the run folder. A session of a run (with $State, or -Patient: the
+# report, the undo restore) tries to connect for $script:ReconnectS seconds
+# when the network or the database does not answer; others for 60 s.
 function Invoke-SqlScript {
-    param($Login, [string]$Script, [string[]]$Arguments = @(), $State = $null, [string]$LogName = '')
+    param($Login, [string]$Script, [string[]]$Arguments = @(), $State = $null, [string]$LogName = '', [switch]$Patient)
     if ($null -ne $State) {
         $State.WorkerSeen = $false
         $State.PollsWithout = 0
     }
-    $session = Start-Session $Login $State
+    $patience = 60
+    if ($null -ne $State -or $Patient) { $patience = $script:ReconnectS }
+    $session = Start-Session $Login $State $patience
     $text = ($session.Lines -join "`r`n")
     if ($session.Ready) {
         $process = $session.Process
@@ -751,9 +817,11 @@ function Invoke-SqlScript {
         if ($session.TimedOut) {
             $text = 'The database did not answer the connection as ' + $Login.User + ' (3 attempts of ' +
                     $script:ConnectTimeoutS + ' s); ' + (Split-Path -Leaf $Script) + ' did not run.'
-        } else {
+        } elseif ($null -ne $session.Process) {
             $session.Process.WaitForExit()
             $text = $text + "`r`n" + $session.Errors.Result
+        } else {
+            $text = $text + "`r`nThe connection as " + $Login.User + ' failed; ' + (Split-Path -Leaf $Script) + ' did not run.'
         }
         $code = $script:ExitFail
     }
@@ -766,10 +834,10 @@ function Invoke-SqlScript {
 # The monitor: one sqlplus session kept open for the whole run. It creates
 # (or attaches) the run and so holds the run lock, polls the live view and
 # ends the run. Throws a TimeoutException when the session does not connect
-# (Start-Session).
+# (Start-Session, trying for $PatienceS seconds).
 function Open-Monitor {
-    param($Login)
-    $session = Start-Session $Login
+    param($Login, [int]$PatienceS = 60)
+    $session = Start-Session $Login $null $PatienceS
     if (-not $session.Ready) {
         $message = 'The monitor session did not connect'
         if ($session.TimedOut) {
@@ -829,20 +897,25 @@ function Close-Monitor {
 }
 
 # Replaces a monitor session that stopped answering and attaches the run
-# again (the run lock is released when the old session ends).
+# again (the run lock is released when the old session ends). Tries for
+# $script:ReconnectS seconds, 5 attempts at least: a network that drops
+# comes back within minutes.
 function Reset-Monitor {
     param($State)
     Write-Out ' ..       restarting the monitor session' 'Yellow'
     try {
-        if (-not $State.Monitor.Process.HasExited) { $State.Monitor.Process.Kill() }
+        if ($null -ne $State.Monitor -and -not $State.Monitor.Process.HasExited) { $State.Monitor.Process.Kill() }
     } catch {
         Write-Out (' ..       ' + $_.Exception.Message) 'Yellow'
     }
     $attach = Get-ScriptLine (Join-Path $script:RunSqlDir 'attach.sql') @([string]$State.RunId)
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
+    $until = (Get-Date).AddSeconds($script:ReconnectS)
+    $attempt = 0
+    while ($true) {
+        $attempt++
         $State.Monitor = $null
         try {
-            $State.Monitor = Open-Monitor $State.Cred
+            $State.Monitor = Open-Monitor $State.Cred ([Math]::Max(60, [int]($until - (Get-Date)).TotalSeconds))
             $lines = Invoke-MonitorCommand $State.Monitor $attach 60000
             if (($lines -join "`n") -match 'EPF_ATTACHED=') { return }
             Write-Out (' ..       attach: ' + (@($lines | Where-Object { $_ -match 'ORA-' }) -join ' ')) 'Yellow'
@@ -850,7 +923,8 @@ function Reset-Monitor {
             Write-Out (' ..       attach: ' + $_.Exception.Message) 'Yellow'
         }
         Close-Monitor $State.Monitor
-        Start-Sleep -Seconds 5
+        if ($attempt -ge 5 -and (Get-Date) -ge $until) { break }
+        Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 30))
     }
     throw (New-Object System.TimeoutException('The run could not be attached again after the monitor session was restarted.'))
 }
@@ -1334,7 +1408,7 @@ function Invoke-ToolRun {
         Disable-StopKey $state
         if ($undoApplied) {
             Write-Section 'UNDO TUNING RESTORE (SYS)'
-            $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') @('RESTORE')
+            $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') @('RESTORE') -Patient
             [System.IO.File]::WriteAllText((Join-Path $state.Folder 'sqlplus_undo_restore.log'), $restore.Output, [System.Text.Encoding]::ASCII)
             Show-Lines $restore.Output -Indent
             if ($restore.ExitCode -ne 0) {
@@ -1345,7 +1419,7 @@ function Invoke-ToolRun {
     }
 
     Write-Section 'REPORT' -Detail
-    $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId)
+    $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId) -Patient
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
     Show-Lines $report.Output -HideMachine -Detail
     $mode = ''
@@ -2687,7 +2761,7 @@ function Invoke-ReclaimRun {
     }
 
     Write-Section 'REPORT' -Detail
-    $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId)
+    $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId) -Patient
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
     Show-Lines $report.Output -HideMachine -Detail
     if (-not $script:Verbose) { Show-Summary 'RECLAIM' $Mode $report.Output }
@@ -3047,6 +3121,12 @@ function Invoke-Main {
         $seconds = Test-Value $timeout -Min 10 -Max 3600
         if ($null -eq $seconds) { Exit-Tool $script:ExitUsage ('CONNECT_TIMEOUT_S: a whole number of seconds from 10 to 3600, got ' + $timeout + '.') }
         $script:ConnectTimeoutS = [int]$seconds
+    }
+    $reconnect = Get-Option 'reconnect' 'RECONNECT_S' ''
+    if ($reconnect -ne '') {
+        $seconds = Test-Value $reconnect -Min 60 -Max 86400
+        if ($null -eq $seconds) { Exit-Tool $script:ExitUsage ('RECONNECT_S: a whole number of seconds from 60 to 86400, got ' + $reconnect + '.') }
+        $script:ReconnectS = [int]$seconds
     }
 
     if ($script:Cli.Flags.ContainsKey('reclaim')) {

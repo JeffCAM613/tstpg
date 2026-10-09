@@ -13,6 +13,11 @@ TNS=localhost:1521/EPFPDB
 # not connected by then is ended and started again, 3 attempts in all;
 # nothing has been sent to it yet.
 #CONNECT_TIMEOUT_S=120
+# Seconds, 60-86400, a session a run depends on (a worker, a restore, a SYS
+# step, the report, the monitor) keeps trying to connect while the network,
+# the listener or the database does not answer. A wrong password or an
+# unknown alias ends the attempts at once.
+#RECONNECT_S=600
 
 # Purge parameters. While a plan is open, a purge or preflight without
 # --retention, --cutoff, --mode or --depth on the command line follows the

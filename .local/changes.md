@@ -2,6 +2,23 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - J6: why J4 could not restore itself; a session a run depends on keeps trying to connect
+
+The digest of J6 (the labs of J2: 10 of 10; J3; J4; J5) with the error lines of a failed run:
+- **What broke J4 (R-000051).** At about 20:49 on the database clock, 1 h 37 min into the run, the connection to EPFPG784 dropped: the monitor got ORA-03113, the worker's sqlplus ORA-03114. The worker's session ended with it: no event after 20:48:54, nothing put back, and J5 found no worker still running. The wrapper started the restore in the same run at once; its CONNECT failed (ORA-12545: target host or object does not exist). **A wrapper fault**: sqlplus prints the ready marker after a failed CONNECT too, so the session counted as ready, the script ran unconnected (SP2-0640, SP2-0670), and it was not tried again: "The restore did not finish either". About a minute later the report connected: a restore that kept trying would have put everything back in the same run.
+- **The compaction itself worked.** Before the drop, DATA had gone from 14.2 GB to 2.2 GB, with 118 tables parked (2.9 GB of the 3.0 GB allowed) and the indexes released; after J5, 6.7 GB with 6.5 GB of segments (J3 forecast 8.4 GB). TRANSMISSION_EXECUTION_AUDIT, the table that held the top in set I: its LOB had an INITIAL of 2.0 GB; the move set it to 64 KB, and the table went from 2.2 GB to 192 KB (its copy still came back to the top, and was parked).
+- **Why it ran so long.** Moving a small table took about 45 s (20 tables of 64 to 576 KB in 15 min, 20:24 to 20:39); parking one takes about 1 s. The cost is per move, not per byte: besides the MOVE, the queries of the move's description (where its segments lay before and after, the free space of the tablespace, MOVE_PLACEMENT) and the trim of the datafile after each move. To be measured on TANM7883 (K5) before changing it.
+
+Change (src/bin/lib/epf.ps1, wrapper only):
+- Start-Session: a CONNECT that printed an error before the ready marker no longer counts as ready. It is ended and tried again after 10, 20, then 30 s, while its patience lasts, unless the error is final (`$script:FinalConnectErrors`: ORA-01005, 01017, 01031, 01045, 12154, 12162, 28000, 28001, 28009, any SP2-); the warning of a password about to expire is no error. Each new attempt says why, in a line.
+- Patience: `RECONNECT_S` (default 600, 60 to 86400; configuration key) for the sessions a run depends on: worker scripts, the restore in the same run, the SYS steps, the undo restore and the report (Invoke-SqlScript with a run state or `-Patient`), and the monitor attached again (Reset-Monitor: for RECONNECT_S, 5 attempts at least, pauses growing to 30 s). Other sessions: 60 s.
+- Test-SessionFailure also counts ORA-03113, 03114, 03135, 12537, 12543, 12545, 12547 and 12560.
+- The configuration example documents RECONNECT_S; PLAN.md 8.1.
+
+Checked offline (the fake sqlplus, new: CONNECTs that fail with ORA-12545, a worker whose connection drops): two failed CONNECTs, then `status` works after 10 and 20 s; a wrong password fails at once, without a retry; a reclaim whose worker drops runs its restore in the same run once the connection works again. T00, T01, T06, T07; the 61 checks of the output.
+
+How to test: K3b and K5 on TANM7883 run with it. A drop is not something a test causes; the next one on the test machine shows it.
+
 ## 2026-10-09 - Set K on TANM7883: 31 of 33; T18D and T18I's own kill check fixed (ORA-00031). J5 restored EPFPG784
 
 Set K, the full suite on TANM7883 (a dump of another client) from a remote server close to the database, 0.8.0: 31 of 33 passed in 38 min 51 s (EPFPG784 took 2 h 34 min from the test machine, where each connection takes about 15 s). T08 passed there: the lighter output on a real run. The clone did not have T18J and T18K yet. T18D and T18I failed one check each, the same: "output contains KILLED|<sid>". Every other check passed (exit 1, "The worker session ended before the reclaim finished", the restore in the same run, R1 and R9, the lab as before, nothing pending), so the kill itself worked. The test's block printed KILLED only after `ALTER SYSTEM KILL SESSION ... IMMEDIATE` returned. On TANM7883 it returns ORA-00031 (session marked for kill: it ends soon after), the block stopped there, and SQL*Plus does not print the output of a block that failed. EPFPG784 never answered so. The tool's own disconnects already accept ORA-00030 and ORA-00031.
