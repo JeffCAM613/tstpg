@@ -2,6 +2,16 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Set K on TANM7883: 31 of 33; T18D and T18I's own kill check fixed (ORA-00031). J5 restored EPFPG784
+
+Set K, the full suite on TANM7883 (a dump of another client) from a remote server close to the database, 0.8.0: 31 of 33 passed in 38 min 51 s (EPFPG784 took 2 h 34 min from the test machine, where each connection takes about 15 s). T08 passed there: the lighter output on a real run. The clone did not have T18J and T18K yet. T18D and T18I failed one check each, the same: "output contains KILLED|<sid>". Every other check passed (exit 1, "The worker session ended before the reclaim finished", the restore in the same run, R1 and R9, the lab as before, nothing pending), so the kill itself worked. The test's block printed KILLED only after `ALTER SYSTEM KILL SESSION ... IMMEDIATE` returned. On TANM7883 it returns ORA-00031 (session marked for kill: it ends soon after), the block stopped there, and SQL*Plus does not print the output of a block that failed. EPFPG784 never answered so. The tool's own disconnects already accept ORA-00030 and ORA-00031.
+
+Change (src/tests/e2e/run_tests.ps1): Stop-WorkerSession, used by T18D and T18I. Each session's kill in its own block: KILLED, KILLED with "marked for kill" for ORA-00031 (noted), NOT_KILLED with the error otherwise. Checked: the PL/SQL text as sent; the suite parses.
+
+J5 on EPFPG784, `reclaim --restore` (R-000052, 0.8.0 with the lighter output): PASS WITH WARNINGS in 11 min. The first SYS connection got no answer within 120 s (the network still drops); the second worked. 118 parked tables back from EPF_PARK_51 to DATA (the largest OP.HISTO_OPERATION 999 MB and OP.HISTO_REGLEMENT 942 MB, DATA growing by what each lacked), EPF_PARK_51 dropped, 972 indexes rebuilt in 6 min 49 s, the 6 accounts unlocked. R1, R6 and R9 PASS; the others skipped (restore only). DATA measured 1.7 GB at its start: J4 had compacted it that far, with the 118 tables parked and the indexes released, before the connection dropped. It ends at 6.7 GB with 6.5 GB of segments (14.2 GB before J4). The only warning: INDEXES_NEED_GROWTH, because the rebuilds needed room above the 1.7 GB the restore found.
+
+How to test: set K, K3b on the status page: `run_tests.bat --only T18D,T18I,T18J,T18K,T18F` on TANM7883.
+
 ## 2026-10-09 - Tests T18J and T18K: a connection lost during a reclaim; TANM7883 from a remote server
 
 Why: J4 failed when the network dropped. The suite only kills the worker's database session (T18C, T18D, T18I), never its connection, so the path of a worker whose client is gone while its call goes on (wait_for_workers, 0.7.2) had no test. The user asked for it, and runs a session on TANM7883 (a dump of another client: other data) from a remote server.

@@ -537,6 +537,29 @@ function Get-TestPark {
     return ''
 }
 
+# Kills a reclaim's worker session (SYS, a run's client identifier) in the
+# database. A session Oracle cannot end at once is marked for kill (ORA-00031)
+# and ends soon after; one that ended meanwhile (ORA-00030) is gone already.
+# Each session's outcome is printed (KILLED, or NOT_KILLED with the error), so
+# one error does not hide the others. Returns whether one was killed.
+function Stop-WorkerSession {
+    $k = Invoke-Sql 'SYS' @(
+        'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON SERVEROUTPUT ON',
+        ("BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' " +
+         "AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP BEGIN EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' " +
+         "|| s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); EXCEPTION WHEN OTHERS " +
+         "THEN IF SQLCODE = -31 THEN DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid || '|marked for kill'); ELSE " +
+         "DBMS_OUTPUT.PUT_LINE('NOT_KILLED|' || s.sid || '|' || SQLERRM); END IF; END; END LOOP; END;"),
+        '/',
+        'EXIT')
+    $killed = ($k.Output -match '(?m)^KILLED\|\d+')
+    Add-Check $killed 'the worker session killed (or marked for kill)'
+    if ($k.Output -match '(?m)^KILLED\|\d+\|marked for kill') {
+        Write-TestLog '  note the worker session was marked for kill (ORA-00031): it ended soon after'
+    }
+    return $killed
+}
+
 # Ends, on this machine, the sqlplus of a reclaim's worker session (SYS, a
 # run's client identifier; its process id in V$SESSION.PROCESS), as a lost
 # connection does: the database session goes on with its call. Returns whether
@@ -1575,12 +1598,7 @@ function Invoke-Suite {
             if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
                 $script:State.StopSent = $true
                 Write-TestLog '---- a table moved and the compaction pauses: killing the worker session (SYS)'
-                $k = Invoke-Sql 'SYS' @(
-                    'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON',
-                    "BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); END LOOP; END;",
-                    '/',
-                    'EXIT')
-                Assert-Match $k 'KILLED\|\d+'
+                $null = Stop-WorkerSession
             }
         }
         try {
@@ -1659,12 +1677,7 @@ function Invoke-Suite {
             if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
                 $script:State.StopSent = $true
                 Write-TestLog '---- the first table is parked and the compaction pauses: killing the worker session (SYS)'
-                $k = Invoke-Sql 'SYS' @(
-                    'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 SERVEROUTPUT ON',
-                    "BEGIN FOR s IN (SELECT sid, serial# FROM v`$session WHERE username = 'SYS' AND client_identifier LIKE 'EPF:%' AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))) LOOP EXECUTE IMMEDIATE 'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE'; DBMS_OUTPUT.PUT_LINE('KILLED|' || s.sid); END LOOP; END;",
-                    '/',
-                    'EXIT')
-                Assert-Match $k 'KILLED\|\d+'
+                $null = Stop-WorkerSession
             }
         }
         try {
