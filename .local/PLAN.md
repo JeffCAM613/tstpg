@@ -952,7 +952,7 @@ Each test database is a dump of one client's database. How fast the tool runs an
 | TANM7883 | CLUBMED8 | a remote server close to the database | K |
 | TANM7884 | CLUBMEDEPF | a remote server close to the database | M |
 
-State on 2026-10-09: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps; EPFPG783 is new and empty; EPFPG784 is being emptied for later runs. Set L runs set K's steps on EPFPG781 (the suite, a dry run, one reclaim with `--scratch`): a like-for-like comparison, and the one result no SONEPARUAT run has shown yet, DATA down to its segments in one reclaim. Set M runs the same steps on TANM7884 (CLUBMEDEPF), a third source. Set N asks how the reclaim does with little freed space: on EPFPG782, a light purge (the first run of a plan of runs of at most 8 GB of redo, the oldest tenth or so of the about 96 million rows a full purge deletes), then the reclaim in place only, then with scratch space.
+State on 2026-10-09: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps; EPFPG783 is new and empty; EPFPG784 is being emptied for later runs. Set L runs set K's steps on EPFPG781 (the suite, a dry run, one reclaim with `--scratch`): a like-for-like comparison, and the one result no SONEPARUAT run has shown yet, DATA down to its segments in one reclaim. Set M runs the same steps on TANM7884 (CLUBMEDEPF), a third source. Set N asks how the reclaim does with little freed space: on EPFPG782, a purge that keeps 1800 days (`--retention 1800`, rows dated before 2021-11-04; the other sets keep 30, which deletes nearly everything), then the reclaim in place only, then with scratch space.
 
 | Measure | SONEPARUAT | CLUBMED8 | CLUBMEDEPF |
 |---|---|---|---|
