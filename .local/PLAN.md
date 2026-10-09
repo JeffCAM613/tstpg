@@ -941,6 +941,26 @@ The purge parity of 12.2, row by row, on two copies of the same database: one pu
 - Covered: FULL, CLOB_ONLY, CLOB_N_LOGS (the previous tool adds LOGS to the depth) on all three modules. Not covered: the previous tool's reclaim, shrink, redo sizing and index scripts, which change no rows.
 - The previous tool's wrapper cannot run a purge (its prompt block is missing, `wmic` is gone from Windows 11). `legacy_purge.sql` (as OPPAYMENTS) runs its purge without it: install `legacy/sql` 01-03, compilation check, `run_purge` with the wrapper's arguments. The wrapper's optional steps run as separate commands in its order: `06_optimize_db.sql` and `utility/08_undo_tune.sql` (SYS), `06b_create_purge_indexes.sql`, the purge, `06c_drop_purge_indexes.sql` (OPPAYMENTS), then undo_retention back to 900 s (SYS).
 
+### 12.7 Test databases and their data
+
+Each test database is a dump of one client's database. How fast the tool runs and what a reclaim gives back depend on that data (table, LOB and index sizes, where the free space lies) and on where the wrapper runs, so figures are compared per source. A new source adds a column.
+
+| Database | Dump of | Where the wrapper ran | Sets |
+|---|---|---|---|
+| EPFPG781, EPFPG782, EPFPG783, EPFPG784 | SONEPARUAT | the test machine, a Windows client: about 15 s per connection; the network dropped during J4 | every set before K |
+| TANM7883 | CLUBMED8 | a remote server close to the database | K |
+
+| Measure | SONEPARUAT | CLUBMED8 |
+|---|---|---|
+| DATA as dumped | bigfile, one file of 41.6 GB, 39.5 GB of segments (12.4, EPFPG781) | K4 |
+| Full suite | 31 of 31 in 2 h 34 min (set I, EPFPG784, 0.7.11) | 31 of 33 in 38 min 51 s, the 2 failing only their own kill check (K3, 0.8.0) |
+| Purge, PAYMENTS, cutoff 2023-09-28 | 84.7 M rows in 24 min 28 s, 17.3 us per row; redo 59.4 GB (753 B per row), undo 30.1 GB (set G, EPFPG782, 0.5.3, batch 530) | only inside the suite |
+| First reclaim of DATA after a purge | 41.7 to 11.9 GB in 6 min 25 s, 6 tables moved (R2, EPFPG781, 0.7.2); 41.7 to 14.2 GB in 7 min 32 s with 12.4 GB of segments, a LOB holding the top (set I, EPFPG784, 0.7.11) | K5 |
+| DATA down to its segments | 11.1 to 7.6 GB with 7.5 GB of segments, R7 PASS, 54 min, 55 of 688 tables moved (R10, EPFPG781, 0.7.9, after the passes of R2 to R9) | K5 |
+| Reclaim with parking (`--scratch 3G`) | 14.2 to 2.2 GB, 118 tables parked, until the network dropped at 1 h 37 min (J4, EPFPG784, 0.8.0); the restore took 11 min, 972 indexes rebuilt in 7 min: 6.7 GB with 6.5 GB of segments (J5) | K5 |
+| Forecast of DATA after a reclaim, against the result | 8.9 GB (R1) against 7.6 GB (R10); 8.4 GB (J3) against 6.7 GB (J5) | K4 against K5 |
+| Time to move a small table; to park one | about 45 s; about 1 s (J4) | K5 |
+
 ---
 
 ## 13. Implementation phases

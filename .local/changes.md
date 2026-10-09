@@ -2,6 +2,12 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Test databases by data source (PLAN.md 12.7)
+
+Every set before K ran on dumps of SONEPARUAT (EPFPG781 to EPFPG784); TANM7883 (set K) holds a dump of CLUBMED8. PLAN.md 12.7 records which database holds which data, where the wrapper ran, and the main figures per source: the suite, a purge, the reclaims, the forecast against the result, the time per move. It is there to compare the tool on other clients' data; set K fills the CLUBMED8 column.
+
+How to use: a new source adds a column, filled from the digests of its runs.
+
 ## 2026-10-09 - J6: why J4 could not restore itself; a session a run depends on keeps trying to connect
 
 The digest of J6 (the labs of J2: 10 of 10; J3; J4; J5) with the error lines of a failed run:
