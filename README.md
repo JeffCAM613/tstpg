@@ -90,8 +90,8 @@ Command-line options override the file. In the wizard, a value in the file is th
 | BATCH_SIZE | `--batch-size` | Root rows per transaction, 100 to 100000 |
 | DRY_RUN | `--dry-run` | Y: simulate only |
 | COMPACT | `--compact` | Y: shrink the purged tables afterwards |
-| REDO_LOGS | `--redo-logs` | Y: enlarge the online redo logs to 4 x 1 GB first (permanent; SYS) |
-| UNDO_TUNING | `--undo-tuning` | Y: lower undo_retention and limit the undo growth for the purge, restored at the end (SYS) |
+| REDO_LOGS | `--redo-logs` | Y: larger online redo logs (4 x 1 GB) for the purge when one batch does not fit; the original groups are put back at the end (SYS) |
+| UNDO_TUNING | `--undo-tuning` | Y: lower undo_retention and limit the undo growth for the purge, restored at the end, and give back what undo and temp grew (SYS) |
 | BACKUP | `--backup` | Without a recent RMAN backup: CONFIRMED (a backup was made another way) or NONE |
 | CONFIRM | `--confirm` | Requirements the DBA confirms are handled: ARCHIVE, UNDO, TEMP |
 | MAX_REDO | `--max-redo` | The most redo one run may write, such as 20G: the purge is split into runs |
@@ -175,8 +175,10 @@ src\bin\epf_purge.bat purge --non-interactive --yes --retention 365 --mode FULL 
 More options for the purge:
 
 - `--compact` shrinks the purged tables afterwards (tables with at least 20 % free inside them).
-- `--undo-tuning` lowers undo_retention and limits the growth of the undo tablespace (4 GB by default) for the purge, then restores both (SYS).
-- `--redo-logs` enlarges the online redo logs to 4 x 1 GB first. This change is permanent (SYS).
+- `--undo-tuning` lowers undo_retention and limits the growth of the undo tablespace (4 GB by default) for the purge, then restores both (SYS). It also records the size of the undo datafiles and of the temporary tablespaces, and gives back what they grew once the purge ends: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents (Oracle keeps undo extents for a while; what is left is given back by a later `src/sql/run/undo.sql RESTORE` or the next purge with undo tuning, and `status` shows it).
+- `--redo-logs` gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).
+
+A datafile does not shrink by itself: Oracle keeps the size an undo, temporary or data file grew to. Undo retention only says how long old undo is kept inside the undo tablespace.
 
 With a preflight or a dry run, `--undo-tuning` and `--redo-logs` are checked as planned; nothing is changed.
 
@@ -278,6 +280,8 @@ The status shows the active run, or the latest one, with its steps and last even
 |---|---|
 | Temporary indexes of an interrupted purge | The next purge drops them. |
 | Undo tuning still active | The purge restores it at its end; otherwise `src/sql/run/undo.sql RESTORE` as SYS (see [SQL*Plus scripts](#sqlplus-scripts)). |
+| Online redo logs replaced for a purge | The purge puts the original groups back at its end; otherwise `src/sql/run/redo_logs.sql RESTORE` as SYS. |
+| Undo or temporary space a purge or reclaim made Oracle add (information) | Given back as far as Oracle allows at the end of the run; the rest by `src/sql/run/undo.sql RESTORE` as SYS, once Oracle releases it. |
 | Reclaim changes: datafile growth stopped, indexes still unusable, accounts still locked, tables still parked, a scratch tablespace | `src\bin\epf_purge.bat reclaim --restore`; a new reclaim restores them too. |
 
 ## Settings
@@ -315,7 +319,8 @@ The tool runs the scripts of `src\sql\run`. Some of them can be run directly in 
 | `status.sql` | EPFPG | The status, as `epf_purge.bat status` |
 | `stop.sql <run_id or ACTIVE>` | EPFPG | A graceful stop |
 | `preflight.sql NEW` | EPFPG | A standalone preflight with the default parameters |
-| `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand |
+| `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand; RESTORE also gives back what undo and temp grew |
+| `redo_logs.sql RESTORE` | SYS AS SYSDBA | Puts back the online redo log groups replaced for a purge |
 
 For example (SQL*Plus asks for the password):
 
@@ -358,7 +363,7 @@ logs\                    run folders (not part of the repository)
 
 ## Testing
 
-The end-to-end test suite runs every feature against a test database, and changes it: it purges every module, clears LOB values, compacts tables, enlarges the online redo logs to 4 x 1 GB (permanent) and changes undo_retention during the purges. Its reclaim tests work on tablespaces they create and remove. Run it only on a copy that can be discarded.
+The end-to-end test suite runs every feature against a test database, and changes it: it purges every module, clears LOB values, compacts tables, enlarges the online redo logs during the purges (put back after each) and changes undo_retention during them. Its reclaim tests work on tablespaces they create and remove. Run it only on a copy that can be discarded.
 
 1. Copy `src\tests\e2e\test.conf.example` to `src\tests\e2e\test.conf`, and set TNS, EXPECTED_DB and DESTRUCTIVE_OK=YES.
 2. Run `src\tests\e2e\run_tests.bat` for the whole suite (about 3 hours), or a part of it, such as `src\tests\e2e\run_tests.bat --only T18A,T18B`.

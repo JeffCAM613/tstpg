@@ -2,6 +2,32 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - A purge puts the online redo logs back and gives back undo and temp growth (0.8.4, D23)
+
+Why: after set L, EPFPG781 took 21.8 GB on disk for 8.5 GB of datafiles of its own: undo 6.3 GB, temp 3.0 GB, 4 redo logs of 1 GB. The user asked that a run leave the instance as it found it, with the original names. Their choices: the original redo log groups put back after a purge; the undo and temp growth resized back as far as Oracle allows, a switch to a new undo tablespace under the same name only on request. And no change to logs that are already large enough. Names: a dropped log group's number and file names, a dropped tablespace's name and file name, can all be used again; nothing has to become undotbs2, undotbs3.
+
+Changes:
+- tables.sql: EPF_INSTANCE_CHANGE gets LOG_GROUP, LOG_THREAD, LOG_MEMBERS; items REDO_GROUP, REDO_ADDED, SIZE_UNDO, SIZE_TEMP.
+- epf_tuning (0.8.4):
+  - enlarge_redo(size, groups, run): with the purge run, nothing changes when one batch (its REDO_LOGS needed bytes) fits in the smallest online log; the groups are made large enough for a batch that needs more than 1 GB. Each group dropped (REDO_GROUP) and added (REDO_ADDED) is recorded first.
+  - redo_restore (new): adds the original groups again (same numbers, threads, sizes, file names with REUSE; Oracle-managed and ASM members are named by Oracle in the same place), then drops the added groups once inactive (switch, checkpoint, archived in ARCHIVELOG) and deletes their files. A group still in use stays recorded; REDO_RESTORED once all is back.
+  - size_record (new): the size of each undo datafile (with undo tuning) and of each temporary tablespace; an open record of the same file is kept.
+  - size_giveback (new): temporary tablespaces SHRINK SPACE KEEP their size before; undo datafiles RESIZE to their size before or to the highest extent still held (DBA_UNDO_EXTENTS). A record closes once within 64 MB of its size before; otherwise it stays open for the next call (Oracle releases undo extents on its own schedule).
+  - undo_apply records the sizes; undo_restore gives them back after putting the settings back.
+- epf_reclaim: compact_all records the temporary tablespaces first; the restore path gives back at its end.
+- redo_logs.sql: `RESTORE`, and the purge run as a third argument.
+- epf.ps1: the redo step runs after the run's own preflight (the batch's redo is known then) and only when the purge is ready; after the purge, in the same place as the undo restore, `redo_logs.sql RESTORE` (REDO LOGS RESTORE (SYS)); a failure says to run it by hand. Help, prompt and choices texts: no longer "permanent".
+- epf_report: status lists online redo logs replaced and not put back yet as pending; open size records as information after the pending list, so "nothing pending" still holds.
+- epf_purge: REDO_LOGS's texts.
+- Tests: T01 records the online redo log groups; T19 checks they are the same at the end and notes open size records (not counted with the pending changes); T11 and T16 check REDO LOGS RESTORE and REDO_UNCHANGED or REDO_RESTORED.
+- README, configuration examples, PLAN.md 6.8, 6.9, D23.
+
+Not done: EPFPG781's logs were enlarged by earlier versions, which recorded nothing, so the originals are not known there. The switch to a new undo tablespace under the same name is not built yet (on request).
+
+Checked here: the wrapper and the suite parse (T00 rules); T00, T01, T06 and T07 against the fake sqlplus (its version now from registry_data.sql); the 64 output checks. Not compiled here.
+
+How to test: set M's suite (T11, T16, T19: the redo logs as before, REDO LOGS RESTORE), set N's purge with undo tuning (UNDO_RESIZED, TEMP_RESIZED at the end).
+
 ## 2026-10-09 - Set L on EPFPG781 (SONEPARUAT, from the remote server, 0.8.2): 35 of 35; DATA 41.6 to 6.9 GB in one reclaim
 
 The digest of set L (the suite's session and the two runs after it):

@@ -3615,14 +3615,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_met     := l_batch_redo <= l_log;
         add_req('REDO_LOGS', 5, l_met, 'N', 'Redo log size', c_why_redo,
                 'smallest online log ' || epf_util.fmt_bytes(g_min_log)
-                || CASE WHEN l_planned THEN ', 4 x 1 GB when the purge starts' END
+                || CASE WHEN l_planned THEN ', 4 x 1 GB during the purge when one batch needs it' END
                 || '; one batch writes about ' || epf_util.fmt_bytes(l_batch_redo),
                 l_batch_redo, l_log,
                 CASE WHEN g_min_log >= 1073741824 THEN 'LOGS_1GB' WHEN l_planned THEN 'REDO_LOGS' ELSE 'BATCH' END);
         add_opt('REDO_LOGS', 'LOGS_1GB', 1, g_min_log >= 1073741824, 'Online logs of at least 1 GB',
                 'smallest now ' || epf_util.fmt_bytes(g_min_log));
         add_opt('REDO_LOGS', 'REDO_LOGS', 2, l_planned AND l_met, 'Enlarge the logs when the purge starts (--redo-logs)',
-                'replaces them with 4 x 1 GB (permanent; SYS)');
+                '4 x 1 GB for the purge, the original groups put back after it (SYS)');
         add_opt('REDO_LOGS', 'SMALLER_BATCH', 3, l_met AND NOT l_planned AND g_min_log < 1073741824,
                 'Smaller batch (--batch-size)',
                 CASE WHEN l_recommend IS NOT NULL THEN 'batch ' || epf_util.fmt_int(l_recommend)

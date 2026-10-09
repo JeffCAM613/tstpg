@@ -14,7 +14,7 @@ EXPECTED_DB=EPFPG783
 
 # The tests purge every module of the test database (rows older than
 # RETENTION_DAYS), clear LOB values, compact tables, enlarge the online redo
-# logs to 4 x 1 GB (permanent) and change undo_retention for the purges.
+# logs for the purges (put back after each) and change undo_retention for them.
 # Set to YES to confirm that this database may be changed that way.
 DESTRUCTIVE_OK=NO
 

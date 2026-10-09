@@ -707,8 +707,14 @@ BEGIN
             CONSTRAINT epf_instance_change_ck CHECK (item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE',
                                                               'RECLAIM_SCRATCH'))
         )]');
+    -- An online redo log group replaced for a purge (REDO_GROUP) or added for
+    -- it (REDO_ADDED): its number, thread and members.
+    add_column('EPF_INSTANCE_CHANGE', 'LOG_GROUP', 'NUMBER');
+    add_column('EPF_INSTANCE_CHANGE', 'LOG_THREAD', 'NUMBER');
+    add_column('EPF_INSTANCE_CHANGE', 'LOG_MEMBERS', 'VARCHAR2(4000)');
     set_check('EPF_INSTANCE_CHANGE', 'EPF_INSTANCE_CHANGE_CK',
-              q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE', 'RECLAIM_SCRATCH')]');
+              q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE', 'RECLAIM_SCRATCH', 'REDO_GROUP',
+                          'REDO_ADDED', 'SIZE_UNDO', 'SIZE_TEMP')]');
 
     -- Per root tree of a preflight: eligible roots, rows per root (all the
     -- tables of the tree), and the redo and undo per root with their basis

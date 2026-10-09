@@ -3915,6 +3915,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     p_ora => ABS(SQLCODE));
                 p_ok := FALSE;
         END;
+        -- What the temporary tablespaces grew (and an undo datafile a purge
+        -- left larger), given back as far as Oracle allows.
+        BEGIN
+            epfpg.epf_tuning.size_giveback;
+        EXCEPTION
+            WHEN OTHERS THEN
+                say(epfpg.epf_log.c_info, 'SIZE_NOT_GIVEN_BACK', 'Temporary and undo space not given back: ' || SQLERRM);
+        END;
     END restore_path;
 
     -- Waits while another session still runs a reclaim on the database (SYS,
@@ -4036,6 +4044,15 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     PROCEDURE compact_all(p_ok IN OUT BOOLEAN) IS
         l_message VARCHAR2(400);
     BEGIN
+        -- The size of each temporary tablespace (the index rebuilds sort
+        -- there), given back at the end of the restore path.
+        BEGIN
+            epfpg.epf_tuning.size_record(g_run.run_id, FALSE);
+        EXCEPTION
+            WHEN OTHERS THEN
+                say(epfpg.epf_log.c_info, 'TEMP_SIZE_UNRECORDED', 'The size of the temporary tablespaces was not '
+                                                                  || 'recorded: ' || SQLERRM);
+        END;
         BEGIN
             epfpg.epf_log.step_start('LOCK_ACCOUNTS');
             lock_accounts(l_message);

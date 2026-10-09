@@ -2317,6 +2317,15 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             put('  undo tuning active: ' || c.item || ' ' || c.target || ' since '
                 || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || '; restore with run/undo.sql RESTORE as SYS');
         END LOOP;
+        FOR c IN (SELECT MIN(applied_at) AS applied_at, MIN(applied_run_id) AS run_id
+                    FROM epf_instance_change
+                   WHERE restored_at IS NULL AND item IN ('REDO_GROUP', 'REDO_ADDED')
+                  HAVING COUNT(*) > 0) LOOP
+            l_count := l_count + 1;
+            put('  online redo logs replaced for ' || epf_util.run_label(c.run_id) || ' since '
+                || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || '; put the original groups back with '
+                || 'run/redo_logs.sql RESTORE as SYS');
+        END LOOP;
         -- What a reclaim left pending: epf_purge.bat reclaim --restore
         -- restores it (a new reclaim does too, before it starts).
         FOR c IN (SELECT target, original_maxbytes, applied_at, applied_run_id
@@ -2369,6 +2378,16 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         IF l_count = 0 THEN
             put('  no temporary index, undo tuning, reclaim change or locked account pending');
         END IF;
+        -- Space a purge or a reclaim made Oracle add, not given back yet:
+        -- information, nothing to restore.
+        FOR c IN (SELECT item, target, file_id, original_value
+                    FROM epf_instance_change
+                   WHERE restored_at IS NULL AND item IN ('SIZE_UNDO', 'SIZE_TEMP')
+                   ORDER BY change_id) LOOP
+            put('  ' || CASE c.item WHEN 'SIZE_UNDO' THEN 'undo datafile ' ELSE 'temporary tablespace ' END || c.target
+                || ' larger than its ' || b(c.original_value) || ' before; given back once Oracle releases it '
+                || '(run/undo.sql RESTORE as SYS, or the next purge with undo tuning)');
+        END LOOP;
         FOR p IN (SELECT plan_id, status, cutoff_date, purge_mode, depth
                     FROM epf_plan
                    WHERE status IN ('READY', 'IN_PROGRESS')) LOOP

@@ -71,8 +71,17 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
             say('WARN', 'REDO_FILE_KEPT', p_file || ' could not be deleted (' || SQLERRM || '); delete it manually');
     END remove_file;
 
-    PROCEDURE enlarge_redo(p_size_mb IN NUMBER DEFAULT 1024, p_groups IN NUMBER DEFAULT 4) IS
+    PROCEDURE enlarge_redo(p_size_mb IN NUMBER DEFAULT 1024, p_groups IN NUMBER DEFAULT 4,
+                           p_run_id IN NUMBER DEFAULT NULL) IS
         l_bytes      NUMBER;
+        l_size_mb    NUMBER;
+        l_need       NUMBER;
+        l_min        NUMBER;
+        l_thread     NUMBER;
+        l_gbytes     NUMBER;
+        l_list       VARCHAR2(4000);
+        l_known      NUMBER;
+        l_run        NUMBER := NVL(p_run_id, epfpg.epf_log.current_run);
         l_log_mode   VARCHAR2(12);
         l_big        NUMBER;
         l_small      NUMBER;
@@ -98,13 +107,32 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END IF;
         l_bytes := p_size_mb * 1048576;
         SELECT log_mode INTO l_log_mode FROM v$database;
+        -- With a run: nothing changes when one batch of it (its REDO_LOGS
+        -- requirement) fits in the smallest online log; groups larger than
+        -- p_size_mb when one batch needs more.
+        IF p_run_id IS NOT NULL THEN
+            SELECT MAX(needed_bytes) INTO l_need
+              FROM epfpg.epf_requirement
+             WHERE run_id = p_run_id AND req_code = 'REDO_LOGS';
+            SELECT MIN(bytes) INTO l_min FROM v$log;
+            IF l_need IS NOT NULL AND l_need <= l_min THEN
+                say('OK', 'REDO_UNCHANGED', 'One batch writes about ' || ROUND(l_need / 1048576) || ' MB of redo and fits '
+                                            || 'in the smallest online log (' || ROUND(l_min / 1048576) || ' MB): left as '
+                                            || 'they are.');
+                RETURN;
+            END IF;
+            IF l_need > l_bytes THEN
+                l_bytes := CEIL(l_need / 268435456) * 268435456;
+            END IF;
+        END IF;
+        l_size_mb := l_bytes / 1048576;
 
         show_groups('before');
         SELECT COUNT(CASE WHEN bytes >= l_bytes THEN 1 END), COUNT(CASE WHEN bytes < l_bytes THEN 1 END), MAX(group#)
           INTO l_big, l_small, l_next
           FROM v$log;
         IF l_big >= p_groups AND l_small = 0 THEN
-            say('OK', 'REDO_UNCHANGED', 'All ' || l_big || ' groups already have at least ' || p_size_mb || ' MB.');
+            say('OK', 'REDO_UNCHANGED', 'All ' || l_big || ' groups already have at least ' || l_size_mb || ' MB.');
             RETURN;
         END IF;
 
@@ -119,8 +147,8 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
           FROM v$logfile
          WHERE group# = (SELECT MIN(group#) FROM v$log)
          ORDER BY member;
-        say('INFO', 'REDO_PLAN', 'adding ' || GREATEST(p_groups - l_big, 0) || ' groups of ' || p_size_mb || ' MB ('
-                                 || GREATEST(p_groups - l_big, 0) * l_ref.COUNT * p_size_mb
+        say('INFO', 'REDO_PLAN', 'adding ' || GREATEST(p_groups - l_big, 0) || ' groups of ' || l_size_mb || ' MB ('
+                                 || GREATEST(p_groups - l_big, 0) * l_ref.COUNT * l_size_mb
                                  || ' MB of new files), then dropping ' || l_small || ' smaller groups');
 
         FOR i IN 1 .. GREATEST(p_groups - l_big, 0) LOOP
@@ -139,16 +167,30 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
             BEGIN
                 EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE GROUP ' || l_next
                                   || CASE WHEN l_members IS NOT NULL THEN ' (' || l_members || ')' END
-                                  || ' SIZE ' || p_size_mb || 'M';
+                                  || ' SIZE ' || l_size_mb || 'M';
                 l_added.EXTEND;
                 l_added(l_added.COUNT) := l_next;
-                say('INFO', 'REDO_GROUP_ADDED', 'group ' || l_next || ', ' || p_size_mb || ' MB: '
+                -- Recorded for redo_restore, which drops it again.
+                SELECT MAX(thread#) INTO l_thread FROM v$log WHERE group# = l_next;
+                SELECT LISTAGG(member, ',') WITHIN GROUP (ORDER BY member) INTO l_list
+                  FROM v$logfile
+                 WHERE group# = l_next;
+                INSERT INTO epfpg.epf_instance_change (item, target, log_group, log_thread, log_members, original_value,
+                                                       applied_at, applied_run_id)
+                VALUES ('REDO_ADDED', 'group ' || l_next, l_next, l_thread, l_list, l_bytes,
+                        CAST(SYSTIMESTAMP AS TIMESTAMP), l_run);
+                COMMIT;
+                say('INFO', 'REDO_GROUP_ADDED', 'group ' || l_next || ', ' || l_size_mb || ' MB: '
                                                 || NVL(l_members, 'Oracle-managed file'));
             EXCEPTION
                 WHEN OTHERS THEN
                     l_error := SQLERRM;
                     FOR k IN 1 .. l_added.COUNT LOOP
                         EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE GROUP ' || l_added(k);
+                        UPDATE epfpg.epf_instance_change
+                           SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+                         WHERE item = 'REDO_ADDED' AND log_group = l_added(k) AND restored_at IS NULL;
+                        COMMIT;
                         say('WARN', 'REDO_GROUP_DROPPED', 'group ' || l_added(k)
                                                           || ' (added by this call; its files remain on disk)');
                     END LOOP;
@@ -166,6 +208,22 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
              ORDER BY group#;
             FOR k IN 1 .. l_candidates.COUNT LOOP
                 SELECT member BULK COLLECT INTO l_files FROM v$logfile WHERE group# = l_candidates(k);
+                -- Recorded first (number, thread, members, size) for redo_restore.
+                SELECT COUNT(*) INTO l_known
+                  FROM epfpg.epf_instance_change
+                 WHERE item = 'REDO_GROUP' AND log_group = l_candidates(k) AND restored_at IS NULL;
+                IF l_known = 0 THEN
+                    SELECT MAX(thread#), MAX(bytes) INTO l_thread, l_gbytes FROM v$log WHERE group# = l_candidates(k);
+                    l_list := NULL;
+                    FOR f IN 1 .. l_files.COUNT LOOP
+                        l_list := l_list || CASE WHEN f > 1 THEN ',' END || l_files(f);
+                    END LOOP;
+                    INSERT INTO epfpg.epf_instance_change (item, target, log_group, log_thread, log_members,
+                                                           original_value, applied_at, applied_run_id)
+                    VALUES ('REDO_GROUP', 'group ' || l_candidates(k), l_candidates(k), l_thread, l_list, l_gbytes,
+                            CAST(SYSTIMESTAMP AS TIMESTAMP), l_run);
+                    COMMIT;
+                END IF;
                 BEGIN
                     EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE GROUP ' || l_candidates(k);
                     FOR f IN 1 .. l_files.COUNT LOOP
@@ -218,6 +276,160 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         SELECT COUNT(*), MIN(bytes) INTO l_big, l_bytes FROM v$log;
         say('OK', 'REDO_ENLARGED', l_big || ' online redo log groups, smallest ' || ROUND(l_bytes / 1048576) || ' MB');
     END enlarge_redo;
+
+    PROCEDURE redo_restore IS
+        l_log_mode VARCHAR2(12);
+        l_omf      VARCHAR2(4000);
+        l_count    NUMBER;
+        l_exists   NUMBER;
+        l_rest     VARCHAR2(4000);
+        l_member   VARCHAR2(1000);
+        l_list     VARCHAR2(4000);
+        l_pos      PLS_INTEGER;
+        l_left     NUMBER;
+        l_files    SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
+        l_removed  BOOLEAN := FALSE;
+    BEGIN
+        check_instance;
+        SELECT COUNT(*) INTO l_count
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item IN ('REDO_GROUP', 'REDO_ADDED');
+        IF l_count = 0 THEN
+            say('INFO', 'REDO_NOTHING_TO_RESTORE', 'No online redo log group to put back');
+            RETURN;
+        END IF;
+        SELECT log_mode INTO l_log_mode FROM v$database;
+        SELECT MAX(value)
+          INTO l_omf
+          FROM v$parameter
+         WHERE name IN ('db_create_online_log_dest_1', 'db_create_file_dest')
+           AND value IS NOT NULL;
+        show_groups('before');
+
+        -- 1. The original groups again: their numbers, threads and sizes, and
+        -- their members under the same names on a file system; Oracle names
+        -- an Oracle-managed member again, in its disk group on ASM.
+        FOR c IN (SELECT change_id, log_group, log_thread, log_members, original_value
+                    FROM epfpg.epf_instance_change
+                   WHERE restored_at IS NULL AND item = 'REDO_GROUP'
+                   ORDER BY log_group) LOOP
+            SELECT COUNT(*) INTO l_exists FROM v$log WHERE group# = c.log_group;
+            IF l_exists = 0 THEN
+                l_list := NULL;
+                l_rest := c.log_members || ',';
+                LOOP
+                    l_pos := INSTR(l_rest, ',');
+                    EXIT WHEN NVL(l_pos, 0) = 0;
+                    l_member := SUBSTR(l_rest, 1, l_pos - 1);
+                    l_rest := SUBSTR(l_rest, l_pos + 1);
+                    IF SUBSTR(l_member, 1, 1) = '+' THEN
+                        l_member := SUBSTR(l_member, 1, INSTR(l_member || '/', '/') - 1);
+                    ELSIF l_omf IS NOT NULL AND INSTR(l_member, 'o1_mf_') > 0 THEN
+                        l_member := NULL;
+                    END IF;
+                    IF l_member IS NOT NULL AND INSTR(NVL(l_list, ' '), '''' || l_member || '''') = 0 THEN
+                        l_list := l_list || CASE WHEN l_list IS NOT NULL THEN ', ' END || ''''
+                                  || REPLACE(l_member, '''', '''''') || '''';
+                    END IF;
+                END LOOP;
+                EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE THREAD ' || NVL(c.log_thread, 1) || ' GROUP ' || c.log_group
+                                  || CASE WHEN l_list IS NOT NULL THEN ' (' || l_list || ')' END
+                                  || ' SIZE ' || ROUND(c.original_value / 1024) || 'K'
+                                  || CASE WHEN l_list IS NOT NULL AND INSTR(l_list, '''+') = 0 THEN ' REUSE' END;
+                say('OK', 'REDO_GROUP_ADDED', 'group ' || c.log_group || ', ' || ROUND(c.original_value / 1048576)
+                                              || ' MB, as before the purge: ' || NVL(l_list, 'Oracle-managed file'));
+            END IF;
+            UPDATE epfpg.epf_instance_change
+               SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+             WHERE change_id = c.change_id;
+            COMMIT;
+        END LOOP;
+
+        -- 2. The groups added for the purge, dropped once Oracle no longer
+        -- needs them (INACTIVE, and archived in ARCHIVELOG mode).
+        FOR r IN 1 .. c_rounds LOOP
+            l_left := 0;
+            FOR c IN (SELECT ch.change_id, ch.log_group, ch.log_members, l.status, l.archived
+                        FROM epfpg.epf_instance_change ch
+                        LEFT JOIN v$log l ON l.group# = ch.log_group
+                       WHERE ch.restored_at IS NULL AND ch.item = 'REDO_ADDED'
+                       ORDER BY ch.log_group) LOOP
+                IF c.status IS NULL
+                   OR (c.status IN ('INACTIVE', 'UNUSED') AND (l_log_mode = 'NOARCHIVELOG' OR c.archived = 'YES')) THEN
+                    BEGIN
+                        IF c.status IS NOT NULL THEN
+                            EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE GROUP ' || c.log_group;
+                            l_rest := c.log_members || ',';
+                            LOOP
+                                l_pos := INSTR(l_rest, ',');
+                                EXIT WHEN NVL(l_pos, 0) = 0;
+                                IF l_pos > 1 THEN
+                                    l_files.EXTEND;
+                                    l_files(l_files.COUNT) := SUBSTR(l_rest, 1, l_pos - 1);
+                                END IF;
+                                l_rest := SUBSTR(l_rest, l_pos + 1);
+                            END LOOP;
+                            say('INFO', 'REDO_GROUP_DROPPED', 'group ' || c.log_group || ' (added for the purge)');
+                        END IF;
+                        UPDATE epfpg.epf_instance_change
+                           SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+                         WHERE change_id = c.change_id;
+                        COMMIT;
+                    EXCEPTION
+                        WHEN OTHERS THEN
+                            -- ORA-01623 current, ORA-01624 needed for crash recovery,
+                            -- ORA-00350 not archived yet: retried after the next switch.
+                            IF SQLCODE NOT IN (-1623, -1624, -350) THEN
+                                RAISE;
+                            END IF;
+                            l_left := l_left + 1;
+                    END;
+                ELSE
+                    l_left := l_left + 1;
+                END IF;
+            END LOOP;
+            EXIT WHEN l_left = 0;
+            EXECUTE IMMEDIATE CASE WHEN l_log_mode = 'ARCHIVELOG' THEN 'ALTER SYSTEM ARCHIVE LOG CURRENT'
+                                   ELSE 'ALTER SYSTEM SWITCH LOGFILE' END;
+            EXECUTE IMMEDIATE 'ALTER SYSTEM CHECKPOINT';
+        END LOOP;
+        FOR c IN (SELECT ch.log_group, l.status
+                    FROM epfpg.epf_instance_change ch
+                    JOIN v$log l ON l.group# = ch.log_group
+                   WHERE ch.restored_at IS NULL AND ch.item = 'REDO_ADDED'
+                   ORDER BY ch.log_group) LOOP
+            say('WARN', 'REDO_GROUP_KEPT', 'group ' || c.log_group || ' (' || c.status || ') is still in use; '
+                                           || 'run src/sql/run/redo_logs.sql RESTORE again to drop it');
+        END LOOP;
+
+        -- Files of the dropped groups (Oracle removes Oracle-managed files itself).
+        FOR k IN 1 .. l_files.COUNT LOOP
+            IF SUBSTR(l_files(k), 1, 1) = '+' THEN
+                say('INFO', 'REDO_FILE_KEPT', l_files(k) || ' is an ASM file; remove it with ASMCMD if it remains');
+            ELSIF NOT (l_omf IS NOT NULL AND INSTR(l_files(k), 'o1_mf_') > 0) THEN
+                remove_file(l_files(k));
+                l_removed := TRUE;
+            END IF;
+        END LOOP;
+        IF l_removed THEN
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP DIRECTORY ' || c_directory;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE <> -4043 THEN
+                        RAISE;
+                    END IF;
+            END;
+        END IF;
+
+        show_groups('after');
+        SELECT COUNT(*) INTO l_count
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item IN ('REDO_GROUP', 'REDO_ADDED');
+        IF l_count = 0 THEN
+            say('OK', 'REDO_RESTORED', 'The online redo logs are as they were before the purge');
+        END IF;
+    END redo_restore;
 
     -- ------------------------------------------------------------------
     -- Undo
@@ -329,6 +541,98 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END LOOP;
     END limit_undo_growth;
 
+    PROCEDURE size_record(p_run_id IN NUMBER, p_undo IN BOOLEAN) IS
+        l_ts VARCHAR2(128) := undo_tablespace;
+    BEGIN
+        IF p_undo THEN
+            INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_value, applied_at, applied_run_id)
+            SELECT 'SIZE_UNDO', d.file_name, d.file_id, d.bytes, CAST(SYSTIMESTAMP AS TIMESTAMP), p_run_id
+              FROM dba_data_files d
+             WHERE d.tablespace_name = l_ts
+               AND NOT EXISTS (SELECT 1
+                                 FROM epfpg.epf_instance_change c
+                                WHERE c.item = 'SIZE_UNDO' AND c.file_id = d.file_id AND c.restored_at IS NULL);
+        END IF;
+        INSERT INTO epfpg.epf_instance_change (item, target, original_value, applied_at, applied_run_id)
+        SELECT 'SIZE_TEMP', t.tablespace_name, SUM(t.bytes), CAST(SYSTIMESTAMP AS TIMESTAMP), p_run_id
+          FROM dba_temp_files t
+         WHERE NOT EXISTS (SELECT 1
+                             FROM epfpg.epf_instance_change c
+                            WHERE c.item = 'SIZE_TEMP' AND c.target = t.tablespace_name AND c.restored_at IS NULL)
+         GROUP BY t.tablespace_name;
+        COMMIT;
+    END size_record;
+
+    PROCEDURE size_giveback IS
+        l_now    NUMBER;
+        l_bs     NUMBER;
+        l_hwm    NUMBER;
+        l_target NUMBER;
+        l_after  NUMBER;
+    BEGIN
+        FOR c IN (SELECT change_id, item, target, file_id, original_value
+                    FROM epfpg.epf_instance_change
+                   WHERE restored_at IS NULL AND item IN ('SIZE_UNDO', 'SIZE_TEMP')
+                   ORDER BY change_id) LOOP
+            l_after := NULL;
+            BEGIN
+                IF c.item = 'SIZE_UNDO' THEN
+                    SELECT MAX(d.bytes), MAX(t.block_size)
+                      INTO l_now, l_bs
+                      FROM dba_data_files d
+                      JOIN dba_tablespaces t ON t.tablespace_name = d.tablespace_name
+                     WHERE d.file_id = c.file_id AND d.file_name = c.target;
+                    l_after := l_now;
+                    IF l_now > c.original_value THEN
+                        -- Not below the highest extent Oracle still holds there.
+                        SELECT NVL(MAX(block_id + blocks), 0) * l_bs
+                          INTO l_hwm
+                          FROM dba_undo_extents
+                         WHERE file_id = c.file_id;
+                        l_target := GREATEST(c.original_value, CEIL(l_hwm / 1048576) * 1048576);
+                        IF l_target < l_now THEN
+                            EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || c.file_id || ' RESIZE '
+                                              || ROUND(l_target / 1024) || 'K';
+                            l_after := l_target;
+                        END IF;
+                        say(CASE WHEN l_after > c.original_value THEN 'INFO' ELSE 'OK' END, 'UNDO_RESIZED',
+                            c.target || ': ' || epfpg.epf_util.fmt_bytes(l_now) || ' -> '
+                            || epfpg.epf_util.fmt_bytes(l_after)
+                            || CASE WHEN l_after > c.original_value
+                                    THEN ' (' || epfpg.epf_util.fmt_bytes(c.original_value) || ' before; Oracle still '
+                                         || 'holds undo above that, given back by a later undo restore)' END);
+                    END IF;
+                ELSE
+                    SELECT SUM(bytes) INTO l_now FROM dba_temp_files WHERE tablespace_name = c.target;
+                    l_after := l_now;
+                    IF l_now > c.original_value THEN
+                        EXECUTE IMMEDIATE 'ALTER TABLESPACE "' || c.target || '" SHRINK SPACE KEEP '
+                                          || CEIL(c.original_value / 1024) || 'K';
+                        SELECT SUM(bytes) INTO l_after FROM dba_temp_files WHERE tablespace_name = c.target;
+                        say(CASE WHEN l_after > c.original_value THEN 'INFO' ELSE 'OK' END, 'TEMP_RESIZED',
+                            c.target || ': ' || epfpg.epf_util.fmt_bytes(l_now) || ' -> '
+                            || epfpg.epf_util.fmt_bytes(l_after)
+                            || CASE WHEN l_after > c.original_value
+                                    THEN ' (' || epfpg.epf_util.fmt_bytes(c.original_value) || ' before; the rest is in use)'
+                               END);
+                    END IF;
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    say('INFO', CASE c.item WHEN 'SIZE_UNDO' THEN 'UNDO_SIZE_KEPT' ELSE 'TEMP_SIZE_KEPT' END,
+                        c.target || ' not resized: ' || SQLERRM);
+            END;
+            -- Closed once back at the size before, within 64 MB (a shrink stops
+            -- at an extent), or gone; otherwise kept for the next call.
+            IF l_after IS NULL OR l_after <= c.original_value + 67108864 THEN
+                UPDATE epfpg.epf_instance_change
+                   SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+                 WHERE change_id = c.change_id;
+                COMMIT;
+            END IF;
+        END LOOP;
+    END size_giveback;
+
     PROCEDURE undo_apply(p_run_id IN NUMBER DEFAULT NULL, p_preflight_run_id IN NUMBER DEFAULT NULL) IS
         l_retention NUMBER := epfpg.epf_util.setting_num('undo_retention_s');
         l_ts        VARCHAR2(128);
@@ -356,6 +660,8 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                                             || 'retention would make transactions fail (ORA-30036).');
         END IF;
         undo_status;
+        -- The sizes the purge may grow, given back by undo_restore.
+        size_record(l_run, TRUE);
 
         SELECT TO_NUMBER(value) INTO l_current FROM v$parameter WHERE name = 'undo_retention';
         IF l_retention < l_current THEN
@@ -414,6 +720,8 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         IF l_count = 0 THEN
             say('INFO', 'UNDO_NOTHING_TO_RESTORE', 'No active undo change');
         END IF;
+        -- What the undo datafiles and the temporary tablespaces grew.
+        size_giveback;
         undo_status;
     END undo_restore;
 

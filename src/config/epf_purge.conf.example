@@ -38,7 +38,8 @@ DEPTH=ALL
 DRY_RUN=N
 # Shrink the purged tables afterwards (purge only, not with a dry run).
 COMPACT=N
-# Enlarge the online redo logs to 4 x 1 GB before the purge (SYS, permanent).
+# Larger online redo logs for the purge (4 x 1 GB) when one batch does not
+# fit in them; the original groups are put back at the end (SYS).
 REDO_LOGS=N
 # Lower undo_retention and limit the growth of the undo tablespace (4 GB by
 # default, setting undo_cap_mb) for the purge; both restored at the end (SYS).

@@ -233,8 +233,9 @@ Options
                        unlock the accounts a reclaim that did not finish left
                        pending
   --compact            shrink the purged tables afterwards (purge only)
-  --redo-logs          enlarge the online redo logs first (4 x 1 GB,
-                       permanent; SYS)
+  --redo-logs          larger online redo logs for the purge (4 x 1 GB)
+                       when one batch does not fit; the original groups
+                       are put back at the end (SYS)
   --undo-tuning        lower undo_retention and limit undo growth (4 GB by
                        default) for the purge; restored at the end (SYS)
                        With preflight or --dry-run, --redo-logs and
@@ -1307,17 +1308,11 @@ function Invoke-ToolRun {
 
     $status = 'FAILED'
     $undoApplied = $false
+    $redoRan = $false
     $closeCode = $null
     $state.StopKeys = Enable-StopKey
     if ($state.StopKeys) { Write-Out ' Ctrl+C requests a graceful stop.' -NoLog }
     try {
-        if ($Action -eq 'PURGE' -and -not $Ctx.DryRun -and $Ctx.RedoLogs) {
-            Write-Section 'REDO LOGS (SYS)'
-            $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'redo_logs.sql') @('-', '-') $state 'sqlplus_redo_logs.log'
-            Show-Lines $result.Output -Indent
-            if ($result.ExitCode -ne 0) { throw 'Redo log sizing failed; the purge was not started.' }
-        }
-
         # Every run checks the requirements with its own choices. After the
         # wizard's preflight run, its root counts are reused (no second scan).
         $preflightOk = $true
@@ -1377,6 +1372,17 @@ function Invoke-ToolRun {
                 if ($result.Output -match 'ORA-\d{5}|SP2-\d{4}') { Show-Lines $result.Output -Indent }
                 $status = 'FAILED'
             } else {
+                # Larger online logs for the purge only when one batch does not
+                # fit in the smallest (the run's own preflight measured it); the
+                # original groups are put back after the purge.
+                if ($Ctx.RedoLogs -and -not $Ctx.DryRun) {
+                    Write-Section 'REDO LOGS (SYS)'
+                    $redoRan = $true
+                    $redoArgs = @('-', '-', [string]$state.RunId)
+                    $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'redo_logs.sql') $redoArgs $state 'sqlplus_redo_logs.log'
+                    Show-Lines $result.Output -Indent
+                    if ($result.ExitCode -ne 0) { throw 'Redo log sizing failed; the purge was not started.' }
+                }
                 if ($Ctx.UndoTuning -and -not $Ctx.DryRun) {
                     Write-Section 'UNDO TUNING (SYS)'
                     $undoApplied = $true
@@ -1413,6 +1419,15 @@ function Invoke-ToolRun {
             Show-Lines $restore.Output -Indent
             if ($restore.ExitCode -ne 0) {
                 Write-Out ' Undo tuning was NOT restored: run src\sql\run\undo.sql RESTORE as SYS.' 'Red'
+            }
+        }
+        if ($redoRan) {
+            Write-Section 'REDO LOGS RESTORE (SYS)'
+            $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'redo_logs.sql') @('RESTORE') -Patient
+            [System.IO.File]::WriteAllText((Join-Path $state.Folder 'sqlplus_redo_restore.log'), $restore.Output, [System.Text.Encoding]::ASCII)
+            Show-Lines $restore.Output -Indent
+            if ($restore.ExitCode -ne 0) {
+                Write-Out ' The online redo logs were NOT put back: run src\sql\run\redo_logs.sql RESTORE as SYS.' 'Red'
             }
         }
         $closeCode = Close-Run $state $status
@@ -2316,7 +2331,7 @@ function Read-Requirement {
             return 'STOP:add room to the tool tablespace, then run the preflight again.'
         }
         'REDO_LOGS' {
-            $answer = Read-Option @('Enlarge the online logs to 4 x 1 GB when the purge starts (SYS, permanent)',
+            $answer = Read-Option @('Enlarge the online logs to 4 x 1 GB for the purge, put back after it (SYS)',
                                     'Leave them: the batch size below keeps one batch within half a log (slower)') '' '1'
             if ($answer -eq '1') { $Ctx.RedoLogs = $true; return 'CHANGED' }
             return 'SAME'
@@ -2427,7 +2442,7 @@ function Show-Review {
     } else {
         Write-Out '  Dry run       no'
         Write-Out ('  Compact       ' + (Get-YN $Ctx.Compact))
-        Write-Out ('  Redo logs     ' + (Get-YN $Ctx.RedoLogs) + '   (enlarge to 4 x 1 GB before the purge; permanent)')
+        Write-Out ('  Redo logs     ' + (Get-YN $Ctx.RedoLogs) + '   (4 x 1 GB for the purge when one batch needs it; the original groups put back after it)')
         Write-Out ('  Undo tuning   ' + (Get-YN $Ctx.UndoTuning) + '   (undo_retention lowered and undo growth limited for the purge, restored at the end)')
         Write-Out ('  Backup        ' + $backupText)
         if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the preflight finds them not met)') }

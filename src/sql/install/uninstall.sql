@@ -78,11 +78,15 @@ BEGIN
 
     SELECT COUNT(*) INTO l_count FROM dba_tables WHERE owner = 'EPFPG' AND table_name = 'EPF_INSTANCE_CHANGE';
     IF l_count > 0 THEN
-        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL' INTO l_count;
+        -- Open size records (SIZE_UNDO, SIZE_TEMP) are information only: they
+        -- do not hold the uninstall.
+        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL '
+                          || 'AND item NOT IN (''SIZE_UNDO'', ''SIZE_TEMP'')' INTO l_count;
         IF l_count > 0 THEN
             RAISE_APPLICATION_ERROR(-20905, l_count || ' instance changes are not restored yet: undo tuning '
-                                            || '(src/sql/run/undo.sql RESTORE as SYS) or datafile settings of a '
-                                            || 'reclaim (epf_purge.bat reclaim --restore). Restore them first.');
+                                            || '(src/sql/run/undo.sql RESTORE as SYS), online redo logs replaced for a '
+                                            || 'purge (src/sql/run/redo_logs.sql RESTORE as SYS) or datafile settings '
+                                            || 'of a reclaim (epf_purge.bat reclaim --restore). Restore them first.');
         END IF;
     END IF;
 

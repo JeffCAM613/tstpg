@@ -20,8 +20,8 @@
 #           the TNS alias of the test database; its SYS password.
 # Effects : DESTRUCTIVE. Purges every module of the test database (rows older
 #           than RETENTION_DAYS), clears LOB values, compacts tables, enlarges
-#           the online redo logs to 4 x 1 GB (permanent), lowers and restores
-#           undo_retention, creates and removes the reclaim lab (tablespace
+#           the online redo logs for the purges (put back after each), lowers
+#           and restores undo_retention, creates and removes the reclaim lab (tablespace
 #           EPF_RT_DATA, accounts EPF_RT, EPF_RT_APP, EPF_RT_APP2, role
 #           EPF_RT_WRITER; src/tests/verify/reclaim_lab.sql) and assesses the
 #           application tablespaces for a reclaim (read-only). Refuses to start
@@ -73,7 +73,7 @@ $script:CurrentPid  = 0
 $script:ConnectTimeoutS = 120
 $script:State       = @{ PreflightRun = ''; StoppedRun = ''; StopBatch = ''; UndoRetention = ''; StopCount = 0;
                          StopSent = $false; InPurge = $false; UndoFiles = @(); UndoBaseBytes = [decimal]0;
-                         DryRun = ''; DryRunExpected = '' }
+                         DryRun = ''; DryRunExpected = ''; RedoStart = @() }
 
 # Child processes read their standard input in the console code page. With a
 # UTF-8 console .NET would begin every child's input with a byte order mark
@@ -883,6 +883,7 @@ function Invoke-Suite {
             if ($line -match '^CONTAINER\|(.*)$') { $container = $Matches[1].Trim() }
             if ($line -match '^INSTANCES\|(\d+)') { $instances = $Matches[1] }
             if ($line -match '^UNDO\|undo_retention=(\d+)') { $script:State.UndoRetention = $Matches[1] }
+            if ($line -match '^REDO\|(group \d+)\|(\d+) MB\|') { $script:State.RedoStart += ($Matches[1] + ': ' + $Matches[2] + ' MB') }
             if ($line -match '^TOOL_VERSION\|(.*)$') { $installed = $Matches[1].Trim() }
         }
         $expected = $script:ExpectedDb.ToUpper()
@@ -1181,6 +1182,12 @@ function Invoke-Suite {
         Assert-Match $r 'UNDO TUNING \(SYS\)'
         Assert-Match $r 'STOP_HONORED'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
+        # The online logs: left as they are when one batch fits, otherwise
+        # replaced for the purge and the original groups put back after it.
+        Assert-Match $r 'REDO LOGS RESTORE \(SYS\)'
+        Assert-Match $r 'REDO_UNCHANGED|REDO_RESTORED'
+        Write-Note $r 'REDO_UNCHANGED' 'redo logs left as they were (one batch fits)'
+        Write-Note $r 'REDO_RESTORED' 'the original redo log groups put back after the purge'
         Assert-Match $r 'UNDO_RETENTION_RESTORED'
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
@@ -1447,8 +1454,9 @@ function Invoke-Suite {
         $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
-        Assert-Match $r 'REDO_UNCHANGED|REDO_ENLARGED'
-        Write-Note $r 'REDO_UNCHANGED' 'redo logs already enlarged by T11 (sizing is idempotent)'
+        Assert-Match $r 'REDO_UNCHANGED|REDO_RESTORED'
+        Assert-Match $r 'REDO LOGS RESTORE \(SYS\)'
+        Write-Note $r 'REDO_UNCHANGED' 'redo logs left as they were (one batch fits)'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
         $run = Get-Run $r 'PURGE'
         foreach ($check in @('P1', 'P3', 'P6')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
@@ -1935,7 +1943,8 @@ function Invoke-Suite {
             'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
             "SELECT 'REDO|group ' || group# || '|' || ROUND(bytes / 1048576) || ' MB|' || status FROM v`$log ORDER BY group#;",
             "SELECT 'UNDO|' || name || '=' || value FROM v`$parameter WHERE name IN ('undo_tablespace', 'undo_retention') ORDER BY name;",
-            "SELECT 'INSTANCE_CHANGES_ACTIVE|' || COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL;",
+            "SELECT 'INSTANCE_CHANGES_ACTIVE|' || COUNT(*) FROM epfpg.epf_instance_change WHERE restored_at IS NULL AND item NOT IN ('SIZE_UNDO', 'SIZE_TEMP');",
+            "SELECT 'SIZE_OPEN|' || item || '|' || target || '|' || original_value FROM epfpg.epf_instance_change WHERE restored_at IS NULL AND item IN ('SIZE_UNDO', 'SIZE_TEMP') ORDER BY change_id;",
             "SELECT 'RECLAIM_ACCOUNTS_LOCKED|' || COUNT(*) FROM epfpg.epf_account_action WHERE locked_at IS NOT NULL AND unlocked_at IS NULL;",
             "SELECT 'RECLAIM_INDEXES_UNUSABLE|' || COUNT(*) FROM epfpg.epf_reclaim_object o WHERE o.unit_type = 'INDEX' AND o.move_status IN ('RELEASED', 'FAILED') AND EXISTS (SELECT 1 FROM dba_indexes i WHERE i.owner = o.owner AND i.index_name = o.object_name AND i.status = 'UNUSABLE');",
             "SELECT 'TEMP_INDEX_LEFT|' || COUNT(*) FROM epfpg.epf_temp_index t WHERE t.dropped_at IS NULL AND EXISTS (SELECT 1 FROM dba_indexes i WHERE i.owner = t.owner AND i.index_name = t.index_name);",
@@ -1949,6 +1958,18 @@ function Invoke-Suite {
         Assert-NoMatch $r 'RUN\|[^\n]*\|(RUNNING|CREATED)\|'
         if ($script:State.UndoRetention -ne '') { Assert-Match $r ('undo_retention=' + $script:State.UndoRetention) }
         Assert-UndoLimits
+        # The online redo logs as T01 found them.
+        $redoEnd = @()
+        foreach ($line in ($r.Output -split "`n")) {
+            if ($line -match '^REDO\|(group \d+)\|(\d+) MB\|') { $redoEnd += ($Matches[1] + ': ' + $Matches[2] + ' MB') }
+        }
+        if ($script:State.RedoStart.Count -gt 0) {
+            Add-Check (($redoEnd -join ', ') -eq ($script:State.RedoStart -join ', ')) ('online redo logs as before the tests: ' + ($redoEnd -join ', '))
+        }
+        # Undo or temporary space not given back yet: Oracle releases undo
+        # extents on its own schedule.
+        Write-Note $r 'SIZE_OPEN\|SIZE_UNDO' 'undo datafile larger than before the tests, given back once Oracle releases it'
+        Write-Note $r 'SIZE_OPEN\|SIZE_TEMP' 'temporary tablespace larger than before the tests'
     }
 }
 
