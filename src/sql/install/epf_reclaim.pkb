@@ -3890,11 +3890,16 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- client is gone can be one: its call goes on until it ends, and a
     -- restore or a new compaction beside it would undo or redo its work.
     -- Reported when found and every 10 minutes; a stop request ends the wait
-    -- with ORA-20162, before any change.
+    -- with ORA-20162, before any change. A restore first asks that reclaim to
+    -- stop (stop_requested of its run, from its client identifier EPF:<run>):
+    -- it stops before its next move and puts back what it changed itself,
+    -- instead of compacting to the end with nobody watching.
     PROCEDURE wait_for_workers IS
         l_own    NUMBER := TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'));
         l_found  BOOLEAN;
         l_what   VARCHAR2(400);
+        l_other  NUMBER;
+        l_asked  BOOLEAN := FALSE;
         l_waited NUMBER := 0;
     BEGIN
         LOOP
@@ -3906,13 +3911,23 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                        ORDER BY logon_time) LOOP
                 l_found := TRUE;
                 l_what := 'session ' || s.sid || ',' || s.serial# || ' (' || s.client_identifier || ', ' || s.action || ')';
+                l_other := TO_NUMBER(REGEXP_SUBSTR(s.client_identifier, '[0-9]+'));
                 EXIT;
             END LOOP;
             EXIT WHEN NOT l_found;
+            IF g_mode = 'RESTORE' AND NOT l_asked AND l_other IS NOT NULL THEN
+                UPDATE epfpg.epf_run
+                   SET stop_requested = 'Y'
+                 WHERE run_id = l_other AND action = 'RECLAIM' AND run_id <> g_run.run_id;
+                l_asked := SQL%ROWCOUNT > 0;
+                COMMIT;
+            END IF;
             IF l_waited = 0 THEN
                 say(epfpg.epf_log.c_warn, 'WORKER_RUNNING',
                     'Another reclaim still runs on the database, ' || l_what || ': its client is gone, but its call goes '
                     || 'on. This ' || CASE g_mode WHEN 'COMPACT' THEN 'compaction' ELSE 'restore' END
+                    || CASE WHEN l_asked THEN ' asked it to stop (it stops before its next move and puts back what it '
+                                              || 'changed) and' END
                     || ' waits for it to end; a stop request ends the wait.');
             ELSIF MOD(l_waited, 600) = 0 THEN
                 say(epfpg.epf_log.c_info, 'WORKER_RUNNING', 'Still running after ' || (l_waited / 60) || ' min: ' || l_what);

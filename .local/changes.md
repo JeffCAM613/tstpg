@@ -2,7 +2,7 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
-## 2026-10-09 - Faster moves: a move's placement read from the inventory; a scratch size that fits (0.8.1)
+## 2026-10-09 - Faster moves: a move's placement read from the inventory; a scratch size that fits; a later restore stops a worker whose client is gone (0.8.1)
 
 Why: J4's console.log (16 lines, 19:15 to 19:20, sent by the user) shows where a move's time went on EPFPG784. Each UNIT_MOVED took 12 to 13 s for a table of OPPAYMENTS and 32 to 33 s for one of OP, and the MOVE_PLACEMENT after it came another 12 to 13 s or 32 to 33 s later. That second wait is the second unit_layout alone, so the first one takes the same, and the rest of the move (free_layout, the MOVE, refresh_item, the trim) about nothing. The cost goes with the owner: unit_layout's DBA_EXTENTS query, with `e.tablespace_name = p_ts` and the type and name joined into one string, reads every extent of that owner in DATA. refresh_item's query, by table names and a subquery on the tablespaces, ran in about a second in the same run (a park takes about 1 s with it). On TANM7883 all of it is fast (K5). And K5 stopped 0.5 GB above DATA's segments: the 2.2 GB table at the top did not fit in the scratch space, which K4 had sized for the largest table alone.
 
@@ -11,11 +11,12 @@ Changes (src/sql/install; tool version 0.8.1):
 - epf_reclaim: scan_ts (the assessment) and refresh_item (after each move, park and return of a unit) fill them: per segment and datafile, the extent count, the smallest and largest extent, the lowest block. unit_layout(p_ts, p_item) reads the unit's rows of the inventory instead of DBA_EXTENTS. MOVE_PLACEMENT keeps its text, so the digest reads it as before. A move now queries the dictionary as much as a park does.
 - check_requirements: the scratch size suggested is the largest table that moves and half of all that moves, plus a tenth, rounded up to 256 MB (it was the largest plus a tenth). Its line names all that moves. For K5 about 8 GB instead of 2.5 GB. The scratch datafile only grows as far as the parked tables need, up to that size.
 - park_unit: PARK_SKIPPED for want of scratch space gives the size that would have taken the table: `(--scratch NM would take it)`.
+- wait_for_workers: a later `reclaim --restore` first asks the reclaim whose client is gone to stop (stop_requested of the run in its client identifier, action RECLAIM, another run than its own); the worker stops before its next move and puts back what it changed itself. Before, the restore waited for the whole compaction: T18K on TANM7883 (0.8.0, the user's run of the first K7: 3 of 3, the restore waited for the worker, RT_TOP put back by the worker) took 23 min 57 s against T18J's 7, the worker pausing 120 s after each move with nobody to stop it; on a real database, the rest of a compaction could take hours. The WORKER_RUNNING line says when it asked. A restore in the same run (T18J) waits as before: the stop flag is its own run's.
 - README: run from a machine on the database's network, not through a VPN (set K from a server close to TANM7883: the suite in 39 min against 2 h 34 min, no dropped connection); the scratch suggestion explained. docs/README.html regenerated. PLAN.md 7.5.
 
 Checked here: ASCII; every call of unit_layout changed; the wrapper still reads `--scratch NM` from the option. Not compiled here: no Oracle.
 
-How to test: K7 and K8 on TANM7883 (status page): install 0.8.1, the labs with T18K (their placement lines in the digest as before), then DATA a second time with the size the dry run suggests (HISTO_REGLEMENT parked, R7 PASS expected). Set L shows the speed on EPFPG781.
+How to test: K7 and K8 on TANM7883 (status page): install 0.8.1, the labs with T18K (their placement lines in the digest as before; T18K in a few minutes, its restore having asked the worker to stop), then DATA a second time with the size the dry run suggests (HISTO_REGLEMENT parked, R7 PASS expected). Set L shows the speed on EPFPG781.
 
 ## 2026-10-09 - K4 to K6 on TANM7883: DATA 18.0 to 9.9 GB in 5 min; a restore waits for a worker whose client is gone; K7 still to run
 
