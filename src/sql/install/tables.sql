@@ -639,6 +639,7 @@ BEGIN
                                                            'FAILED'))
         )]');
     add_column('EPF_RECLAIM_TS', 'STOP_DETAIL', 'VARCHAR2(2000)');
+    add_column('EPF_RECLAIM_TS', 'COMPACT_BYTES', 'NUMBER');
 
     -- Temporary supporting indexes created for a purge. owner is the index
     -- owner (the tool schema); table_owner.table_name is the indexed table.

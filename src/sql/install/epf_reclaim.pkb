@@ -3279,6 +3279,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_parked NUMBER;
         l_start  NUMBER := ts_bytes(p_ts);
         l_freed  NUMBER;
+        l_left   NUMBER;
         l_status VARCHAR2(20);
         l_was    VARCHAR2(20);
         l_why    VARCHAR2(400);
@@ -3370,6 +3371,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
          WHERE run_id = g_run.run_id AND unit_type IN ('TABLE', 'IOT') AND source_ts = p_ts AND move_status = 'PENDING';
         COMMIT;
         l_freed := trim_ts(p_ts, 0, FALSE);
+        -- Where the compaction leaves it, before the parked tables come back and
+        -- the indexes are rebuilt (R7 tells the two apart).
+        l_left := ts_bytes(p_ts);
+        UPDATE epfpg.epf_reclaim_ts
+           SET compact_bytes = l_left
+         WHERE run_id = g_run.run_id AND tablespace_name = p_ts;
+        COMMIT;
         SELECT COUNT(CASE WHEN move_status = 'MOVED' THEN 1 END), COUNT(CASE WHEN move_status = 'PARKED' THEN 1 END)
           INTO l_moved, l_parked
           FROM epfpg.epf_reclaim_object

@@ -2,7 +2,18 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
-## 2026-10-09 - A purge shows what it holds on disk, not the redo and undo it writes (0.8.3, D22)
+## 2026-10-09 - Set L on EPFPG781 (SONEPARUAT, from the remote server, 0.8.2): 35 of 35; DATA 41.6 to 6.9 GB in one reclaim
+
+The digest of set L (the suite's session and the two runs after it):
+- **L3, the suite:** 35 of 35 in 1 h 14 min 44 s from the remote server (set I on EPFPG784 from the test machine: 2 h 34 min); T13, PAYMENTS to the end, 29 min 44 s: 89,124,373 rows in 28 min 53 s. T01: OPPAYMENTS 34,006 MB, OP 6,408 MB, a fresh copy. T18D and T18I: the worker session marked for kill (ORA-00031) here too, so it is the connection's way, not the data's. T18J and T18K: the restore waited for the worker whose client was gone.
+- **L4, the dry run** (R-000035, 26 s): DATA 41.6 GB, highest block 39.6 GB, 38.3 GB of segments; 688 tables move (27.9 GB, about 5.2 GB after), 969 indexes (10.5 GB); forecast 8.3 GB. 8 segments with an INITIAL larger than needed (950 MB, OPPAYMENTS.AUDIT_ARCHIVE 783 MB). The one warning: PUBLIC_DML, as in set I.
+- **L5, the reclaim** (R-000036, the scratch space up to 5.0 GB, 19 min 7 s, PASS WITH WARNINGS): **DATA 41.6 to 6.9 GB, 34.8 GB given back, with 6.5 GB of segments**, in one run, which no SONEPARUAT run had done (set I stopped at 14.2 GB, J4 lost its connection, R10 needed earlier passes). R1 to R6, R8 and R9 PASS; 569 of 688 tables moved.
+  - The compaction, 10 min 13 s: TRANSMISSION_EXECUTION_AUDIT, DIRECTORY_DISPATCHING and FILE_DISPATCHING (2.2, 10.3 and 4.3 GB, purged) moved first as 192 KB each; 294 tables moved and 275 parked (up to 3.7 GB), about a second each on the server where J4 took 45 s a move (0.8.1); DATA down to 127.6 MB, where OP.WEB_RAPPORT (a LONG column) holds the top.
+  - The 275 came back in 3 min 43 s (DATA to 3.8 GB), the 969 indexes were rebuilt in 4 min 9 s (DATA grown once to 7.1 GB for them, about 3.2 GB), trimmed to 6.9 GB.
+  - R7 WARN: 6.9 GB for 6.5 GB of segments; about 0.34 GB free below the highest block once the 64 MB margin is counted, above the 256 MB R7 allows. All of it above the 127.6 MB the compaction left: between the tables that came back and the rebuilt indexes. The report named the compaction's stop instead (OP.WEB_RAPPORT): fixed in 0.8.3 (entry below).
+- PLAN.md 12.7: the SONEPARUAT column.
+
+## 2026-10-09 - A purge shows what it holds on disk, not the redo and undo it writes (0.8.3, D22); R7 names what the end of a reclaim left
 
 Why: in set L the user read `MODULE_END PAYMENTS DONE: 89,124,373 rows deleted, 62.6 GB redo, 31.7 GB undo` and the progress line's `redo 136.3 MB/batch undo 69.0 MB/batch` as disk the purge took. They are volumes written: the redo passes through online logs that are reused in turn (kept only as archived logs, in ARCHIVELOG), the undo through an undo tablespace whose space is reused. A user would worry for nothing. The user asked for the live state instead; the fill of the current online log is not in a documented view (only SYS's X$ tables) and goes from 0 to 100% every 20 s or so, so the online log in use and, in ARCHIVELOG, the recovery area take its place.
 
@@ -11,6 +22,7 @@ Changes:
 - BATCH_PROGRESS: `... rows 64,631,611 57,990/s undo 1.3 of 4.0 GB (33%) redo log 3 of 4 ETA 00:09:27` (was `redo 136.3 MB/batch undo 69.0 MB/batch`). MODULE_END: `PAYMENTS DONE: 89,124,373 rows deleted in 00:28:53; undo at most 1.5 of 4.0 GB (38%); redo: 4 logs of 1.0 GB reused, nothing kept (NOARCHIVELOG)`, or `archived logs about +62.6 GB, recovery area 64.1 of 100.0 GB (64%)` in ARCHIVELOG. The step end of the batches gives batches and rows only. Event DISK_USE (INFO) at the end of a purge with batches: the same for the whole run.
 - epf_report: a purge's report prints ` DISK      <DISK_USE>` after FORECAST AND RESULT; the forecast tables' columns are `Redo written` and `Undo written`, the forecast-against-result lines `redo written` and `undo written`, the section `REDO AND UNDO WRITTEN (what the purge kept on disk: DISK)`.
 - grants.sql: SELECT on DBA_UNDO_EXTENTS for EPFPG.
+- Reclaim, R7 (from set L): the compaction records the size it leaves each tablespace at (EPF_RECLAIM_TS.COMPACT_BYTES, add_column), before the parked tables come back and the indexes are rebuilt. When a tablespace ends above that size, R7's warning says so: `the compaction left it at 127.6 MB; free space then stayed between what came back after it, the parked tables and the rebuilt indexes`. Before, it named where the compaction stopped (L5: OP.WEB_RAPPORT, a LONG column, at 127.6 MB), which did not hold DATA at 6.9 GB.
 - epf.ps1: the summary of a purge (default view) shows the DISK line (Get-DiskLines).
 - T13 asserts the disk figures in BATCH_PROGRESS, the text after MODULE_END's duration and the report's DISK line; notes the undo peak.
 - PLAN.md 6.8, 6.9, D22, the test table.

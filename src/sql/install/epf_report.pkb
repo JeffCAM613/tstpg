@@ -470,7 +470,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
 
         -- R7 efficiency: each tablespace ends within max(1 %, 256 MB) of its
         -- segments plus the margin of its datafiles; otherwise a warning that
-        -- names what stopped it.
+        -- names what stopped it: where the compaction stopped, or, when the
+        -- tablespace ends above the size the compaction left it at, the free
+        -- space between the parked tables and the indexes that came back.
         IF l_restore THEN
             add_check('R7', 'SKIP', r_title('R7'), 'restore only');
         ELSE
@@ -479,6 +481,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             l_detail := NULL;
             l_value := NULL;
             FOR t IN (SELECT r.tablespace_name, r.end_bytes, r.end_segment_bytes, r.file_count, r.status, r.stop_detail,
+                             r.compact_bytes,
                              (SELECT MAX(i.owner || '.' || i.object_name || ' (' || i.blocker_reason || ')')
                                      KEEP (DENSE_RANK LAST ORDER BY i.top_block)
                                 FROM epf_ts_inventory i
@@ -493,7 +496,13 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                     l_soft := l_soft + 1;
                     l_detail := add_detail(l_detail, t.tablespace_name || ' ' || b(t.end_bytes) || ' for '
                                                      || b(t.end_segment_bytes) || ' of segments: '
-                                                     || CASE WHEN t.stop_detail IS NOT NULL THEN t.stop_detail
+                                                     || CASE WHEN t.compact_bytes IS NOT NULL
+                                                                  AND t.end_bytes > t.compact_bytes
+                                                                                    + l_margin * NVL(t.file_count, 1)
+                                                             THEN 'the compaction left it at ' || b(t.compact_bytes)
+                                                                  || '; free space then stayed between what came back '
+                                                                  || 'after it, the parked tables and the rebuilt indexes'
+                                                             WHEN t.stop_detail IS NOT NULL THEN t.stop_detail
                                                              WHEN t.status = 'PARTIAL'
                                                              THEN 'tables did not fit, failed or were not reached'
                                                              WHEN t.top_pin IS NOT NULL
