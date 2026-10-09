@@ -65,6 +65,9 @@ $script:Results     = New-Object 'System.Collections.Generic.List[object]'
 $script:ChoicesSection = '(?m-i)^ CHOICES +\d\d:\d\d:\d\d'
 $script:Aborted     = $false
 $script:InHangReport = $false
+# The process Invoke-Process runs now (the latest one when an $OnLine runs
+# another): Stop-WrapperTree ends it.
+$script:CurrentPid  = 0
 # Seconds a sqlplus session may take to connect before it is ended and tried
 # again (Invoke-Sql); about 15 s on the test network.
 $script:ConnectTimeoutS = 120
@@ -270,6 +273,8 @@ function Invoke-Process {
     $info.WorkingDirectory = $WorkDir
     $started = Get-Date
     $process = [System.Diagnostics.Process]::Start($info)
+    $outerPid = $script:CurrentPid
+    $script:CurrentPid = $process.Id
     $ready = ($ReadyMarker -eq '')
     if ($ready) {
         foreach ($l in $InputLines) { $process.StandardInput.WriteLine($l) }
@@ -349,6 +354,7 @@ function Invoke-Process {
     }
     $code = $process.ExitCode
     if ($timedOut) { $code = -1 }
+    $script:CurrentPid = $outerPid
     $seconds = [int]((Get-Date) - $started).TotalSeconds
     Write-TestLog ('exit ' + $code + ' (' + (Format-Duration $seconds) + ')')
     $orphans = $orphans + (Stop-Orphans $started)
@@ -529,6 +535,40 @@ function Get-TestPark {
                               "SELECT 'PARK|' || value FROM epf_setting WHERE name = 'reclaim_test_park';", 'EXIT')
     if ($r.Output -match '(?m)^PARK\|([YN])') { return $Matches[1] }
     return ''
+}
+
+# Ends, on this machine, the sqlplus of a reclaim's worker session (SYS, a
+# run's client identifier; its process id in V$SESSION.PROCESS), as a lost
+# connection does: the database session goes on with its call. Returns whether
+# it ended one.
+function Stop-WorkerClient {
+    $k = Invoke-Sql 'SYS' @(
+        'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
+        ("SELECT 'WORKER|' || s.process || '|' || s.sid || ',' || s.serial# FROM v`$session s WHERE s.username = 'SYS' " +
+         "AND s.client_identifier LIKE 'EPF:%' AND s.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'));"),
+        'EXIT')
+    foreach ($line in ($k.Output -split "`n")) {
+        if ($line.Trim() -notmatch '^WORKER\|(\d+)[^|]*\|(\S+)') { continue }
+        $session = $Matches[2]
+        $p = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+        if ($null -eq $p -or $p.ProcessName -ne 'sqlplus') { continue }
+        Stop-Process -Id $p.Id -Force
+        Write-TestLog ('---- sqlplus PID ' + $p.Id + ' ended; its session ' + $session + ' goes on in the database')
+        return $true
+    }
+    Write-TestLog '---- no sqlplus of a worker session found on this machine' 'Yellow'
+    return $false
+}
+
+# Ends the process tree of the wrapper Invoke-Wrapper runs (cmd, powershell,
+# every sqlplus), as a client that loses the network does: the database
+# sessions waiting for their client end, a worker's call goes on. For its
+# $OnLine. Returns whether it ended one.
+function Stop-WrapperTree {
+    if ($script:CurrentPid -eq 0) { return $false }
+    Stop-Tree $script:CurrentPid
+    Write-TestLog ('---- the wrapper (PID ' + $script:CurrentPid + ') and its sqlplus sessions ended')
+    return $true
 }
 
 # Static checks of a PowerShell script: it parses, every command it calls is
@@ -767,6 +807,8 @@ $script:TestList = @(
     'T18D Reclaim lab: a worker session killed during the compaction is restored in the same run',
     'T18H Reclaim lab: parking (--scratch): a table waits in a scratch tablespace and comes back; nothing left behind',
     'T18I Reclaim lab: a worker session killed while a table is parked: the table comes back in the same run',
+    'T18J Reclaim lab: the worker''s connection lost during the compaction: the restore in the same run waits for its call; nothing left',
+    'T18K Reclaim lab: the whole wrapper lost while a table is parked: a later reclaim --restore waits for the worker''s call; nothing left',
     'T18E Reclaim: assessment of the application tablespaces (dry run, read-only)',
     'T18F Reclaim lab removed',
     'T18G Reclaim lab 2: two datafiles, index and LOB tablespaces, a queue table, INITIAL of each kind, quota gate',
@@ -1646,6 +1688,93 @@ function Invoke-Suite {
         Assert-Manifest $run 'check.R1' '^PASS'
         Assert-Manifest $run 'check.R6' '^(PASS|WARN)'
         Assert-Manifest $run 'check.R9' '^PASS'
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    # T18J and T18K: the connection lost instead of the session killed. The
+    # worker's sqlplus ends on this machine; its call goes on in the database
+    # (the compaction, then its own restore path). The restore of the wrapper
+    # (T18J), or a later reclaim --restore after the whole wrapper was lost
+    # (T18K), waits for that session (WORKER_RUNNING) before it changes
+    # anything. A database that ends such a session at once is noted: the
+    # restore then puts everything back itself.
+    Invoke-Test 'T18J' 'Reclaim lab: the worker''s connection lost during the compaction: the restore in the same run waits for its call; nothing left' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        $script:State.StopSent = $false
+        $script:State.ClientEnded = $false
+        $onLine = {
+            param($line)
+            if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
+                $script:State.StopSent = $true
+                Write-TestLog '---- a table moved and the compaction pauses: ending the worker''s sqlplus on this machine'
+                $script:State.ClientEnded = Stop-WorkerClient
+            }
+        }
+        try {
+            Set-TestPause 120
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
+                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+        } finally {
+            Set-TestPause 0
+        }
+        Add-Check $script:State.ClientEnded 'the worker''s sqlplus ended while its session went on'
+        Assert-Exit $r @(1)
+        Assert-Match $r 'The worker session ended before the reclaim finished'
+        Assert-Match $r 'RECLAIM  RESTORE'
+        Write-Note $r 'WORKER_RUNNING' 'the restore waited for the worker whose client was gone'
+        Write-Note $r 'WORKER_ENDED' 'the worker''s call ended, then the restore went on'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'status' '^FAILED$'
+        Assert-Manifest $run 'check.R1' '^PASS'
+        Assert-Manifest $run 'check.R9' '^PASS'
+        Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
+        $s = Invoke-Wrapper @('status', '--non-interactive')
+        Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'
+    }
+
+    Invoke-Test 'T18K' 'Reclaim lab: the whole wrapper lost while a table is parked: a later reclaim --restore waits for the worker''s call; nothing left' {
+        $lab = Invoke-Lab 'SETUP' -TimeoutMin 10
+        Assert-Exit $lab @(0)
+        $before = Read-Lab $lab
+        $script:State.StopSent = $false
+        $script:State.ClientEnded = $false
+        $onLine = {
+            param($line)
+            if (-not $script:State.StopSent -and $line -match 'TEST_PAUSE') {
+                $script:State.StopSent = $true
+                Write-TestLog '---- the first table is parked and the compaction pauses: ending the wrapper and its sqlplus sessions'
+                $script:State.ClientEnded = Stop-WrapperTree
+            }
+        }
+        try {
+            Set-TestPark 'Y'
+            Set-TestPause 120
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', '512M') -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            Add-Check $script:State.ClientEnded 'the wrapper ended while the first table was parked'
+            Assert-Match $r 'UNIT_PARKED +EPF_RT\.RT_TOP'
+            # The run lost with the wrapper is ended (ABANDONED) by the next
+            # one, once the database has ended the monitor's session.
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $r = Invoke-Wrapper @('reclaim', '--restore', '--non-interactive') -TimeoutMin 60
+                if ($r.ExitCode -ne 4 -or $r.Output -notmatch 'Another run is active') { break }
+                Write-TestLog '---- the lost run still holds the run lock: trying again in 30 s' 'Yellow'
+                Start-Sleep -Seconds 30
+            }
+        } finally {
+            Set-TestPause 0
+            Set-TestPark 'N'
+        }
+        Assert-Exit $r @(0, 2)
+        Write-Note $r 'WORKER_RUNNING' 'the restore waited for the worker whose client was gone'
+        Write-Note $r 'UNIT_RETURNED' 'the restore moved RT_TOP back itself (the worker''s call had ended)'
+        $run = Get-Run $r 'RECLAIM'
+        Assert-Manifest $run 'reclaim_mode' '^RESTORE$'
+        foreach ($check in @('R1', 'R6', 'R9')) { Assert-Manifest $run ('check.' + $check) '^(PASS|SKIP)' }
         Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK'))
         $s = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Match $s 'no temporary index, undo tuning, reclaim change or locked account pending'

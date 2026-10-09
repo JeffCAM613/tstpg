@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - Tests T18J and T18K: a connection lost during a reclaim; TANM7883 from a remote server
+
+Why: J4 failed when the network dropped. The suite only kills the worker's database session (T18C, T18D, T18I), never its connection, so the path of a worker whose client is gone while its call goes on (wait_for_workers, 0.7.2) had no test. The user asked for it, and runs a session on TANM7883 (a dump of another client: other data) from a remote server.
+
+Changes (src/tests/e2e/run_tests.ps1):
+- **T18J**: after the first move (TEST_PAUSE), the worker's sqlplus is ended on this machine (Stop-WorkerClient: its process id from V$SESSION.PROCESS of the SYS session with a run's client identifier). Its call goes on in the database. Required: exit 1, "The worker session ended before the reclaim finished", RECLAIM RESTORE, R1 and R9 PASS, the lab as before, nothing pending. Noted: WORKER_RUNNING and WORKER_ENDED (the restore waited for the call).
+- **T18K**: with `--scratch 512M` and reclaim_test_park, while RT_TOP is parked, the whole wrapper is ended (Stop-WrapperTree: cmd, powershell, every sqlplus; Invoke-Process records the process it runs in `$script:CurrentPid`). Then `reclaim --restore` ends the lost run (ABANDONED; tried again after 30 s, up to 3 times, while the database still holds the run lock of the lost monitor). Required: exit 0 or 2, mode RESTORE, R1, R6 and R9 PASS or SKIP, the lab as before, nothing pending. Noted: WORKER_RUNNING, and UNIT_RETURNED (the restore moved RT_TOP back itself).
+- A database that ends a session whose client is gone at once takes the other path: no wait, and the restore puts everything back itself. Hence the notes: the end state is required either way.
+- PLAN.md: fault injection, the test table.
+
+Checked offline: the suite parses under the T00 rules. Not run here: T18J and T18K need the lab on Oracle.
+
+How to test: set K on the status page (the full suite on TANM7883 from the remote server). On EPFPG784 after J5: `run_tests.bat --only T18A,T18J,T18K,T18F`.
+
 ## 2026-10-09 - Set J on EPFPG784: J1 to J3 good; J4's reclaim of DATA failed when the network dropped; the digest shows why a run failed
 
 J4 (R-000051, 0.8.0, `--scratch 3G`) ended FAILED after 01:40:16, the user reports through network instability. Its checks: R1 FAIL 0/972 indexes usable; R2-R5 not verified (the run ended before VERIFY); R6 FAIL (DATA's growth setting not restored, scratch tablespace EPF_PARK_51 not dropped); R8 FAIL 43 of 691 moved, 568 below where the datafile stopped, 80 still parked; R9 FAIL 6 accounts still locked (ANON_META, KDCM, OP, OPPAYMENTS, OPREPORTS, SUPER). So neither the restore path of the worker nor the wrapper's restore in the same run ran to its end. The worker's call may have gone on inside the database after its client was gone; `reclaim --restore` waits for such a worker (WORKER_RUNNING) and then restores: the parked tables come back to DATA, the indexes are rebuilt, the growth setting is restored, EPF_PARK_51 is dropped, the accounts are unlocked. 80 parked tables within 3 GB fits a DATA that the earlier reclaim left nearly full (14.2 GB, 13.1 GB of segments): almost nothing fits below the top, so the compaction parks it.
