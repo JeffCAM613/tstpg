@@ -1031,7 +1031,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || r(b(f.free_bytes), 12));
         END LOOP;
 
-        title('REDO AND UNDO');
+        title('REDO AND UNDO WRITTEN (what the purge kept on disk: DISK)');
         FOR t IN (SELECT e.module_code, ev.object_owner || '.' || ev.object_name AS root_table,
                          SUM(CASE WHEN ev.event_code = 'TREE_REDO' THEN ev.bytes END) AS redo,
                          SUM(CASE WHEN ev.event_code = 'TREE_UNDO' THEN ev.bytes END) AS undo,
@@ -1221,8 +1221,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END IF;
         title(CASE p_origin WHEN 'DRY_RUN' THEN 'SIMULATION (dry run: nothing was changed)'
                             ELSE 'ESTIMATE (rows before the cutoff are counted exactly by a dry run)' END);
-        put('  ' || l('Module', 18) || r('Rows', 14) || r('Roots', 12) || r('Batches', 9) || r('Redo', 11)
-            || r('Undo', 11) || r('Deleting', 10) || r('Space freed', 13));
+        put('  ' || l('Module', 18) || r('Rows', 14) || r('Roots', 12) || r('Batches', 9) || r('Redo written', 14)
+            || r('Undo written', 14) || r('Deleting', 10) || r('Space freed', 13));
         FOR x IN (SELECT f.module_code, f.row_count, f.roots, f.batches, f.redo_bytes, f.undo_bytes,
                          f.delete_seconds, f.freed_bytes
                     FROM epf_forecast f
@@ -1230,7 +1230,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    WHERE f.run_id = l_run AND f.origin = p_origin
                    ORDER BY m.display_order) LOOP
             put('  ' || l(x.module_code, 18) || r(n(x.row_count), 14) || r(n(x.roots), 12) || r(n(x.batches), 9)
-                || r(b(x.redo_bytes), 11) || r(b(x.undo_bytes), 11) || r(dur(x.delete_seconds), 10)
+                || r(b(x.redo_bytes), 14) || r(b(x.undo_bytes), 14) || r(dur(x.delete_seconds), 10)
                 || r(b(x.freed_bytes), 13));
             l_rows  := l_rows + NVL(x.row_count, 0);
             l_roots := l_roots + NVL(x.roots, 0);
@@ -1242,7 +1242,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END LOOP;
         IF l_count > 1 THEN
             put('  ' || l('Total', 18) || r(CASE WHEN p_origin = 'DRY_RUN' THEN n(l_rows) ELSE '-' END, 14)
-                || r(n(l_roots), 12) || r(n(l_batch), 9) || r(b(l_redo), 11) || r(b(l_undo), 11) || r(dur(l_secs), 10)
+                || r(n(l_roots), 12) || r(n(l_batch), 9) || r(b(l_redo), 14) || r(b(l_undo), 14) || r(dur(l_secs), 10)
                 || r(CASE WHEN p_origin = 'DRY_RUN' THEN b(l_freed) ELSE '-' END, 13));
         END IF;
         -- One line per basis; the modules it applies to when they differ.
@@ -1592,8 +1592,8 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             put('  ' || l(l_module, 18) || 'forecast of ' || epf_util.run_label(l_fc_run)
                 || CASE l_origin WHEN 'DRY_RUN' THEN ' (dry run)' ELSE ' (preflight, estimated)' END);
             line('rows', 'ROWS', l_f_rows, l_rows, n(l_f_rows), n(l_rows));
-            line('redo', 'REDO', l_f_redo, l_redo, b(l_f_redo), b(l_redo));
-            line('undo', 'UNDO', l_f_undo, l_undo, b(l_f_undo), b(l_undo));
+            line('redo written', 'REDO', l_f_redo, l_redo, b(l_f_redo), b(l_redo));
+            line('undo written', 'UNDO', l_f_undo, l_undo, b(l_f_undo), b(l_undo));
             line('deleting time', 'SECONDS', l_f_secs, l_secs, dur(l_f_secs), dur(l_secs));
             line('space freed', 'FREED', l_f_freed, l_freed, b(l_f_freed), b(l_freed));
         END LOOP;
@@ -1601,6 +1601,20 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             put('  The purge ended ' || l_status || ': the actual values cover only what it did.');
         END IF;
     END print_forecast_result;
+
+    -- What a purge kept on disk while it ran (DISK_USE): the most undo it held
+    -- against the undo tablespace's limit, and where its redo went.
+    PROCEDURE print_disk IS
+    BEGIN
+        FOR d IN (SELECT message
+                    FROM epf_event
+                   WHERE run_id = g_run.run_id AND event_code = 'DISK_USE'
+                   ORDER BY event_id DESC
+                   FETCH FIRST 1 ROWS ONLY) LOOP
+            put;
+            put(' DISK      ' || d.message);
+        END LOOP;
+    END print_disk;
 
     -- ------------------------------------------------------------------
     -- Plans
@@ -2131,6 +2145,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 print_expected;
             ELSE
                 print_forecast_result;
+                print_disk;
                 print_requirements;
             END IF;
             print_run_plan;

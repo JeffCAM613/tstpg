@@ -1254,6 +1254,12 @@ function Invoke-Suite {
         Assert-Match $r 'PREFLIGHT'
         Assert-Match $r 'undo tuning planned for this purge'
         Assert-Match $r 'FORECAST AND RESULT'
+        # What the purge kept on disk, not the redo and undo it wrote: the
+        # progress lines, the end of the module and the report (DISK).
+        Assert-Match $r 'BATCH_PROGRESS +PAYMENTS batch .* (undo \S+ of \S+ \S+ \(\d+%\)|redo log \d+ of \d+|archive \S+ of )'
+        Assert-Match $r 'MODULE_END +PAYMENTS DONE: [\d,]+ rows deleted in \d\d:\d\d:\d\d; '
+        Assert-Match $r ' DISK +(undo at most|redo: |archived logs )'
+        Write-Note $r 'undo at most \S+ of \S+ \S+ \(\d+%\)' 'the most undo the purge held, against its limit'
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'

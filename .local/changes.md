@@ -2,6 +2,23 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - A purge shows what it holds on disk, not the redo and undo it writes (0.8.3, D22)
+
+Why: in set L the user read `MODULE_END PAYMENTS DONE: 89,124,373 rows deleted, 62.6 GB redo, 31.7 GB undo` and the progress line's `redo 136.3 MB/batch undo 69.0 MB/batch` as disk the purge took. They are volumes written: the redo passes through online logs that are reused in turn (kept only as archived logs, in ARCHIVELOG), the undo through an undo tablespace whose space is reused. A user would worry for nothing. The user asked for the live state instead; the fill of the current online log is not in a documented view (only SYS's X$ tables) and goes from 0 to 100% every 20 s or so, so the online log in use and, in ARCHIVELOG, the recovery area take its place.
+
+Changes:
+- epf_purge (0.8.3): disk_sample, read with each progress event only (at most every progress_interval_s, 5 s; three small queries): the undo tablespace of the instance, its active and unexpired extents (DBA_UNDO_EXTENTS, dynamic SQL) against the most its datafiles may grow to (DBA_DATA_FILES, as check_undo), and where the redo goes: `redo log k of n` (V$LOG of this thread) in NOARCHIVELOG, `archive U of L (P%)` from V$RECOVERY_FILE_DEST (used less reclaimable) in ARCHIVELOG. A figure that cannot be read is left out; nothing of it can stop a purge. The most undo seen is kept per module and per run. Reading the undo is timed: above a second (a large dictionary, as DBA_EXTENTS took 12 to 33 s on EPFPG784), it is read no more in that run (INFO DISK_UNDO_OFF) and the summaries leave undo out.
+- BATCH_PROGRESS: `... rows 64,631,611 57,990/s undo 1.3 of 4.0 GB (33%) redo log 3 of 4 ETA 00:09:27` (was `redo 136.3 MB/batch undo 69.0 MB/batch`). MODULE_END: `PAYMENTS DONE: 89,124,373 rows deleted in 00:28:53; undo at most 1.5 of 4.0 GB (38%); redo: 4 logs of 1.0 GB reused, nothing kept (NOARCHIVELOG)`, or `archived logs about +62.6 GB, recovery area 64.1 of 100.0 GB (64%)` in ARCHIVELOG. The step end of the batches gives batches and rows only. Event DISK_USE (INFO) at the end of a purge with batches: the same for the whole run.
+- epf_report: a purge's report prints ` DISK      <DISK_USE>` after FORECAST AND RESULT; the forecast tables' columns are `Redo written` and `Undo written`, the forecast-against-result lines `redo written` and `undo written`, the section `REDO AND UNDO WRITTEN (what the purge kept on disk: DISK)`.
+- grants.sql: SELECT on DBA_UNDO_EXTENTS for EPFPG.
+- epf.ps1: the summary of a purge (default view) shows the DISK line (Get-DiskLines).
+- T13 asserts the disk figures in BATCH_PROGRESS, the text after MODULE_END's duration and the report's DISK line; notes the undo peak.
+- PLAN.md 6.8, 6.9, D22, the test table.
+
+Checked here: the wrapper and the suite parse (T00 rules); the output checks, 64 of 64 (new: a purge's summary shows DISK once, a refused purge none). Not compiled here.
+
+How to test: set M's suite (T13 installs 0.8.3 through T03 and checks the lines); set N's purge (N3) on the screen.
+
 ## 2026-10-09 - Sets M and N planned: a third source (CLUBMEDEPF, TANM7884); the reclaim after a light purge (SONEPARUAT, EPFPG782)
 
 The user runs set L from the remote server, close to the databases, and asked for two more sets:

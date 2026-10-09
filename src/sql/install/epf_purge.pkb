@@ -129,6 +129,16 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Statistic numbers of 'redo size' and 'undo change vector size'.
     g_redo_stat  NUMBER;
     g_undo_stat  NUMBER;
+    -- What the purge holds on disk (disk_sample): the most undo seen held in
+    -- the module and in the run, the limit of the undo tablespace, and the
+    -- redo the run wrote (for the archived logs).
+    g_mod_peak   NUMBER := 0;
+    g_disk_peak  NUMBER := 0;
+    g_disk_limit NUMBER;
+    g_disk_redo  NUMBER := 0;
+    -- TRUE once reading the undo tablespace took more than a second: it is no
+    -- longer read in this run, and the summaries leave undo out.
+    g_undo_off   BOOLEAN := FALSE;
 
     -- ------------------------------------------------------------------
     -- Names and SQL fragments
@@ -572,6 +582,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         g_reuse_run  := NULL;
         g_silent     := FALSE;
         g_rows_root.DELETE;
+        g_mod_peak   := 0;
+        g_disk_peak  := 0;
+        g_disk_limit := NULL;
+        g_disk_redo  := 0;
+        g_undo_off   := FALSE;
         load_registry;
         SELECT module_code BULK COLLECT INTO g_modules
           FROM epf_module
@@ -1569,6 +1584,142 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
          WHERE statistic# IN (g_redo_stat, g_undo_stat);
     END session_redo_undo;
 
+    -- p_part of p_whole as text, such as '1.3 of 4.0 GB (33%)': the unit once
+    -- when both have the same.
+    FUNCTION of_bytes(p_part IN NUMBER, p_whole IN NUMBER) RETURN VARCHAR2 IS
+        l_part  VARCHAR2(40) := epf_util.fmt_bytes(p_part);
+        l_whole VARCHAR2(40) := epf_util.fmt_bytes(p_whole);
+    BEGIN
+        IF SUBSTR(l_part, INSTR(l_part, ' ')) = SUBSTR(l_whole, INSTR(l_whole, ' ')) THEN
+            l_part := SUBSTR(l_part, 1, INSTR(l_part, ' ') - 1);
+        END IF;
+        RETURN l_part || ' of ' || l_whole || ' (' || ROUND(100 * p_part / NULLIF(p_whole, 0)) || '%)';
+    END of_bytes;
+
+    -- What the purge holds on disk now, as text for BATCH_PROGRESS. The undo
+    -- tablespace of this instance: its active and unexpired extents (Oracle
+    -- reuses unexpired ones when it needs room) against the most its
+    -- datafiles may grow to; the most seen is kept (g_mod_peak, g_disk_peak).
+    -- Where the redo goes: in NOARCHIVELOG the online log in use (they are
+    -- reused in turn), in ARCHIVELOG the recovery area in use against its
+    -- limit. Read with the progress events only; a figure that cannot be read
+    -- is left out, since they only describe the purge. Reading the undo takes
+    -- longer on a large dictionary: above a second, it is read no more
+    -- (DISK_UNDO_OFF), so that it never slows the purge.
+    FUNCTION disk_sample RETURN VARCHAR2 IS
+        l_t0    PLS_INTEGER;
+        l_ts    VARCHAR2(128);
+        l_held  NUMBER;
+        l_limit NUMBER;
+        l_mode  VARCHAR2(12);
+        l_pos   NUMBER;
+        l_count NUMBER;
+        l_used  NUMBER;
+        l_text  VARCHAR2(400);
+    BEGIN
+        IF NOT g_undo_off THEN
+            BEGIN
+                l_t0 := DBMS_UTILITY.GET_TIME;
+                SELECT UPPER(value) INTO l_ts FROM v$parameter WHERE name = 'undo_tablespace';
+                EXECUTE IMMEDIATE 'SELECT NVL(SUM(bytes), 0) FROM dba_undo_extents '
+                                  || 'WHERE tablespace_name = :ts AND status IN (''ACTIVE'', ''UNEXPIRED'')'
+                    INTO l_held USING l_ts;
+                SELECT SUM(CASE WHEN autoextensible = 'YES' THEN GREATEST(maxbytes, bytes) ELSE bytes END)
+                  INTO l_limit
+                  FROM dba_data_files
+                 WHERE tablespace_name = l_ts;
+                IF l_limit > 0 THEN
+                    g_mod_peak   := GREATEST(g_mod_peak, l_held);
+                    g_disk_peak  := GREATEST(g_disk_peak, l_held);
+                    g_disk_limit := l_limit;
+                    l_text := 'undo ' || of_bytes(l_held, l_limit);
+                END IF;
+                IF DBMS_UTILITY.GET_TIME - l_t0 > 100 THEN
+                    g_undo_off := TRUE;
+                    epf_log.info('DISK_UNDO_OFF', 'Reading the undo tablespace took '
+                                                  || ROUND((DBMS_UTILITY.GET_TIME - l_t0) / 100, 1)
+                                                  || ' s: the progress lines no longer show it');
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    NULL;
+            END;
+        END IF;
+        BEGIN
+            SELECT log_mode INTO l_mode FROM v$database;
+            IF l_mode = 'NOARCHIVELOG' THEN
+                SELECT MAX(CASE WHEN status = 'CURRENT' THEN pos END), COUNT(*)
+                  INTO l_pos, l_count
+                  FROM (SELECT status, ROW_NUMBER() OVER (ORDER BY group#) AS pos
+                          FROM v$log
+                         WHERE thread# = (SELECT thread# FROM v$instance));
+                IF l_pos IS NOT NULL THEN
+                    l_text := l_text || CASE WHEN l_text IS NOT NULL THEN ' ' END || 'redo log ' || l_pos || ' of '
+                              || l_count;
+                END IF;
+            ELSE
+                EXECUTE IMMEDIATE 'SELECT MAX(space_limit), MAX(space_used - space_reclaimable) '
+                                  || 'FROM v$recovery_file_dest'
+                    INTO l_limit, l_used;
+                IF l_limit > 0 AND l_used IS NOT NULL THEN
+                    l_text := l_text || CASE WHEN l_text IS NOT NULL THEN ' ' END || 'archive '
+                              || of_bytes(l_used, l_limit);
+                END IF;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;
+        RETURN l_text;
+    END disk_sample;
+
+    -- What the purge took on disk, as text (MODULE_END, DISK_USE): the most
+    -- undo seen held (p_peak) against the undo tablespace's limit, and where
+    -- its redo (p_redo) went: in NOARCHIVELOG through the online logs, reused
+    -- in turn and none kept; in ARCHIVELOG into archived logs, with the
+    -- recovery area in use against its limit when it holds them.
+    FUNCTION disk_summary(p_peak IN NUMBER, p_redo IN NUMBER) RETURN VARCHAR2 IS
+        l_mode  VARCHAR2(12);
+        l_count NUMBER;
+        l_size  NUMBER;
+        l_limit NUMBER;
+        l_used  NUMBER;
+        l_text  VARCHAR2(400);
+    BEGIN
+        IF g_disk_limit > 0 AND NOT g_undo_off THEN
+            l_text := 'undo at most ' || of_bytes(p_peak, g_disk_limit);
+        END IF;
+        BEGIN
+            SELECT log_mode INTO l_mode FROM v$database;
+            IF l_mode = 'NOARCHIVELOG' THEN
+                SELECT COUNT(*), MAX(bytes)
+                  INTO l_count, l_size
+                  FROM v$log
+                 WHERE thread# = (SELECT thread# FROM v$instance);
+                l_text := l_text || CASE WHEN l_text IS NOT NULL THEN '; ' END || 'redo: ' || l_count || ' logs of '
+                          || epf_util.fmt_bytes(l_size) || ' reused, nothing kept (NOARCHIVELOG)';
+            ELSE
+                l_text := l_text || CASE WHEN l_text IS NOT NULL THEN '; ' END || 'archived logs about +'
+                          || epf_util.fmt_bytes(p_redo);
+                BEGIN
+                    EXECUTE IMMEDIATE 'SELECT MAX(space_limit), MAX(space_used - space_reclaimable) '
+                                      || 'FROM v$recovery_file_dest'
+                        INTO l_limit, l_used;
+                    IF l_limit > 0 AND l_used IS NOT NULL THEN
+                        l_text := l_text || ', recovery area ' || of_bytes(l_used, l_limit);
+                    END IF;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        NULL;
+                END;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;
+        RETURN l_text;
+    END disk_summary;
+
     -- Processes the batches of the module's trees. p_processed, p_table_redo
     -- and p_table_undo add up per table (index: table_id) the rows, redo and
     -- undo of its statements in the committed batches.
@@ -1606,6 +1757,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_tree_undo  NUMBER;
         l_tree_start TIMESTAMP;
         l_tree_roots NUMBER;
+        l_disk       VARCHAR2(400);
         k            PLS_INTEGER;
 
         -- Records the redo and undo of one root tree (TREE_REDO / TREE_UNDO:
@@ -1714,12 +1866,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 IF l_done = 1 OR l_done = p_total OR l_last IS NULL OR epf_util.elapsed_s(l_last) >= l_interval THEN
                     l_elapsed := epf_util.elapsed_s(l_start);
                     l_pct := ROUND(100 * l_done / NULLIF(p_total, 0), 1);
+                    -- What the purge holds on disk now; the redo and undo it
+                    -- writes are in the report (REDO AND UNDO WRITTEN).
+                    l_disk := disk_sample;
                     epf_log.event(epf_log.c_progress, 'BATCH_PROGRESS',
                                   p_module || ' batch ' || epf_util.fmt_int(l_done) || '/' || epf_util.fmt_int(p_total)
                                   || ' ' || TO_CHAR(l_pct, 'FM990.0') || '% ' || l_unit || ' ' || epf_util.fmt_int(l_rows)
                                   || ' ' || epf_util.fmt_int(CASE WHEN l_elapsed > 0 THEN l_rows / l_elapsed END) || '/s'
-                                  || ' redo ' || epf_util.fmt_bytes(p_redo / l_done) || '/batch'
-                                  || ' undo ' || epf_util.fmt_bytes(p_undo / l_done) || '/batch'
+                                  || CASE WHEN l_disk IS NOT NULL THEN ' ' || l_disk END
                                   || ' ETA ' || epf_util.fmt_duration(l_elapsed / l_done * (p_total - l_done)),
                                   p_rows => l_rows, p_bytes => p_redo, p_pct => l_pct, p_elapsed_s => l_elapsed);
                     l_last := epf_util.now_ts;
@@ -1735,8 +1889,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         p_undo := session_undo - l_undo_start;
         epf_log.step_end(CASE p_result WHEN 'FAILED' THEN 'FAILED' ELSE 'DONE' END,
                          epf_util.fmt_int(l_done) || '/' || epf_util.fmt_int(p_total) || ' batches, '
-                         || epf_util.fmt_int(l_rows) || ' ' || l_unit || ', ' || epf_util.fmt_bytes(p_redo) || ' redo, '
-                         || epf_util.fmt_bytes(p_undo) || ' undo'
+                         || epf_util.fmt_int(l_rows) || ' ' || l_unit
                          || CASE p_result WHEN 'STOPPED' THEN ', stopped on request' END);
     END process_batches;
 
@@ -1761,6 +1914,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_undo      NUMBER;
         l_sum       NUMBER := 0;
         l_start     TIMESTAMP := epf_util.now_ts;
+        l_disk      VARCHAR2(400);
         k           PLS_INTEGER;
     BEGIN
         SELECT table_id BULK COLLECT INTO l_roots
@@ -1815,8 +1969,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
 
             IF NOT l_failed THEN
                 BEGIN
+                    g_mod_peak := 0;
                     process_batches(p_module, l_action, l_active, l_total, l_processed, l_t_redo, l_t_undo,
                                     l_batch_res, l_redo, l_undo);
+                    g_disk_redo := g_disk_redo + NVL(l_redo, 0);
                     l_failed := l_batch_res = 'FAILED';
                 EXCEPTION
                     WHEN OTHERS THEN
@@ -1854,6 +2010,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_sum := l_sum + l_processed(k);
             k := l_processed.NEXT(k);
         END LOOP;
+        -- What the module took on disk, after its batches.
+        IF l_redo IS NOT NULL THEN
+            l_disk := disk_summary(g_mod_peak, l_redo);
+        END IF;
         epf_log.event(CASE p_result WHEN 'DONE' THEN epf_log.c_ok WHEN 'STOPPED' THEN epf_log.c_warn
                                     ELSE epf_log.c_error END,
                       'MODULE_END',
@@ -1861,10 +2021,9 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                       || CASE WHEN g_run.dry_run = 'Y' THEN ' (dry run, nothing changed)'
                               ELSE ': ' || epf_util.fmt_int(l_sum) || ' '
                                    || CASE l_action WHEN c_delete THEN 'rows deleted' ELSE 'LOB values cleared' END
-                                   || CASE WHEN l_redo IS NOT NULL THEN ', ' || epf_util.fmt_bytes(l_redo) || ' redo, '
-                                                                        || epf_util.fmt_bytes(l_undo) || ' undo' END
                          END
-                      || ' in ' || epf_util.fmt_duration(epf_util.elapsed_s(l_start)),
+                      || ' in ' || epf_util.fmt_duration(epf_util.elapsed_s(l_start))
+                      || CASE WHEN l_disk IS NOT NULL THEN '; ' || l_disk END,
                       p_rows => l_sum, p_bytes => l_redo, p_elapsed_s => epf_util.elapsed_s(l_start));
     END process_module;
 
@@ -3888,6 +4047,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_compact_stop BOOLEAN;
         l_start    TIMESTAMP := epf_util.now_ts;
         l_unmet    VARCHAR2(400);
+        l_disk     VARCHAR2(400);
     BEGIN
         init(p_run_id, 'PURGE');
         epf_log.set_phase('PURGE');
@@ -4013,6 +4173,13 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         IF undo_tuning_text IS NOT NULL THEN
             epf_log.info('UNDO_TUNING', 'Undo tuning is still active; restore it with src/sql/run/undo.sql RESTORE '
                                         || 'as SYS');
+        END IF;
+        -- What the purge took on disk, for the report (DISK).
+        IF g_run.dry_run = 'N' AND g_disk_redo > 0 THEN
+            l_disk := disk_summary(g_disk_peak, g_disk_redo);
+            IF l_disk IS NOT NULL THEN
+                epf_log.info('DISK_USE', l_disk);
+            END IF;
         END IF;
         p_status := CASE WHEN l_failed THEN 'FAILED'
                          WHEN l_stopped THEN 'STOPPED'

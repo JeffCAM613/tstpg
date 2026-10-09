@@ -1949,6 +1949,8 @@ function Show-Summary {
     } elseif ($Action -eq 'PURGE' -and $Mode -eq 'DRY_RUN') {
         Add-Lines $lines (Get-TableLines $Report 'SIMULATION')
         Add-Lines $lines (Get-ExpectedLines $Report)
+    } elseif ($Action -eq 'PURGE') {
+        Add-Lines $lines (Get-DiskLines $Report)
     } elseif ($Action -eq 'RECLAIM') {
         Add-Lines $lines (Get-ReclaimLines $Report $Mode)
         if ($Mode -eq 'ASSESS') { Add-Lines $lines (Get-TableLines $Report 'ACCOUNTS') }
@@ -1986,6 +1988,16 @@ function Get-TableLines {
     foreach ($line in ((Get-ReportSection $Report $Title) -split "`r?`n")) {
         if ($line.Trim() -eq '' -or $line -match '^ -{20,}' -or $line -match '^  (Redo and undo |Deleting time: )') { continue }
         $out.Add($line.TrimEnd())
+    }
+    return ,$out.ToArray()
+}
+
+# What a purge kept on disk while it ran: the DISK line of its report.
+function Get-DiskLines {
+    param([string]$Report)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in ($Report -split "`r?`n")) {
+        if ($line -match '^ DISK  ') { $out.Add($line.TrimEnd()) }
     }
     return ,$out.ToArray()
 }
