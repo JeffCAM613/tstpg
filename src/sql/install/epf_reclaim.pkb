@@ -2970,7 +2970,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- that the copy takes the free space the compaction left and the
     -- datafiles grow only for the rest; when the move still finds no space,
     -- they grow by all it needs, above their start size if need be
-    -- (RETURN_GREW, a warning): the table must come back. Its indexes the move
+    -- (RETURN_GREW: a warning when they end above it): the table must come
+    -- back. Its indexes the move
     -- left unusable are rebuilt by step REBUILD_INDEXES (release_moved).
     -- Nothing of it in p_park: its parking did not happen (the session ended
     -- first); it stays where it was (SKIPPED). Returns FALSE when it stays
@@ -2996,6 +2997,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_ts      VARCHAR2(128);
         l_into    VARCHAR2(1000);
         l_for     VARCHAR2(400) := p_owner || '.' || p_table || ' coming back from ' || p_park;
+        l_size    NUMBER;
+        l_above   NUMBER := 0;
         l_started TIMESTAMP := epfpg.epf_util.now_ts;
     BEGIN
         SELECT NVL(SUM(s.bytes), 0)
@@ -3094,10 +3097,31 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             l_ts := l_needs.NEXT(l_ts);
         END LOOP;
         IF l_more > 0 THEN
-            say(epfpg.epf_log.c_warn, 'RETURN_GREW',
-                p_owner || '.' || p_table || ' did not fit within the room of ' || l_into || ': its datafiles grew by '
-                || b(l_more) || ', above their size at the start if need be, to take it back',
-                p_owner => p_owner, p_object => p_table, p_bytes => l_more);
+            -- A warning only when a datafile ended above what run p_run
+            -- allows it (its size at the start, plus the growth allowed);
+            -- otherwise the free space lay in pieces too small for its
+            -- extents, and the growth stayed within that size.
+            l_ts := l_needs.FIRST;
+            WHILE l_ts IS NOT NULL LOOP
+                l_size := ts_bytes(l_ts);
+                SELECT l_above + COUNT(*)
+                  INTO l_above
+                  FROM epfpg.epf_reclaim_ts
+                 WHERE run_id = p_run AND tablespace_name = l_ts
+                   AND start_bytes + NVL(growth_bytes, 0) * NVL(file_count, 1) < l_size;
+                l_ts := l_needs.NEXT(l_ts);
+            END LOOP;
+            IF l_above > 0 THEN
+                say(epfpg.epf_log.c_warn, 'RETURN_GREW',
+                    p_owner || '.' || p_table || ' did not fit within the room of ' || l_into || ': its datafiles grew by '
+                    || b(l_more) || ', above their size at the start, to take it back',
+                    p_owner => p_owner, p_object => p_table, p_bytes => l_more);
+            ELSE
+                say(epfpg.epf_log.c_info, 'RETURN_GREW',
+                    p_owner || '.' || p_table || ' did not fit in the free space of ' || l_into || ', in pieces too small '
+                    || 'for its extents: its datafiles grew by ' || b(l_more) || ' more, within their size at the start',
+                    p_owner => p_owner, p_object => p_table, p_bytes => l_more);
+            END IF;
         END IF;
         say(epfpg.epf_log.c_ok, 'UNIT_RETURNED',
             p_owner || '.' || p_table || ' moved back from ' || p_park || ' to ' || l_into || ': ' || b(l_there)

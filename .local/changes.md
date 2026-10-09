@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - K7 and K8 on TANM7883 (0.8.1): DATA down to its segments; RETURN_GREW a warning only above the start size (0.8.2)
+
+K7 (0.8.1 installed, `--only T18A,T18B,T18H,T18G,T18K,T18F`): 7 of 7 in 5 min 49 s. The runs ran on 0.8.1, so it compiled. T18K took 1 min 14 s, against 23 min 57 s on 0.8.0: the later restore asked the worker whose client was gone to stop, the worker put RT_TOP back itself (noted: waited yes, RT_TOP moved back by the restore no). The placement lines (`| was ... now ...; free before ...`) read from the inventory have the form the digest expects.
+
+K8, DATA a second time:
+- Dry run R-000062 (32 s): DATA 9.9 GB, segments 9.4 GB; 738 tables (9.2 GB, about 8.6 GB after); forecast 9.9 GB, "OP.HISTO_REGLEMENT (about 2.2 GB after the move) may not fit in the 941.1 MB of free space below the top". The forecast stops at such a table: it does not count what parking gives. 4 segments with an INITIAL larger than needed (OP.SPEC_TRT_LOG 936 MB: below where K5 stopped, never moved).
+- Reclaim R-000063 with the size suggested (the scratch datafile up to 7.3 GB), 6 min 32 s, PASS WITH WARNINGS: DATA 9.9 to 9.4 GB with 9.4 GB of segments, **R7 PASS**; R1 to R6, R8 and R9 PASS. HISTO_REGLEMENT still did not fit below after the 16 tables moved to make room, and was parked (2.1 GB), then 35 more tables, up to 5.5 GB of scratch space; the compaction took DATA down to 4.2 GB, where OP.PLAN_TABLE (a LONG column) holds the top; the 36 came back in 1 min 25 s, DATA growing to 9.2 GB, the index rebuilds to 9.5 GB, trimmed to 9.4 GB. Small moves about a second each, as in K5.
+- The one warning, P5: RETURN_GREW for OP.IMPORT_OPERATION (52 MB): the free space it was given was in pieces too small for its extents, and DATA grew 53 MB more to take it, from 7.0 to 7.1 GB, far below its 9.9 GB at the start. The event said "above their size at the start if need be"; nothing went above it, and R6 passed.
+
+Change (src/sql/install/epf_reclaim.pkb, return_unit; tool version 0.8.2): after the second growth, RETURN_GREW is a warning only when a tablespace of the table ends above what run p_run allows it (start_bytes plus the growth allowed, as in R6); otherwise an INFO event saying the free space lay in pieces too small for its extents and the growth stayed within the start size. The report's R6 counts RETURN_GREW events only to explain a tablespace above its limit, which the INFO case never is.
+
+Checked here: ASCII; the columns used (start_bytes, growth_bytes, file_count) as in the report's R6. Not compiled here.
+
+How to test: set L installs 0.8.2 (T03); a K8-like run that returns tables into fragmented free space shows RETURN_GREW as INFO and PASS.
+
 ## 2026-10-09 - Faster moves: a move's placement read from the inventory; a scratch size that fits; a later restore stops a worker whose client is gone (0.8.1)
 
 Why: J4's console.log (16 lines, 19:15 to 19:20, sent by the user) shows where a move's time went on EPFPG784. Each UNIT_MOVED took 12 to 13 s for a table of OPPAYMENTS and 32 to 33 s for one of OP, and the MOVE_PLACEMENT after it came another 12 to 13 s or 32 to 33 s later. That second wait is the second unit_layout alone, so the first one takes the same, and the rest of the move (free_layout, the MOVE, refresh_item, the trim) about nothing. The cost goes with the owner: unit_layout's DBA_EXTENTS query, with `e.tablespace_name = p_ts` and the type and name joined into one string, reads every extent of that owner in DATA. refresh_item's query, by table names and a subquery on the tablespaces, ran in about a second in the same run (a park takes about 1 s with it). On TANM7883 all of it is fast (K5). And K5 stopped 0.5 GB above DATA's segments: the 2.2 GB table at the top did not fit in the scratch space, which K4 had sized for the largest table alone.
