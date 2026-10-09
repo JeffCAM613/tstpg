@@ -809,9 +809,11 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     BEGIN
         DELETE FROM epfpg.epf_ts_inventory WHERE run_id = g_run.run_id AND item_id = p_item;
         INSERT INTO epfpg.epf_ts_inventory (run_id, tablespace_name, kind, owner, object_name, sub_name, segment_type,
-                                            bytes, file_id, top_block, handler, item_id, est_bytes)
+                                            bytes, file_id, top_block, handler, item_id, est_bytes, extents, min_extent,
+                                            max_extent, low_block)
         SELECT g_run.run_id, e.tablespace_name, 'SEGMENT', e.owner, e.segment_name, e.partition_name, e.segment_type,
-               SUM(e.bytes), e.file_id, MAX(e.block_id + e.blocks - 1), 'MOVE', p_item, SUM(e.bytes)
+               SUM(e.bytes), e.file_id, MAX(e.block_id + e.blocks - 1), 'MOVE', p_item, SUM(e.bytes), COUNT(*),
+               MIN(e.bytes), MAX(e.bytes), MIN(e.block_id)
           FROM dba_extents e
          WHERE e.owner = p_owner
            AND e.segment_type || '|' || e.segment_name IN (SELECT column_value FROM TABLE(l_names))
@@ -903,15 +905,16 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     END resolve_targets;
 
     -- Reads the segments of p_ts from DBA_EXTENTS into EPF_TS_INVENTORY: one
-    -- row per segment and datafile with its highest block; recycle-bin
-    -- segments marked.
+    -- row per segment and datafile with its extents (count, smallest and
+    -- largest) and its lowest and highest block; recycle-bin segments marked.
     PROCEDURE scan_ts(p_ts IN VARCHAR2) IS
     BEGIN
         DELETE FROM epfpg.epf_ts_inventory WHERE run_id = g_run.run_id AND tablespace_name = p_ts;
         INSERT INTO epfpg.epf_ts_inventory (run_id, tablespace_name, kind, owner, object_name, sub_name, segment_type,
-                                            bytes, file_id, top_block)
+                                            bytes, file_id, top_block, extents, min_extent, max_extent, low_block)
         SELECT g_run.run_id, p_ts, 'SEGMENT', e.owner, e.segment_name, e.partition_name, e.segment_type,
-               SUM(e.bytes), e.file_id, MAX(e.block_id + e.blocks - 1)
+               SUM(e.bytes), e.file_id, MAX(e.block_id + e.blocks - 1), COUNT(*), MIN(e.bytes), MAX(e.bytes),
+               MIN(e.block_id)
           FROM dba_extents e
          WHERE e.tablespace_name = p_ts
          GROUP BY e.owner, e.segment_name, e.partition_name, e.segment_type, e.file_id;
@@ -1600,6 +1603,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_place   VARCHAR2(600);
         l_enc     VARCHAR2(1000);
         l_suggest NUMBER;
+        l_moving  NUMBER;
     BEGIN
         DELETE FROM epfpg.epf_req_option WHERE run_id = g_run.run_id;
         DELETE FROM epfpg.epf_requirement WHERE run_id = g_run.run_id;
@@ -1773,10 +1777,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         -- the top of the file again although there is free space below; a
         -- table may also not fit below. With scratch space, such a table waits
         -- in a scratch tablespace of the run while the rest is compacted, and
-        -- comes back at the end into what is left free.
+        -- comes back at the end into what is left free. The size suggested
+        -- holds the largest table that moves and half of what moves: the
+        -- tables parked before the largest one take their share of it first.
         SELECT MAX(est_bytes) KEEP (DENSE_RANK LAST ORDER BY est_bytes NULLS FIRST),
-               MAX(owner || '.' || object_name) KEEP (DENSE_RANK LAST ORDER BY est_bytes NULLS FIRST)
-          INTO l_largest, l_name
+               MAX(owner || '.' || object_name) KEEP (DENSE_RANK LAST ORDER BY est_bytes NULLS FIRST),
+               SUM(est_bytes)
+          INTO l_largest, l_name, l_moving
           FROM epfpg.epf_reclaim_object
          WHERE run_id = g_run.run_id AND unit_type IN ('TABLE', 'IOT');
         IF l_largest IS NULL THEN
@@ -1794,7 +1801,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
               FROM dba_tablespaces t
              WHERE t.encrypted = 'YES'
                AND t.tablespace_name IN (SELECT r.tablespace_name FROM epfpg.epf_reclaim_ts r WHERE r.run_id = g_run.run_id);
-            l_suggest := CEIL(l_largest * 1.1 / (256 * c_mb)) * 256 * c_mb;
+            l_suggest := CEIL((l_largest + NVL(l_moving, 0) / 2) * 1.1 / (256 * c_mb)) * 256 * c_mb;
             add_req('SCRATCH', 6, CASE WHEN g_scratch > 0 THEN 'MET' ELSE 'NOT_MET' END, 'N',
                     'Scratch space for the tables that cannot move lower',
                     'Oracle chooses where the copy of a table goes, and may put it at the top of the file again '
@@ -1805,11 +1812,13 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                                                  || 'dropped at the end'
                          ELSE 'none (--scratch SIZE allows it)' END
                     || '; its datafile: ' || l_place || '; the largest table that moves: ' || l_name || ', about '
-                    || b(l_largest) || CASE WHEN l_enc IS NOT NULL THEN '; not for ' || l_enc || ' (encrypted)' END,
+                    || b(l_largest) || '; all that moves: about ' || b(l_moving)
+                    || CASE WHEN l_enc IS NOT NULL THEN '; not for ' || l_enc || ' (encrypted)' END,
                     l_suggest, g_scratch, CASE WHEN g_scratch > 0 THEN 'SCRATCH' END);
             add_opt('SCRATCH', 'SIZE', 1, g_scratch > 0, 'Allow scratch space for the run',
                     '--scratch SIZE, for example --scratch ' || TRIM(TO_CHAR(l_suggest / c_mb)) || 'M (the largest table '
-                    || 'that moves, plus a tenth); free disk for it next to ' || l_first || '''s first datafile');
+                    || 'that moves and half of all that moves, plus a tenth); free disk for it next to ' || l_first
+                    || '''s first datafile');
         END IF;
         COMMIT;
     END check_requirements;
@@ -2466,27 +2475,30 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             RETURN NULL;
     END free_layout;
 
-    -- Where the segments of table p_owner.p_table lie in p_ts, as text
-    -- (MOVE_PLACEMENT): their size, extents and extent sizes, and their
-    -- lowest and highest position in their datafile. NULL when it cannot be
-    -- read: it only describes the move.
-    FUNCTION unit_layout(p_ts IN VARCHAR2, p_owner IN VARCHAR2, p_table IN VARCHAR2) RETURN VARCHAR2 IS
-        l_names SYS.ODCIVARCHAR2LIST;
-        l_bs    NUMBER;
-        l_count NUMBER;
-        l_bytes NUMBER;
+    -- Where the segments of unit p_item lie in p_ts, as text (MOVE_PLACEMENT):
+    -- their size, extents and extent sizes, and their lowest and highest
+    -- position in their datafile. Read from the inventory, which the
+    -- assessment and each move or park of the unit (refresh_item) keep
+    -- current: a query of DBA_EXTENTS for one owner can take half a minute on
+    -- a large dictionary. NULL when it cannot be read: it only describes the
+    -- move.
+    FUNCTION unit_layout(p_ts IN VARCHAR2, p_item IN NUMBER) RETURN VARCHAR2 IS
+        l_bs     NUMBER;
+        l_count  NUMBER;
+        l_bytes  NUMBER;
         l_minext NUMBER;
         l_maxext NUMBER;
-        l_low   NUMBER;
-        l_high  NUMBER;
+        l_low    NUMBER;
+        l_high   NUMBER;
     BEGIN
-        l_names := unit_segments(p_owner, p_table);
         SELECT block_size INTO l_bs FROM dba_tablespaces WHERE tablespace_name = p_ts;
-        SELECT COUNT(*), NVL(SUM(e.bytes), 0), MIN(e.bytes), MAX(e.bytes), MIN(e.block_id), MAX(e.block_id + e.blocks)
+        SELECT SUM(extents), NVL(SUM(bytes), 0), MIN(min_extent), MAX(max_extent), MIN(low_block), MAX(top_block) + 1
           INTO l_count, l_bytes, l_minext, l_maxext, l_low, l_high
-          FROM dba_extents e
-         WHERE e.owner = p_owner AND e.tablespace_name = p_ts
-           AND e.segment_type || '|' || e.segment_name IN (SELECT column_value FROM TABLE(l_names));
+          FROM epfpg.epf_ts_inventory
+         WHERE run_id = g_run.run_id AND item_id = p_item AND tablespace_name = p_ts AND kind = 'SEGMENT';
+        IF l_count IS NULL THEN
+            RETURN NULL;
+        END IF;
         RETURN b(l_bytes) || ' in ' || l_count || ' extents of ' || b(l_minext) || ' to ' || b(l_maxext) || ', from '
                || b(l_low * l_bs) || ' to ' || b(l_high * l_bs);
     EXCEPTION
@@ -2553,7 +2565,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
          WHERE run_id = g_run.run_id AND item_id = p_item;
         COMMIT;
         l_other := other_ts(p_item, p_ts, TRUE);
-        l_from := unit_layout(p_ts, l_owner, l_table);
+        l_from := unit_layout(p_ts, p_item);
         l_space := free_layout(p_ts);
         LOOP
             l_tries := l_tries + 1;
@@ -2627,7 +2639,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             -- Where the copy went, against the free space it had (console.log).
             say(epfpg.epf_log.c_info, 'MOVE_PLACEMENT',
                 SUBSTR(l_owner || '.' || l_table || ' in ' || p_ts || ': was ' || NVL(l_from, '-') || '; now '
-                       || NVL(unit_layout(p_ts, l_owner, l_table), '-') || '; before the move ' || NVL(l_space, '-'),
+                       || NVL(unit_layout(p_ts, p_item), '-') || '; before the move ' || NVL(l_space, '-'),
                        1, 2000),
                 p_owner => l_owner, p_object => l_table);
             test_pause;
@@ -2851,7 +2863,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_why := CASE WHEN l_enc = 'YES' THEN p_ts || ' is encrypted: its tables are not parked outside it'
                       WHEN g_parked + l_need > g_scratch
                       THEN 'about ' || b(l_need) || ' needed in the scratch space, ' || b(GREATEST(g_scratch - g_parked, 0))
-                           || ' of the ' || b(g_scratch) || ' allowed left' END;
+                           || ' of the ' || b(g_scratch) || ' allowed left (--scratch '
+                           || TRIM(TO_CHAR(CEIL((g_parked + l_need) * 1.1 / (256 * c_mb)) * 256)) || 'M would take it)' END;
         IF l_why IS NOT NULL THEN
             IF INSTR(NVL(l_detail, '-'), 'not parked: ') = 0 THEN
                 UPDATE epfpg.epf_reclaim_object

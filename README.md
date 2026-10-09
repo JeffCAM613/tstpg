@@ -54,6 +54,7 @@ The space a purge frees stays inside the tables: the datafiles keep their size. 
 - Oracle Database 12.2 or later (developed on 19c). In a multitenant database, connect to the PDB service.
 - The SYS password (AS SYSDBA) to install, upgrade and uninstall, to reclaim, and for `--redo-logs` and `--undo-tuning`. Everything else uses the tool's own account, EPFPG, which the install creates.
 - For a reclaim: a single-instance database (not RAC).
+- Best run from a machine on the database's own network rather than through a VPN. Every step opens a sqlplus session, and a long reclaim depends on its connection until the end: a dropped connection ends the run, which then restores what it changed. Short drops are retried for 10 minutes (`RECONNECT_S`).
 
 ## Install
 
@@ -218,7 +219,7 @@ Options:
 
 - `--tablespaces DATA,INDX` limits the reclaim to those tablespaces. By default it takes every tablespace holding segments of the application's schemas.
 - `--confirm RECYCLEBIN` lets it purge the recycle bin of those tablespaces first; without it, recycle-bin objects stop the reclaim before any change. `--confirm ARCHIVE` and `--confirm TEMP` work as for a purge.
-- `--scratch SIZE`, such as `--scratch 3G`, allows a scratch tablespace. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. The dry run shows where the scratch datafile would go and suggests a size.
+- `--scratch SIZE`, such as `--scratch 3G`, allows a scratch tablespace. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. The dry run shows where the scratch datafile would go and suggests a size: the largest table that moves and half of all that moves, plus a tenth. The scratch datafile grows only as far as the tables parked need, up to that size. A table that does not fit in what is left is reported with the size that would have taken it.
 
 The assessment checks these requirements: RECYCLEBIN, ARCHIVE, TEMP and QUOTA block the reclaim when not met (QUOTA cannot be confirmed: the owners need a space quota where their tables are written again); BACKUP and SCRATCH are advice.
 

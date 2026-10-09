@@ -508,6 +508,10 @@ BEGIN
     add_column('EPF_TS_INVENTORY', 'FILE_ID', 'NUMBER');
     add_column('EPF_TS_INVENTORY', 'TOP_BLOCK', 'NUMBER');
     add_column('EPF_TS_INVENTORY', 'EST_BYTES', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'EXTENTS', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'MIN_EXTENT', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'MAX_EXTENT', 'NUMBER');
+    add_column('EPF_TS_INVENTORY', 'LOW_BLOCK', 'NUMBER');
     create_index('EPF_TS_INVENTORY_IX',
         'CREATE INDEX epf_ts_inventory_ix ON epf_ts_inventory (run_id, tablespace_name)');
     create_index('EPF_TS_INVENTORY_FILE_IX',
