@@ -954,14 +954,17 @@ State on 2026-10-09: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps; EPFPG783
 
 | Measure | SONEPARUAT | CLUBMED8 |
 |---|---|---|
-| DATA as dumped | bigfile, one file of 41.6 GB, 39.5 GB of segments (12.4, EPFPG781) | K4 |
+| Application data | OPPAYMENTS 34 GB (tables 11.9, LOBs 14.0, indexes 8.1), OP 6.4 GB, as dumped (12.4, EPFPG781) | OP 9,201 MB, OPPAYMENTS 7,056 MB, after the suite's purges (T01, K3b) |
+| DATA before the first reclaim | as dumped, one bigfile datafile of 41.6 GB with 39.5 GB of segments (12.4); 41.7 GB after the suite's purges (R1, set I) | 18.0 GB after the suite's purges, one datafile, its highest block at 17.1 GB, 15.9 GB of segments (K4) |
+| What a reclaim of DATA moves | 688 tables, 969 indexes (set R); 691 tables, 972 indexes (set J) | 738 tables (15.4 GB, about 10.0 GB after), 175 indexes (450.5 MB); 26 segments with an INITIAL larger than needed, 2.3 GB in all (K4) |
 | Full suite | 31 of 31 in 2 h 34 min (set I, EPFPG784, 0.7.11) | 31 of 33 in 38 min 51 s, the 2 failing only their own kill check (K3, 0.8.0) |
 | Purge, PAYMENTS, cutoff 2023-09-28 | 84.7 M rows in 24 min 28 s, 17.3 us per row; redo 59.4 GB (753 B per row), undo 30.1 GB (set G, EPFPG782, 0.5.3, batch 530) | only inside the suite |
-| First reclaim of DATA after a purge | 41.7 to 11.9 GB in 6 min 25 s, 6 tables moved (R2, EPFPG781, 0.7.2); 41.7 to 14.2 GB in 7 min 32 s with 12.4 GB of segments, a LOB holding the top (set I, EPFPG784, 0.7.11) | K5 |
-| DATA down to its segments | 11.1 to 7.6 GB with 7.5 GB of segments, R7 PASS, 54 min, 55 of 688 tables moved (R10, EPFPG781, 0.7.9, after the passes of R2 to R9) | K5 |
-| Reclaim with parking (`--scratch 3G`) | 14.2 to 2.2 GB, 118 tables parked, until the network dropped at 1 h 37 min (J4, EPFPG784, 0.8.0); the restore took 11 min, 972 indexes rebuilt in 7 min: 6.7 GB with 6.5 GB of segments (J5) | K5 |
-| Forecast of DATA after a reclaim, against the result | 8.9 GB (R1) against 7.6 GB (R10); 8.4 GB (J3) against 6.7 GB (J5) | K4 against K5 |
-| Time to move a small table; to park one | about 45 s; about 1 s (J4) | K5 |
+| First reclaim of DATA after a purge | 41.7 to 11.9 GB in 6 min 25 s, 6 tables moved (R2, EPFPG781, 0.7.2); 41.7 to 14.2 GB in 7 min 32 s with 12.4 GB of segments, a LOB holding the top (set I, EPFPG784, 0.7.11) | 18.0 to 9.9 GB in 5 min 10 s with 9.4 GB of segments, PASS WITH WARNINGS: 62 of 738 tables moved, 13 parked (K5, 0.8.0, `--scratch 3G`) |
+| DATA down to its segments | 11.1 to 7.6 GB with 7.5 GB of segments, R7 PASS, 54 min, 55 of 688 tables moved (R10, EPFPG781, 0.7.9, after the passes of R2 to R9) | 0.5 GB above them in one run, R7 WARN: OP.HISTO_REGLEMENT (2.2 GB) came back to the top after each of its 3 moves and did not fit in the scratch space left (1.5 GB of 3 GB) (K5) |
+| Reclaim with parking (`--scratch 3G`) | 14.2 to 2.2 GB, 118 tables parked, until the network dropped at 1 h 37 min (J4, EPFPG784, 0.8.0); the restore took 11 min, 972 indexes rebuilt in 7 min: 6.7 GB with 6.5 GB of segments (J5) | 13 tables parked (1.5 GB), all back in 20 s; 175 indexes rebuilt in about 20 s (K5) |
+| Forecast of DATA after a reclaim, against the result | 8.9 GB (R1) against 7.6 GB (R10); 8.4 GB (J3) against 6.7 GB (J5) | 10.7 GB (K4) against 9.9 GB (K5) |
+| Time to move a small table; to park one | about 45 s; about 1 s (J4) | under 1 s; about 1 s (K5) |
+| A worker whose client is gone | J4's network drop ended its session too (J5 found no worker) | its call went on; the restore waited for it (WORKER_RUNNING), then went on (T18J, K3b) |
 | A session killed with KILL SESSION IMMEDIATE | ends at once (T18D, T18I, sets I and J) | marked for kill first, ORA-00031 (K3) |
 | The reclaim lab tests: the lab's own tables, so they measure the connection, not the data | T01 29 s, T18D 6 min 32 s, T18I 5 min 12 s, T18F 37 s (J2, EPFPG784, 0.8.0) | T01 2 s, T18D 58 s, T18I 54 s, T18F 6 s; T18J 6 min 59 s with its 120 s pause (K3b, 0.8.0) |
 

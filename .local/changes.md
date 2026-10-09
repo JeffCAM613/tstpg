@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - K4 to K6 on TANM7883: DATA 18.0 to 9.9 GB in 5 min; a restore waits for a worker whose client is gone; K7 still to run
+
+The digest of K6 (K3b's session, K4, K5):
+- **K4** (R-000049, dry run, 34 s, PASS): DATA 18.0 GB in one datafile, its highest block at 17.1 GB, 15.9 GB of segments; 738 tables to move (15.4 GB, about 10.0 GB after), 175 indexes (450.5 MB); forecast 10.7 GB. INITIAL_OVERSIZED: 26 segments, 2.3 GB in all (OP.SPEC_TRT_LOG: INITIAL 936 MB for about nothing).
+- **K5** (R-000050, `--scratch 3G`, PASS WITH WARNINGS, exit 2, 5 min 10 s): DATA 18.0 to 9.9 GB (8.1 GB given back) with 9.4 GB of segments, below the forecast; R1 to R6, R8 and R9 PASS. The compaction took 2 min 57 s: 49 tables moved, 13 parked (1.5 GB of the 3 GB), all returned, EPF_PARK_50 dropped; the index rebuilds about 20 s, the verify 39 s. R7 WARN, 0.5 GB above the segments: OP.HISTO_REGLEMENT (2.2 GB) came back to the top after each of its 3 moves, and PARK_SKIPPED: about 2.2 GB needed, 1.5 GB of the 3 GB left. The suggestion of K4 is the largest table plus a tenth (check_requirements), which leaves out what is parked before it.
+- **Speed**: a small table moves in under a second (6 in 2 s, 10 in 8 s), a park takes about 1 s. J4 on EPFPG784, the same 0.8.0: about 45 s per small move (14 in 11 min 25 s), a park about 1 s. A park also runs the loop's free_bytes (DBA_FREE_SPACE), refresh_item (DBA_EXTENTS) and trim_ts; other_ts does nothing for a table whose segments are all in DATA. What only a move runs: unit_layout before and after it (DBA_EXTENTS, `e.tablespace_name = p_ts` where refresh_item has a subquery), free_layout (DBA_FREE_SPACE) and the move within DATA itself. One of these is slow on EPFPG784. console.log shows which: each UNIT_MOVED ends with its time (from the start of the move to the trim after it, the first unit_layout and free_layout included), and the MOVE_PLACEMENT after it comes once the second unit_layout is done. The digest folds these lines; the status page asks for J4's.
+- **T18J's notes**: the restore waited for the worker whose client was gone (WORKER_RUNNING) and went on when its call ended; the path of 0.7.2, seen on Oracle for the first time. T18D and T18I: the worker session marked for kill (ORA-00031), ended soon after.
+- T01 on TANM7883: OP 9,201 MB, OPPAYMENTS 7,056 MB, after 6 purges of the suite.
+
+K7 (T18K) is still to run: the one test of a client lost as a whole while a table is parked. The run is left RUNNING, the next run marks it ABANDONED once its lock is free, and `reclaim --restore` brings the table back. T18J showed the wait for an orphan worker and J5 a later restore of parked tables; T18K covers the rest of that path.
+
+Proposed next version: the slow part of a move made cheap (which one: J4's console.log), each move's event giving where its time went; the scratch suggestion covering what is parked before the largest table, and PARK_SKIPPED giving the size that would have taken the table. Then set L on EPFPG781. PLAN.md 12.7: the CLUBMED8 column.
+
+How to test: K7 on TANM7883 (status page).
+
 ## 2026-10-09 - K3b on TANM7883: the lab tests pass; T18K after the digest (K7); set L planned on EPFPG781
 
 K3b on TANM7883 (0.8.0, from the remote server; log `logs/tests/2026-10-09_075844_TANM7883`): `--only T18D,T18I,T18J,T18F`, 5 of 5 in 9 min after the pull, the same as the run before it. T18D and T18I pass with the kill check of 9171309. T18J passed in 6 min 59 s: the worker's sqlplus ended by the test, the restore in the same run, nothing left behind. T18K was not in the command. The same lab tests took 5 to 7 times as long on EPFPG784 from the test machine (T18D 6 min 32 s against 58 s): the lab holds the tool's own tables, so the difference is the connection, not the data.
