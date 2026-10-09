@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-09 - K3b on TANM7883: the lab tests pass; T18K after the digest (K7); set L planned on EPFPG781
+
+K3b on TANM7883 (0.8.0, from the remote server; log `logs/tests/2026-10-09_075844_TANM7883`): `--only T18D,T18I,T18J,T18F`, 5 of 5 in 9 min after the pull, the same as the run before it. T18D and T18I pass with the kill check of 9171309. T18J passed in 6 min 59 s: the worker's sqlplus ended by the test, the restore in the same run, nothing left behind. T18K was not in the command. The same lab tests took 5 to 7 times as long on EPFPG784 from the test machine (T18D 6 min 32 s against 58 s): the lab holds the tool's own tables, so the difference is the connection, not the data.
+
+T18K runs after K6's digest (K7 on the status page, with a digest of its own). A digest covers the latest test session and the wrapper runs started after it, so a test session started after K5 would leave K4 and K5 out of it; and while K5 runs, the lab's reclaim would be refused (another run holds the lock).
+
+K4, the dry run on TANM7883, ran without `--verbose`; its output is still to be read (K6's digest includes it). K5 is running.
+
+Set L (status page): set K's steps on EPFPG781, a fresh SONEPARUAT dump: the suite, a dry run, one reclaim with `--scratch`, the digest. No SONEPARUAT run has yet taken DATA to its segments in one reclaim (set I stopped at 14.2 GB, J4 lost its connection, R10 got there after earlier passes), and set L compares both sources on the same steps. After set K is read, and after the faster moves if K5 calls for them.
+
+Test databases now: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps, EPFPG783 is new and empty, EPFPG784 is being emptied; set D (ARCHIVELOG, optional) leaves EPFPG784 for another copy. PLAN.md 12.7: these states, set L, how a killed session ends and the lab timings per source.
+
+How to test: K5, K6, then K7 on TANM7883; set L on EPFPG781 later.
+
 ## 2026-10-09 - Test databases by data source (PLAN.md 12.7)
 
 Every set before K ran on dumps of SONEPARUAT (EPFPG781 to EPFPG784); TANM7883 (set K) holds a dump of CLUBMED8. PLAN.md 12.7 records which database holds which data, where the wrapper ran, and the main figures per source: the suite, a purge, the reclaims, the forecast against the result, the time per move. It is there to compare the tool on other clients' data; set K fills the CLUBMED8 column.

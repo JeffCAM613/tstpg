@@ -950,6 +950,8 @@ Each test database is a dump of one client's database. How fast the tool runs an
 | EPFPG781, EPFPG782, EPFPG783, EPFPG784 | SONEPARUAT | the test machine, a Windows client: about 15 s per connection; the network dropped during J4 | every set before K |
 | TANM7883 | CLUBMED8 | a remote server close to the database | K |
 
+State on 2026-10-09: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps; EPFPG783 is new and empty; EPFPG784 is being emptied for later runs. Set L runs set K's steps on EPFPG781 (the suite, a dry run, one reclaim with `--scratch`): a like-for-like comparison, and the one result no SONEPARUAT run has shown yet, DATA down to its segments in one reclaim.
+
 | Measure | SONEPARUAT | CLUBMED8 |
 |---|---|---|
 | DATA as dumped | bigfile, one file of 41.6 GB, 39.5 GB of segments (12.4, EPFPG781) | K4 |
@@ -960,6 +962,8 @@ Each test database is a dump of one client's database. How fast the tool runs an
 | Reclaim with parking (`--scratch 3G`) | 14.2 to 2.2 GB, 118 tables parked, until the network dropped at 1 h 37 min (J4, EPFPG784, 0.8.0); the restore took 11 min, 972 indexes rebuilt in 7 min: 6.7 GB with 6.5 GB of segments (J5) | K5 |
 | Forecast of DATA after a reclaim, against the result | 8.9 GB (R1) against 7.6 GB (R10); 8.4 GB (J3) against 6.7 GB (J5) | K4 against K5 |
 | Time to move a small table; to park one | about 45 s; about 1 s (J4) | K5 |
+| A session killed with KILL SESSION IMMEDIATE | ends at once (T18D, T18I, sets I and J) | marked for kill first, ORA-00031 (K3) |
+| The reclaim lab tests: the lab's own tables, so they measure the connection, not the data | T01 29 s, T18D 6 min 32 s, T18I 5 min 12 s, T18F 37 s (J2, EPFPG784, 0.8.0) | T01 2 s, T18D 58 s, T18I 54 s, T18F 6 s; T18J 6 min 59 s with its 120 s pause (K3b, 0.8.0) |
 
 ---
 
