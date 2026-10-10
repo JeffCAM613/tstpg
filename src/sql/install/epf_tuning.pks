@@ -1,15 +1,16 @@
 CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
 -- ============================================================================
--- EPF Data Purge - Instance tuning for purges (opt-in)
+-- EPF Data Purge - Instance tuning for purges
 -- ============================================================================
 -- A purge writes about 1 KB of redo and about half as much undo per deleted
--- row. Two opt-in actions keep that from stalling the purge or growing the
--- disk footprint:
---   redo  enlarge_redo replaces undersized online redo log groups for a
---         purge, so the session does not wait on 'log file switch (checkpoint
---         incomplete)', and records them; redo_restore puts the original
---         groups back after the purge.
---   undo  undo_apply lowers undo_retention (SCOPE=MEMORY) and limits the
+-- row. Two actions keep that from stalling the purge or growing the disk
+-- footprint:
+--   redo  (opt-in) enlarge_redo replaces undersized online redo log groups
+--         for a purge, so the session does not wait on 'log file switch
+--         (checkpoint incomplete)', and records them; redo_restore puts the
+--         original groups back after the purge. set_redo sets the online
+--         logs to a size the DBA chooses, kept after the call.
+--   undo  (every purge) undo_apply lowers undo_retention (SCOPE=MEMORY) and limits the
 --         growth of the undo datafiles for the duration of a purge, so
 --         committed undo is reused instead of growing the undo tablespace.
 --         With autoextensible undo datafiles Oracle keeps undo for the longest
@@ -68,6 +69,20 @@ CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
     --      the next call.
     -- Does nothing when nothing is recorded.
     PROCEDURE redo_restore;
+
+    -- Sets the online redo logs to p_groups groups of p_size_mb, the DBA's
+    -- choice, kept after the call (nothing is recorded to put back), such as
+    -- the size they had before a tool replaced them:
+    --   1. keeps up to p_groups groups that already have that size; adds the
+    --      others under the lowest free group numbers (members as
+    --      enlarge_redo names them, so group 1 is redo01.log; REUSE when such
+    --      a file is still there),
+    --   2. switches logs and checkpoints until each other group is INACTIVE
+    --      (and archived in ARCHIVELOG mode), drops it and deletes its files;
+    --      a group that stays in use is kept and reported.
+    -- Nothing changes when the logs already are so. Refused while groups a
+    -- purge replaced are not put back (redo_restore first).
+    PROCEDURE set_redo(p_size_mb IN NUMBER, p_groups IN NUMBER);
 
     -- Growth limit of the undo tablespace during a purge in bytes: the largest
     -- of its current size, setting undo_cap_mb and 4 x p_batch_undo (the undo

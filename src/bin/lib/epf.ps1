@@ -235,12 +235,11 @@ Options
   --compact            shrink the purged tables afterwards (purge only)
   --redo-logs          larger online redo logs for the purge (4 x 1 GB)
                        when one batch does not fit; the original groups
-                       are put back at the end (SYS)
-  --undo-tuning        lower undo_retention and limit undo growth (4 GB by
-                       default) for the purge; restored at the end (SYS)
-                       With preflight or --dry-run, --redo-logs and
-                       --undo-tuning are checked as planned; nothing is
+                       are put back at the end (SYS). With preflight or
+                       --dry-run it is checked as planned; nothing is
                        changed
+  --undo-tuning        accepted, changes nothing: every purge runs with undo
+                       tuning (see Undo tuning below)
   --max-redo SIZE      the most redo one run of the plan may write, such as
                        500M or 20G (preflight, and the wizard's purge): the
                        plan splits the purge into runs of at most that much,
@@ -264,14 +263,28 @@ Options
 Requirements and choices
   The preflight checks six requirements: archive space, undo, TEMP, index
   space, redo logs and backup. Run it without --non-interactive and it asks,
-  for each one not met, how to meet it (undo tuning, larger redo logs, the
-  backup choice, a confirmation by the DBA, or stop), then the batch size,
-  and checks again. The answers are saved with the preflight and its plan:
-  the purges of the plan follow them. Options on the command line
-  (--batch-size, --backup, --confirm, --undo-tuning, --redo-logs) are choices
-  too. A purge does not start while a blocking requirement (archive, undo,
-  TEMP, backup) is not met. A dry run simulates the purge and predicts its
-  outcome.
+  for each one not met, how to meet it (larger redo logs, a smaller batch,
+  the backup choice, a confirmation by the DBA, or stop), then the batch
+  size, and checks again. The answers are saved with the preflight and its
+  plan: the purges of the plan follow them. Options on the command line
+  (--batch-size, --backup, --confirm, --redo-logs) are choices too. A purge
+  does not start while a blocking requirement (archive, undo, TEMP, backup)
+  is not met. A dry run simulates the purge and predicts its outcome.
+
+Undo tuning (every purge; SYS)
+  Every row a purge deletes writes undo: 31.7 GB for 89 M rows on one test
+  copy. Oracle keeps committed undo for undo_retention, and with
+  autoextensible undo datafiles for as long as the longest call runs; a
+  purge is one long call, so the undo tablespace would grow by tens of GB
+  (27.6 GB in one purge), and its datafiles never shrink by themselves. For
+  the purge, undo tuning keeps undo 60 s and caps the undo tablespace at the
+  largest of its size, 4 GB and 4 batches of undo: each batch commits, so
+  the purge reuses its own undo instead. At the end undo_retention and the
+  cap are restored and the datafiles resized back as far as Oracle has
+  released them. It does not slow the purge. Meanwhile a long query of
+  another session can fail with ORA-01555 (snapshot too old): purge in a
+  quiet window. It needs the SYS password; an undo tablespace with RETENTION
+  GUARANTEE has to be set to NOGUARANTEE by the DBA first.
 
 Plan of smaller runs
   The preflight also plans the purge: one run, or several when the archive
@@ -303,8 +316,8 @@ Reclaim
 
 Environment
   EPF_PASSWORD         EPFPG password
-  EPF_SYS_PASSWORD     SYS password (install, uninstall, reclaim, --redo-logs,
-                       --undo-tuning)
+  EPF_SYS_PASSWORD     SYS password (install, uninstall, reclaim, and every
+                       purge: undo tuning, --redo-logs)
 
 While a run is shown, Ctrl+C requests a graceful stop: the purge stops after
 its current batch (a reclaim after its current table) and the run ends with
@@ -1653,7 +1666,7 @@ function Get-PurgeContext {
     param($Login, [string]$Action, $Plan = $null)
     $ctx = [pscustomobject]@{
         Cred = $Login; SysCred = $null; Retention = ''; Cutoff = ''; Depth = ''; Mode = ''; BatchSize = '';
-        DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $false; Backup = ''; Confirm = '';
+        DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $true; Backup = ''; Confirm = '';
         PreflightRun = ''; MaxRedo = ''; NewPlan = $false; PlanId = ''; PlanStep = ''; PlanLabel = ''; Plan = $null
     }
     if ($Action -ne 'PURGE') {
@@ -1729,9 +1742,10 @@ function Get-PurgeContext {
         }
     }
     # Applied by a purge that deletes; a preflight or dry run checks the
-    # requirements as if they were applied.
+    # requirements as if they were applied. Undo tuning is part of every
+    # purge (--undo-tuning and UNDO_TUNING are accepted and change nothing).
     $ctx.RedoLogs = Get-Choice 'redo-logs' 'REDO_LOGS' ''
-    $ctx.UndoTuning = Get-Choice 'undo-tuning' 'UNDO_TUNING' ''
+    $ctx.UndoTuning = $true
     return $ctx
 }
 
@@ -2007,12 +2021,13 @@ function Get-TableLines {
     return ,$out.ToArray()
 }
 
-# What a purge kept on disk while it ran: the DISK line of its report.
+# What a purge kept on disk while it ran and the time it waited for log
+# switches: the DISK and WAITS lines of its report.
 function Get-DiskLines {
     param([string]$Report)
     $out = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in ($Report -split "`r?`n")) {
-        if ($line -match '^ DISK  ') { $out.Add($line.TrimEnd()) }
+        if ($line -match '^ (DISK|WAITS)  ') { $out.Add($line.TrimEnd()) }
     }
     return ,$out.ToArray()
 }
@@ -2304,10 +2319,12 @@ function Read-Requirement {
                 $undoMax -gt 0 -and $undoMax -lt $batch) {
                 Write-Out ('   A batch of ' + $batch + ' needs more undo than the tablespace holds 4 times; the batch size question offers a smaller one.')
             }
-            $answer = Read-Option @('Undo tuning for the purge: undo kept 60 s and its growth capped, restored after (SYS)',
-                                    'Accept the growth: the DBA confirms the disk has room for it') `
+            # Undo tuning is part of every purge: what is left is the batch size
+            # or room the DBA gives the undo tablespace.
+            $answer = Read-Option @('A smaller batch: the batch size question below offers one',
+                                    'The DBA confirms the undo tablespace has room for 4 batches') `
                                   'Stop here: make room in the undo tablespace, then run the preflight again' '1'
-            if ($answer -eq '1') { $Ctx.UndoTuning = $true; return 'CHANGED' }
+            if ($answer -eq '1') { return 'SAME' }
             if ($answer -eq '2') { Add-Confirm $Ctx 'UNDO'; return 'CHANGED' }
             return 'STOP:make room in the undo tablespace, then run the preflight again.'
         }
@@ -2352,10 +2369,6 @@ function Invoke-Choices {
     # The run holds the choices it was started with until they are saved.
     $held = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
     Write-Section 'CHOICES'
-    if ($advice.UNDO_ACTIVE -eq 'Y' -and -not $Ctx.UndoTuning) {
-        Write-Out ' Undo tuning from an earlier run is still active.' 'Yellow'
-        $Ctx.UndoTuning = Read-YesNo 'Keep it for this purge and restore it at the end (SYS)' $true
-    }
     while ($true) {
         $unmet = Get-Unmet $advice -All
         if ($unmet.Count -eq 0) {
@@ -2437,13 +2450,14 @@ function Show-Review {
     Write-Out ('  Batch size    ' + $batch)
     if ($Ctx.DryRun) {
         Write-Out '  Dry run       yes (simulation: nothing is deleted)'
-        if ($Ctx.UndoTuning) { Write-Out '  Undo tuning   planned (checked as applied, nothing is changed)' }
+        Write-Out '  Undo tuning   planned, as for every purge (checked as applied, nothing is changed)'
         if ($Ctx.RedoLogs) { Write-Out '  Redo logs     enlargement planned (checked as done, nothing is changed)' }
     } else {
         Write-Out '  Dry run       no'
         Write-Out ('  Compact       ' + (Get-YN $Ctx.Compact))
         Write-Out ('  Redo logs     ' + (Get-YN $Ctx.RedoLogs) + '   (4 x 1 GB for the purge when one batch needs it; the original groups put back after it)')
-        Write-Out ('  Undo tuning   ' + (Get-YN $Ctx.UndoTuning) + '   (undo_retention lowered and undo growth limited for the purge, restored at the end)')
+        Write-Out '  Undo tuning   Y   (every purge: undo kept 60 s and its tablespace capped, so it does not grow by'
+        Write-Out '                    tens of GB; restored and given back at the end; SYS)'
         Write-Out ('  Backup        ' + $backupText)
         if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the preflight finds them not met)') }
     }
@@ -2579,6 +2593,9 @@ function Invoke-PurgeAction {
     }
 
     if ($Action -eq 'PURGE' -and -not $ctx.DryRun -and ($ctx.RedoLogs -or $ctx.UndoTuning)) {
+        if ($script:Interactive) {
+            Write-Out ' Every purge runs with undo tuning, so that the undo tablespace does not grow by tens of GB: it needs SYS.'
+        }
         $ctx.SysCred = Connect-Sys $login.Tns
     }
     if ($Action -eq 'PURGE') {

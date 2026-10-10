@@ -2,6 +2,43 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-10 - Every purge with undo tuning; the time a purge waits for log switches; redo_logs.sql SET; parking stops once the scratch space is full (0.9.0, D24)
+
+Why: the user dropped the speed and disk levels proposed for a purge ("make the changes mandatory to minimize disk spike during runtime"), and decided undo tuning is part of every purge, with the reason given where the tool asks for it. On the redo logs they remembered slow purges with small logs: R-000008 on EPFPG781 (2026-09-28, 3 x 150 MB logs, about 1 GB of redo per batch, `log file switch (checkpoint incomplete)` waits) took about 62 s a batch against 19 s for R-000002, but R-000002 also had the temporary FK indexes R-000008 lacked, so the share of the logs was never measured. They asked for a test on CLUBMED8 from the remote server (set O), which needs the waits measured and small logs on TANM7883 first. And set M (entry below) ended with 69 warnings, all from parking into a full scratch space.
+
+Changes:
+- Undo tuning for every purge (D24):
+  - epf_control: every PURGE and PREFLIGHT run is created with with_undo_tuning Y, and set_choices keeps it Y (the argument is only validated).
+  - epf_purge: a purge that deletes does not start without undo tuning applied: UNDO_TUNING_MISSING after the requirements gate, nothing deleted, the run FAILED; it names undo.sql APPLY for purge.sql. The UNDO requirement loses its ROOM option ("holds the purge without tuning"); UNDO_TUNING is titled "every purge".
+  - epf.ps1: the context always has undo tuning; `--undo-tuning` and UNDO_TUNING are accepted and change nothing. The SYS password is asked for every purge that deletes, after one line saying why (interactive). The wizard's UNDO question offers a smaller batch, the DBA's confirmation or stop; the question about tuning left active by an earlier run is gone (it is kept and restored at the end). The review explains it in two lines. Help: a section "Undo tuning (every purge; SYS)" with why (31.7 GB of undo for 89 M rows; Oracle keeps it for the longest call with autoextensible undo; 27.6 GB of growth in one purge without tuning; datafiles never shrink by themselves), what it does, that it costs no speed, ORA-01555 for other sessions, RETENTION GUARANTEE.
+  - undo.sql header: every purge; RESTORE gives back what undo and temp grew.
+- Log switch waits:
+  - epf_purge: switch_wait reads this session's waits on `log file switch%` (V$SESSION_EVENT, dynamic SQL, NULL when it cannot be read) before and after each module's batches; MODULE_END ends with `log switch waits HH:MI:SS (n%)`; before PURGE_END, REDO_WAITS: `log switches HH:MI:SS of HH:MI:SS in batches (n%), online logs 3 x 200.0 MB`, and either `larger online logs make fewer switches (--redo-logs)` (at least 1 s and 1%) or `the online logs keep up with the purge`.
+  - grants.sql: SELECT on V_$SESSION_EVENT.
+  - epf_report: print_disk prints a WAITS line after DISK; epf.ps1's summary shows it (Get-DiskLines).
+- epf_tuning.set_redo (new), `redo_logs.sql SET <size_mb> <groups>`: the online logs become exactly that, kept, nothing recorded: groups of that size kept (lowest numbers first), the others added under the lowest free group numbers whose file names no group uses (redo01.log for group 1, REUSE), the rest dropped once inactive (switch, checkpoint, archived in ARCHIVELOG) and their files deleted; REDO_SET at the end. Refused while a purge's replacement is not put back. For logs enlarged without a record (earlier versions, the previous tool) and for set O.
+- epf_reclaim: once less than 64 MB of the scratch space is left, or a park fails for lack of space, SCRATCH_FULL (INFO, once) with the size that would have taken the table, and no more parking in the run; a space error with room left is a PARK_SKIPPED (INFO), not a PARK_FAILED warning. Set M's 69 warnings would have been one INFO line.
+- Tests: T09B (new): purge.sql without undo.sql APPLY ends with UNDO_TUNING_MISSING and no batch. T08B, T11, T13, T14, T16 and T13B run without `--undo-tuning` (T12B keeps it: still accepted); T14 and T13B no longer confirm UNDO, and check undo tuning instead (req.UNDO met by UNDO_TUNING); T15 checks the restore. T13 checks the log switch waits in MODULE_END and WAITS and notes both lines; T01 notes the online redo logs found; the digest keeps T13's notes and, for a purge run outside the suite, MODULE_END, DISK_USE, REDO_WAITS (and SCRATCH_FULL for a reclaim).
+- README (undo tuning section, WAITS, redo_logs.sql SET, SCRATCH_FULL), docs/README.html, PLAN.md (principle 9, 6.8, 6.9, 6.10, D18, D24, tests, 12.7). Tool version 0.9.0.
+
+Not done: the switch to a new undo tablespace under the same name (on request). The levels of speed against disk (dropped). `--redo-logs` stays as it is until set O.
+
+Checked here: the wrapper and the suite parse (T00 rules); T00, T01, T06 and T07 against the fake sqlplus; the 64 output checks. Not compiled here.
+
+How to test: set O on TANM7883 (status page): install 0.9.0, the precheck, `redo_logs.sql SET 200 3`, a plan of PAYMENTS in two halves, the first half with the small logs, `redo_logs.sql SET 1024 4`, the second half; compare the two WAITS lines and the speed. A later full suite: T09B, and T13's WAITS.
+
+## 2026-10-10 - Set M on TANM7884 (CLUBMEDEPF, from the remote server, 0.8.3): 35 of 35; DATA 23.7 to 14.4 GB in one reclaim, R7 PASS
+
+The digest of set M (TM.log). It ran 0.8.3: 0.8.4 was committed but not pushed (GitHub's main was 2b72eba), so the suite installed 0.8.3.
+- **M3, the suite:** 35 of 35 in 53 min 52 s; T13 (PAYMENTS) 4 min 47 s. T01: OP 15,160 MB, OPPAYMENTS 7,752 MB, a fresh copy. T18D and T18I: the worker marked for kill (ORA-00031), as on the other databases from this server. T18J and T18K: the restore waited for the worker whose client was gone.
+- **M4, the dry run** (R-000061, 28 s): DATA 23.7 GB in one datafile, highest block at 22.5 GB, 21.3 GB of segments; 738 tables move (15.4 GB, about 10.1 GB after), 1000 indexes (6.0 GB), 2 segments stay; forecast 15.7 GB. 41 segments with an INITIAL larger than needed (2.5 GB; OP.SPEC_TRT_LOG 936 MB).
+- **M5, the reclaim** (R-000062, 8.0 GB of scratch space allowed, 23 min 58 s, PASS WITH WARNINGS): **DATA 23.7 to 14.4 GB, 9.3 GB given back, with 14.3 GB of segments: R7 PASS** in one run; R1 to R6, R8 and R9 PASS, 206 of 738 tables moved.
+  - The compaction, 7 min 45 s: 116 tables moved and 90 parked, DATA down to 4.4 GB, where OP.MCH_MESSAGES (moved 10 times) held the top.
+  - The scratch space was full about 3 min in (6.7 GB at 07:10, 9 MB left at 07:11). After that 15 tables were skipped (the PARK_SKIPPED lines asked for 9216M to 9472M) and 69 failed to park, 68 with ORA-01658 (no room for the INITIAL extent) and one with ORA-01652: the run's 69 warnings, about 3.5 min of attempts. Nothing was lost; those tables stayed in place. 0.9.0 stops parking once the scratch space is full.
+  - The 90 came back in 1 min 47 s (DATA to 9.3 GB); the 1000 indexes were rebuilt in 13 min 8 s (DATA grown once to 15.2 GB for about 5.7 GB of them; SONEPARUAT's 969 took 4 min 9 s for 3.2 GB), trimmed to 14.4 GB.
+- **What TANM7884 kept:** the user's listing after the run: data.dbf 14.4 GB, undotbs01.dbf 5.3 GB, temp01.dbf 3.1 GB, four online logs of 1 GB (redo04 to redo07; the original groups are gone), system, sysaux, epfpg_data01.dbf (the tool's own 128 MB, removed with the uninstall), 28.6 GB in all. 0.8.3 replaced the logs for good when the wizard enlarged them (T11) and gave nothing back of undo and temp; 0.8.4 records and puts back, but only what it changes itself. To put TANM7884 back: `redo_logs.sql SET` with the sizes its first T01 printed (REDO|group lines in the session's test.log), and the undo and temp resized once.
+- PLAN.md 12.7: the CLUBMEDEPF column.
+
 ## 2026-10-09 - A purge puts the online redo logs back and gives back undo and temp growth (0.8.4, D23)
 
 Why: after set L, EPFPG781 took 21.8 GB on disk for 8.5 GB of datafiles of its own: undo 6.3 GB, temp 3.0 GB, 4 redo logs of 1 GB. The user asked that a run leave the instance as it found it, with the original names. Their choices: the original redo log groups put back after a purge; the undo and temp growth resized back as far as Oracle allows, a switch to a new undo tablespace under the same name only on request. And no change to logs that are already large enough. Names: a dropped log group's number and file names, a dropped tablespace's name and file name, can all be used again; nothing has to become undotbs2, undotbs3.

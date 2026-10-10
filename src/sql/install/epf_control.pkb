@@ -269,6 +269,8 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         END IF;
 
         IF l_action IN ('PURGE', 'PREFLIGHT') THEN
+            -- Every purge runs with undo tuning.
+            l_undo  := 'Y';
             l_mode  := normalize_mode(NVL(p_mode, 'FULL'));
             l_depth := scope_depth(l_mode, normalize_depth(NVL(p_depth, 'ALL')));
 
@@ -564,9 +566,11 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
         l_backup  VARCHAR2(10)  := norm_backup(p_backup_choice);
         l_confirm VARCHAR2(100) := norm_confirm(p_confirm);
     BEGIN
+        -- Every purge runs with undo tuning: the run keeps it planned
+        -- (l_undo only validates the argument).
         UPDATE epf_run
            SET batch_size       = l_batch,
-               with_undo_tuning = l_undo,
+               with_undo_tuning = 'Y',
                with_redo_logs   = l_redo,
                backup_choice    = l_backup,
                confirmed_reqs   = l_confirm

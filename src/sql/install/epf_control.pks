@@ -35,9 +35,11 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- The cutoff is TRUNC(SYSDATE) - p_retention_days, or p_cutoff_date when
     -- given (the retention is then the days between them; giving both is an
     -- error), so a purge run on a later day can keep the cutoff of its
-    -- preflight. p_with_undo_tuning: undo tuning is planned for the purge
-    -- (PURGE: the caller applies it unless dry run; PREFLIGHT and dry runs
-    -- check the requirements as if it were applied). p_backup_choice: CONFIRMED or NONE, how the
+    -- preflight. Every PURGE and PREFLIGHT run is created with undo tuning
+    -- planned (with_undo_tuning Y, whatever p_with_undo_tuning says): a purge
+    -- that deletes starts only once the caller applied it (epf_tuning, SYS);
+    -- PREFLIGHT and dry runs check the requirements as if it were applied;
+    -- p_with_undo_tuning Y for another action is an error. p_backup_choice: CONFIRMED or NONE, how the
     -- operator meets the BACKUP requirement without a recent RMAN backup.
     -- p_confirm: blocking requirements the operator confirms are handled
     -- although the preflight finds them not met, separated by commas: ARCHIVE,
@@ -103,9 +105,10 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     FUNCTION normalize_mode(p_mode IN VARCHAR2) RETURN VARCHAR2;
 
     -- The operator's choices for a running PURGE or PREFLIGHT run, validated
-    -- as in start_run: batch size, undo tuning and redo log sizing planned,
-    -- backup choice and confirmed requirements. A preflight keeps them as the
-    -- choices a later purge with the same scope follows.
+    -- as in start_run: batch size, redo log sizing planned, backup choice and
+    -- confirmed requirements; undo tuning stays planned (every purge runs
+    -- with it; p_with_undo_tuning is only validated). A preflight keeps them
+    -- as the choices a later purge with the same scope follows.
     PROCEDURE set_choices(
         p_run_id           IN NUMBER,
         p_batch_size       IN NUMBER,

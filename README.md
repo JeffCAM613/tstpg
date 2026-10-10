@@ -52,7 +52,7 @@ The space a purge frees stays inside the tables: the datafiles keep their size. 
 
 - A Windows machine with Windows PowerShell 5.1 and an Oracle client: `sqlplus.exe` in the PATH or in `%ORACLE_HOME%\bin`, and a TNS alias or an EZConnect string for the database.
 - Oracle Database 12.2 or later (developed on 19c). In a multitenant database, connect to the PDB service.
-- The SYS password (AS SYSDBA) to install, upgrade and uninstall, to reclaim, and for `--redo-logs` and `--undo-tuning`. Everything else uses the tool's own account, EPFPG, which the install creates.
+- The SYS password (AS SYSDBA) to install, upgrade and uninstall, to reclaim, and for every purge (its [undo tuning](#undo-tuning-every-purge), and `--redo-logs`). Everything else uses the tool's own account, EPFPG, which the install creates.
 - For a reclaim: a single-instance database (not RAC).
 - Best run from a machine on the database's own network rather than through a VPN. Every step opens a sqlplus session, and a long reclaim depends on its connection until the end: a dropped connection ends the run, which then restores what it changed. Short drops are retried for 10 minutes (`RECONNECT_S`).
 
@@ -91,7 +91,7 @@ Command-line options override the file. In the wizard, a value in the file is th
 | DRY_RUN | `--dry-run` | Y: simulate only |
 | COMPACT | `--compact` | Y: shrink the purged tables afterwards |
 | REDO_LOGS | `--redo-logs` | Y: larger online redo logs (4 x 1 GB) for the purge when one batch does not fit; the original groups are put back at the end (SYS) |
-| UNDO_TUNING | `--undo-tuning` | Y: lower undo_retention and limit the undo growth for the purge, restored at the end, and give back what undo and temp grew (SYS) |
+| UNDO_TUNING | `--undo-tuning` | Accepted and ignored: every purge runs with [undo tuning](#undo-tuning-every-purge) |
 | BACKUP | `--backup` | Without a recent RMAN backup: CONFIRMED (a backup was made another way) or NONE |
 | CONFIRM | `--confirm` | Requirements the DBA confirms are handled: ARCHIVE, UNDO, TEMP |
 | MAX_REDO | `--max-redo` | The most redo one run may write, such as 20G: the purge is split into runs |
@@ -142,7 +142,7 @@ Without `--non-interactive` it asks, for each requirement not met, how to meet i
 | Requirement | Blocking | What it checks | How to meet it |
 |---|---|---|---|
 | ARCHIVE | yes | In ARCHIVELOG mode, the archive destination has room for the purge's redo, plus 20 % | Free archive space; a [plan of smaller runs](#large-purges-a-plan-of-smaller-runs); or `--confirm ARCHIVE` when the database cannot measure the destination |
-| UNDO | yes | The undo tablespace holds four batches and the undo kept for undo_retention | `--undo-tuning`, a smaller batch size, or `--confirm UNDO` |
+| UNDO | yes | The undo tablespace holds four batches within the limit [undo tuning](#undo-tuning-every-purge) sets | A smaller batch size, room in the undo tablespace, or `--confirm UNDO` |
 | TEMP | yes | The temporary tablespace holds the purge's work keys | Room in TEMP, or `--confirm TEMP` |
 | BACKUP | yes | An RMAN database backup newer than 24 hours | A backup; or `--backup confirmed` (made another way) or `--backup none` |
 | INDEX_SPACE | no | EPFPG_DATA holds the temporary indexes the purge creates | Room in EPFPG_DATA |
@@ -175,12 +175,25 @@ src\bin\epf_purge.bat purge --non-interactive --yes --retention 365 --mode FULL 
 More options for the purge:
 
 - `--compact` shrinks the purged tables afterwards (tables with at least 20 % free inside them).
-- `--undo-tuning` lowers undo_retention and limits the growth of the undo tablespace (4 GB by default) for the purge, then restores both (SYS). It also records the size of the undo datafiles and of the temporary tablespaces, and gives back what they grew once the purge ends: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents (Oracle keeps undo extents for a while; what is left is given back by a later `src/sql/run/undo.sql RESTORE` or the next purge with undo tuning, and `status` shows it).
 - `--redo-logs` gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).
 
-A datafile does not shrink by itself: Oracle keeps the size an undo, temporary or data file grew to. Undo retention only says how long old undo is kept inside the undo tablespace.
+The end of each module and the summary show how long the batches waited for log switches, for example `WAITS  log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB`. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs (`--redo-logs`) could save.
 
-With a preflight or a dry run, `--undo-tuning` and `--redo-logs` are checked as planned; nothing is changed.
+With a preflight or a dry run, `--redo-logs` is checked as planned and undo tuning as applied; nothing is changed.
+
+### Undo tuning (every purge)
+
+Every purge runs with undo tuning, and needs the SYS password for it. Why:
+
+- Every row a purge deletes writes undo, about half as much as its redo: 31.7 GB for 89 M rows on one test copy.
+- Oracle keeps committed undo for undo_retention (900 s by default), and with autoextensible undo datafiles for as long as the longest call runs. A purge is one long call, so the undo tablespace grows by tens of GB (27.6 GB in one purge without tuning).
+- A datafile does not shrink by itself: Oracle keeps the size an undo, temporary or data file grew to. Undo retention only says how long old undo is kept inside the undo tablespace.
+
+For the purge, undo tuning sets undo_retention to 60 s (in memory only) and caps the undo tablespace at the largest of its size, 4 GB (setting undo_cap_mb) and 4 batches of undo. Each batch commits, so the purge reuses its own undo instead of growing the tablespace. It does not slow the purge.
+
+At the end it restores undo_retention and the cap, and gives back what the undo datafiles and the temporary tablespaces grew: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents. Oracle keeps undo extents for a while; what is left is given back by a later `src/sql/run/undo.sql RESTORE` or the next purge, and `status` shows it.
+
+While it is applied, a long query of another session can fail with ORA-01555 (snapshot too old): run purges in a quiet window. An undo tablespace with RETENTION GUARANTEE has to be set to NOGUARANTEE by the DBA first.
 
 ## Large purges: a plan of smaller runs
 
@@ -221,7 +234,7 @@ Options:
 
 - `--tablespaces DATA,INDX` limits the reclaim to those tablespaces. By default it takes every tablespace holding segments of the application's schemas.
 - `--confirm RECYCLEBIN` lets it purge the recycle bin of those tablespaces first; without it, recycle-bin objects stop the reclaim before any change. `--confirm ARCHIVE` and `--confirm TEMP` work as for a purge.
-- `--scratch SIZE`, such as `--scratch 3G`, allows a scratch tablespace. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. The dry run shows where the scratch datafile would go and suggests a size: the largest table that moves and half of all that moves, plus a tenth. The scratch datafile grows only as far as the tables parked need, up to that size. A table that does not fit in what is left is reported with the size that would have taken it.
+- `--scratch SIZE`, such as `--scratch 3G`, allows a scratch tablespace. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. The dry run shows where the scratch datafile would go and suggests a size: the largest table that moves and half of all that moves, plus a tenth. The scratch datafile grows only as far as the tables parked need, up to that size. A table that does not fit in what is left is reported with the size that would have taken it; once the scratch space is full, no more table is parked in that run (SCRATCH_FULL, with the size that would have taken the next one), and the tables that cannot move lower stay where they are.
 
 The assessment checks these requirements: RECYCLEBIN, ARCHIVE, TEMP and QUOTA block the reclaim when not met (QUOTA cannot be confirmed: the owners need a space quota where their tables are written again); BACKUP and SCRATCH are advice.
 
@@ -319,8 +332,9 @@ The tool runs the scripts of `src\sql\run`. Some of them can be run directly in 
 | `status.sql` | EPFPG | The status, as `epf_purge.bat status` |
 | `stop.sql <run_id or ACTIVE>` | EPFPG | A graceful stop |
 | `preflight.sql NEW` | EPFPG | A standalone preflight with the default parameters |
-| `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand; RESTORE also gives back what undo and temp grew |
+| `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand (APPLY before `purge.sql`, which does not start without it); RESTORE also gives back what undo and temp grew |
 | `redo_logs.sql RESTORE` | SYS AS SYSDBA | Puts back the online redo log groups replaced for a purge |
+| `redo_logs.sql SET <size_mb> <groups>` | SYS AS SYSDBA | Sets the online redo logs to that many groups of that size and keeps them so, such as `SET 200 3` for the size they had before another tool enlarged them. New groups take the lowest free numbers (group 1 is redo01.log); the others are dropped once Oracle no longer needs them, with their files |
 
 For example (SQL*Plus asks for the password):
 

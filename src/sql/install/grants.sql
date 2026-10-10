@@ -57,7 +57,7 @@ BEGIN
                          'DBA_TAB_PRIVS', 'DBA_RESUMABLE', 'DATABASE_PROPERTIES',
                          'V_$SESSION', 'V_$SESSION_LONGOPS', 'V_$TRANSACTION', 'V_$LOCKED_OBJECT',
                          'V_$DATABASE', 'V_$INSTANCE', 'V_$VERSION', 'V_$PARAMETER',
-                         'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME',
+                         'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME', 'V_$SESSION_EVENT',
                          'V_$UNDOSTAT', 'DBA_UNDO_EXTENTS', 'V_$ARCHIVE_DEST', 'V_$RECOVERY_FILE_DEST', 'V_$ASM_DISKGROUP',
                          'V_$RMAN_BACKUP_JOB_DETAILS', 'DBA_TEMP_FREE_SPACE', 'DBA_TEMP_FILES',
                          'DBA_TRIGGERS', 'DBA_ROLES', 'DBA_ROLE_PRIVS', 'DBA_SYS_PRIVS', 'DBA_OBJECT_TABLES',

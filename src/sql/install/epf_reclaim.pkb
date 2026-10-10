@@ -7,6 +7,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     c_mb      CONSTANT NUMBER       := 1048576;
     -- A move of at least this many bytes is reported OK, a smaller one INFO.
     c_big     CONSTANT NUMBER       := 67108864;
+    -- The scratch tablespace is full once less than this is left of the
+    -- scratch space allowed (one extent of 64 MB).
+    c_park_room CONSTANT NUMBER     := 67108864;
 
     TYPE t_flags IS TABLE OF BOOLEAN INDEX BY PLS_INTEGER;
     TYPE t_counts IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
@@ -2708,6 +2711,19 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- Parking
     -- ------------------------------------------------------------------
 
+    -- Parking stops for the rest of the run once the scratch tablespace is
+    -- full (g_park_off): said once (SCRATCH_FULL), with the scratch size that
+    -- would have taken unit p_unit (about p_need). The tables that cannot
+    -- move lower stay where they are from then on.
+    PROCEDURE scratch_full(p_unit IN VARCHAR2, p_need IN NUMBER) IS
+    BEGIN
+        g_park_off := 'the scratch space is full';
+        say(epfpg.epf_log.c_info, 'SCRATCH_FULL',
+            g_park_ts || ' is full (' || b(g_parked) || ' of the ' || b(g_scratch) || ' allowed): no more table is '
+            || 'parked in this run; ' || p_unit || ' needed about ' || b(p_need) || ' (--scratch '
+            || TRIM(TO_CHAR(CEIL((g_parked + p_need) * 1.1 / (256 * c_mb)) * 256)) || 'M would have taken it)');
+    END scratch_full;
+
     -- Creates this run's scratch tablespace EPF_PARK_<run> when it does not
     -- exist yet, recorded first (EPF_INSTANCE_CHANGE, RECLAIM_SCRATCH; the
     -- restore path drops it): a bigfile tablespace next to the first datafile
@@ -2859,6 +2875,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
           FROM epfpg.epf_ts_inventory
          WHERE run_id = g_run.run_id AND item_id = p_item;
         l_need := l_est + extent_for(l_est, 'SYSTEM', NULL);
+        IF g_parked > 0 AND g_scratch - g_parked < c_park_room THEN
+            scratch_full(l_owner || '.' || l_table, l_need);
+            RETURN FALSE;
+        END IF;
         SELECT MAX(encrypted) INTO l_enc FROM dba_tablespaces WHERE tablespace_name = p_ts;
         l_why := CASE WHEN l_enc = 'YES' THEN p_ts || ' is encrypted: its tables are not parked outside it'
                       WHEN g_parked + l_need > g_scratch
@@ -2920,6 +2940,18 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                        detail = SUBSTR('not parked: ' || l_msg || NVL2(detail, '; ' || detail, NULL), 1, 4000)
                  WHERE run_id = g_run.run_id AND item_id = p_item;
                 COMMIT;
+                -- No room for it in the scratch tablespace: nothing is lost,
+                -- the table stays where it is.
+                IF is_space_error(l_code) THEN
+                    IF g_scratch - g_parked < GREATEST(c_park_room, l_need) THEN
+                        scratch_full(l_owner || '.' || l_table, l_need);
+                    ELSE
+                        say(epfpg.epf_log.c_info, 'PARK_SKIPPED',
+                            l_owner || '.' || l_table || ' (' || p_why || ') is not parked: no room for it in '
+                            || g_park_ts || ' (' || l_msg || ')', p_owner => l_owner, p_object => l_table);
+                    END IF;
+                    RETURN FALSE;
+                END IF;
                 say(epfpg.epf_log.c_warn, 'PARK_FAILED',
                     l_owner || '.' || l_table || ' (' || p_why || ') could not be parked in ' || g_park_ts || ': ' || l_msg
                     || ' [' || l_sql || ']', p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));

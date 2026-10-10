@@ -812,14 +812,15 @@ $script:TestList = @(
     'T08  Preflight through the wrapper: the output by default, every line in console.log',
     'T08B Preflight with questions: choices saved, a dry run follows them',
     'T09  preflight.sql NEW',
+    'T09B purge.sql without undo tuning: refused before anything is deleted',
     'T10  Dry run of all modules through the wrapper: simulation and expected outcome',
     'T10B Requirements gate: a purge without a backup choice does not start; S stops the preflight questions',
-    'T11  PAYMENTS purge through the wizard with redo log sizing and undo tuning; graceful stop',
+    'T11  PAYMENTS purge through the wizard with redo log sizing; undo tuning without the option; graceful stop',
     'T12  State after the stop: undo restored, nothing pending',
     'T12B PAYMENTS dry run: the simulation T13 is compared with',
-    'T13  PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result',
+    'T13  PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result; log switch waits',
     'T13B Plan of smaller runs: LOGS in steps (--max-redo); continue, refuse, rehearse, close',
-    'T14  LOGS purge with compaction, non-interactive, undo growth confirmed',
+    'T14  LOGS purge with compaction, non-interactive, undo tuning without the option',
     'T15  BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive',
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
     'T17  Reports through the wrapper: latest, and the stopped run',
@@ -906,6 +907,10 @@ function Invoke-Suite {
         # Whether the copy suits the tests of the application's purge: it holds
         # the application's data, and this tool has not purged it before
         # (T11 to T13 and T17 stop a purge after its third batch).
+        # The online logs as found, for T19 and the digest.
+        if ($script:State.RedoStart.Count -gt 0) {
+            Write-TestLog ('  note online redo logs: ' + ($script:State.RedoStart -join ', '))
+        }
         if ($apps.Count -gt 0) {
             Write-TestLog ('  note application data: ' + ($apps -join ', '))
         } else {
@@ -1043,9 +1048,9 @@ function Invoke-Suite {
         # One day more than the suite's retention: no other purge of the
         # suite has this scope, so none follows these choices.
         $retention = [string]([int]$script:Retention + 1)
-        # With these options every requirement is met: the only question is
-        # the batch size.
-        $r = Invoke-Wrapper @('preflight', '--retention', $retention, '--mode', 'LOGS', '--undo-tuning', '--redo-logs',
+        # With these options (and undo tuning, part of every purge) every
+        # requirement is met: the only question is the batch size.
+        $r = Invoke-Wrapper @('preflight', '--retention', $retention, '--mode', 'LOGS', '--redo-logs',
                               '--backup', 'none') -Answers @('200') -TimeoutMin 30
         Assert-Exit $r @(0, 2)
         Assert-Match $r $script:ChoicesSection
@@ -1079,6 +1084,20 @@ function Invoke-Suite {
         $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'preflight.sql') @('NEW'))) -TimeoutMin 30
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'RUN_END'
+    }
+
+    Invoke-Test 'T09B' 'purge.sql without undo tuning: refused before anything is deleted' {
+        # Every purge runs with undo tuning: purge.sql without undo.sql APPLY
+        # ends FAILED before its first batch. Old LOGS rows only (twice the
+        # suite's retention), should it ever delete.
+        $r = Invoke-Sql 'SYS' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'undo.sql') @('STATUS')))
+        Assert-Exit $r @(0)
+        Assert-NoMatch $r 'active change'
+        $retention = [string]([int]$script:Retention * 2)
+        $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'purge.sql') @('NEW', $retention, '-', 'LOGS', '-', 'N', 'N'))) -TimeoutMin 30
+        Assert-Exit $r @(1)
+        Assert-Match $r 'UNDO_TUNING_MISSING'
+        Assert-NoMatch $r 'BATCH_PROGRESS'
     }
 
     Invoke-Test 'T10' 'Dry run of all modules through the wrapper: simulation and expected outcome' {
@@ -1142,7 +1161,7 @@ function Invoke-Suite {
         }
     }
 
-    Invoke-Test 'T11' 'PAYMENTS purge through the wizard with redo log sizing and undo tuning; graceful stop' {
+    Invoke-Test 'T11' 'PAYMENTS purge through the wizard with redo log sizing; undo tuning without the option; graceful stop' {
         $script:State.StopCount = 0
         $script:State.StopSent = $false
         $script:State.InPurge = $false
@@ -1161,10 +1180,11 @@ function Invoke-Suite {
         }
         # Wizard answers: retention, mode, dry run, compact; in the preflight's
         # CHOICES the batch size (Enter: the recommendation for 1 GB logs);
-        # final confirmation. --redo-logs, --undo-tuning and --backup none meet
-        # the requirements, so no other question is asked.
+        # final confirmation. --redo-logs, --backup none and undo tuning (part
+        # of every purge, without --undo-tuning) meet the requirements, so no
+        # other question is asked.
         $answers = @($script:Retention, 'FULL', 'N', 'N', '', 'yes')
-        $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
+        $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
         Assert-Exit $r @(3)
@@ -1229,6 +1249,7 @@ function Invoke-Suite {
     Invoke-Test 'T12B' 'PAYMENTS dry run: the simulation T13 is compared with' {
         $batch = $script:State.StopBatch
         if ($batch -eq '' -or $batch -eq '-') { $batch = $script:PayBatch }
+        # --undo-tuning is still accepted; it changes nothing.
         $list = @('purge', '--non-interactive', '--retention', $script:Retention, '--depth', 'PAYMENTS', '--dry-run',
                   '--undo-tuning', '--backup', 'none')
         if ($batch -ne '') { $list += @('--batch-size', $batch) }
@@ -1250,10 +1271,10 @@ function Invoke-Suite {
         }
     }
 
-    Invoke-Test 'T13' 'PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result' {
+    Invoke-Test 'T13' 'PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result; log switch waits' {
         $batch = $script:State.StopBatch
         if ($batch -eq '' -or $batch -eq '-') { $batch = $script:PayBatch }
-        $list = @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--depth', 'PAYMENTS', '--undo-tuning',
+        $list = @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--depth', 'PAYMENTS',
                   '--backup', 'none')
         if ($batch -ne '') { $list += @('--batch-size', $batch) }
         $r = Invoke-Wrapper $list -TimeoutMin 240 -StopOnTimeout
@@ -1267,6 +1288,12 @@ function Invoke-Suite {
         Assert-Match $r 'MODULE_END +PAYMENTS DONE: [\d,]+ rows deleted in \d\d:\d\d:\d\d; '
         Assert-Match $r ' DISK +(undo at most|redo: |archived logs )'
         Write-Note $r 'undo at most \S+ of \S+ \S+ \(\d+%\)' 'the most undo the purge held, against its limit'
+        # The time the batches waited for log switches: per module and for the
+        # purge (WAITS); the figures go to the digest as notes.
+        Assert-Match $r 'MODULE_END +PAYMENTS DONE: .*log switch waits \d\d:\d\d:\d\d \(\d+%\)'
+        Assert-Match $r ' WAITS +log switches \d\d:\d\d:\d\d of \d\d:\d\d:\d\d in batches \(\d+%\)'
+        if ($r.Output -match '(?m)MODULE_END +(PAYMENTS DONE: .*?)\s*$') { Write-TestLog ('  note ' + $Matches[1]) }
+        if ($r.Output -match '(?m)^ WAITS +(.*?)\s*$') { Write-TestLog ('  note ' + $Matches[1]) }
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
@@ -1324,7 +1351,7 @@ function Invoke-Suite {
         # Older LOGS rows only (twice the suite's retention), so T14 still
         # finds rows to purge. No plan is open to start with.
         $retention = [string]([int]$script:Retention * 2)
-        $options = @('--retention', $retention, '--mode', 'LOGS', '--backup', 'none', '--confirm', 'UNDO')
+        $options = @('--retention', $retention, '--mode', 'LOGS', '--backup', 'none')
         $r = Invoke-Wrapper @('plan', '--close', '--non-interactive', '--yes')
         Assert-Exit $r @(0)
         $r = Invoke-Wrapper (@('preflight', '--non-interactive') + $options) -TimeoutMin 30
@@ -1386,7 +1413,7 @@ function Invoke-Suite {
         $run = Get-Run $r 'PURGE'
         Assert-Manifest $run 'mode' '^LOGS$'
         Assert-Manifest $run 'backup' '^NONE$'
-        Assert-Manifest $run 'confirmed' '^UNDO$'
+        Assert-Manifest $run 'undo_tuning' '^Y$'
         Assert-Manifest $run 'check.P1' '^PASS'
         Assert-Manifest $run 'plan_step' '^1$'
         Assert-Manifest $run 'plan_done' '^1$'
@@ -1422,19 +1449,21 @@ function Invoke-Suite {
         Assert-Match $r ('PLAN ' + [regex]::Escape($label) + '  CLOSED: 1 of ' + $steps + ' steps done')
     }
 
-    Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive, undo growth confirmed' {
-        # --confirm UNDO: no undo tuning (no SYS); the undo tablespace may grow.
+    Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive, undo tuning without the option' {
+        # No --undo-tuning: every purge runs with it (SYS), and it meets UNDO.
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS',
-                              '--compact', '--backup', 'none', '--confirm', 'UNDO') -TimeoutMin 90 -StopOnTimeout
+                              '--compact', '--backup', 'none') -TimeoutMin 90 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'PURGE COMPACT DONE'
+        Assert-Match $r 'UNDO TUNING \(SYS\)'
+        Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
         Write-Note $r 'COMPACTED' 'tables compacted (none when an earlier run already compacted them)'
         $run = Get-Run $r 'PURGE'
         foreach ($check in @('P1', 'P3', 'P6')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Assert-Manifest $run 'check.P8' '^(PASS|WARN)'
         Assert-Manifest $run 'compact' '^Y$'
-        Assert-Manifest $run 'confirmed' '^UNDO$'
-        Assert-Manifest $run 'req.UNDO' '^MET\|Y\|(ROOM|CONFIRMED)$'
+        Assert-Manifest $run 'undo_tuning' '^Y$'
+        Assert-Manifest $run 'req.UNDO' '^MET\|Y\|UNDO_TUNING$'
     }
 
     Invoke-Test 'T15' 'BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive' {
@@ -1442,6 +1471,7 @@ function Invoke-Suite {
                               '--depth', 'BANK_STATEMENTS', '--backup', 'none') -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'LOB values cleared'
+        Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
         $run = Get-Run $r 'PURGE'
         foreach ($check in @('P1', 'P3', 'P6')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
         Write-Note $r 'BASICFILE LOB segments' 'BASICFILE LOB note in the report'
@@ -1451,7 +1481,7 @@ function Invoke-Suite {
         # Menu answers: 1 Purge, retention, mode, dry run, compact, batch size (in
         # the preflight's CHOICES), confirmation.
         $answers = @('1', $script:Retention, 'FULL', 'N', 'N', '', 'yes')
-        $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--undo-tuning', '--backup', 'none') -Answers $answers `
+        $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'REDO_UNCHANGED|REDO_RESTORED'
@@ -1976,25 +2006,27 @@ function Invoke-Suite {
 # ----------------------------------------------------------------------------
 # Digest (--digest): what to send back after a test session, instead of its
 # full log, in as few lines as a diagnosis needs. The summary; the notes and
-# failed checks of the reclaim tests and of every test that failed, with the
-# lines naming an error; then, for each compaction of the session, each run of
-# a test that failed and each run in logs\ started after the session (a
-# reclaim of an application tablespace): a line for the run, one for its
-# checks, and its key events, one line each (a move with where its copy went,
-# where each datafile stopped, the result per tablespace, steps of 30 s or
-# more, every warning and error). Written to logs\digest.txt and copied to the
-# clipboard; the full logs stay as they are.
+# failed checks of the reclaim tests, of T13 (the PAYMENTS purge) and of every
+# test that failed, with the lines naming an error; then, for each compaction
+# of the session, each run of a test that failed and each run in logs\
+# started after the session (a purge, or a reclaim of an application
+# tablespace): a line for the run, one for its checks, and its key events,
+# one line each (a module purged with its time and waits, a move with where
+# its copy went, where each datafile stopped, the result per tablespace,
+# steps of 30 s or more, every warning and error). Written to
+# logs\digest.txt and copied to the clipboard; the full logs stay as they are.
 # ----------------------------------------------------------------------------
 
 # Event codes of a run's console.log that the digest keeps, besides every
-# warning and error and the steps of 30 s or more: of an assessment, and of a
-# compaction.
+# warning and error and the steps of 30 s or more: of an assessment, of a
+# compaction and of a purge.
 $script:DigestAssess = @('TS_ASSESSED', 'INITIAL_OVERSIZED', 'NO_TARGET')
 $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_MOVED', 'MOVE_PLACEMENT',
                           'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
-                          'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW', 'RETURN_FAILED',
-                          'SCRATCH_DROPPED', 'SCRATCH_KEPT')
+                          'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
+                          'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT')
+$script:DigestPurge = @('MODULE_END', 'DISK_USE', 'REDO_WAITS', 'STOP_HONORED')
 # The wrapper's lines that say why a run failed (Add-DigestRun): errors of
 # its sessions, lost connections, the monitor, an early end and its restore.
 $script:DigestTrouble = 'ORA-\d{5}|TNS-\d{5}|SP2-\d{4}|did not answer|did not finish|ended before|could not|' +
@@ -2130,9 +2162,10 @@ function Add-DigestRun {
     }
     $codes = $script:DigestCompact
     if ($mode -eq 'ASSESS') { $codes = $script:DigestAssess }
+    if ([string]$manifest['action'] -eq 'PURGE') { $codes = $script:DigestPurge }
     if ($Brief) {
         $codes = @('FILE_DONE', 'RECLAIM_RESULT', 'STOP_HONORED', 'UNIT_PARKED', 'UNIT_RETURNED', 'PARK_FAILED',
-                   'PARK_UNAVAILABLE', 'RETURN_GREW', 'RETURN_FAILED', 'SCRATCH_KEPT')
+                   'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'RETURN_GREW', 'RETURN_FAILED', 'SCRATCH_KEPT')
     }
     # The key events as entries: a move with its placement; a run of growths
     # of one datafile as one; a room making said again left out.
@@ -2304,7 +2337,7 @@ function Invoke-Digest {
         }
         foreach ($id in $order) {
             $failed = ([string]$status[$id] -eq 'FAIL')
-            if (-not $failed -and -not $id.StartsWith('T18') -and $id -ne 'T01') { continue }
+            if (-not $failed -and -not $id.StartsWith('T18') -and $id -ne 'T01' -and $id -ne 'T13') { continue }
             $kept = New-Object 'System.Collections.Generic.List[string]'
             foreach ($line in $lines[$id]) {
                 if (($line -match '^\s+note ' -and $line -notmatch '^\s+note probe [A-F]:') -or $line -match ': FAILED\s*$' -or

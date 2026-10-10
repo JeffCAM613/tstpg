@@ -1612,16 +1612,23 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
     END print_forecast_result;
 
     -- What a purge kept on disk while it ran (DISK_USE): the most undo it held
-    -- against the undo tablespace's limit, and where its redo went.
+    -- against the undo tablespace's limit, and where its redo went; then the
+    -- time its batches waited for log switches (REDO_WAITS).
     PROCEDURE print_disk IS
+        l_first BOOLEAN := TRUE;
     BEGIN
-        FOR d IN (SELECT message
-                    FROM epf_event
-                   WHERE run_id = g_run.run_id AND event_code = 'DISK_USE'
-                   ORDER BY event_id DESC
-                   FETCH FIRST 1 ROWS ONLY) LOOP
-            put;
-            put(' DISK      ' || d.message);
+        FOR d IN (SELECT event_code, message
+                    FROM (SELECT event_code, message,
+                                 ROW_NUMBER() OVER (PARTITION BY event_code ORDER BY event_id DESC) AS rn
+                            FROM epf_event
+                           WHERE run_id = g_run.run_id AND event_code IN ('DISK_USE', 'REDO_WAITS'))
+                   WHERE rn = 1
+                   ORDER BY CASE event_code WHEN 'DISK_USE' THEN 1 ELSE 2 END) LOOP
+            IF l_first THEN
+                put;
+                l_first := FALSE;
+            END IF;
+            put(CASE d.event_code WHEN 'DISK_USE' THEN ' DISK      ' ELSE ' WAITS     ' END || d.message);
         END LOOP;
     END print_disk;
 

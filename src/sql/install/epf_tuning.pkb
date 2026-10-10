@@ -431,6 +431,172 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END IF;
     END redo_restore;
 
+    PROCEDURE set_redo(p_size_mb IN NUMBER, p_groups IN NUMBER) IS
+        l_bytes      NUMBER;
+        l_log_mode   VARCHAR2(12);
+        l_omf        VARCHAR2(4000);
+        l_count      NUMBER;
+        l_same       NUMBER;
+        l_other      NUMBER;
+        l_left       NUMBER;
+        l_taken      NUMBER;
+        l_number     NUMBER := 0;
+        l_name       VARCHAR2(1000);
+        l_members    VARCHAR2(4000);
+        l_ref        SYS.ODCIVARCHAR2LIST;
+        l_files      SYS.ODCIVARCHAR2LIST;
+        l_old_files  SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
+        l_keep       SYS.ODCINUMBERLIST;
+        l_candidates SYS.ODCINUMBERLIST;
+        l_removed    BOOLEAN := FALSE;
+    BEGIN
+        check_instance;
+        IF p_size_mb IS NULL OR p_size_mb <> TRUNC(p_size_mb) OR p_size_mb NOT BETWEEN 64 AND 16384 THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Log size must be a whole number of MB between 64 and 16384, got: '
+                                            || p_size_mb);
+        END IF;
+        IF p_groups IS NULL OR p_groups <> TRUNC(p_groups) OR p_groups NOT BETWEEN 2 AND 16 THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Group count must be a whole number between 2 and 16, got: ' || p_groups);
+        END IF;
+        SELECT COUNT(*) INTO l_count
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item IN ('REDO_GROUP', 'REDO_ADDED');
+        IF l_count > 0 THEN
+            RAISE_APPLICATION_ERROR(-20150, 'Online redo log groups replaced for a purge are not put back yet: run '
+                                            || 'src/sql/run/redo_logs.sql RESTORE first.');
+        END IF;
+        l_bytes := p_size_mb * 1048576;
+        SELECT log_mode INTO l_log_mode FROM v$database;
+
+        -- Groups that already have the size are kept, the lowest numbers first.
+        SELECT group# BULK COLLECT INTO l_keep
+          FROM (SELECT group# FROM v$log WHERE bytes = l_bytes ORDER BY group#)
+         WHERE ROWNUM <= p_groups;
+        SELECT COUNT(*) INTO l_other
+          FROM v$log
+         WHERE group# NOT IN (SELECT column_value FROM TABLE(l_keep));
+        IF l_keep.COUNT = p_groups AND l_other = 0 THEN
+            say('OK', 'REDO_UNCHANGED', 'The online logs already are ' || p_groups || ' groups of ' || p_size_mb || ' MB.');
+            RETURN;
+        END IF;
+        show_groups('before');
+
+        -- New groups: Oracle-managed when a destination is set, otherwise one
+        -- member next to each member of the lowest-numbered existing group.
+        SELECT MAX(value)
+          INTO l_omf
+          FROM v$parameter
+         WHERE name IN ('db_create_online_log_dest_1', 'db_create_file_dest')
+           AND value IS NOT NULL;
+        SELECT member BULK COLLECT INTO l_ref
+          FROM v$logfile
+         WHERE group# = (SELECT MIN(group#) FROM v$log)
+         ORDER BY member;
+        say('INFO', 'REDO_PLAN', 'adding ' || (p_groups - l_keep.COUNT) || ' groups of ' || p_size_mb || ' MB ('
+                                 || (p_groups - l_keep.COUNT) * l_ref.COUNT * p_size_mb || ' MB of new files), then '
+                                 || 'dropping ' || l_other || ' other groups');
+        FOR i IN 1 .. p_groups - l_keep.COUNT LOOP
+            -- The lowest free group number whose member names no group uses.
+            LOOP
+                l_number := l_number + 1;
+                SELECT COUNT(*) INTO l_taken FROM v$log WHERE group# = l_number;
+                CONTINUE WHEN l_taken > 0;
+                l_members := NULL;
+                IF l_omf IS NULL THEN
+                    FOR m IN 1 .. l_ref.COUNT LOOP
+                        l_name := CASE WHEN SUBSTR(l_ref(m), 1, 1) = '+'
+                                       THEN SUBSTR(l_ref(m), 1, INSTR(l_ref(m) || '/', '/') - 1)
+                                       ELSE dir_of(l_ref(m)) || 'redo' || LPAD(l_number, 2, '0')
+                                            || CASE WHEN l_ref.COUNT > 1 THEN CHR(96 + m) END || '.log'
+                                  END;
+                        SELECT COUNT(*) INTO l_taken FROM v$logfile WHERE member = l_name;
+                        EXIT WHEN l_taken > 0;
+                        l_members := l_members || CASE WHEN m > 1 THEN ', ' END || ''''
+                                     || REPLACE(l_name, '''', '''''') || '''';
+                    END LOOP;
+                END IF;
+                EXIT WHEN l_taken = 0;
+            END LOOP;
+            EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE GROUP ' || l_number
+                              || CASE WHEN l_members IS NOT NULL THEN ' (' || l_members || ')' END
+                              || ' SIZE ' || p_size_mb || 'M'
+                              || CASE WHEN l_members IS NOT NULL AND INSTR(l_members, '''+') = 0 THEN ' REUSE' END;
+            l_keep.EXTEND;
+            l_keep(l_keep.COUNT) := l_number;
+            say('INFO', 'REDO_GROUP_ADDED', 'group ' || l_number || ', ' || p_size_mb || ' MB: '
+                                            || NVL(l_members, 'Oracle-managed file'));
+        END LOOP;
+
+        -- The other groups, dropped once Oracle no longer needs them.
+        FOR r IN 1 .. c_rounds LOOP
+            SELECT group# BULK COLLECT INTO l_candidates
+              FROM v$log
+             WHERE group# NOT IN (SELECT column_value FROM TABLE(l_keep))
+               AND status IN ('INACTIVE', 'UNUSED')
+               AND (l_log_mode = 'NOARCHIVELOG' OR archived = 'YES')
+             ORDER BY group#;
+            FOR k IN 1 .. l_candidates.COUNT LOOP
+                SELECT member BULK COLLECT INTO l_files FROM v$logfile WHERE group# = l_candidates(k);
+                BEGIN
+                    EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE GROUP ' || l_candidates(k);
+                    FOR f IN 1 .. l_files.COUNT LOOP
+                        l_old_files.EXTEND;
+                        l_old_files(l_old_files.COUNT) := l_files(f);
+                    END LOOP;
+                    say('INFO', 'REDO_GROUP_DROPPED', 'group ' || l_candidates(k));
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        -- ORA-01623 current, ORA-01624 needed for crash recovery,
+                        -- ORA-00350 not archived yet: retried after the next switch.
+                        IF SQLCODE NOT IN (-1623, -1624, -350) THEN
+                            RAISE;
+                        END IF;
+                END;
+            END LOOP;
+            SELECT COUNT(*) INTO l_left
+              FROM v$log
+             WHERE group# NOT IN (SELECT column_value FROM TABLE(l_keep));
+            EXIT WHEN l_left = 0;
+            EXECUTE IMMEDIATE CASE WHEN l_log_mode = 'ARCHIVELOG' THEN 'ALTER SYSTEM ARCHIVE LOG CURRENT'
+                                   ELSE 'ALTER SYSTEM SWITCH LOGFILE' END;
+            EXECUTE IMMEDIATE 'ALTER SYSTEM CHECKPOINT';
+        END LOOP;
+        FOR g IN (SELECT group#, status
+                    FROM v$log
+                   WHERE group# NOT IN (SELECT column_value FROM TABLE(l_keep))
+                   ORDER BY group#) LOOP
+            say('WARN', 'REDO_GROUP_KEPT', 'group ' || g.group# || ' (' || g.status || ') is still in use; run '
+                                           || 'redo_logs.sql SET again to drop it');
+        END LOOP;
+
+        -- Files of the dropped groups (Oracle removes Oracle-managed files itself).
+        FOR k IN 1 .. l_old_files.COUNT LOOP
+            IF SUBSTR(l_old_files(k), 1, 1) = '+' THEN
+                say('INFO', 'REDO_FILE_KEPT', l_old_files(k) || ' is an ASM file; remove it with ASMCMD if it remains');
+            ELSIF NOT (l_omf IS NOT NULL AND INSTR(l_old_files(k), 'o1_mf_') > 0) THEN
+                remove_file(l_old_files(k));
+                l_removed := TRUE;
+            END IF;
+        END LOOP;
+        IF l_removed THEN
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP DIRECTORY ' || c_directory;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    -- ORA-04043: the directory was never created (every removal failed before it).
+                    IF SQLCODE <> -4043 THEN
+                        RAISE;
+                    END IF;
+            END;
+        END IF;
+
+        show_groups('after');
+        SELECT COUNT(*), COUNT(CASE WHEN bytes = l_bytes THEN 1 END) INTO l_count, l_same FROM v$log;
+        say(CASE WHEN l_count = l_same THEN 'OK' ELSE 'WARN' END, 'REDO_SET',
+            l_same || ' online redo log groups of ' || p_size_mb || ' MB'
+            || CASE WHEN l_count > l_same THEN ', ' || (l_count - l_same) || ' other still in use' END);
+    END set_redo;
+
     -- ------------------------------------------------------------------
     -- Undo
     -- ------------------------------------------------------------------

@@ -1,10 +1,12 @@
 -- ============================================================================
--- EPF Data Purge - Undo tuning for a purge (opt-in)
+-- EPF Data Purge - Undo tuning for a purge (every purge)
 -- ============================================================================
 -- Purpose : Before a purge, lowers undo_retention and limits the growth of the
 --           undo datafiles, so committed undo is reused instead of growing the
 --           undo tablespace; after the purge, restores the recorded original
 --           values (epf_tuning.undo_apply / undo_restore / undo_status).
+--           epf_purge.bat does both; a purge started with purge.sql does not
+--           start without APPLY first (UNDO_TUNING_MISSING).
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/run/undo.sql <APPLY|RESTORE|STATUS> [<run_id> [<preflight_run_id>]]
 --             APPLY    record, then set undo_retention to setting
 --                      undo_retention_s (SCOPE=MEMORY) and limit the growth of
@@ -15,9 +17,11 @@
 --             STATUS   print the undo tablespace and the active changes
 -- Requires: SYS AS SYSDBA; single-instance, non-CDB database.
 -- Effects : APPLY/RESTORE change undo_retention (memory only) and the growth
---           limit (MAXSIZE) of the undo datafiles; no file is resized. Every
---           change is recorded in EPFPG.EPF_INSTANCE_CHANGE. While applied,
---           long queries of other sessions can fail with ORA-01555.
+--           limit (MAXSIZE) of the undo datafiles; RESTORE then resizes the
+--           undo datafiles and temporary tablespaces back towards their size
+--           before, as far as Oracle has released them. Every change is
+--           recorded in EPFPG.EPF_INSTANCE_CHANGE. While applied, long
+--           queries of other sessions can fail with ORA-01555.
 -- ============================================================================
 SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED

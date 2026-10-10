@@ -139,6 +139,11 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- TRUE once reading the undo tablespace took more than a second: it is no
     -- longer read in this run, and the summaries leave undo out.
     g_undo_off   BOOLEAN := FALSE;
+    -- Time the run's batches took and, of it, the time this session waited
+    -- for log switches (switch_wait), in seconds; NULL once the waits could
+    -- not be read.
+    g_batch_s    NUMBER := 0;
+    g_switch_s   NUMBER := 0;
 
     -- ------------------------------------------------------------------
     -- Names and SQL fragments
@@ -587,6 +592,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         g_disk_limit := NULL;
         g_disk_redo  := 0;
         g_undo_off   := FALSE;
+        g_batch_s    := 0;
+        g_switch_s   := 0;
         load_registry;
         SELECT module_code BULK COLLECT INTO g_modules
           FROM epf_module
@@ -1584,6 +1591,39 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
          WHERE statistic# IN (g_redo_stat, g_undo_stat);
     END session_redo_undo;
 
+    -- Time this session has waited for log switches so far, in seconds
+    -- (V$SESSION_EVENT: 'log file switch (checkpoint incomplete)', 'log file
+    -- switch (archiving needed)', 'log file switch completion' and the like):
+    -- a full online log can be reused only once Oracle has checkpointed it
+    -- (and archived it in ARCHIVELOG mode). NULL when it cannot be read.
+    FUNCTION switch_wait RETURN NUMBER IS
+        l_micro NUMBER;
+    BEGIN
+        EXECUTE IMMEDIATE q'[SELECT NVL(SUM(time_waited_micro), 0) FROM v$session_event
+                              WHERE sid = SYS_CONTEXT('USERENV', 'SID') AND event LIKE 'log file switch%']'
+            INTO l_micro;
+        RETURN l_micro / 1000000;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END switch_wait;
+
+    -- The online logs of this instance as text, such as '3 x 200.0 MB'.
+    FUNCTION logs_text RETURN VARCHAR2 IS
+        l_text VARCHAR2(200);
+    BEGIN
+        SELECT LISTAGG(n || ' x ' || epf_util.fmt_bytes(bytes), ', ') WITHIN GROUP (ORDER BY bytes)
+          INTO l_text
+          FROM (SELECT bytes, COUNT(*) AS n
+                  FROM v$log
+                 WHERE thread# = (SELECT thread# FROM v$instance)
+                 GROUP BY bytes);
+        RETURN l_text;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END logs_text;
+
     -- p_part of p_whole as text, such as '1.3 of 4.0 GB (33%)': the unit once
     -- when both have the same.
     FUNCTION of_bytes(p_part IN NUMBER, p_whole IN NUMBER) RETURN VARCHAR2 IS
@@ -1915,6 +1955,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_sum       NUMBER := 0;
         l_start     TIMESTAMP := epf_util.now_ts;
         l_disk      VARCHAR2(400);
+        l_wait0     NUMBER;
+        l_waited    NUMBER;
+        l_batch0    TIMESTAMP;
+        l_batch_s   NUMBER;
         k           PLS_INTEGER;
     BEGIN
         SELECT table_id BULK COLLECT INTO l_roots
@@ -1970,9 +2014,16 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             IF NOT l_failed THEN
                 BEGIN
                     g_mod_peak := 0;
+                    l_wait0 := switch_wait;
+                    l_batch0 := epf_util.now_ts;
                     process_batches(p_module, l_action, l_active, l_total, l_processed, l_t_redo, l_t_undo,
                                     l_batch_res, l_redo, l_undo);
                     g_disk_redo := g_disk_redo + NVL(l_redo, 0);
+                    -- The time the batches waited for log switches.
+                    l_batch_s := epf_util.elapsed_s(l_batch0);
+                    l_waited := switch_wait - l_wait0;
+                    g_batch_s := g_batch_s + l_batch_s;
+                    g_switch_s := g_switch_s + l_waited;
                     l_failed := l_batch_res = 'FAILED';
                 EXCEPTION
                     WHEN OTHERS THEN
@@ -2010,9 +2061,14 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             l_sum := l_sum + l_processed(k);
             k := l_processed.NEXT(k);
         END LOOP;
-        -- What the module took on disk, after its batches.
+        -- What the module took on disk, after its batches, and the time they
+        -- waited for log switches.
         IF l_redo IS NOT NULL THEN
             l_disk := disk_summary(g_mod_peak, l_redo);
+        END IF;
+        IF l_waited IS NOT NULL AND l_batch_s > 0 THEN
+            l_disk := l_disk || CASE WHEN l_disk IS NOT NULL THEN '; ' END || 'log switch waits '
+                      || epf_util.fmt_duration(l_waited) || ' (' || ROUND(100 * l_waited / l_batch_s) || '%)';
         END IF;
         epf_log.event(CASE p_result WHEN 'DONE' THEN epf_log.c_ok WHEN 'STOPPED' THEN epf_log.c_warn
                                     ELSE epf_log.c_error END,
@@ -3513,14 +3569,10 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                        || ' (without it undo_retention would keep about ' || epf_util.fmt_bytes(g_undo_kept) || ')'
                    ELSE '; undo_retention keeps about ' || epf_util.fmt_bytes(g_undo_kept) END,
                 g_undo_batch, g_undo_max, l_met_by);
-        add_opt('UNDO', 'UNDO_TUNING', 1, g_undo_limit AND l_ok, 'Undo tuning (--undo-tuning)',
+        add_opt('UNDO', 'UNDO_TUNING', 1, g_undo_limit AND l_ok, 'Undo tuning (every purge)',
                 'undo kept 60 s and its growth limited'
                 || CASE WHEN g_undo_cap IS NOT NULL THEN ' to about ' || epf_util.fmt_bytes(g_undo_cap) END
                 || ' for the purge, restored after (SYS)');
-        add_opt('UNDO', 'ROOM', 2, l_ok AND NVL(g_undo_kept, 0) <= NVL(g_undo_size, 0),
-                'The undo tablespace holds the purge without tuning',
-                'the undo kept for undo_retention (about ' || epf_util.fmt_bytes(g_undo_kept) || ') fits in its '
-                || epf_util.fmt_bytes(g_undo_size) || ' without growing');
         IF NOT l_ok THEN
             add_opt('UNDO', 'SMALLER_BATCH', 3, FALSE, 'Smaller batch (--batch-size)',
                     'one batch needs ' || epf_util.fmt_bytes(g_undo_batch) || '; ' || g_undo_ts || ' can hold '
@@ -4060,13 +4112,12 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         plan_steps;
         scope_event;
         l_tuning := undo_tuning_text;
-        epf_log.info('UNDO_TUNING',
-                     CASE WHEN l_tuning IS NOT NULL THEN 'Undo tuning active: ' || l_tuning
-                          WHEN g_run.dry_run = 'Y' THEN
-                              'Dry run: nothing is deleted, so no undo is written'
-                              || CASE WHEN g_run.with_undo_tuning = 'Y' THEN '; undo tuning is planned for the purge' END
-                          ELSE 'Undo tuning not applied: the undo tablespace keeps undo for undo_retention and may '
-                               || 'grow during the purge (preflight step UNDO)' END);
+        IF l_tuning IS NOT NULL OR g_run.dry_run = 'Y' THEN
+            epf_log.info('UNDO_TUNING',
+                         CASE WHEN l_tuning IS NOT NULL THEN 'Undo tuning active: ' || l_tuning
+                              ELSE 'Dry run: nothing is deleted, so no undo is written; the purge runs with undo '
+                                   || 'tuning' END);
+        END IF;
 
         epf_log.step_start('REGISTRY');
         epf_registry.validate(l_errors, l_warnings);
@@ -4090,6 +4141,20 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
                 epf_log.error('REQUIREMENTS_NOT_MET', 'The purge did not start: blocking requirements not met: '
                                                       || l_unmet || ' (REQUIREMENTS in the report: ways to meet them)');
                 epf_log.step_skip_pending('blocking requirements not met');
+                p_status := 'FAILED';
+                RETURN;
+            END IF;
+            -- Every purge that deletes runs with undo tuning (epf_tuning,
+            -- applied as SYS before this phase): a delete writes undo for
+            -- every row, and without it Oracle keeps that undo for
+            -- undo_retention and grows the undo tablespace by tens of GB,
+            -- which its datafiles never give back by themselves.
+            IF l_tuning IS NULL THEN
+                epf_log.error('UNDO_TUNING_MISSING',
+                              'The purge did not start: undo tuning is not applied. Every purge runs with it, so that '
+                              || 'the undo tablespace does not grow: epf_purge.bat applies it (SYS); with purge.sql, '
+                              || 'run src/sql/run/undo.sql APPLY as SYS before it and undo.sql RESTORE after it');
+                epf_log.step_skip_pending('undo tuning not applied');
                 p_status := 'FAILED';
                 RETURN;
             END IF;
@@ -4173,6 +4238,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         IF undo_tuning_text IS NOT NULL THEN
             epf_log.info('UNDO_TUNING', 'Undo tuning is still active; restore it with src/sql/run/undo.sql RESTORE '
                                         || 'as SYS');
+        END IF;
+        -- The time the batches waited for log switches, for the report
+        -- (WAITS): a full online log is reused only once Oracle has
+        -- checkpointed it, so small logs make the purge wait.
+        IF g_run.dry_run = 'N' AND g_batch_s > 0 AND g_switch_s IS NOT NULL THEN
+            epf_log.event(epf_log.c_info, 'REDO_WAITS',
+                          'log switches ' || epf_util.fmt_duration(g_switch_s) || ' of '
+                          || epf_util.fmt_duration(g_batch_s) || ' in batches ('
+                          || ROUND(100 * g_switch_s / g_batch_s) || '%), online logs ' || NVL(logs_text, 'unknown')
+                          || CASE WHEN g_switch_s >= GREATEST(1, 0.01 * g_batch_s)
+                                  THEN ': larger online logs make fewer switches (--redo-logs)'
+                                  ELSE ': the online logs keep up with the purge' END,
+                          p_elapsed_s => g_switch_s);
         END IF;
         -- What the purge took on disk, for the report (DISK).
         IF g_run.dry_run = 'N' AND g_disk_redo > 0 THEN
