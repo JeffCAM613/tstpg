@@ -709,12 +709,19 @@ BEGIN
         )]');
     -- An online redo log group replaced for a purge (REDO_GROUP) or added for
     -- it (REDO_ADDED): its number, thread and members.
+    -- An undo switch in progress (epf_tuning.undo_switch): SWITCH_SWAP, target
+    -- the swap tablespace, log_members the undo tablespace switched,
+    -- original_autoextend YES for a bigfile one, original_value 1 for
+    -- RETENTION GUARANTEE, applied_value 1 when the spfile named
+    -- undo_tablespace; and one SWITCH_UNDO per datafile of it, target its
+    -- name, original_value the size it is created again at, the growth
+    -- settings, applied_value its order. Restored once the swap is dropped.
     add_column('EPF_INSTANCE_CHANGE', 'LOG_GROUP', 'NUMBER');
     add_column('EPF_INSTANCE_CHANGE', 'LOG_THREAD', 'NUMBER');
     add_column('EPF_INSTANCE_CHANGE', 'LOG_MEMBERS', 'VARCHAR2(4000)');
     set_check('EPF_INSTANCE_CHANGE', 'EPF_INSTANCE_CHANGE_CK',
               q'[item IN ('UNDO_RETENTION', 'UNDO_DATAFILE', 'RECLAIM_DATAFILE', 'RECLAIM_SCRATCH', 'REDO_GROUP',
-                          'REDO_ADDED', 'SIZE_UNDO', 'SIZE_TEMP')]');
+                          'REDO_ADDED', 'SIZE_UNDO', 'SIZE_TEMP', 'SWITCH_SWAP', 'SWITCH_UNDO')]');
 
     -- Per root tree of a preflight: eligible roots, rows per root (all the
     -- tables of the tree), and the redo and undo per root with their basis

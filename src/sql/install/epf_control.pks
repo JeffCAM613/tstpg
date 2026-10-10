@@ -107,7 +107,7 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- The operator's choices for a running PURGE or PREFLIGHT run, validated
     -- as in start_run: batch size, redo log sizing planned, backup choice and
     -- confirmed requirements; undo tuning stays planned (every purge runs
-    -- with it; p_with_undo_tuning is only validated). A preflight keeps them
+    -- with it; p_with_undo_tuning is ignored). A preflight keeps them
     -- as the choices a later purge with the same scope follows.
     PROCEDURE set_choices(
         p_run_id           IN NUMBER,

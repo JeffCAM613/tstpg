@@ -21,7 +21,8 @@ CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
 --         and 4 x the undo of one batch; a batch commits, so only the running
 --         batch needs undo that cannot be reused. undo_restore puts back the
 --         recorded original values, then gives back what the undo datafiles
---         and the temporary tablespaces grew (size_giveback). Every change
+--         and the temporary tablespaces grew (size_giveback, and undo_switch
+--         when a resize cannot give the undo back). Every change
 --         is recorded in EPFPG.EPF_INSTANCE_CHANGE before it is made, so the
 --         restore is exact even after an interrupted session. While applied,
 --         long queries of other sessions can fail with ORA-01555 (snapshot
@@ -36,6 +37,8 @@ CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
 --              call are dropped again)
 --   ORA-20152  undo tablespace with RETENTION GUARANTEE (retention cannot be
 --              lowered without failing transactions)
+--   ORA-20153  undo_apply: an undo switch is not finished (transactions of
+--              other sessions still hold the original); undo_switch carries on
 -- ============================================================================
 
     -- Ensures p_groups online redo log groups of at least p_size_mb:
@@ -107,8 +110,32 @@ CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
     -- Puts back every recorded, unrestored undo change (newest first):
     -- undo_retention, and the growth limit of an undo datafile when one is
     -- recorded. Marks each change restored. Then gives back what the undo
-    -- datafiles and temporary tablespaces grew (size_giveback).
+    -- datafiles and temporary tablespaces grew (size_giveback); when the undo
+    -- datafiles are still more than setting undo_switch_min_mb above their
+    -- size before, switches the undo tablespace (undo_switch).
     PROCEDURE undo_restore;
+
+    -- Gives back all the undo tablespace grew by creating it again under the
+    -- same names (Oracle releases undo extents on its own schedule, so a
+    -- resize alone often cannot):
+    --   1. creates the undo tablespace EPF_UNDO_SWAP next to its first
+    --      datafile and makes it the instance's undo tablespace,
+    --   2. once no undo segment of the original is in use, drops it with its
+    --      datafiles and creates it again: the same tablespace name, the same
+    --      file names (on a file system; Oracle names Oracle-managed and ASM
+    --      files), each file at its size before and with its growth settings,
+    --   3. makes it the undo tablespace again and drops EPF_UNDO_SWAP.
+    -- Sizes: p_size_mb for each datafile when given; otherwise the sizes
+    -- recorded before the purge (SIZE_UNDO, closed by the switch). Every step
+    -- is recorded first (SWITCH_SWAP, SWITCH_UNDO): a call that stops part
+    -- way, or finds transactions of other sessions still in the original
+    -- after setting undo_switch_wait_s, leaves it recorded, and the next call
+    -- (or undo_restore, undo_apply) carries on from there. Not started, with
+    -- the reason (UNDO_SWITCH_SKIPPED): without an spfile (the instance
+    -- must always start with an undo tablespace that exists), with a standby
+    -- destination, an encrypted undo tablespace, undo tuning still active,
+    -- or transactions of other sessions open after undo_switch_wait_s.
+    PROCEDURE undo_switch(p_size_mb IN NUMBER DEFAULT NULL);
 
     -- Prints the undo tablespace, its files, undo_retention and the recorded
     -- changes that are still active.

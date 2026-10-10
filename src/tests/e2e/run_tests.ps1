@@ -441,27 +441,30 @@ function Get-ScriptLine {
     return ('@"' + $Path + '" ' + ($Arguments -join ' ')).TrimEnd()
 }
 
-# Datafiles of the undo tablespace (SYS): id, autoextend, growth limit, size.
+# Datafiles of the undo tablespace (SYS): id, autoextend, growth limit, size,
+# name.
 function Get-UndoFiles {
     $r = Invoke-Sql 'SYS' @(
         'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON',
-        "SELECT 'UNDOFILE|' || file_id || '|' || autoextensible || '|' || maxbytes || '|' || bytes FROM dba_data_files WHERE tablespace_name = (SELECT UPPER(value) FROM v`$parameter WHERE name = 'undo_tablespace') ORDER BY file_id;",
+        "SELECT 'UNDOFILE|' || file_id || '|' || autoextensible || '|' || maxbytes || '|' || bytes || '|' || file_name FROM dba_data_files WHERE tablespace_name = (SELECT UPPER(value) FROM v`$parameter WHERE name = 'undo_tablespace') ORDER BY file_id;",
         'EXIT')
     $files = New-Object 'System.Collections.Generic.List[object]'
     foreach ($line in ($r.Output -split "`n")) {
-        if ($line -match '^UNDOFILE\|(\d+)\|([A-Z]+)\|(\d+)\|(\d+)') {
-            $files.Add([pscustomobject]@{ Id = $Matches[1]; Auto = $Matches[2]; Max = [decimal]$Matches[3]; Bytes = [decimal]$Matches[4] })
+        if ($line -match '^UNDOFILE\|(\d+)\|([A-Z]+)\|(\d+)\|(\d+)(\|.*)?$') {
+            $files.Add([pscustomobject]@{ Id = $Matches[1]; Auto = $Matches[2]; Max = [decimal]$Matches[3]; Bytes = [decimal]$Matches[4];
+                                          Name = ([string]$Matches[5]).TrimStart('|').Trim() })
         }
     }
     return ,$files.ToArray()
 }
 
-# Every undo datafile has the growth limit it had before the tests.
+# Every undo datafile has the growth limit it had before the tests, by its
+# name (an undo switch creates it again under the same name, another id).
 function Assert-UndoLimits {
     if ($script:State.UndoFiles.Count -eq 0) { return }
     $now = Get-UndoFiles
     foreach ($base in $script:State.UndoFiles) {
-        $match = @($now | Where-Object { $_.Id -eq $base.Id -and $_.Auto -eq $base.Auto -and $_.Max -eq $base.Max })
+        $match = @($now | Where-Object { $_.Name -eq $base.Name -and $_.Auto -eq $base.Auto -and $_.Max -eq $base.Max })
         Add-Check ($match.Count -eq 1) ('undo datafile ' + $base.Id + ' has its original growth limit (autoextend ' +
                                         $base.Auto + ', max ' + [Math]::Round($base.Max / 1MB) + ' MB)')
     }
@@ -1305,6 +1308,16 @@ function Invoke-Suite {
         $limit = [Math]::Max([double]$script:State.UndoBaseBytes, 4GB) + 64MB
         Add-Check ($bytes -le $limit) ('undo tablespace ' + [Math]::Round($bytes / 1MB) + ' MB after the purge, within ' +
                                         [Math]::Round($limit / 1MB) + ' MB')
+        # What came back after the purge: resized as far as Oracle allows, or
+        # created again under the same names (undo switch) when it still holds
+        # more than undo_switch_min_mb above the size before.
+        Assert-NoMatch $r 'UNDO_SWITCH_FAILED'
+        Write-Note $r 'UNDO_SWITCHED ' 'undo tablespace created again under the same names (undo switch)'
+        if ($r.Output -match '(?m)UNDO_SWITCH_(SKIPPED|NOT_NEEDED|PENDING) +(.*?)\s*$') {
+            Write-TestLog ('  note undo switch ' + $Matches[1].ToLower() + ': ' + $Matches[2])
+        }
+        Write-TestLog ('  note undo datafiles ' + [Math]::Round($bytes / 1MB) + ' MB after the purge, ' +
+                       [Math]::Round([double]$script:State.UndoBaseBytes / 1MB) + ' MB before the tests')
         Assert-UndoLimits
         $run = Get-Run $r 'PURGE'
         Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'

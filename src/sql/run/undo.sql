@@ -6,22 +6,34 @@
 --           undo tablespace; after the purge, restores the recorded original
 --           values (epf_tuning.undo_apply / undo_restore / undo_status).
 --           epf_purge.bat does both; a purge started with purge.sql does not
---           start without APPLY first (UNDO_TUNING_MISSING).
+--           start without APPLY first (UNDO_TUNING_MISSING). SWITCH gives back
+--           all the undo tablespace grew (epf_tuning.undo_switch).
 -- Usage   : sqlplus -L "sys@<service> AS SYSDBA" @src/sql/run/undo.sql <APPLY|RESTORE|STATUS> [<run_id> [<preflight_run_id>]]
+--           sqlplus -L "sys@<service> AS SYSDBA" @src/sql/run/undo.sql SWITCH [<size_mb>]
 --             APPLY    record, then set undo_retention to setting
 --                      undo_retention_s (SCOPE=MEMORY) and limit the growth of
 --                      the undo tablespace to the largest of its current size,
 --                      setting undo_cap_mb and 4 x the undo of one batch of
 --                      run_id (estimated by preflight_run_id, default run_id)
---             RESTORE  put back every recorded original value
+--             RESTORE  put back every recorded original value; when the undo
+--                      datafiles are still more than undo_switch_min_mb above
+--                      their size before, SWITCH as well
 --             STATUS   print the undo tablespace and the active changes
+--             SWITCH   create the undo tablespace again under the same names:
+--                      each datafile at size_mb when given, otherwise at its
+--                      size before the purge; or carry on a switch that did
+--                      not finish
 -- Requires: SYS AS SYSDBA; single-instance, non-CDB database.
 -- Effects : APPLY/RESTORE change undo_retention (memory only) and the growth
 --           limit (MAXSIZE) of the undo datafiles; RESTORE then resizes the
 --           undo datafiles and temporary tablespaces back towards their size
---           before, as far as Oracle has released them. Every change is
---           recorded in EPFPG.EPF_INSTANCE_CHANGE. While applied, long
---           queries of other sessions can fail with ORA-01555.
+--           before, as far as Oracle has released them. SWITCH uses the undo
+--           tablespace EPF_UNDO_SWAP (256 MB, dropped at the end) while it
+--           drops and creates the original again; it needs an spfile, and
+--           waits up to undo_switch_wait_s for transactions of other
+--           sessions. Every change is recorded in EPFPG.EPF_INSTANCE_CHANGE.
+--           While applied, long queries of other sessions can fail with
+--           ORA-01555.
 -- ============================================================================
 SET ECHO OFF TAB OFF FEEDBACK OFF VERIFY OFF HEADING OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
@@ -47,7 +59,8 @@ BEGIN
                                                         TO_NUMBER(NULLIF(TRIM('&pre_arg'), '-')));
         WHEN 'RESTORE' THEN epfpg.epf_tuning.undo_restore;
         WHEN 'STATUS'  THEN epfpg.epf_tuning.undo_status;
-        ELSE RAISE_APPLICATION_ERROR(-20150, 'Unknown action: &undo_action. Valid values: APPLY, RESTORE, STATUS');
+        WHEN 'SWITCH'  THEN epfpg.epf_tuning.undo_switch(TO_NUMBER(NULLIF(TRIM('&run_arg'), '-')));
+        ELSE RAISE_APPLICATION_ERROR(-20150, 'Unknown action: &undo_action. Valid values: APPLY, RESTORE, STATUS, SWITCH');
     END CASE;
 END;
 /

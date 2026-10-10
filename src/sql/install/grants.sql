@@ -59,6 +59,7 @@ BEGIN
                          'V_$DATABASE', 'V_$INSTANCE', 'V_$VERSION', 'V_$PARAMETER',
                          'V_$LOG', 'V_$LOGFILE', 'V_$LOG_HISTORY', 'V_$MYSTAT', 'V_$STATNAME', 'V_$SESSION_EVENT',
                          'V_$UNDOSTAT', 'DBA_UNDO_EXTENTS', 'V_$ARCHIVE_DEST', 'V_$RECOVERY_FILE_DEST', 'V_$ASM_DISKGROUP',
+                         'DBA_ROLLBACK_SEGS', 'V_$SPPARAMETER', 'V_$DATAFILE',
                          'V_$RMAN_BACKUP_JOB_DETAILS', 'DBA_TEMP_FREE_SPACE', 'DBA_TEMP_FILES',
                          'DBA_TRIGGERS', 'DBA_ROLES', 'DBA_ROLE_PRIVS', 'DBA_SYS_PRIVS', 'DBA_OBJECT_TABLES',
                          'DBA_QUEUE_TABLES', 'DBA_MVIEWS', 'DBA_MVIEW_LOGS', 'DBA_FLASHBACK_ARCHIVE_TABLES'))) LOOP

@@ -191,7 +191,13 @@ Every purge runs with undo tuning, and needs the SYS password for it. Why:
 
 For the purge, undo tuning sets undo_retention to 60 s (in memory only) and caps the undo tablespace at the largest of its size, 4 GB (setting undo_cap_mb) and 4 batches of undo. Each batch commits, so the purge reuses its own undo instead of growing the tablespace. It does not slow the purge.
 
-At the end it restores undo_retention and the cap, and gives back what the undo datafiles and the temporary tablespaces grew: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents. Oracle keeps undo extents for a while; what is left is given back by a later `src/sql/run/undo.sql RESTORE` or the next purge, and `status` shows it.
+At the end it restores undo_retention and the cap, and gives back what the undo datafiles and the temporary tablespaces grew: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents. Oracle keeps undo extents for hours (18 hours after the purges, one test database could only go from 5.4 to 4.6 GB), so when the undo datafiles are still more than 1 GB (setting undo_switch_min_mb) above their size before, the undo tablespace is switched:
+
+1. A small undo tablespace, EPF_UNDO_SWAP (256 MB, next to the undo datafile), becomes the instance's undo tablespace.
+2. Once none of the original's undo segments is in use, the original is dropped with its datafiles and created again: the same tablespace name, the same file names, each file at its size before and with its growth settings. On Oracle-managed files and ASM, Oracle names the files.
+3. It becomes the undo tablespace again, and EPF_UNDO_SWAP is dropped with its file.
+
+Nothing is renamed, run after run. The switch takes a few seconds. It needs an spfile, so that the instance can always start with an undo tablespace that exists, and no standby database. It waits up to 5 minutes (setting undo_switch_wait_s) for the transactions of other sessions to end; otherwise it is skipped and says why. Each step is recorded first: a switch that stops part way is carried on by `src/sql/run/undo.sql SWITCH`, the next restore or the next purge, and `status` shows it. `undo.sql SWITCH <size_mb>` switches by hand, such as on a database a tool grew before.
 
 While it is applied, a long query of another session can fail with ORA-01555 (snapshot too old): run purges in a quiet window. An undo tablespace with RETENTION GUARANTEE has to be set to NOGUARANTEE by the DBA first.
 
@@ -293,8 +299,9 @@ The status shows the active run, or the latest one, with its steps and last even
 |---|---|
 | Temporary indexes of an interrupted purge | The next purge drops them. |
 | Undo tuning still active | The purge restores it at its end; otherwise `src/sql/run/undo.sql RESTORE` as SYS (see [SQL*Plus scripts](#sqlplus-scripts)). |
+| An undo switch not finished (another session's transaction still held the original) | `src/sql/run/undo.sql SWITCH` as SYS carries it on; the next purge does too. |
 | Online redo logs replaced for a purge | The purge puts the original groups back at its end; otherwise `src/sql/run/redo_logs.sql RESTORE` as SYS. |
-| Undo or temporary space a purge or reclaim made Oracle add (information) | Given back as far as Oracle allows at the end of the run; the rest by `src/sql/run/undo.sql RESTORE` as SYS, once Oracle releases it. |
+| Undo or temporary space a purge or reclaim made Oracle add (information) | Given back as far as Oracle allows at the end of the run, undo by a switch when more than 1 GB stays; the rest by `src/sql/run/undo.sql RESTORE`, or all of the undo at once by `undo.sql SWITCH`, as SYS. |
 | Reclaim changes: datafile growth stopped, indexes still unusable, accounts still locked, tables still parked, a scratch tablespace | `src\bin\epf_purge.bat reclaim --restore`; a new reclaim restores them too. |
 
 ## Settings
@@ -310,6 +317,7 @@ The tunables are rows of the table EPFPG.EPF_SETTING. An upgrade keeps the value
 | backup_max_age_h | 24 | An RMAN backup newer than this meets BACKUP |
 | archive_margin_pct | 20 | Margin added to the redo estimate for ARCHIVE |
 | undo_cap_mb | 4096 | Undo growth limit with undo tuning |
+| undo_switch_min_mb | 1024 | After a purge, the undo tablespace is switched when its datafiles are still this much above their size before |
 | compact_min_free_pct | 20 | `--compact` shrinks the tables with at least this share free |
 | reclaim_margin_mb | 64 | Free space a reclaim leaves at the end of each datafile |
 | reclaim_growth_mb | 0 | How far a reclaim may grow a datafile above its size at the start |
@@ -333,6 +341,7 @@ The tool runs the scripts of `src\sql\run`. Some of them can be run directly in 
 | `stop.sql <run_id or ACTIVE>` | EPFPG | A graceful stop |
 | `preflight.sql NEW` | EPFPG | A standalone preflight with the default parameters |
 | `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand (APPLY before `purge.sql`, which does not start without it); RESTORE also gives back what undo and temp grew |
+| `undo.sql SWITCH [<size_mb>]` | SYS AS SYSDBA | Creates the undo tablespace again under the same names: each datafile at its size before the purge, or at `size_mb`. Also carries on a switch that stopped part way |
 | `redo_logs.sql RESTORE` | SYS AS SYSDBA | Puts back the online redo log groups replaced for a purge |
 | `redo_logs.sql SET <size_mb> <groups>` | SYS AS SYSDBA | Sets the online redo logs to that many groups of that size and keeps them so, such as `SET 200 3` for the size they had before another tool enlarged them. New groups take the lowest free numbers (group 1 is redo01.log); the others are dropped once Oracle no longer needs them, with their files |
 

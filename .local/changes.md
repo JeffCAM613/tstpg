@@ -2,6 +2,27 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-10 - The undo switch: undo given back in full under the same names, after every purge when it stays more than 1 GB above (0.9.1, D25)
+
+Why: M7 showed a resize alone cannot give the undo back: 18 hours after set M's purges, TANM7884's undo datafile could only go from 5,436 to 4,564 MB, Oracle still holding extents near its end. The user asked that the names never change from run to run (no undotbs2, undotbs3), and chose the switch at the end of every purge when the resize leaves more than about 1 GB, with `undo.sql SWITCH` by hand as well.
+
+Changes:
+- epf_tuning.undo_switch (new; `undo.sql SWITCH [<size_mb>]`), switch_undo (private, also called by undo_restore and undo_apply):
+  - Starts only with an spfile (the instance must always start with an undo tablespace that exists), no standby destination, an undo tablespace not encrypted, undo tuning restored, and no transaction of another session open (waits up to undo_switch_wait_s, 300 s); otherwise UNDO_SWITCH_SKIPPED with the reason, nothing changed.
+  - Records first: SWITCH_SWAP (the swap tablespace, the undo tablespace switched, bigfile, RETENTION GUARANTEE, whether the spfile named undo_tablespace) and one SWITCH_UNDO per datafile (name, size to create it at: size_mb or its size before the purge from SIZE_UNDO, growth settings, order).
+  - Steps, each skipped when done, so a call that stops part way is carried on by the next: EPF_UNDO_SWAP (256 MB, autoextend up to undo_cap_mb, next to the first datafile; Oracle-managed or the disk group on ASM) and undo_tablespace on it (SCOPE=BOTH); once none of the original's undo segments is in use (DBA_ROLLBACK_SEGS, waiting up to undo_switch_wait_s), the original dropped with its datafiles and created again (BIGFILE and RETENTION GUARANTEE as before; each file under its name with REUSE, its size and growth settings; Oracle names Oracle-managed and ASM files); undo_tablespace back on it (and reset in the spfile when it was not set there); EPF_UNDO_SWAP dropped with its file; the records and the SIZE_UNDO records of the files closed (UNDO_SWITCHED with the size given back).
+  - An error before the instance uses the swap drops it again and closes the switch as skipped (WARN UNDO_SWITCH_SKIPPED, nothing changed). Transactions of other sessions still in the original after the wait: UNDO_SWITCH_PENDING, the instance on EPF_UNDO_SWAP meanwhile, carried on by `undo.sql SWITCH`, the next restore or the next purge's undo_apply (which refuses with ORA-20153 while it cannot finish).
+  - undo_restore switches after size_giveback when the undo datafiles are still more than undo_switch_min_mb (1024) above their size before, or a switch is not finished; a failure is UNDO_SWITCH_FAILED (WARN) and does not fail the restore. undo_status shows a switch not finished.
+- tables.sql: items SWITCH_SWAP, SWITCH_UNDO. registry_data.sql: settings undo_switch_min_mb (1024) and undo_switch_wait_s (300); tool version 0.9.1. grants.sql: DBA_ROLLBACK_SEGS, V_$SPPARAMETER, V_$DATAFILE.
+- epf_report status: an undo switch not finished is pending (undo.sql SWITCH); the size line names SWITCH. uninstall.sql names undo.sql SWITCH among the changes to finish first.
+- epf_control.set_choices: the unused variable gone (p_with_undo_tuning ignored).
+- Tests: the undo datafiles are matched by name (a switch keeps the names, not the file ids); T13 fails on UNDO_SWITCH_FAILED and notes the switch (done, skipped and why) and the undo size after the purge against before the tests, for the digest.
+- Help (undo tuning), README (the switch, `undo.sql SWITCH`, status, settings), docs/README.html, PLAN.md 6.9, D25.
+
+Checked here: the wrapper and the suite parse; T00, T01, T06 and T07 on the fake sqlplus; the 64 output checks; the package checks (order of definition, undeclared names, private functions in SQL). Not compiled here.
+
+How to test: set O's purges (the restore after each: UNDO_RESIZED, then UNDO_SWITCHED when more than 1 GB stayed, or UNDO_SWITCH_SKIPPED with its reason); `undo.sql STATUS` afterwards: the same undo tablespace and file names, no switch pending. On TANM7884 (tool uninstalled in M8): install, `undo.sql SWITCH <T05's MB>`, uninstall.
+
 ## 2026-10-10 - Every purge with undo tuning; the time a purge waits for log switches; redo_logs.sql SET; parking stops once the scratch space is full (0.9.0, D24)
 
 Why: the user dropped the speed and disk levels proposed for a purge ("make the changes mandatory to minimize disk spike during runtime"), and decided undo tuning is part of every purge, with the reason given where the tool asks for it. On the redo logs they remembered slow purges with small logs: R-000008 on EPFPG781 (2026-09-28, 3 x 150 MB logs, about 1 GB of redo per batch, `log file switch (checkpoint incomplete)` waits) took about 62 s a batch against 19 s for R-000002, but R-000002 also had the temporary FK indexes R-000008 lacked, so the share of the logs was never measured. They asked for a test on CLUBMED8 from the remote server (set O), which needs the waits measured and small logs on TANM7883 first. And set M (entry below) ended with 69 warnings, all from parking into a full scratch space.

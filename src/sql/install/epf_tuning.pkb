@@ -2,6 +2,9 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
 
     c_rounds    CONSTANT PLS_INTEGER  := 12;
     c_directory CONSTANT VARCHAR2(30) := 'EPF_REDO_OLD';
+    -- The undo tablespace an undo switch uses while the original is created
+    -- again (undo_switch).
+    c_swap      CONSTANT VARCHAR2(30) := 'EPF_UNDO_SWAP';
 
     PROCEDURE say(p_severity IN VARCHAR2, p_code IN VARCHAR2, p_message IN VARCHAR2) IS
     BEGIN
@@ -637,6 +640,13 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                                              || ROUND(c.applied_value / 1048576) || ' MB' END
                                  || ' since ' || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS'));
         END LOOP;
+        FOR c IN (SELECT log_members, applied_at
+                    FROM epfpg.epf_instance_change
+                   WHERE restored_at IS NULL AND item = 'SWITCH_SWAP') LOOP
+            DBMS_OUTPUT.PUT_LINE('  undo switch            ' || c.log_members || ' being created again under the same '
+                                 || 'names since ' || TO_CHAR(c.applied_at, 'YYYY-MM-DD HH24:MI:SS') || ' ('
+                                 || c_swap || ' in use meanwhile); undo.sql SWITCH carries on');
+        END LOOP;
     END undo_status;
 
     FUNCTION undo_cap(p_batch_undo IN NUMBER) RETURN NUMBER IS
@@ -799,6 +809,360 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END LOOP;
     END size_giveback;
 
+    -- ------------------------------------------------------------------
+    -- Undo switch
+    -- ------------------------------------------------------------------
+
+    -- Undo segments of tablespace p_ts not offline yet: in use, or pending
+    -- offline while transactions of other sessions are open in them.
+    FUNCTION segs_in_use(p_ts IN VARCHAR2) RETURN NUMBER IS
+        l_count NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO l_count
+          FROM dba_rollback_segs
+         WHERE tablespace_name = p_ts AND status <> 'OFFLINE';
+        RETURN l_count;
+    END segs_in_use;
+
+    -- TRUE once no undo segment of p_ts is in use, waiting up to p_wait_s.
+    FUNCTION wait_offline(p_ts IN VARCHAR2, p_wait_s IN NUMBER) RETURN BOOLEAN IS
+        l_until TIMESTAMP := SYSTIMESTAMP + NUMTODSINTERVAL(p_wait_s, 'SECOND');
+    BEGIN
+        LOOP
+            IF segs_in_use(p_ts) = 0 THEN
+                RETURN TRUE;
+            END IF;
+            EXIT WHEN SYSTIMESTAMP > l_until;
+            DBMS_LOCK.SLEEP(2);
+        END LOOP;
+        RETURN FALSE;
+    END wait_offline;
+
+    -- Transactions of other sessions open now.
+    FUNCTION other_transactions RETURN NUMBER IS
+        l_count NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO l_count
+          FROM v$transaction t
+         WHERE t.ses_addr NOT IN (SELECT s.saddr FROM v$session s
+                                   WHERE s.sid = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')));
+        RETURN l_count;
+    END other_transactions;
+
+    -- The DATAFILE clause of an undo datafile: its name on a file system
+    -- (REUSE), the disk group on ASM, nothing for an Oracle-managed file
+    -- (p_omf: Oracle-managed files in use); its size and growth settings.
+    FUNCTION undo_file_spec(p_name IN VARCHAR2, p_bytes IN NUMBER, p_auto IN VARCHAR2, p_incr IN NUMBER,
+                            p_max IN NUMBER, p_unlimited IN NUMBER, p_omf IN VARCHAR2) RETURN VARCHAR2 IS
+        l_where VARCHAR2(1100);
+    BEGIN
+        l_where := CASE WHEN SUBSTR(p_name, 1, 1) = '+'
+                        THEN '''' || SUBSTR(p_name, 1, INSTR(p_name || '/', '/') - 1) || ''' '
+                        WHEN p_omf IS NOT NULL AND INSTR(p_name, 'o1_mf_') > 0 THEN NULL
+                        ELSE '''' || REPLACE(p_name, '''', '''''') || ''' ' END;
+        RETURN l_where || 'SIZE ' || CEIL(p_bytes / 1048576) || 'M'
+               || CASE WHEN l_where IS NOT NULL AND SUBSTR(p_name, 1, 1) <> '+' THEN ' REUSE' END
+               || CASE WHEN p_auto = 'YES'
+                       THEN ' AUTOEXTEND ON NEXT ' || GREATEST(CEIL(NVL(p_incr, 0) / 1024), 8) || 'K MAXSIZE '
+                            || CASE WHEN p_max >= p_unlimited THEN 'UNLIMITED'
+                                    ELSE TO_CHAR(CEIL(GREATEST(p_max, CEIL(p_bytes / 1048576) * 1048576) / 1024)) || 'K' END
+                       ELSE ' AUTOEXTEND OFF' END;
+    END undo_file_spec;
+
+    -- Starts or carries on an undo switch (undo_switch). p_auto: called by
+    -- undo_restore after a purge, which only does so when the undo is still
+    -- more than undo_switch_min_mb above its size before.
+    PROCEDURE switch_undo(p_size_mb IN NUMBER, p_auto IN BOOLEAN) IS
+        l_wait      NUMBER := NVL(epfpg.epf_util.setting_num('undo_switch_wait_s'), 300);
+        l_min       NUMBER := CASE WHEN p_auto THEN NVL(epfpg.epf_util.setting_num('undo_switch_min_mb'), 1024)
+                                   ELSE 64 END * 1048576;
+        l_bs        NUMBER;
+        l_swap_id   NUMBER;
+        l_ts        VARCHAR2(128);
+        l_current   VARCHAR2(128);
+        l_big       VARCHAR2(3);
+        l_guarantee VARCHAR2(11);
+        l_keep_guar NUMBER;
+        l_enc       VARCHAR2(3);
+        l_named     NUMBER;
+        l_started   TIMESTAMP;
+        l_omf       VARCHAR2(4000);
+        l_open      NUMBER;
+        l_spfile    NUMBER;
+        l_standby   NUMBER;
+        l_known     NUMBER := 0;
+        l_now       NUMBER := 0;
+        l_target    NUMBER := 0;
+        l_count     NUMBER;
+        l_exists    NUMBER;
+        l_new       NUMBER;
+        l_reason    VARCHAR2(1000);
+        l_first     VARCHAR2(513);
+        l_specs     VARCHAR2(32767);
+        l_files     VARCHAR2(4000);
+        l_order     PLS_INTEGER := 0;
+        l_until     TIMESTAMP;
+    BEGIN
+        check_instance;
+        SELECT TO_NUMBER(value) INTO l_bs FROM v$parameter WHERE name = 'db_block_size';
+        SELECT MAX(value)
+          INTO l_omf
+          FROM v$parameter
+         WHERE name = 'db_create_file_dest' AND value IS NOT NULL;
+        SELECT MAX(change_id) INTO l_swap_id
+          FROM epfpg.epf_instance_change
+         WHERE item = 'SWITCH_SWAP' AND restored_at IS NULL;
+
+        IF l_swap_id IS NULL THEN
+            -- A new switch: the conditions, then each datafile's size to create
+            -- it again at (p_size_mb, or its size before the purge).
+            l_ts := undo_tablespace;
+            SELECT COUNT(*) INTO l_open
+              FROM epfpg.epf_instance_change
+             WHERE restored_at IS NULL AND item IN ('UNDO_RETENTION', 'UNDO_DATAFILE');
+            SELECT COUNT(*) INTO l_spfile FROM v$parameter WHERE name = 'spfile' AND value IS NOT NULL;
+            SELECT COUNT(*) INTO l_standby FROM v$archive_dest WHERE status = 'VALID' AND target = 'STANDBY';
+            SELECT MAX(bigfile), MAX(retention), MAX(encrypted)
+              INTO l_big, l_guarantee, l_enc
+              FROM dba_tablespaces
+             WHERE tablespace_name = l_ts AND contents = 'UNDO';
+            l_reason := CASE WHEN l_open > 0 THEN 'undo tuning is still active (undo.sql RESTORE does both)'
+                             WHEN l_big IS NULL THEN 'no undo tablespace in use (undo_tablespace ' || NVL(l_ts, 'not set') || ')'
+                             WHEN l_spfile = 0 THEN 'the instance has no spfile, so it could not always start with an '
+                                                    || 'undo tablespace that exists'
+                             WHEN l_standby > 0 THEN 'a standby database receives the redo'
+                             WHEN l_enc = 'YES' THEN l_ts || ' is encrypted'
+                             WHEN l_ts = c_swap THEN 'the instance already uses ' || c_swap END;
+            IF l_reason IS NOT NULL THEN
+                say('INFO', 'UNDO_SWITCH_SKIPPED', NVL(l_ts, 'Undo') || ' not switched: ' || l_reason);
+                RETURN;
+            END IF;
+            FOR f IN (SELECT d.file_id, d.file_name, d.bytes,
+                             (SELECT MAX(c.original_value)
+                                FROM epfpg.epf_instance_change c
+                               WHERE c.item = 'SIZE_UNDO' AND c.restored_at IS NULL AND c.file_id = d.file_id
+                                 AND c.target = d.file_name) AS before
+                        FROM dba_data_files d
+                       WHERE d.tablespace_name = l_ts) LOOP
+                l_now := l_now + f.bytes;
+                l_target := l_target + CASE WHEN p_size_mb IS NOT NULL THEN p_size_mb * 1048576
+                                            ELSE LEAST(NVL(f.before, f.bytes), f.bytes) END;
+                IF f.before IS NOT NULL THEN
+                    l_known := l_known + 1;
+                END IF;
+            END LOOP;
+            IF p_size_mb IS NULL AND l_known = 0 THEN
+                IF p_auto THEN
+                    RETURN;
+                END IF;
+                RAISE_APPLICATION_ERROR(-20150, 'Nothing is recorded for the datafiles of ' || l_ts || ': give the size '
+                                                || 'in MB for each of them (undo.sql SWITCH <size_mb>).');
+            END IF;
+            IF l_now - l_target < l_min THEN
+                say('INFO', 'UNDO_SWITCH_NOT_NEEDED', l_ts || ' is ' || epfpg.epf_util.fmt_bytes(l_now) || ', '
+                                                      || epfpg.epf_util.fmt_bytes(l_target) || ' wanted: nothing to give back');
+                RETURN;
+            END IF;
+            -- Transactions of other sessions would keep the original in use.
+            l_until := SYSTIMESTAMP + NUMTODSINTERVAL(l_wait, 'SECOND');
+            LOOP
+                l_count := other_transactions;
+                EXIT WHEN l_count = 0 OR SYSTIMESTAMP > l_until;
+                DBMS_LOCK.SLEEP(5);
+            END LOOP;
+            IF l_count > 0 THEN
+                say('INFO', 'UNDO_SWITCH_SKIPPED', l_ts || ' not switched: ' || l_count || ' transactions of other '
+                                                   || 'sessions still open after ' || l_wait || ' s; run undo.sql SWITCH '
+                                                   || 'when the database is quiet');
+                RETURN;
+            END IF;
+            -- Recorded before anything changes.
+            SELECT COUNT(*) INTO l_named
+              FROM v$spparameter
+             WHERE name = 'undo_tablespace' AND isspecified = 'TRUE';
+            INSERT INTO epfpg.epf_instance_change (item, target, log_members, original_autoextend, original_value,
+                                                   applied_value, applied_at)
+            VALUES ('SWITCH_SWAP', c_swap, l_ts, l_big, CASE WHEN l_guarantee = 'GUARANTEE' THEN 1 ELSE 0 END,
+                    LEAST(l_named, 1), CAST(SYSTIMESTAMP AS TIMESTAMP));
+            FOR f IN (SELECT d.file_id, d.file_name, d.bytes, d.autoextensible, d.increment_by * l_bs AS incr_bytes,
+                             d.maxbytes,
+                             (SELECT MAX(c.original_value)
+                                FROM epfpg.epf_instance_change c
+                               WHERE c.item = 'SIZE_UNDO' AND c.restored_at IS NULL AND c.file_id = d.file_id
+                                 AND c.target = d.file_name) AS before
+                        FROM dba_data_files d
+                       WHERE d.tablespace_name = l_ts
+                       ORDER BY d.file_id) LOOP
+                l_order := l_order + 1;
+                INSERT INTO epfpg.epf_instance_change (item, target, file_id, original_value, original_autoextend,
+                                                       original_maxbytes, original_increment, applied_value, log_group,
+                                                       applied_at)
+                VALUES ('SWITCH_UNDO', f.file_name, f.file_id,
+                        CASE WHEN p_size_mb IS NOT NULL THEN p_size_mb * 1048576
+                             ELSE LEAST(NVL(f.before, f.bytes), f.bytes) END,
+                        f.autoextensible, f.maxbytes, f.incr_bytes, f.bytes, l_order, CAST(SYSTIMESTAMP AS TIMESTAMP));
+            END LOOP;
+            COMMIT;
+            SELECT MAX(change_id) INTO l_swap_id
+              FROM epfpg.epf_instance_change
+             WHERE item = 'SWITCH_SWAP' AND restored_at IS NULL;
+            say('INFO', 'UNDO_SWITCH_START', l_ts || ' ' || epfpg.epf_util.fmt_bytes(l_now) || ' -> '
+                                             || epfpg.epf_util.fmt_bytes(l_target) || ': created again under the '
+                                             || 'same names, ' || c_swap || ' in use meanwhile');
+        END IF;
+
+        -- The switch as recorded; each step is skipped when it is done.
+        SELECT log_members, original_autoextend, original_value, applied_value, applied_at
+          INTO l_ts, l_big, l_keep_guar, l_named, l_started
+          FROM epfpg.epf_instance_change
+         WHERE change_id = l_swap_id;
+        l_current := undo_tablespace;
+        SELECT COUNT(*) INTO l_exists FROM dba_tablespaces WHERE tablespace_name = l_ts;
+        -- Created again by this switch: its datafiles are newer than the record.
+        SELECT COUNT(*) INTO l_new
+          FROM dba_data_files d
+          JOIN v$datafile v ON v.file# = d.file_id
+         WHERE d.tablespace_name = l_ts AND v.creation_time >= CAST(l_started AS DATE);
+
+        IF l_new = 0 THEN
+            -- 1. and 2. The swap tablespace, next to the first datafile, and the
+            -- instance on it. Until the instance uses it nothing is lost: on an
+            -- error the swap is dropped again and the switch closed as skipped.
+            BEGIN
+                SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name = c_swap;
+                IF l_count = 0 THEN
+                    SELECT MIN(target) KEEP (DENSE_RANK FIRST ORDER BY log_group)
+                      INTO l_first
+                      FROM epfpg.epf_instance_change
+                     WHERE item = 'SWITCH_UNDO' AND restored_at IS NULL;
+                    EXECUTE IMMEDIATE 'CREATE UNDO TABLESPACE ' || c_swap || ' DATAFILE '
+                                      || CASE WHEN SUBSTR(l_first, 1, 1) = '+'
+                                              THEN '''' || SUBSTR(l_first, 1, INSTR(l_first || '/', '/') - 1) || ''' '
+                                              WHEN l_omf IS NOT NULL AND INSTR(l_first, 'o1_mf_') > 0 THEN NULL
+                                              ELSE '''' || REPLACE(dir_of(l_first), '''', '''''') || 'epf_undo_swap.dbf'' '
+                                         END
+                                      || 'SIZE 256M'
+                                      || CASE WHEN SUBSTR(l_first, 1, 1) <> '+'
+                                                   AND NOT (l_omf IS NOT NULL AND INSTR(l_first, 'o1_mf_') > 0)
+                                              THEN ' REUSE' END
+                                      || ' AUTOEXTEND ON NEXT 64M MAXSIZE '
+                                      || NVL(epfpg.epf_util.setting_num('undo_cap_mb'), 4096) || 'M';
+                    say('INFO', 'UNDO_SWAP_CREATED', c_swap || ', 256 MB, next to ' || l_first);
+                END IF;
+                IF l_current = l_ts THEN
+                    EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || c_swap || ' SCOPE = BOTH';
+                    say('INFO', 'UNDO_SWITCHED_OUT', 'undo_tablespace ' || c_swap);
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    l_reason := SQLERRM;
+                    IF NVL(undo_tablespace, '-') = c_swap THEN
+                        RAISE;
+                    END IF;
+                    SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name = c_swap;
+                    IF l_count > 0 THEN
+                        EXECUTE IMMEDIATE 'DROP TABLESPACE ' || c_swap || ' INCLUDING CONTENTS AND DATAFILES';
+                    END IF;
+                    UPDATE epfpg.epf_instance_change
+                       SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+                     WHERE restored_at IS NULL AND item IN ('SWITCH_SWAP', 'SWITCH_UNDO');
+                    COMMIT;
+                    say('WARN', 'UNDO_SWITCH_SKIPPED', l_ts || ' not switched, nothing changed: ' || l_reason);
+                    RETURN;
+            END;
+            -- 3. The original dropped once none of its undo segments is in use.
+            IF l_exists > 0 THEN
+                IF NOT wait_offline(l_ts, l_wait) THEN
+                    say('WARN', 'UNDO_SWITCH_PENDING', l_ts || ': ' || segs_in_use(l_ts) || ' undo segments still in '
+                                                       || 'use by transactions of other sessions after ' || l_wait
+                                                       || ' s; the instance uses ' || c_swap || ' meanwhile. Run '
+                                                       || 'undo.sql SWITCH again to finish.');
+                    RETURN;
+                END IF;
+                BEGIN
+                    EXECUTE IMMEDIATE 'DROP TABLESPACE ' || l_ts || ' INCLUDING CONTENTS AND DATAFILES';
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        -- ORA-30013: still in use after all.
+                        IF SQLCODE <> -30013 THEN
+                            RAISE;
+                        END IF;
+                        say('WARN', 'UNDO_SWITCH_PENDING', l_ts || ' is still in use; the instance uses ' || c_swap
+                                                           || ' meanwhile. Run undo.sql SWITCH again to finish.');
+                        RETURN;
+                END;
+                say('INFO', 'UNDO_DROPPED', l_ts || ' dropped with its datafiles');
+            END IF;
+            -- 4. The original created again: the same names, the sizes recorded.
+            FOR c IN (SELECT target, original_value, original_autoextend, original_maxbytes, original_increment
+                        FROM epfpg.epf_instance_change
+                       WHERE item = 'SWITCH_UNDO' AND restored_at IS NULL
+                       ORDER BY log_group) LOOP
+                l_specs := l_specs || CASE WHEN l_specs IS NOT NULL THEN ', ' END
+                           || undo_file_spec(c.target, c.original_value, c.original_autoextend, c.original_increment,
+                                             c.original_maxbytes,
+                                             CASE WHEN l_big = 'YES' THEN 4294967290 ELSE 4194302 END * l_bs, l_omf);
+                l_files := SUBSTR(l_files || CASE WHEN l_files IS NOT NULL THEN ', ' END || c.target || ' '
+                                  || epfpg.epf_util.fmt_bytes(c.original_value), 1, 3000);
+            END LOOP;
+            EXECUTE IMMEDIATE 'CREATE ' || CASE WHEN l_big = 'YES' THEN 'BIGFILE ' END || 'UNDO TABLESPACE ' || l_ts
+                              || ' DATAFILE ' || l_specs
+                              || CASE WHEN l_keep_guar = 1 THEN ' RETENTION GUARANTEE' END;
+            say('OK', 'UNDO_CREATED', l_ts || ' created again: ' || l_files);
+        END IF;
+        -- 5. The instance back on it; undo_tablespace left out of the spfile
+        -- again when it was not there.
+        IF NVL(undo_tablespace, '-') <> l_ts THEN
+            EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || l_ts || ' SCOPE = BOTH';
+            IF l_named = 0 THEN
+                BEGIN
+                    EXECUTE IMMEDIATE 'ALTER SYSTEM RESET undo_tablespace SCOPE = SPFILE';
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        IF SQLCODE <> -32010 THEN
+                            RAISE;
+                        END IF;
+                END;
+            END IF;
+            say('INFO', 'UNDO_SWITCHED_BACK', 'undo_tablespace ' || l_ts);
+        END IF;
+        -- 6. The swap tablespace dropped once none of its segments is in use.
+        SELECT COUNT(*) INTO l_count FROM dba_tablespaces WHERE tablespace_name = c_swap;
+        IF l_count > 0 THEN
+            IF NOT wait_offline(c_swap, l_wait) THEN
+                say('WARN', 'UNDO_SWAP_KEPT', c_swap || ' still holds transactions of other sessions after ' || l_wait
+                                              || ' s; run undo.sql SWITCH again to drop it.');
+                RETURN;
+            END IF;
+            EXECUTE IMMEDIATE 'DROP TABLESPACE ' || c_swap || ' INCLUDING CONTENTS AND DATAFILES';
+            say('INFO', 'UNDO_SWAP_DROPPED', c_swap || ' dropped with its datafile');
+        END IF;
+        -- 7. Done: the switch, and the sizes it gave back, closed.
+        SELECT NVL(SUM(applied_value), 0), NVL(SUM(original_value), 0)
+          INTO l_now, l_target
+          FROM epfpg.epf_instance_change
+         WHERE item = 'SWITCH_UNDO' AND restored_at IS NULL;
+        UPDATE epfpg.epf_instance_change
+           SET restored_at = CAST(SYSTIMESTAMP AS TIMESTAMP)
+         WHERE restored_at IS NULL
+           AND (item IN ('SWITCH_SWAP', 'SWITCH_UNDO')
+                OR (item = 'SIZE_UNDO' AND target IN (SELECT s.target FROM epfpg.epf_instance_change s
+                                                       WHERE s.item = 'SWITCH_UNDO' AND s.restored_at IS NULL)));
+        COMMIT;
+        say('OK', 'UNDO_SWITCHED', l_ts || ' under the same names, ' || epfpg.epf_util.fmt_bytes(l_now) || ' -> '
+                                   || epfpg.epf_util.fmt_bytes(l_target) || ' ('
+                                   || epfpg.epf_util.fmt_bytes(GREATEST(l_now - l_target, 0)) || ' given back)');
+    END switch_undo;
+
+    PROCEDURE undo_switch(p_size_mb IN NUMBER DEFAULT NULL) IS
+    BEGIN
+        IF p_size_mb IS NOT NULL AND (p_size_mb <> TRUNC(p_size_mb) OR p_size_mb < 16) THEN
+            RAISE_APPLICATION_ERROR(-20150, 'The size must be a whole number of MB, at least 16, got: ' || p_size_mb);
+        END IF;
+        switch_undo(p_size_mb, FALSE);
+        undo_status;
+    END undo_switch;
+
     PROCEDURE undo_apply(p_run_id IN NUMBER DEFAULT NULL, p_preflight_run_id IN NUMBER DEFAULT NULL) IS
         l_retention NUMBER := epfpg.epf_util.setting_num('undo_retention_s');
         l_ts        VARCHAR2(128);
@@ -810,6 +1174,21 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         l_cap       NUMBER;
     BEGIN
         check_instance;
+        -- An undo switch that did not finish is carried on first: the purge
+        -- needs the undo tablespace it records sizes of.
+        SELECT COUNT(*) INTO l_active
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item = 'SWITCH_SWAP';
+        IF l_active > 0 THEN
+            switch_undo(NULL, TRUE);
+            SELECT COUNT(*) INTO l_active
+              FROM epfpg.epf_instance_change
+             WHERE restored_at IS NULL AND item = 'SWITCH_SWAP';
+            IF l_active > 0 THEN
+                RAISE_APPLICATION_ERROR(-20153, 'An undo switch is not finished (undo.sql STATUS shows it): run '
+                                                || 'undo.sql SWITCH once the transactions of other sessions have ended.');
+            END IF;
+        END IF;
         SELECT COUNT(*) INTO l_active
           FROM epfpg.epf_instance_change
          WHERE restored_at IS NULL AND item LIKE 'UNDO%';
@@ -856,6 +1235,8 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
     PROCEDURE undo_restore IS
         l_count  NUMBER := 0;
         l_exists NUMBER;
+        l_switch NUMBER;
+        l_grown  NUMBER;
     BEGIN
         check_instance;
         FOR c IN (SELECT change_id, item, target, file_id, original_value, original_maxbytes, original_increment
@@ -888,6 +1269,27 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         END IF;
         -- What the undo datafiles and the temporary tablespaces grew.
         size_giveback;
+        -- Undo still well above its size before (Oracle releases undo extents
+        -- on its own schedule): the undo tablespace is created again under the
+        -- same names. A failure leaves the steps done recorded for undo.sql
+        -- SWITCH and does not fail the restore.
+        SELECT COUNT(*) INTO l_switch
+          FROM epfpg.epf_instance_change
+         WHERE restored_at IS NULL AND item = 'SWITCH_SWAP';
+        SELECT NVL(SUM(d.bytes - c.original_value), 0)
+          INTO l_grown
+          FROM epfpg.epf_instance_change c
+          JOIN dba_data_files d ON d.file_id = c.file_id AND d.file_name = c.target
+         WHERE c.item = 'SIZE_UNDO' AND c.restored_at IS NULL;
+        IF l_switch > 0 OR l_grown > NVL(epfpg.epf_util.setting_num('undo_switch_min_mb'), 1024) * 1048576 THEN
+            BEGIN
+                switch_undo(NULL, TRUE);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    say('WARN', 'UNDO_SWITCH_FAILED', SQLERRM || '; the steps done are recorded: run undo.sql SWITCH '
+                                                      || 'to carry on');
+            END;
+        END IF;
         undo_status;
     END undo_restore;
 

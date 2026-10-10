@@ -84,7 +84,8 @@ BEGIN
                           || 'AND item NOT IN (''SIZE_UNDO'', ''SIZE_TEMP'')' INTO l_count;
         IF l_count > 0 THEN
             RAISE_APPLICATION_ERROR(-20905, l_count || ' instance changes are not restored yet: undo tuning '
-                                            || '(src/sql/run/undo.sql RESTORE as SYS), online redo logs replaced for a '
+                                            || '(src/sql/run/undo.sql RESTORE as SYS), an undo switch not finished '
+                                            || '(src/sql/run/undo.sql SWITCH as SYS), online redo logs replaced for a '
                                             || 'purge (src/sql/run/redo_logs.sql RESTORE as SYS) or datafile settings '
                                             || 'of a reclaim (epf_purge.bat reclaim --restore). Restore them first.');
         END IF;

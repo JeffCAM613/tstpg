@@ -281,10 +281,14 @@ Undo tuning (every purge; SYS)
   largest of its size, 4 GB and 4 batches of undo: each batch commits, so
   the purge reuses its own undo instead. At the end undo_retention and the
   cap are restored and the datafiles resized back as far as Oracle has
-  released them. It does not slow the purge. Meanwhile a long query of
-  another session can fail with ORA-01555 (snapshot too old): purge in a
-  quiet window. It needs the SYS password; an undo tablespace with RETENTION
-  GUARANTEE has to be set to NOGUARANTEE by the DBA first.
+  released them; when it still holds more than 1 GB above their size before,
+  the undo tablespace is created again under the same names and sizes (an
+  undo switch, with EPF_UNDO_SWAP in use for a few seconds; it needs an
+  spfile and no open transaction of another session). It does not slow the
+  purge. Meanwhile a long query of another session can fail with ORA-01555
+  (snapshot too old): purge in a quiet window. It needs the SYS password; an
+  undo tablespace with RETENTION GUARANTEE has to be set to NOGUARANTEE by
+  the DBA first.
 
 Plan of smaller runs
   The preflight also plans the purge: one run, or several when the archive

@@ -561,13 +561,12 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
     ) IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_batch   NUMBER        := norm_batch(p_batch_size);
-        l_undo    VARCHAR2(1)   := yes_no(p_with_undo_tuning, 'with_undo_tuning');
         l_redo    VARCHAR2(1)   := yes_no(p_with_redo_logs, 'with_redo_logs');
         l_backup  VARCHAR2(10)  := norm_backup(p_backup_choice);
         l_confirm VARCHAR2(100) := norm_confirm(p_confirm);
     BEGIN
-        -- Every purge runs with undo tuning: the run keeps it planned
-        -- (l_undo only validates the argument).
+        -- Every purge runs with undo tuning: the run keeps it planned, whatever
+        -- p_with_undo_tuning says.
         UPDATE epf_run
            SET batch_size       = l_batch,
                with_undo_tuning = 'Y',
