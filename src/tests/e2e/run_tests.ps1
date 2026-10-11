@@ -9,13 +9,20 @@
 #           the reclaim on a scratch tablespace, reports. Everything is
 #           written to one log file with a check list and a summary.
 # Usage   : run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest]
+#           run_tests.bat [--config FILE] --sys SCRIPT [ARGUMENTS]
 #             --config  test configuration (default src\tests\e2e\test.conf)
 #             --only    run these tests (T01, the safety precheck, always runs)
 #             --from    run this test and the ones after it
 #             --list    print the tests and exit
-#             --digest  print the short digest of the latest test session and
-#                       of the runs in logs\ after it (logs\digest.txt, also
-#                       copied to the clipboard), and exit; no database needed
+#             --digest  print the short digest of the latest test session, of
+#                       the runs in logs\ and of the SYS scripts run with
+#                       --sys after it (logs\digest.txt, also copied to the
+#                       clipboard), and exit; no database needed
+#             --sys     run one SYS script of src\sql\run (redo_logs.sql,
+#                       undo.sql) on the test database with the arguments
+#                       that follow, and keep its output in logs\sys\ for the
+#                       digest; the SYS password comes from test.conf or
+#                       EPF_SYS_PASSWORD, or is asked for
 # Requires: Windows PowerShell 5.1; sqlplus.exe in PATH or ORACLE_HOME\bin;
 #           the TNS alias of the test database; its SYS password.
 # Effects : DESTRUCTIVE. Purges every module of the test database (rows older
@@ -2413,6 +2420,86 @@ function Add-DigestRun {
     }
 }
 
+# Adds a SYS script run with --sys to the digest: its header line (script,
+# arguments, database, exit code), then what the script said it did (its
+# event lines) and every line naming an error.
+function Add-DigestSys {
+    param($Out, [string]$Path)
+    $lines = Get-FileLines $Path
+    $Out.Add('')
+    $head = '-- ' + [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    if ($lines.Count -gt 0) { $head = '-- ' + (Split-Path -Leaf $Path).Substring(0, 17) + ' ' + [string]$lines[0] }
+    $Out.Add($head)
+    $shown = 0
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        $line = [string]$lines[$i]
+        if ($line -cnotmatch '^\s{1,3}[A-Z][A-Z0-9_]{3,}\s+\S' -and $line -notmatch 'ORA-\d{5}|SP2-\d{4}|TNS-\d{5}') { continue }
+        $shown++
+        if ($shown -gt 40) { $Out.Add(' ... more in ' + (Split-Path -Leaf $Path)); break }
+        $Out.Add(' ' + (Format-DigestText $line))
+    }
+}
+
+# --sys: runs SYS script $Name of src\sql\run on the test database with
+# $Arguments, as typed in SQL*Plus, after checking the database is the one
+# test.conf expects. Its output is shown as it comes and kept in
+# logs\sys\<yyyy-MM-dd_HHmmss>_<script>_<arguments>.log under a header line
+# (the digest reads it). Returns the exit code of sqlplus.
+function Invoke-SysScript {
+    param([string]$Name, [string[]]$Arguments)
+    $path = Join-Path $script:RunSqlDir $Name
+    if ($Name -notmatch '^[A-Za-z0-9_]+\.sql$' -or -not (Test-Path -LiteralPath $path)) {
+        Exit-Suite 4 ('--sys: ' + $Name + ' is not a script of ' + $script:RunSqlDir + '.')
+    }
+    foreach ($a in $Arguments) {
+        if ($a -notmatch '^[A-Za-z0-9_.-]+$') { Exit-Suite 4 ('--sys: argument ' + $a + ' is not a word or a number.') }
+    }
+    $shown = ('SYS ' + $Name + ' ' + ($Arguments -join ' ')).TrimEnd() + ' on ' + $script:Tns
+    Write-Host (' ' + $shown)
+    $sql = @(
+        ('CONNECT sys/"' + $script:SysPw + '"@' + $script:Tns + ' AS SYSDBA'),
+        'SET FEEDBACK OFF SERVEROUTPUT ON',
+        'WHENEVER SQLERROR EXIT 4',
+        ("DECLARE l_name VARCHAR2(30); BEGIN SELECT name INTO l_name FROM v`$database; IF l_name <> '" + $script:ExpectedDb +
+         "' THEN RAISE_APPLICATION_ERROR(-20999, 'This database is ' || l_name || ', not " + $script:ExpectedDb +
+         ": nothing done.'); END IF; DBMS_OUTPUT.PUT_LINE('EPF_SYS_CONNECTED'); END;"),
+        '/',
+        (Get-ScriptLine $path $Arguments),
+        'EXIT 9')
+    $kept = New-Object 'System.Collections.Generic.List[string]'
+    $stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $code = 9
+    $state = @{ Connected = $false }
+    try {
+        ($sql -join "`r`n") | & $script:SqlPlus '-S' '-L' '/nolog' | ForEach-Object {
+            $line = ([string]$_).TrimEnd()
+            if ($line -eq 'EPF_SYS_CONNECTED') {
+                $state.Connected = $true
+            } else {
+                Write-Host $line
+                $kept.Add($line)
+            }
+        }
+        $code = $LASTEXITCODE
+    } catch {
+        $kept.Add([string]$_.Exception.Message)
+        Write-Host ([string]$_.Exception.Message) -ForegroundColor Red
+    }
+    # Without a connection the script's commands fail one by one and it still
+    # ends with its own exit code.
+    if (-not $state.Connected -and $code -eq 0) { $code = 4 }
+    $dir = Join-Path (Join-Path $script:RepoDir 'logs') 'sys'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $file = $stamp + '_' + ((@([System.IO.Path]::GetFileNameWithoutExtension($Name)) + $Arguments) -join '_') + '.log'
+    $text = @($shown + ': exit ' + $code) + $kept.ToArray()
+    [System.IO.File]::WriteAllLines((Join-Path $dir $file), [string[]]$text, [System.Text.Encoding]::ASCII)
+    $color = 'Green'
+    if ($code -ne 0) { $color = 'Red' }
+    Write-Host ''
+    Write-Host (' ' + $shown + ': exit ' + $code + '; kept in ' + (Join-Path $dir $file) + ' for the digest') -ForegroundColor $color
+    return $code
+}
+
 # The database as it is now, for the digest (SYS, read-only): how the
 # instance started, the tool installed and what it left open, the online
 # logs, every datafile and temporary file with its size, and their total: what
@@ -2428,7 +2515,7 @@ function Get-DbState {
         ('CONNECT sys/"' + $script:SysPw + '"@' + $script:Tns + ' AS SYSDBA'),
         'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON SERVEROUTPUT ON',
         "SELECT 'STATE|db|' || d.name || ', ' || d.log_mode || ', started from ' || NVL2((SELECT MAX(value) FROM v`$parameter WHERE name = 'spfile'), 'an spfile', 'a pfile') || ', undo tablespace ' || (SELECT MAX(value) FROM v`$parameter WHERE name = 'undo_tablespace') FROM v`$database d;",
-        "DECLARE l_v VARCHAR2(100); l_p VARCHAR2(2000); l_s VARCHAR2(10); BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; EXECUTE IMMEDIATE 'SELECT LISTAGG(item || '' x'' || n, '', '') WITHIN GROUP (ORDER BY item) FROM (SELECT item, COUNT(*) AS n FROM epfpg.epf_instance_change WHERE restored_at IS NULL GROUP BY item)' INTO l_p; EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''undo_switch_pfile''' INTO l_s; DBMS_OUTPUT.PUT_LINE('STATE|db|tool ' || l_v || ', open change records: ' || NVL(l_p, 'none') || ', undo_switch_pfile ' || NVL(l_s, '-')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('STATE|db|tool not installed'); END;",
+        "DECLARE l_v VARCHAR2(100); l_p VARCHAR2(2000); l_s VARCHAR2(10); l_n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; EXECUTE IMMEDIATE 'SELECT LISTAGG(item || '' x'' || n, '', '') WITHIN GROUP (ORDER BY item) FROM (SELECT item, COUNT(*) AS n FROM epfpg.epf_instance_change WHERE restored_at IS NULL GROUP BY item)' INTO l_p; EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''undo_switch_pfile''' INTO l_s; SELECT COUNT(*) INTO l_n FROM dba_objects WHERE owner = 'EPFPG' AND status <> 'VALID'; DBMS_OUTPUT.PUT_LINE('STATE|db|tool ' || l_v || ', ' || CASE WHEN l_n = 0 THEN 'EPFPG objects valid' ELSE l_n || ' EPFPG objects INVALID' END || ', open change records: ' || NVL(l_p, 'none') || ', undo_switch_pfile ' || NVL(l_s, '-')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('STATE|db|tool not installed'); END;",
         '/',
         "SELECT 'STATE|log|group ' || l.group# || ' ' || ROUND(l.bytes / 1048576) || ' MB ' || (SELECT LISTAGG(SUBSTR(f.member, GREATEST(INSTR(f.member, '/', -1), INSTR(f.member, '\', -1)) + 1), ' ') WITHIN GROUP (ORDER BY f.member) FROM v`$logfile f WHERE f.group# = l.group#) FROM v`$log l ORDER BY l.group#;",
         "SELECT 'STATE|file|' || RPAD(tablespace_name, 12) || ' ' || RPAD(SUBSTR(file_name, GREATEST(INSTR(file_name, '/', -1), INSTR(file_name, '\', -1)) + 1), 26) || ' ' || LPAD(ROUND(bytes / 1048576), 8) || ' MB' FROM (SELECT tablespace_name, file_name, bytes, file_id, 1 AS kind FROM dba_data_files UNION ALL SELECT tablespace_name, file_name, bytes, file_id, 2 FROM dba_temp_files) ORDER BY kind, tablespace_name, file_id;",
@@ -2532,13 +2619,20 @@ function Invoke-Digest {
     } else {
         $out.Add('EPF digest (' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + '): no test session in ' + (Join-Path $logs 'tests'))
     }
+    # After the session, in the order they were started: the runs in logs\
+    # and the SYS scripts run with --sys (logs\sys\).
     $later = @()
     if (Test-Path -LiteralPath $logs) {
         $later = @(Get-ChildItem -LiteralPath $logs -Directory | Where-Object {
-                       $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_R-\d+$' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 } |
-                   Sort-Object Name)
+                       $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_R-\d+$' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 })
     }
-    foreach ($run in $later) { Add-DigestRun $out $run.FullName '' }
+    if (Test-Path -LiteralPath (Join-Path $logs 'sys')) {
+        $later = $later + @(Get-ChildItem -LiteralPath (Join-Path $logs 'sys') -File -Filter '*.log' | Where-Object {
+                                $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 })
+    }
+    foreach ($item in ($later | Sort-Object Name)) {
+        if ($item.PSIsContainer) { Add-DigestRun $out $item.FullName '' } else { Add-DigestSys $out $item.FullName }
+    }
     if ($later.Count -eq 0) {
         $out.Add('')
         $out.Add('-- no run in ' + $logs + ' started after the test session')
@@ -2563,6 +2657,8 @@ function Invoke-Digest {
 function Invoke-Main {
     $configPath = Join-Path $script:TestDir 'test.conf'
     $digest = $false
+    $sysScript = ''
+    $sysArgs = @()
     $i = 0
     while ($i -lt $script:CliArgs.Count) {
         $arg = [string]$script:CliArgs[$i]
@@ -2572,9 +2668,35 @@ function Invoke-Main {
             '--from'   { $i++; $script:From = ([string]$script:CliArgs[$i]).ToUpper().Trim() }
             '--list'   { $script:TestList | ForEach-Object { Write-Host $_ }; exit 0 }
             '--digest' { $digest = $true }
-            default    { Exit-Suite 4 ('Unknown argument ' + $arg + '. Usage: run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest]') }
+            '--sys'    {
+                # The script, then its arguments: everything that follows.
+                $i++
+                if ($i -lt $script:CliArgs.Count) { $sysScript = [string]$script:CliArgs[$i] }
+                while ($i + 1 -lt $script:CliArgs.Count) { $i++; $sysArgs += [string]$script:CliArgs[$i] }
+                if ($sysScript -eq '') { Exit-Suite 4 '--sys needs a script of src\sql\run, such as: --sys redo_logs.sql SET 200 3' }
+            }
+            default    { Exit-Suite 4 ('Unknown argument ' + $arg + '. Usage: run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest] | --sys SCRIPT [ARGUMENTS]') }
         }
         $i++
+    }
+    if ($sysScript -ne '') {
+        if (-not (Test-Path -LiteralPath $configPath)) {
+            Exit-Suite 4 ('Configuration file not found: ' + $configPath + ' (copy test.conf.example to test.conf).')
+        }
+        $config = Read-Config $configPath
+        $script:Tns = Get-Value $config 'TNS'
+        $script:ExpectedDb = Get-Value $config 'EXPECTED_DB'
+        if ($script:Tns -eq '' -or $script:ExpectedDb -notmatch '^[A-Za-z0-9_$#]+$') { Exit-Suite 4 'TNS and EXPECTED_DB must be set in the configuration.' }
+        if ((Get-Value $config 'DESTRUCTIVE_OK').ToUpper() -ne 'YES') {
+            Exit-Suite 4 ('DESTRUCTIVE_OK is not YES: --sys changes ' + $script:ExpectedDb + '. Set it in ' + $configPath + '.')
+        }
+        $script:SqlPlus = Find-SqlPlus
+        if ($null -eq $script:SqlPlus) { Exit-Suite 4 'sqlplus.exe was not found in PATH or in ORACLE_HOME\bin.' }
+        $script:SysPw = Get-Value $config 'SYS_PASSWORD'
+        if ($script:SysPw -eq '') { $script:SysPw = [string]$env:EPF_SYS_PASSWORD }
+        if ($script:SysPw -eq '') { $script:SysPw = Read-Password ('SYS password of ' + $script:ExpectedDb) }
+        if ($script:SysPw.Contains('"')) { Exit-Suite 4 'The passwords must not contain quotes.' }
+        exit (Invoke-SysScript $sysScript $sysArgs)
     }
     if ($digest) {
         # The digest reads the logs. With the configuration and the SYS

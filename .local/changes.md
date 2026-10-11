@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - Every box of sets U, O and Q answered by the digest: run_tests.bat --sys, the tool's objects in "database now" (0.9.2, third commit)
+
+Why: the user asked whether the digest now gives all that each box needs. Checked box by box against what the digest prints, it did not for two kinds of step: the SYS scripts run by hand in SQL*Plus (O3, O6, O8: `redo_logs.sql SET`, whose REDO_SET and REDO_FILE_REMOVED lines are only on the screen, since a script outside a run records no event), and the install run through the wrapper (O1, Q1: "EPFPG objects valid").
+
+Changes (test suite only; the tool is unchanged):
+- run_tests.ps1 `--sys SCRIPT [ARGUMENTS]`: runs one SYS script of src\sql\run on the database of test.conf, as typed in SQL*Plus, after checking that the database name is EXPECTED_DB (and DESTRUCTIVE_OK=YES). The SYS password comes from test.conf or EPF_SYS_PASSWORD, or is asked for; it goes to sqlplus on standard input. The output is shown as it comes and kept in `logs\sys\<time>_<script>_<arguments>.log` under a header line with the exit code (4 when the connection or the name check failed).
+- The digest lists these scripts in order with the runs after the session: the header line, the script's event lines and every line naming an error.
+- "database now": the tool line says `EPFPG objects valid` or how many are invalid.
+- README and PLAN.md 12 say so; run_tests.bat usage.
+
+What the digest cannot show, said on the page: the free disk space on the server (U4: the user checks it before U5; the reclaim's SCRATCH_FULL or its absence says whether it was enough), and of the screen during a purge only the first and the last progress line of each module.
+
+Checked here: `--sys` against a stand-in sqlplus (the script's lines shown, kept and digested; no connection and the wrong database both end with exit 4 and nothing run; a script that is not in src\sql\run and an argument with a semicolon refused); the suite parses.
+
+How to test: set O's O3, O6 and O8 use `run_tests.bat --sys redo_logs.sql SET <size> <groups>`; the digest of O9 then shows each with its REDO_SET line.
+
 ## 2026-10-12 - The digest carries everything a test step is judged on (0.9.2, second commit)
 
 Why: after set P three boxes stayed open because the digest did not show them (the dry run's requirements with the scratch size, the datafiles before and after the reclaim, a line for the emptied datafile), and earlier sets asked the user for listings of the data directory, the screen during a purge and the output of a query. The user expected the digest to carry all of it, and asked for that before the next tests.
