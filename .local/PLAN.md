@@ -957,6 +957,7 @@ Each test database is a dump of one client's database. How fast the tool runs an
 | EPFPG781, EPFPG782, EPFPG783, EPFPG784 | SONEPARUAT | the test machine, a Windows client: about 15 s per connection; the network dropped during J4 | every set before K |
 | EPFPG781, EPFPG782 | SONEPARUAT | the remote server, close to the databases | L, N |
 | EPFPG783 | SONEPARUAT, DATA in 4 datafiles created before the import | the remote server | P |
+| a fresh SONEPARUAT copy (EPFPG782 loaded again) | SONEPARUAT | the remote server | Q: a cutoff taking about 20% of the bulk payments |
 | TANM7883 | CLUBMED8 | a remote server close to the database | K, O |
 | TANM7884 | CLUBMEDEPF | a remote server close to the database | M |
 
