@@ -283,8 +283,10 @@ Undo tuning (every purge; SYS)
   cap are restored and the datafiles resized back as far as Oracle has
   released them; when it still holds more than 1 GB above their size before,
   the undo tablespace is created again under the same names and sizes (an
-  undo switch, with EPF_UNDO_SWAP in use for a few seconds; it needs an
-  spfile and no open transaction of another session). It does not slow the
+  undo switch, with EPF_UNDO_SWAP in use for a few seconds; not while
+  another session has a transaction open, and on an instance started from a
+  pfile that names undo_tablespace only with setting undo_switch_pfile Y).
+  It does not slow the
   purge. Meanwhile a long query of another session can fail with ORA-01555
   (snapshot too old): purge in a quiet window. It needs the SYS password; an
   undo tablespace with RETENTION GUARANTEE has to be set to NOGUARANTEE by

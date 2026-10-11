@@ -2,6 +2,28 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - Set P on EPFPG783 (SONEPARUAT, DATA in 4 datafiles, 0.9.1): 36 of 36, 44.0 to 6.6 GB; the forecast for several datafiles and the undo switch on a pfile instance (0.9.2); set U planned (RFS6528)
+
+The digest of set P (TP.log, session 2026-10-11_163252_EPFPG783):
+- **P4, the suite on 0.9.1:** 36 of 36 in 1 h 15 min; T09B (new) passes. T01: logs 3 x 150 MB; OP 6,434 MB, OPPAYMENTS 34,122 MB. T19: the online logs as before the tests.
+  - T13, PAYMENTS: 89,317,840 rows in 37 min 52 s, **11 min 8 s of the 35 min 58 s of batches waiting for log switches (31%)** with 3 x 150 MB. Set L's T13, the same data with 4 x 1 GB on EPFPG781: 89.1 M rows in 28 min 53 s. The waits are the difference: on SONEPARUAT small logs make the purge about a third longer (set N: 29%); on CLUBMED8 5% (set O).
+  - **The undo switch was skipped:** "the instance has no spfile". Undo 4,096 MB after the purge, 405 MB before the tests. EPFPG783 starts from a pfile, as the other test copies may.
+- **P5, the dry run** (R-000036): DATA 44.0 GB in 4 datafiles, 38.5 GB of segments; 688 tables move (28.0 GB, about 5.3 GB after), 969 indexes (10.4 GB). **Forecast 33.3 GB, far from the 6.6 GB reached:** the forecast took the datafiles end to end, so a LONG table low in the last file held all the files before it.
+- **P6, the reclaim** (R-000037, 5.0 GB of scratch space allowed, 28 min 38 s, PASS WITH WARNINGS: PUBLIC_DML): **DATA 44.0 to 6.6 GB (37.4 GB given back), its 6.6 GB of segments, R7 PASS**; R1 to R6, R8, R9 PASS; 263 tables moved and 359 parked (at most about 1 GB in the scratch space). Each datafile shrank on its own: data04 to 27.4 MB and data01 to 18.0 MB (OP.WEB_RAPPORT, a LONG column, in both), data03 to 14.8 MB (OP.PLAN_TABLE), data02 emptied. The 359 came back in 5 min 45 s and the 969 indexes were rebuilt in 3 min 42 s, all into the first datafile (18 MB to 7.0 GB, never above its 11 GB), the others staying small. Several datafiles work; what was spread over four files ends in one.
+
+Changes (0.9.2):
+- epf_reclaim.forecast_ts: positions take the used part of each datafile end to end (up to its highest block, not its size), and with several datafiles the floor is the sum of the highest block that cannot move in each file. TS_ASSESSED says "their highest blocks at ... in all" for several datafiles. A single datafile forecasts as before.
+- epf_tuning, the undo switch on an instance started from a pfile: it runs when the pfile does not name undo_tablespace (any undo tablespace is taken at startup), and when it does only with the new setting undo_switch_pfile Y, since a crash between the drop and the creation of the original would need the pfile edited before the next startup; UNDO_SWITCH_SKIPPED says so. ALTER SYSTEM SET without SCOPE (the spfile too when there is one). The original is created at 32 MB a file at most and then resized to its recorded size, so that moment is well under a second.
+- registry_data.sql: setting undo_switch_pfile (N); tool version 0.9.2.
+- Tests: T05 sets undo_switch_pfile Y on the test copy, so that the suite exercises the switch there too.
+- Help, README, undo.sql and the specification say when the switch runs. PLAN.md 6.9, 7.5, 12.7.
+
+Not changed: after a reclaim everything comes back into the first datafile that has room (grow_ts fills the files in order, each up to its size at the start). Fine for the space; a layout spread on purpose over several disks would need the files filled in turn (not built).
+
+Checked here: the wrapper and the suite parse; T00, T01, T06, T07 on the fake sqlplus; the 64 output checks; the package checks. Not compiled here.
+
+How to test: set U (RFS6528 on EPFPG784): the suite on 0.9.2, a dry run, one reclaim; T13's notes say whether the undo switch ran. Set O again on a fresh CLUBMED8 copy (the user): the plan must show 2 steps before step 1.
+
 ## 2026-10-11 - Set O's first half on TANM7883 (CLUBMED8, 0.9.0): 5% of the batches waiting with 3 x 200 MB logs; the digest shows the plan step and the restore
 
 The digest (T0.log, session 2026-10-11_150006_TANM7883; 0.9.0, since 0.9.1 was not pushed yet):

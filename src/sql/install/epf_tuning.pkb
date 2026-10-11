@@ -885,6 +885,7 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
         l_keep_guar NUMBER;
         l_enc       VARCHAR2(3);
         l_named     NUMBER;
+        l_in_pfile  NUMBER;
         l_started   TIMESTAMP;
         l_omf       VARCHAR2(4000);
         l_open      NUMBER;
@@ -921,6 +922,12 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
               FROM epfpg.epf_instance_change
              WHERE restored_at IS NULL AND item IN ('UNDO_RETENTION', 'UNDO_DATAFILE');
             SELECT COUNT(*) INTO l_spfile FROM v$parameter WHERE name = 'spfile' AND value IS NOT NULL;
+            -- Started from a pfile that names undo_tablespace: between the drop
+            -- and the creation of the original, the pfile names a tablespace
+            -- that does not exist.
+            SELECT COUNT(*) INTO l_in_pfile
+              FROM v$parameter
+             WHERE name = 'undo_tablespace' AND isdefault = 'FALSE' AND l_spfile = 0;
             SELECT COUNT(*) INTO l_standby FROM v$archive_dest WHERE status = 'VALID' AND target = 'STANDBY';
             SELECT MAX(bigfile), MAX(retention), MAX(encrypted)
               INTO l_big, l_guarantee, l_enc
@@ -928,8 +935,10 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
              WHERE tablespace_name = l_ts AND contents = 'UNDO';
             l_reason := CASE WHEN l_open > 0 THEN 'undo tuning is still active (undo.sql RESTORE does both)'
                              WHEN l_big IS NULL THEN 'no undo tablespace in use (undo_tablespace ' || NVL(l_ts, 'not set') || ')'
-                             WHEN l_spfile = 0 THEN 'the instance has no spfile, so it could not always start with an '
-                                                    || 'undo tablespace that exists'
+                             WHEN l_in_pfile > 0 AND NVL(epfpg.epf_util.setting('undo_switch_pfile'), 'N') <> 'Y'
+                             THEN 'the instance starts from a pfile that names undo_tablespace: a crash in the '
+                                  || 'moment between the drop and the creation of ' || l_ts || ' would need the '
+                                  || 'pfile edited before the next startup (setting undo_switch_pfile Y accepts that)'
                              WHEN l_standby > 0 THEN 'a standby database receives the redo'
                              WHEN l_enc = 'YES' THEN l_ts || ' is encrypted'
                              WHEN l_ts = c_swap THEN 'the instance already uses ' || c_swap END;
@@ -976,10 +985,14 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                                                    || 'when the database is quiet');
                 RETURN;
             END IF;
-            -- Recorded before anything changes.
+            -- Recorded before anything changes. Without an spfile there is no
+            -- undo_tablespace entry to take out of it again.
             SELECT COUNT(*) INTO l_named
               FROM v$spparameter
              WHERE name = 'undo_tablespace' AND isspecified = 'TRUE';
+            IF l_spfile = 0 THEN
+                l_named := 1;
+            END IF;
             INSERT INTO epfpg.epf_instance_change (item, target, log_members, original_autoextend, original_value,
                                                    applied_value, applied_at)
             VALUES ('SWITCH_SWAP', c_swap, l_ts, l_big, CASE WHEN l_guarantee = 'GUARANTEE' THEN 1 ELSE 0 END,
@@ -1050,7 +1063,9 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                     say('INFO', 'UNDO_SWAP_CREATED', c_swap || ', 256 MB, next to ' || l_first);
                 END IF;
                 IF l_current = l_ts THEN
-                    EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || c_swap || ' SCOPE = BOTH';
+                    -- No SCOPE: the spfile too when the instance has one, memory
+                    -- only when it started from a pfile.
+                    EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || c_swap;
                     say('INFO', 'UNDO_SWITCHED_OUT', 'undo_tablespace ' || c_swap);
                 END IF;
             EXCEPTION
@@ -1093,14 +1108,15 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                 END;
                 say('INFO', 'UNDO_DROPPED', l_ts || ' dropped with its datafiles');
             END IF;
-            -- 4. The original created again: the same names, the sizes recorded.
+            -- 4. The original created again under the same names, small first
+            -- (at most 32 MB a file), so that the moment without it is short.
             FOR c IN (SELECT target, original_value, original_autoextend, original_maxbytes, original_increment
                         FROM epfpg.epf_instance_change
                        WHERE item = 'SWITCH_UNDO' AND restored_at IS NULL
                        ORDER BY log_group) LOOP
                 l_specs := l_specs || CASE WHEN l_specs IS NOT NULL THEN ', ' END
-                           || undo_file_spec(c.target, c.original_value, c.original_autoextend, c.original_increment,
-                                             c.original_maxbytes,
+                           || undo_file_spec(c.target, LEAST(c.original_value, 33554432), c.original_autoextend,
+                                             c.original_increment, GREATEST(c.original_maxbytes, c.original_value),
                                              CASE WHEN l_big = 'YES' THEN 4294967290 ELSE 4194302 END * l_bs, l_omf);
                 l_files := SUBSTR(l_files || CASE WHEN l_files IS NOT NULL THEN ', ' END || c.target || ' '
                                   || epfpg.epf_util.fmt_bytes(c.original_value), 1, 3000);
@@ -1110,10 +1126,25 @@ CREATE OR REPLACE PACKAGE BODY epf_tuning AS
                               || CASE WHEN l_keep_guar = 1 THEN ' RETENTION GUARANTEE' END;
             say('OK', 'UNDO_CREATED', l_ts || ' created again: ' || l_files);
         END IF;
+        -- Each of its datafiles at the size recorded (the nth datafile of the
+        -- tablespace is the nth recorded).
+        FOR c IN (SELECT d.file_id, d.bytes, s.original_value
+                    FROM epfpg.epf_instance_change s
+                    JOIN (SELECT file_id, bytes, ROW_NUMBER() OVER (ORDER BY file_id) AS pos
+                            FROM dba_data_files
+                           WHERE tablespace_name = l_ts) d
+                      ON d.pos = s.log_group
+                   WHERE s.item = 'SWITCH_UNDO' AND s.restored_at IS NULL
+                   ORDER BY s.log_group) LOOP
+            IF c.bytes < c.original_value THEN
+                EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ' || c.file_id || ' RESIZE '
+                                  || CEIL(c.original_value / 1048576) || 'M';
+            END IF;
+        END LOOP;
         -- 5. The instance back on it; undo_tablespace left out of the spfile
         -- again when it was not there.
         IF NVL(undo_tablespace, '-') <> l_ts THEN
-            EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || l_ts || ' SCOPE = BOTH';
+            EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_tablespace = ' || l_ts;
             IF l_named = 0 THEN
                 BEGIN
                     EXECUTE IMMEDIATE 'ALTER SYSTEM RESET undo_tablespace SCOPE = SPFILE';

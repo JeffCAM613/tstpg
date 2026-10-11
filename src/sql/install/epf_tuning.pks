@@ -130,11 +130,15 @@ CREATE OR REPLACE PACKAGE epf_tuning AUTHID CURRENT_USER AS
     -- is recorded first (SWITCH_SWAP, SWITCH_UNDO): a call that stops part
     -- way, or finds transactions of other sessions still in the original
     -- after setting undo_switch_wait_s, leaves it recorded, and the next call
-    -- (or undo_restore, undo_apply) carries on from there. Not started, with
-    -- the reason (UNDO_SWITCH_SKIPPED): without an spfile (the instance
-    -- must always start with an undo tablespace that exists), with a standby
-    -- destination, an encrypted undo tablespace, undo tuning still active,
-    -- or transactions of other sessions open after undo_switch_wait_s.
+    -- (or undo_restore, undo_apply) carries on from there. The original is
+    -- created small and then resized, so that the moment without it is short.
+    -- Not started, with the reason (UNDO_SWITCH_SKIPPED): on an instance
+    -- started from a pfile that names undo_tablespace (a crash in that moment
+    -- would need the pfile edited before the next startup; an spfile follows
+    -- each step, and a pfile without the parameter takes any undo tablespace;
+    -- setting undo_switch_pfile Y accepts it), with a standby destination, an
+    -- encrypted undo tablespace, undo tuning still active, or transactions of
+    -- other sessions open after undo_switch_wait_s.
     PROCEDURE undo_switch(p_size_mb IN NUMBER DEFAULT NULL);
 
     -- Prints the undo tablespace, its files, undo_retention and the recorded

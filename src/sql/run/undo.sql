@@ -29,9 +29,11 @@
 --           undo datafiles and temporary tablespaces back towards their size
 --           before, as far as Oracle has released them. SWITCH uses the undo
 --           tablespace EPF_UNDO_SWAP (256 MB, dropped at the end) while it
---           drops and creates the original again; it needs an spfile, and
---           waits up to undo_switch_wait_s for transactions of other
---           sessions. Every change is recorded in EPFPG.EPF_INSTANCE_CHANGE.
+--           drops and creates the original again; on an instance started
+--           from a pfile that names undo_tablespace it needs setting
+--           undo_switch_pfile Y, and it waits up to undo_switch_wait_s for
+--           transactions of other sessions. Every change is recorded in
+--           EPFPG.EPF_INSTANCE_CHANGE.
 --           While applied, long queries of other sessions can fail with
 --           ORA-01555.
 -- ============================================================================

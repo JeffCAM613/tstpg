@@ -196,7 +196,7 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Settings
     -- ------------------------------------------------------------------
-    put_setting('tool_version',           '0.9.1', 'Version of the installed tool objects', p_force => TRUE);
+    put_setting('tool_version',           '0.9.2', 'Version of the installed tool objects', p_force => TRUE);
     put_setting('app_schemas',            'OP,OPPAYMENTS,OPREPORTS', 'Application schemas; the tablespaces they occupy are reclaim candidates');
     put_setting('retention_days_default', '30',    'Retention in days when none is given');
     put_setting('retention_days_min',     '1',     'Smallest retention accepted');
@@ -221,6 +221,7 @@ BEGIN
     put_setting('undo_cap_mb',            '4096',  'Undo tuning limits the growth of the undo tablespace to the largest of its current size, this value and 4 x the undo of one batch');
     put_setting('undo_switch_min_mb',     '1024',  'After a purge, the undo tablespace is switched to a copy under the same names when its datafiles are still this much above their size before (Oracle releases undo extents on its own schedule)');
     put_setting('undo_switch_wait_s',     '300',   'An undo switch waits this many seconds for the transactions of other sessions to end, before and during the switch');
+    put_setting('undo_switch_pfile',      'N',     'Y lets the undo switch run on an instance started from a pfile that names undo_tablespace: a crash in the moment between the drop and the creation of the undo tablespace would need the pfile edited before the next startup');
     put_setting('archive_margin_pct',     '20',    'Margin added to the redo estimate when the preflight checks the archive destination (requirement ARCHIVE)');
     put_setting('backup_max_age_h',       '24',    'A successful RMAN database backup newer than this many hours meets the BACKUP requirement');
     put_setting('delete_rows_s',          '50000', 'Rows deleted per second assumed for the time forecast until a purge on the database has measured it');

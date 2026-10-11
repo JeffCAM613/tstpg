@@ -1163,8 +1163,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- otherwise the room the file has given back since the start is used,
     -- and a table that still does not fit stops the file there. The parked
     -- tables and the released indexes go into the free space left below,
-    -- and beyond. Positions are bytes with the datafiles of the tablespace
-    -- taken end to end (exact for a single datafile, an estimate otherwise).
+    -- and beyond. Positions are bytes with the used part of each datafile of
+    -- the tablespace (up to its highest block) taken end to end: exact for a
+    -- single datafile, an estimate otherwise. With several datafiles a
+    -- segment that cannot move holds only its own file, so the floor is the
+    -- sum of the highest such block of each file, not its position end to
+    -- end.
     -- A copy Oracle places at the top again is not foreseen.
     PROCEDURE forecast_ts(p_ts IN VARCHAR2) IS
         TYPE t_num IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
@@ -1216,20 +1220,32 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
           INTO l_hwm, l_pintop
           FROM epfpg.epf_ts_inventory i
           JOIN (SELECT file_id,
-                       NVL(SUM(bytes) OVER (ORDER BY file_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+                       NVL(SUM(file_top) OVER (ORDER BY file_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
                            AS file_offset
-                  FROM dba_data_files
-                 WHERE tablespace_name = p_ts) f
+                  FROM (SELECT x.file_id, (MAX(x.top_block) + 1) * l_bs AS file_top
+                          FROM epfpg.epf_ts_inventory x
+                         WHERE x.run_id = g_run.run_id AND x.tablespace_name = p_ts
+                         GROUP BY x.file_id)) f
             ON f.file_id = i.file_id
          WHERE i.run_id = g_run.run_id AND i.tablespace_name = p_ts;
+        IF l_files > 1 THEN
+            SELECT NVL(SUM(top_bytes), 0)
+              INTO l_pintop
+              FROM (SELECT MAX((i.top_block + 1) * l_bs) AS top_bytes
+                      FROM epfpg.epf_ts_inventory i
+                     WHERE i.run_id = g_run.run_id AND i.tablespace_name = p_ts AND i.handler = 'PIN'
+                     GROUP BY i.file_id);
+        END IF;
         FOR u IN (SELECT i.item_id, MAX(f.file_offset + (i.top_block + 1) * l_bs) AS top_bytes,
                          SUM(i.bytes) AS alloc_bytes, SUM(i.est_bytes) AS est_bytes
                     FROM epfpg.epf_ts_inventory i
                     JOIN (SELECT file_id,
-                                 NVL(SUM(bytes) OVER (ORDER BY file_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                                 NVL(SUM(file_top) OVER (ORDER BY file_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
                                      0) AS file_offset
-                            FROM dba_data_files
-                           WHERE tablespace_name = p_ts) f
+                            FROM (SELECT x.file_id, (MAX(x.top_block) + 1) * l_bs AS file_top
+                                    FROM epfpg.epf_ts_inventory x
+                                   WHERE x.run_id = g_run.run_id AND x.tablespace_name = p_ts
+                                   GROUP BY x.file_id)) f
                       ON f.file_id = i.file_id
                    WHERE i.run_id = g_run.run_id AND i.tablespace_name = p_ts AND i.handler = 'MOVE'
                    GROUP BY i.item_id
@@ -1316,8 +1332,10 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         SELECT * INTO r FROM epfpg.epf_reclaim_ts WHERE run_id = g_run.run_id AND tablespace_name = p_ts;
         SELECT block_size INTO l_bs FROM dba_tablespaces WHERE tablespace_name = p_ts;
         say(epfpg.epf_log.c_info, 'TS_ASSESSED',
-            p_ts || ': ' || b(r.start_bytes) || ' in ' || r.file_count || ' datafile(s), highest block at '
-            || b(r.start_hwm_bytes) || ', segments ' || b(r.segment_bytes) || '; ' || r.unit_count || ' tables move ('
+            p_ts || ': ' || b(r.start_bytes) || ' in ' || r.file_count || ' datafile(s), '
+            || CASE WHEN r.file_count > 1 THEN 'their highest blocks at ' || b(r.start_hwm_bytes) || ' in all'
+                    ELSE 'highest block at ' || b(r.start_hwm_bytes) END
+            || ', segments ' || b(r.segment_bytes) || '; ' || r.unit_count || ' tables move ('
             || b(r.unit_bytes) || ', about ' || b(r.unit_est_bytes) || ' after), ' || r.index_count
             || ' indexes released and rebuilt (' || b(r.index_bytes) || '), ' || r.pin_count || ' segments stay ('
             || b(r.pin_bytes) || '); forecast ' || b(r.est_final_bytes)

@@ -954,6 +954,12 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T05' 'Undo tuning left from earlier work restored; undo datafile limits recorded' {
+        # On a test copy the undo switch also runs when the instance started
+        # from a pfile that names undo_tablespace (setting undo_switch_pfile),
+        # so that the tests exercise it; a production database keeps the
+        # default N.
+        $r = Invoke-Sql 'EPFPG' @("UPDATE epf_setting SET value = 'Y' WHERE name = 'undo_switch_pfile';", 'COMMIT;', 'EXIT')
+        Assert-Exit $r @(0)
         $undo = Join-Path $script:RunSqlDir 'undo.sql'
         $r = Invoke-Sql 'SYS' @((Get-ScriptLine $undo @('RESTORE')))
         Assert-Exit $r @(0)
