@@ -2,6 +2,26 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - The digest carries everything a test step is judged on (0.9.2, second commit)
+
+Why: after set P three boxes stayed open because the digest did not show them (the dry run's requirements with the scratch size, the datafiles before and after the reclaim, a line for the emptied datafile), and earlier sets asked the user for listings of the data directory, the screen during a purge and the output of a query. The user expected the digest to carry all of it, and asked for that before the next tests.
+
+Changes:
+- epf.ps1: every run writes summary.txt in its folder, with or without --verbose: the summary shown at the end (estimate or simulation, tablespaces, requirements with their figures, the checks, the verdict), and for a reclaim that compacts or restores also the report's DATAFILES section (each file at the start and at the end). A dry run's summary now includes the RETENTION OPTIONS table.
+- epf_reclaim: a datafile left without a segment gets its FILE_DONE line too ("is empty").
+- run_tests.ps1, the digest:
+  - each run's header line ends with the tool version of its manifest;
+  - the steps that say what a run did are kept whatever they took (the compaction, the return of the parked tables, the index rebuilds; a purge's batches, temporary indexes and compaction);
+  - a purge: the first and the last progress line of each module (the screen during the purge), after its restore lines;
+  - a run outside the suite, or of a failed test: its summary.txt (without the checks, which are in the line above), so the requirements, the scratch size suggested, the simulation, the retention options and the datafiles of a reclaim are there;
+  - at the end, the database as it is now (SYS, read-only): how the instance started, the tool version, the open change records and undo_switch_pfile, the online logs with their files, every datafile and temporary file with its size, and the total: what `ls -l` of the data directory showed. Read with SYS_PASSWORD of test.conf or EPF_SYS_PASSWORD; the digest never asks for a password and says so when it could not read it.
+- T01: notes whether the instance started from an spfile or a pfile and the tool installed, and for each root table present its roots and the share dated before 1 January of each year (what a cutoff would take), so that a retention can be chosen from the digest (set Q's query is no longer run by hand).
+- README: summary.txt, the digest. Tool version stays 0.9.2 (not pushed before).
+
+Checked here: the digest of a made-up purge run folder (header with plan and version, steps, restore lines, progress lines, summary), without a database for the state section; the wrapper and the suite parse; T00, T01, T06, T07 on the fake sqlplus; the 64 output checks.
+
+How to test: sets U, O and Q end with the digest alone; their boxes name what to find in it.
+
 ## 2026-10-12 - Set P on EPFPG783 (SONEPARUAT, DATA in 4 datafiles, 0.9.1): 36 of 36, 44.0 to 6.6 GB; the forecast for several datafiles and the undo switch on a pfile instance (0.9.2); set U planned (RFS6528)
 
 The digest of set P (TP.log, session 2026-10-11_163252_EPFPG783):

@@ -865,6 +865,37 @@ function Invoke-Suite {
             "SELECT 'APPDATA|' || owner || '|' || ROUND(SUM(bytes) / 1048576) || ' MB' FROM dba_segments WHERE owner IN ('OP', 'OPPAYMENTS', 'OPREPORTS') GROUP BY owner ORDER BY owner;",
             "DECLARE l_n NUMBER; l_d VARCHAR2(10); BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*), TO_CHAR(MAX(started_at), ''YYYY-MM-DD'') FROM epfpg.epf_run WHERE action = ''PURGE'' AND dry_run = ''N'' AND status IN (''SUCCESS'', ''WARNING'', ''STOPPED'')' INTO l_n, l_d; DBMS_OUTPUT.PUT_LINE('PURGED|' || l_n || '|' || l_d); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('PURGED|0|'); END;",
             '/',
+            "SELECT 'PARAMFILE|' || NVL2(MAX(value), 'spfile', 'pfile') FROM v`$parameter WHERE name = 'spfile';",
+            # The roots of each module per year: for each root table present,
+            # the share dated before 1 January of each year (what a purge
+            # with that cutoff takes, before rows held back).
+            'DECLARE',
+            "  TYPE t_s IS TABLE OF VARCHAR2(200);",
+            "  l_roots t_s := t_s('PAYMENTS|OPPAYMENTS|BULK_PAYMENT|VALUE_DATE', 'PAYMENTS|OPPAYMENTS|FILE_INTEGRATION|INTEGRATION_DATE', 'LOGS|OPPAYMENTS|AUDIT_TRAIL|AUDIT_TIMESTAMP', 'LOGS|OP|SPEC_TRT_LOG|DTLOG', 'BANK_STATEMENTS|OPPAYMENTS|FILE_DISPATCHING|DATE_RECEPTION');",
+            "  TYPE t_c IS REF CURSOR; c t_c; l_m VARCHAR2(30); l_o VARCHAR2(30); l_t VARCHAR2(30); l_d VARCHAR2(30);",
+            "  l_n NUMBER; l_total NUMBER; l_sum NUMBER; l_y NUMBER; l_cnt NUMBER; l_line VARCHAR2(4000);",
+            'BEGIN',
+            '  FOR i IN 1 .. l_roots.COUNT LOOP',
+            "    l_m := REGEXP_SUBSTR(l_roots(i), '[^|]+', 1, 1); l_o := REGEXP_SUBSTR(l_roots(i), '[^|]+', 1, 2);",
+            "    l_t := REGEXP_SUBSTR(l_roots(i), '[^|]+', 1, 3); l_d := REGEXP_SUBSTR(l_roots(i), '[^|]+', 1, 4);",
+            '    SELECT COUNT(*) INTO l_n FROM dba_tab_columns WHERE owner = l_o AND table_name = l_t AND column_name = l_d;',
+            '    IF l_n = 1 THEN',
+            "      EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ' || l_o || '.' || l_t || ' WHERE ' || l_d || ' IS NOT NULL' INTO l_total;",
+            '      l_sum := 0; l_line := NULL;',
+            "      OPEN c FOR 'SELECT EXTRACT(YEAR FROM ' || l_d || '), COUNT(*) FROM ' || l_o || '.' || l_t || ' WHERE ' || l_d || ' IS NOT NULL GROUP BY EXTRACT(YEAR FROM ' || l_d || ') ORDER BY 1';",
+            '      LOOP',
+            '        FETCH c INTO l_y, l_cnt; EXIT WHEN c%NOTFOUND;',
+            '        l_sum := l_sum + l_cnt;',
+            "        l_line := SUBSTR(l_line || CASE WHEN l_line IS NOT NULL THEN ', ' END || (l_y + 1) || ' ' || ROUND(100 * l_sum / l_total) || '%', 1, 3000);",
+            '      END LOOP;',
+            '      CLOSE c;',
+            "      DBMS_OUTPUT.PUT_LINE('COVERAGE|' || l_m || ' ' || l_t || '|' || l_total || ' roots; dated before 1 January of ' || NVL(l_line, '(none)'));",
+            '    END IF;',
+            '  END LOOP;',
+            'EXCEPTION',
+            "  WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('COVERAGE|not read|' || SQLERRM);",
+            'END;',
+            '/',
             'EXIT')
         Assert-Exit $r @(0)
         $db = ''
@@ -873,11 +904,15 @@ function Invoke-Suite {
         $logMode = ''
         $instances = ''
         $installed = 'none'
+        $paramFile = ''
         $apps = New-Object 'System.Collections.Generic.List[string]'
+        $coverage = New-Object 'System.Collections.Generic.List[string]'
         $purged = 0
         $purgedLast = ''
         foreach ($line in ($r.Output -split "`n")) {
             if ($line -match '^APPDATA\|([^|]+)\|(.*)$') { $apps.Add($Matches[1].Trim() + ' ' + $Matches[2].Trim()) }
+            if ($line -match '^COVERAGE\|([^|]+)\|(.*)$') { $coverage.Add($Matches[1].Trim() + ': ' + $Matches[2].Trim()) }
+            if ($line -match '^PARAMFILE\|(\w+)') { $paramFile = $Matches[1] }
             if ($line -match '^PURGED\|(\d+)\|(.*)$') { $purged = [int]$Matches[1]; $purgedLast = $Matches[2].Trim() }
             if ($line -match '^DB\|([^|]*)\|([^|]*)\|([^|]*)\|') {
                 $db = $Matches[1].Trim()
@@ -914,6 +949,10 @@ function Invoke-Suite {
         if ($script:State.RedoStart.Count -gt 0) {
             Write-TestLog ('  note online redo logs: ' + ($script:State.RedoStart -join ', '))
         }
+        if ($paramFile -ne '') { Write-TestLog ('  note the instance started from a' + $(if ($paramFile -eq 'spfile') { 'n spfile' } else { ' pfile' }) + ', tool installed: ' + $installed) }
+        # What a cutoff would take of each module's roots (the digest keeps
+        # the notes): to choose a retention before any purge.
+        foreach ($c in $coverage) { Write-TestLog ('  note roots ' + $c) }
         if ($apps.Count -gt 0) {
             Write-TestLog ('  note application data: ' + ($apps -join ', '))
         } else {
@@ -2147,6 +2186,7 @@ function Add-DigestRun {
         if ([string]$manifest['plan_step'] -ne '') { $head = $head + ' step ' + [string]$manifest['plan_step'] }
         $head = $head + ' (' + [string]$manifest['plan_done'] + ' of ' + [string]$manifest['plan_steps'] + ' done)'
     }
+    if ([string]$manifest['tool_version'] -ne '') { $head = $head + ', tool ' + [string]$manifest['tool_version'] }
     $Out.Add('')
     $Out.Add($head)
     $detail = New-Object 'System.Collections.Generic.List[string]'
@@ -2206,8 +2246,14 @@ function Add-DigestRun {
         $text = Format-DigestText $Matches[4]
         # The end of the run is in its header line already.
         $keep = (($tag -eq 'WARN' -or $tag -eq 'FAIL' -or $codes -contains $code) -and $code -ne 'RUN_END')
-        if (-not $keep -and -not $Brief -and $code -eq 'STEP_END' -and $text -match ' in (\d+):(\d\d):(\d\d)') {
-            $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
+        if (-not $keep -and -not $Brief -and $code -eq 'STEP_END') {
+            # The steps that say what a run did, whatever they took; the others
+            # from 30 s.
+            if ($text -match '^(RECLAIM (COMPACT|RETURN_PARKED|REBUILD_INDEXES)|PURGE (PROCESS_BATCHES|TEMP_INDEXES|COMPACT)) ') {
+                $keep = $true
+            } elseif ($text -match ' in (\d+):(\d\d):(\d\d)') {
+                $keep = ([int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]) -ge 30
+            }
         }
         if (-not $keep) { continue }
         if ($code -eq 'MOVE_PLACEMENT' -and $pendingUnit -ne '' -and $text.StartsWith($pendingUnit + ' in ')) {
@@ -2325,14 +2371,92 @@ function Add-DigestRun {
     }
     if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log') }
     # What a purge's undo and redo restore did (the SYS sessions print it; it
-    # is not among the run's events): resizes, the undo switch, the logs.
+    # is not among the run's events): resizes, the undo switch, the logs. And
+    # the screen during the purge: the first and the last progress line of
+    # each module.
     if ([string]$manifest['action'] -eq 'PURGE') {
+        $first = @{}
+        $last = @{}
+        $modules = New-Object 'System.Collections.Generic.List[string]'
         foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
             if ($line -match '^\s+((UNDO|TEMP)_(RESIZED|SIZE_KEPT)|UNDO_SWITCH\w*|UNDO_SWAP_\w+|UNDO_(CREATED|DROPPED)|REDO_(UNCHANGED|ENLARGED|RESTORED|GROUP_KEPT))\s+(.*?)\s*$') {
                 $Out.Add(' restore: ' + $Matches[1] + ' ' + (Format-DigestText $Matches[6]))
+            } elseif ($line -match '^\s(\d\d:\d\d:\d\d) \[.{4}\] BATCH_PROGRESS\s+((\S+) .*?)\s*$') {
+                $time = $Matches[1]
+                $body = $Matches[2]
+                $module = $Matches[3]
+                $text = $time + ' ' + (Format-DigestText $body)
+                if (-not $first.ContainsKey($module)) { $first[$module] = $text; $modules.Add($module) }
+                $last[$module] = $text
             }
         }
+        foreach ($m in $modules) {
+            $Out.Add(' progress: ' + $first[$m])
+            if ($last[$m] -ne $first[$m]) { $Out.Add(' progress: ' + $last[$m]) }
+        }
     }
+    # The end of the run as the wrapper showed it (summary.txt): the estimate
+    # or the simulation with its retention options, the tablespaces, the
+    # requirements with their figures, and for a reclaim its datafiles at the
+    # start and at the end. The checks are in the line above already.
+    if (-not $Brief) {
+        $shown = 0
+        $inChecks = $false
+        foreach ($line in (Get-FileLines (Join-Path $Folder 'summary.txt'))) {
+            if ($line -match '^ CHECKS(\s|$)') { $inChecks = $true }
+            elseif ($line -match '^ DATAFILES(\s|$)') { $inChecks = $false }
+            if ($inChecks -or $line.Trim() -eq '') { continue }
+            $shown++
+            if ($shown -gt 80) { $Out.Add(' | ... more in summary.txt'); break }
+            $Out.Add(' | ' + $line.TrimEnd())
+        }
+    }
+}
+
+# The database as it is now, for the digest (SYS, read-only): how the
+# instance started, the tool installed and what it left open, the online
+# logs, every datafile and temporary file with its size, and their total: what
+# a listing of the data directory shows. One line saying why when it cannot
+# be read (no configuration, no SYS password at hand, no connection); the
+# digest never asks for a password.
+function Get-DbState {
+    if ($script:Tns -eq '') { return @('-- database now: not read (no test.conf)') }
+    if ($script:SysPw -eq '' -or $null -eq $script:SqlPlus) {
+        return @('-- database now: not read (set EPF_SYS_PASSWORD, or SYS_PASSWORD in test.conf, and the digest adds its files and logs)')
+    }
+    $sql = @(
+        ('CONNECT sys/"' + $script:SysPw + '"@' + $script:Tns + ' AS SYSDBA'),
+        'SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMOUT ON SERVEROUTPUT ON',
+        "SELECT 'STATE|db|' || d.name || ', ' || d.log_mode || ', started from ' || NVL2((SELECT MAX(value) FROM v`$parameter WHERE name = 'spfile'), 'an spfile', 'a pfile') || ', undo tablespace ' || (SELECT MAX(value) FROM v`$parameter WHERE name = 'undo_tablespace') FROM v`$database d;",
+        "DECLARE l_v VARCHAR2(100); l_p VARCHAR2(2000); l_s VARCHAR2(10); BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; EXECUTE IMMEDIATE 'SELECT LISTAGG(item || '' x'' || n, '', '') WITHIN GROUP (ORDER BY item) FROM (SELECT item, COUNT(*) AS n FROM epfpg.epf_instance_change WHERE restored_at IS NULL GROUP BY item)' INTO l_p; EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''undo_switch_pfile''' INTO l_s; DBMS_OUTPUT.PUT_LINE('STATE|db|tool ' || l_v || ', open change records: ' || NVL(l_p, 'none') || ', undo_switch_pfile ' || NVL(l_s, '-')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('STATE|db|tool not installed'); END;",
+        '/',
+        "SELECT 'STATE|log|group ' || l.group# || ' ' || ROUND(l.bytes / 1048576) || ' MB ' || (SELECT LISTAGG(SUBSTR(f.member, GREATEST(INSTR(f.member, '/', -1), INSTR(f.member, '\', -1)) + 1), ' ') WITHIN GROUP (ORDER BY f.member) FROM v`$logfile f WHERE f.group# = l.group#) FROM v`$log l ORDER BY l.group#;",
+        "SELECT 'STATE|file|' || RPAD(tablespace_name, 12) || ' ' || RPAD(SUBSTR(file_name, GREATEST(INSTR(file_name, '/', -1), INSTR(file_name, '\', -1)) + 1), 26) || ' ' || LPAD(ROUND(bytes / 1048576), 8) || ' MB' FROM (SELECT tablespace_name, file_name, bytes, file_id, 1 AS kind FROM dba_data_files UNION ALL SELECT tablespace_name, file_name, bytes, file_id, 2 FROM dba_temp_files) ORDER BY kind, tablespace_name, file_id;",
+        "SELECT 'STATE|db|total ' || ROUND(((SELECT SUM(bytes) FROM dba_data_files) + (SELECT NVL(SUM(bytes), 0) FROM dba_temp_files) + (SELECT SUM(bytes * members) FROM v`$log) + (SELECT NVL(SUM(block_size * file_size_blks), 0) FROM v`$controlfile)) / 1073741824, 2) || ' GB in datafiles, temporary files, online logs and control files' FROM dual;",
+        'EXIT')
+    $answer = @()
+    try { $answer = @(($sql -join "`r`n") | & $script:SqlPlus '-S' '-L' '/nolog') } catch { $answer = @([string]$_.Exception.Message) }
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $logs = New-Object 'System.Collections.Generic.List[string]'
+    $files = New-Object 'System.Collections.Generic.List[string]'
+    $general = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in $answer) {
+        $text = [string]$line
+        if ($text -match '^STATE\|log\|(.*?)\s*$') { $logs.Add($Matches[1]) }
+        elseif ($text -match '^STATE\|file\|(.*?)\s*$') { $files.Add($Matches[1]) }
+        elseif ($text -match '^STATE\|db\|(.*?)\s*$') { $general.Add($Matches[1]) }
+    }
+    if ($general.Count -eq 0) {
+        $why = @($answer | Where-Object { [string]$_ -match 'ORA-\d{5}|SP2-\d{4}|TNS-\d{5}' } | Select-Object -First 1)
+        $reason = 'the connection as SYS failed'
+        if ($why.Count -gt 0) { $reason = $reason + ': ' + ([string]$why[0]).Trim() }
+        return @('-- database now: not read (' + $reason + ')')
+    }
+    $out.Add('-- database now (' + $script:Tns + ', ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + ')')
+    foreach ($g in $general) { $out.Add(' ' + $g) }
+    if ($logs.Count -gt 0) { $out.Add(' online logs: ' + ($logs -join '; ')) }
+    foreach ($f in $files) { $out.Add(' ' + $f) }
+    return ,$out.ToArray()
 }
 
 function Invoke-Digest {
@@ -2419,6 +2543,8 @@ function Invoke-Digest {
         $out.Add('')
         $out.Add('-- no run in ' + $logs + ' started after the test session')
     }
+    $out.Add('')
+    foreach ($line in (Get-DbState)) { $out.Add($line) }
     $text = $out -join "`r`n"
     if (-not (Test-Path -LiteralPath $logs)) { New-Item -ItemType Directory -Path $logs -Force | Out-Null }
     $path = Join-Path $logs 'digest.txt'
@@ -2436,6 +2562,7 @@ function Invoke-Digest {
 
 function Invoke-Main {
     $configPath = Join-Path $script:TestDir 'test.conf'
+    $digest = $false
     $i = 0
     while ($i -lt $script:CliArgs.Count) {
         $arg = [string]$script:CliArgs[$i]
@@ -2444,10 +2571,24 @@ function Invoke-Main {
             '--only'   { $i++; $script:Only = @(([string]$script:CliArgs[$i]).ToUpper().Split(',') | ForEach-Object { $_.Trim() }) }
             '--from'   { $i++; $script:From = ([string]$script:CliArgs[$i]).ToUpper().Trim() }
             '--list'   { $script:TestList | ForEach-Object { Write-Host $_ }; exit 0 }
-            '--digest' { Invoke-Digest; exit 0 }
+            '--digest' { $digest = $true }
             default    { Exit-Suite 4 ('Unknown argument ' + $arg + '. Usage: run_tests.bat [--config FILE] [--only T03,T05] [--from T11] [--list] [--digest]') }
         }
         $i++
+    }
+    if ($digest) {
+        # The digest reads the logs. With the configuration and the SYS
+        # password at hand (test.conf, or EPF_SYS_PASSWORD), it adds the
+        # database's files and logs as they are now; it never asks for one.
+        if (Test-Path -LiteralPath $configPath) {
+            $config = Read-Config $configPath
+            $script:Tns = Get-Value $config 'TNS'
+            $script:SysPw = Get-Value $config 'SYS_PASSWORD'
+            if ($script:SysPw -eq '') { $script:SysPw = [string]$env:EPF_SYS_PASSWORD }
+            $script:SqlPlus = Find-SqlPlus
+        }
+        Invoke-Digest
+        exit 0
     }
     if (-not (Test-Path -LiteralPath $configPath)) {
         Exit-Suite 4 ('Configuration file not found: ' + $configPath + ' (copy test.conf.example to test.conf).')

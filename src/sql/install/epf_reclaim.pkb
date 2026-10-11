@@ -2352,6 +2352,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                  WHERE run_id = g_run.run_id AND file_id = f.file_id;
                 IF l_top_item IS NULL THEN
                     p_done(f.file_id) := TRUE;
+                    FOR d IN (SELECT file_name FROM dba_data_files WHERE file_id = f.file_id) LOOP
+                        say(epfpg.epf_log.c_info, 'FILE_DONE', d.file_name || ' is empty: no segment is left in it');
+                    END LOOP;
                     EXIT;
                 END IF;
                 SELECT unit_type, move_status, attempts, last_ora, owner, object_name, detail

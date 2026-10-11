@@ -1458,7 +1458,7 @@ function Invoke-ToolRun {
     Show-Lines $report.Output -HideMachine -Detail
     $mode = ''
     if ($Ctx.DryRun) { $mode = 'DRY_RUN' }
-    if (-not $script:Verbose) { Show-Summary $Action $mode $report.Output }
+    Show-Summary $Action $mode $report.Output $state.Folder
     # The requirements and the plan of the run, each in its own file.
     foreach ($part in @(@('REQUIREMENTS', 'requirements.txt'), @('PLAN', 'plan.txt'))) {
         $text = Get-ReportSection $report.Output $part[0]
@@ -1972,17 +1972,21 @@ function Get-ReportSection {
 # The end of a run on the console without --verbose: the parts of its report
 # that matter for the action (console.log and report.txt have the whole
 # report). A preflight: the estimate per module; a dry run: the simulation
-# per module and the expected outcome; a reclaim: each tablespace in one line
-# and, for an assessment, the accounts a compaction locks. Then the
-# requirements, unless a purge or compaction found them all met; then the
-# checks in short and the verdict. Not logged.
+# per module, the retention options and the expected outcome; a reclaim:
+# each tablespace in one line and, for an assessment, the accounts a
+# compaction locks. Then the requirements, unless a purge or compaction found
+# them all met; then the checks in short and the verdict. Not logged. With
+# $Folder, the same lines go to summary.txt there, with or without
+# --verbose, followed for a reclaim by its datafiles at the start and at the
+# end (the test suite's digest reads it).
 function Show-Summary {
-    param([string]$Action, [string]$Mode, [string]$Report)
+    param([string]$Action, [string]$Mode, [string]$Report, [string]$Folder = '')
     $lines = New-Object 'System.Collections.Generic.List[string]'
     if ($Action -eq 'PREFLIGHT') {
         Add-Lines $lines (Get-TableLines $Report 'ESTIMATE')
     } elseif ($Action -eq 'PURGE' -and $Mode -eq 'DRY_RUN') {
         Add-Lines $lines (Get-TableLines $Report 'SIMULATION')
+        Add-Lines $lines (Get-TableLines $Report 'RETENTION OPTIONS')
         Add-Lines $lines (Get-ExpectedLines $Report)
     } elseif ($Action -eq 'PURGE') {
         Add-Lines $lines (Get-DiskLines $Report)
@@ -1996,7 +2000,13 @@ function Show-Summary {
         Add-Lines $lines $requirements
     }
     Add-Lines $lines (Get-CheckLines $Report)
-    if ($lines.Count -eq 0) { return }
+    if ($Folder -ne '') {
+        $file = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($line in $lines) { $file.Add($line) }
+        if ($Action -eq 'RECLAIM' -and $Mode -ne 'ASSESS') { Add-Lines $file (Get-TableLines $Report 'DATAFILES') }
+        [System.IO.File]::WriteAllLines((Join-Path $Folder 'summary.txt'), $file.ToArray(), [System.Text.Encoding]::ASCII)
+    }
+    if ($script:Verbose -or $lines.Count -eq 0) { return }
     Write-Section 'SUMMARY' -NoLog
     foreach ($line in $lines) {
         $color = ''
@@ -2814,7 +2824,7 @@ function Invoke-ReclaimRun {
     $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId) -Patient
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
     Show-Lines $report.Output -HideMachine -Detail
-    if (-not $script:Verbose) { Show-Summary 'RECLAIM' $Mode $report.Output }
+    Show-Summary 'RECLAIM' $Mode $report.Output $state.Folder
     $text = Get-ReportSection $report.Output 'REQUIREMENTS'
     if ($text -ne '') {
         [System.IO.File]::WriteAllText((Join-Path $state.Folder 'requirements.txt'), $text, [System.Text.Encoding]::ASCII)

@@ -268,6 +268,7 @@ Every action that works on the database creates a run, such as R-000123, recorde
 | report.txt | The run's report: parameters, steps, results, checks and verdict |
 | manifest.txt | A key=value summary: status, verdict, exit code, checks |
 | requirements.txt, plan.txt | The requirements and the plan, when the run has them |
+| summary.txt | The summary shown at the end of the run; for a reclaim, also its datafiles at the start and at the end |
 | sqlplus_*.log | The output of the SQL*Plus sessions |
 
 Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:
@@ -390,4 +391,4 @@ The end-to-end test suite runs every feature against a test database, and change
 
 1. Copy `src\tests\e2e\test.conf.example` to `src\tests\e2e\test.conf`, and set TNS, EXPECTED_DB and DESTRUCTIVE_OK=YES.
 2. Run `src\tests\e2e\run_tests.bat` for the whole suite (about 3 hours), or a part of it, such as `src\tests\e2e\run_tests.bat --only T18A,T18B`.
-3. `src\tests\e2e\run_tests.bat --digest` writes a short summary of the last test session to `logs\digest.txt` and copies it to the clipboard.
+3. `src\tests\e2e\run_tests.bat --digest` writes a short summary of the last test session and of the runs after it to `logs\digest.txt` and copies it to the clipboard: each run with its checks, key events, restore lines and summary. With the SYS password at hand (EPF_SYS_PASSWORD, or SYS_PASSWORD in test.conf) it adds the database as it is now: how the instance started, the tool installed, the online logs, and every datafile and temporary file with its size.
