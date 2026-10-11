@@ -2,6 +2,19 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-11 - Set O's first half on TANM7883 (CLUBMED8, 0.9.0): 5% of the batches waiting with 3 x 200 MB logs; the digest shows the plan step and the restore
+
+The digest (T0.log, session 2026-10-11_150006_TANM7883; 0.9.0, since 0.9.1 was not pushed yet):
+- O2, T01: TANM7883's own logs 3 x 150 MB; OP 10,183 MB, OPPAYMENTS 7,142 MB.
+- O4: the dry run of PAYMENTS (R-000001, 34 s) and the preflight of the plan (R-000002). The two warnings of every run: OPPAYMENTS.APPROBATION_EXECUTION_OPT and WORKFLOW_EXECUTION_OPT are not in CLUBMED8 (REG_TABLE_MISSING).
+- O5, step 1 with 3 x 200 MB (R-000003, 7 min 4 s, PASS WITH WARNINGS): PAYMENTS 11,075,375 rows in 6 min 29 s, 139 batches in 5 min 21 s, 29 us per row; 21 temporary indexes; undo at most 4.0 of 4.0 GB. **Log switch waits 16 s, 5% of the batches**, against 29% on EPFPG782 with 3 x 150 MB (set N): the cost of small logs depends on the database, which the WAITS line now shows on each purge.
+- Not in the digest: the plan step the purge carried out, and what the undo restore did (its lines are printed by the SYS session, not events).
+
+Changes (tests only):
+- run_tests.ps1, the digest: a purge's or preflight's header line names its plan, the step it carried out and the steps done; after a purge's events, its undo and redo restore lines (`restore:` TEMP_RESIZED, UNDO_RESIZED, the UNDO_SWITCH and UNDO_SWAP lines, REDO_UNCHANGED, REDO_ENLARGED, REDO_RESTORED, REDO_GROUP_KEPT) from console.log.
+
+Next: push, install 0.9.1 on TANM7883 (the plan is kept), then O6 (4 x 1 GB), O7 (step 2, with the undo switch at its end), O8 (back to 3 x 150 MB), O9.
+
 ## 2026-10-11 - Set N on EPFPG782 (SONEPARUAT, retention 1800, 0.9.0): small logs cost 29% of the purge; the reclaim reaches the segments after a lighter purge; set P planned (DATA in several datafiles)
 
 The digest (TN.log; its test session is still set M's, as N2 was not run on EPFPG782):

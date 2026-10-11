@@ -2134,6 +2134,13 @@ function Add-DigestRun {
     if ([string]$manifest['tablespaces'] -ne '') { $head = $head + ' ' + [string]$manifest['tablespaces'] }
     $head = $head + ': ' + [string]$manifest['status'] + ', ' + [string]$manifest['verdict'] + ', exit '
     $head = $head + [string]$manifest['exit_code'] + ', ' + $duration
+    # The plan of a purge or preflight: the step this run carried out, and
+    # where the plan stands after it.
+    if ([string]$manifest['plan'] -ne '') {
+        $head = $head + ', plan ' + [string]$manifest['plan']
+        if ([string]$manifest['plan_step'] -ne '') { $head = $head + ' step ' + [string]$manifest['plan_step'] }
+        $head = $head + ' (' + [string]$manifest['plan_done'] + ' of ' + [string]$manifest['plan_steps'] + ' done)'
+    }
     $Out.Add('')
     $Out.Add($head)
     $detail = New-Object 'System.Collections.Generic.List[string]'
@@ -2311,6 +2318,15 @@ function Add-DigestRun {
         $Out.Add(' ' + $lines[$i])
     }
     if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log') }
+    # What a purge's undo and redo restore did (the SYS sessions print it; it
+    # is not among the run's events): resizes, the undo switch, the logs.
+    if ([string]$manifest['action'] -eq 'PURGE') {
+        foreach ($line in (Get-FileLines (Join-Path $Folder 'console.log'))) {
+            if ($line -match '^\s+((UNDO|TEMP)_(RESIZED|SIZE_KEPT)|UNDO_SWITCH\w*|UNDO_SWAP_\w+|UNDO_(CREATED|DROPPED)|REDO_(UNCHANGED|ENLARGED|RESTORED|GROUP_KEPT))\s+(.*?)\s*$') {
+                $Out.Add(' restore: ' + $Matches[1] + ' ' + (Format-DigestText $Matches[6]))
+            }
+        }
+    }
 }
 
 function Invoke-Digest {
