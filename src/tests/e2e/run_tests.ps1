@@ -2094,6 +2094,9 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
                           'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK')
 $script:DigestPurge = @('MODULE_END', 'DISK_USE', 'REDO_WAITS', 'STOP_HONORED')
+# The runs added to the digest and their durations in all (Add-DigestRun).
+$script:DigestRunSeconds = 0
+$script:DigestRunCount = 0
 # The wrapper's lines that say why a run failed (Add-DigestRun): errors of
 # its sessions, lost connections, the monitor, an early end and its restore.
 $script:DigestTrouble = 'ORA-\d{5}|TNS-\d{5}|SP2-\d{4}|did not answer|did not finish|ended before|could not|' +
@@ -2171,15 +2174,31 @@ function Add-DigestRun {
     param($Out, [string]$Folder, [string]$Test, [bool]$Brief = $false)
     $manifest = @{}
     $checks = New-Object 'System.Collections.Generic.List[string]'
+    # Every step of the run with its duration (step.<phase>.<step>.<scope>=
+    # <status>|<seconds>), in order: what an estimate for another database
+    # starts from. Steps under a second are counted, not listed.
+    $steps = New-Object 'System.Collections.Generic.List[string]'
+    $short = 0
     foreach ($line in (Get-FileLines (Join-Path $Folder 'manifest.txt'))) {
         $eq = $line.IndexOf('=')
         if ($eq -le 0) { continue }
         $manifest[$line.Substring(0, $eq)] = $line.Substring($eq + 1)
         if ($line.StartsWith('check.')) { $checks.Add($line.Substring(6)) }
+        if ($line -match '^step\.[^.]+\.([^.=]+)\.([^=]*)=([^|]*)\|(\d+)$') {
+            if ([int]$Matches[4] -lt 1) { $short++; continue }
+            $name = $Matches[1]
+            if ($Matches[2] -ne '-' -and $Matches[2] -ne '') { $name = $name + ' ' + $Matches[2] }
+            if ($Matches[3] -ne 'DONE') { $name = $name + ' ' + $Matches[3] }
+            $steps.Add($name + ' ' + (Format-Duration ([int]$Matches[4])))
+        }
     }
     $duration = ''
     foreach ($line in (Get-FileLines (Join-Path $Folder 'report.txt'))) {
         if ($line -match 'duration (\d+:\d\d:\d\d)') { $duration = $Matches[1]; break }
+    }
+    if ($duration -match '^(\d+):(\d\d):(\d\d)$') {
+        $script:DigestRunSeconds += [int]$Matches[1] * 3600 + [int]$Matches[2] * 60 + [int]$Matches[3]
+        $script:DigestRunCount++
     }
     $mode = [string]$manifest['reclaim_mode'] + [string]$manifest['mode']
     $head = '-- ' + (Split-Path -Leaf $Folder)
@@ -2215,6 +2234,11 @@ function Add-DigestRun {
     }
     foreach ($status in $statuses) { $detail.Add($status + ' ' + ($plain[$status] -join ' ')) }
     if ($detail.Count -gt 0) { $Out.Add(' checks: ' + ($detail -join '; ')) }
+    if (-not $Brief -and $steps.Count -gt 0) {
+        $text = ' steps: ' + ($steps -join '; ')
+        if ($short -gt 0) { $text = $text + '; ' + $short + ' more under 1 s' }
+        $Out.Add($text)
+    }
     # A run that failed: the wrapper's own messages while it was shown and the
     # errors of its sqlplus sessions (a lost connection shows there, not in
     # the events).
@@ -2279,8 +2303,11 @@ function Add-DigestRun {
         }
         $e = New-Object psobject -Property @{ Time = $time; Last = $time; Tag = $tag; Code = $code; Text = $text;
                                                Unit = ''; Small = $false; Absorbed = $false; Room = $false;
-                                               Init = 0; Ts = ''; From = ''; To = ''; Bytes = [double]0; Count = 1 }
+                                               Init = 0; Ts = ''; From = ''; To = ''; Bytes = [double]0; Count = 1;
+                                               Took = '' }
         if ($code -eq 'UNIT_MOVED') {
+            # How long the move took: kept for a move shown on its own line.
+            if ($text -match ' \((\d+:\d\d:\d\d)\)$') { $e.Took = $Matches[1] }
             $e.Text = $text -replace ' \(\d+:\d\d:\d\d\)$', ''
             $e.Unit = ($text -split ':')[0]
             $pendingUnit = $e.Unit
@@ -2357,7 +2384,12 @@ function Add-DigestRun {
         $prefix = $prefix + ' '
         if ($e.Tag -eq 'WARN' -or $e.Tag -eq 'FAIL') { $prefix = $prefix + $e.Tag + ' ' }
         if ($e.Code -eq 'UNIT_MOVED') {
-            $lines.Add($prefix + 'MOVED ' + $e.Text)
+            # "table: size -> size in HH:MM:SS; tablespace ...": the rate of
+            # a large table, with and without LOB segments.
+            $moved = $e.Text
+            $semi = $moved.IndexOf(';')
+            if ($e.Took -ne '' -and $semi -gt 0) { $moved = $moved.Substring(0, $semi) + ' in ' + $e.Took + $moved.Substring($semi) }
+            $lines.Add($prefix + 'MOVED ' + $moved)
         } elseif ($e.Code -eq 'FILE_GROWN' -and $e.Count -gt 1) {
             $grown = $prefix + 'FILE_GROWN x' + $e.Count + ' ' + $e.Unit + ': ' + $e.From + ' -> ' + $e.To + ' '
             $lines.Add($grown + ($e.Text -replace '^File \d+ of \S+: \S+ \S+ -> \S+ \S+ ', ''))
@@ -2634,8 +2666,14 @@ function Invoke-Digest {
         $later = $later + @(Get-ChildItem -LiteralPath (Join-Path $logs 'sys') -File -Filter '*.log' | Where-Object {
                                 $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 })
     }
+    $script:DigestRunSeconds = 0
+    $script:DigestRunCount = 0
     foreach ($item in ($later | Sort-Object Name)) {
         if ($item.PSIsContainer) { Add-DigestRun $out $item.FullName '' } else { Add-DigestSys $out $item.FullName }
+    }
+    if ($script:DigestRunCount -gt 1) {
+        $out.Add('')
+        $out.Add('-- ' + $script:DigestRunCount + ' runs after the test session: ' + (Format-Duration $script:DigestRunSeconds) + ' in all')
     }
     if ($later.Count -eq 0) {
         $out.Add('')

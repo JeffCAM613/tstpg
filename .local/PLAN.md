@@ -982,11 +982,59 @@ State on 2026-10-10: set M ran on 0.8.3 (0.8.4 was not pushed), which left TANM7
 | Reclaim with parking (`--scratch`) | 14.2 to 2.2 GB, 118 tables parked, until the network dropped at 1 h 37 min (J4, EPFPG784, 0.8.0); the restore took 11 min, 972 indexes rebuilt in 7 min: 6.7 GB with 6.5 GB of segments (J5). 40 parked (up to 7.3 GB of 7.5 GB), the compaction down to 5.3 GB, all back in 6 min 59 s (N5) | 13 tables parked (1.5 GB), all back in 20 s; 175 indexes rebuilt in about 20 s (K5). 36 parked (up to 5.5 GB of 7.3 GB), the compaction down to 4.2 GB (OP.PLAN_TABLE, a LONG column, at the top), all back in 1 min 25 s (K8) | 90 tables parked, up to the 8.0 GB allowed: full about 3 min into the compaction; then 15 tables skipped (PARK_SKIPPED asked for 9216M to 9472M) and 69 that failed to park, ORA-01658 (no room for their INITIAL extent), the run's 69 warnings; 0.9.0 stops parking once the scratch space is full (SCRATCH_FULL) (M5) |
 | Forecast of DATA after a reclaim, against the result | 8.9 GB (R1) against 7.6 GB (R10); 8.4 GB (J3) against 6.7 GB (J5); 8.3 GB (L4) against 6.9 GB (L5); with 4 datafiles 33.3 GB (P5) against 6.6 GB (P6): the forecast took the files end to end, corrected in 0.9.2 | 10.7 GB (K4) against 9.9 GB (K5); 9.9 GB (K8 dry run) against 9.4 GB (K8): the forecast does not count what parking gives | 15.7 GB (M4) against 14.4 GB (M5) |
 | A light purge, then the reclaim (set Q, EPFPG782, 0.9.1) | Cutoff 2016-05-10, taking a fifth: PAYMENTS 18.2 M of 89.3 M rows in 8 min 49 s (23% waiting for log switches, 3 x 150 MB), the whole purge 10 min. DATA 41.7 GB, 39.6 GB of segments. In place: 41.7 to 36.8 GB in 1 h 28 min for 33.8 GB of segments (R7 WARN), 14 tables moved; OPPAYMENTS.DIRECTORY_DISPATCHING (8.4 GB with its LOB) moved 4 times, 63 min, its copy at the top again twice. Then with 22.5 GB of scratch space: 36.8 to 32.7 GB in 1 h 19 min for 32.6 GB of segments (R7 PASS), 97 moved and 25 parked (22.4 GB), the compaction down to 1.9 GB in 37 min, all back in 31 min, 969 indexes in 10 min; **46.1 GB on disk at the worst moment**. 9.0 GB given back in 2 h 47 min. Led to D26. On 0.9.2 (Q9), the same reclaim again on the compact copy: nothing parked, no table moved ("0 B free below: parking it would not make DATA smaller"), 10 min 32 s, all of it the 969 index rebuilds | - | - |
-| A datafile minutes after a reclaim | 32.7 GB at the end of Q7 and of Q9, 34.4 GB (35,215 MB) shortly after, both times; 15.7 GB after set N, then 16.55 GB: about 5% each time. Likely Oracle's own background extension of a datafile that can grow, once less than about 5% of its tablespace is free (to confirm with DATA's free space, Q10) | - | - |
+| A datafile minutes after a reclaim | 32.7 GB at the end of Q7 and of Q9, 34.4 GB (35,215 MB) shortly after, both times; 15.7 GB after set N, then 16.55 GB: about 5% each time. Free space, not data (Q10): DATA 35,215 MB with 1,700 MB free, 17 steps of its 100 MB increment. Oracle extends a datafile that can grow ahead of need, until about 5% is free; a reclaim's end size is about 5% below where such a datafile settles | - | - |
 | Time to move a small table; to park one | about 45 s; about 1 s (J4, 0.8.0); about 1 s each on the same server with 0.8.1 (L5: 569 moves and parks in 10 min 13 s) | under 1 s; about 1 s (K5, and K8 on 0.8.1) | about 1 s; under 1 s (M5) |
 | A worker whose client is gone | J4's network drop ended its session too (J5 found no worker) | its call went on; the restore waited for it (WORKER_RUNNING), then went on (T18J, K3b) | its call went on; the restore waited for it (T18J, T18K, M3) |
 | A session killed with KILL SESSION IMMEDIATE | ends at once (T18D, T18I, sets I and J, from the test machine); marked for kill first, ORA-00031 (L3, from the remote server) | marked for kill first, ORA-00031 (K3) | marked for kill first, ORA-00031 (T18D, T18I, M3) |
 | The reclaim lab tests: the lab's own tables, so they measure the connection, not the data | T01 29 s, T18D 6 min 32 s, T18I 5 min 12 s, T18F 37 s from the test machine (J2, EPFPG784, 0.8.0); T01 2 s, T18D 1 min 19 s, T18I 1 min 4 s, T18F 6 s, T18J 7 min 13 s, T18K 1 min 12 s from the remote server (L3, EPFPG781, 0.8.2) | T01 2 s, T18D 58 s, T18I 54 s, T18F 6 s; T18J 6 min 59 s with its 120 s pause (K3b, 0.8.0); T18K 23 min 57 s on 0.8.0 (the restore waited for the whole compaction of the orphan worker) and 1 min 14 s on 0.8.1 (it asks it to stop), T18A 36 s, T18B 50 s, T18H 1 min 37 s, T18G 1 min 24 s (K7) | T01 2 s, T18D 1 min 5 s, T18I 56 s, T18F 6 s, T18J 7 min 1 s, T18K 1 min 8 s, T18A 40 s, T18B 56 s, T18H 1 min 34 s, T18G 1 min 19 s (M3) |
+
+### 12.8 Durations and rates (to estimate a run on another database)
+
+Every test set's durations are recorded here, with what the time bought (rows deleted, bytes written again), so that a run on a larger database can be estimated. The time of a purge follows the rows it deletes; the time of a reclaim follows the bytes it writes again (tables that move, twice when parked, and indexes rebuilt), not the size of the database. All from the remote server close to the databases unless noted. The rates depend on the server and its storage: one measured run on the target calibrates them. The digest lists every step of a run with its duration (`steps:`), each large move with its time, and the total of the runs.
+
+**Set Q step by step** (EPFPG782, SONEPARUAT, DATA 41.7 GB, online logs 3 x 150 MB, cutoff 2016-05-10):
+
+| Step | Run | Time | What it did |
+|---|---|---|---|
+| Purge, dry run | R-000001 | 1 min 25 s | 3 modules; the count of PAYMENTS 41 s |
+| Purge | R-000002 | 10 min 1 s | PAYMENTS 18.2 M rows in 8 min 49 s (batches 7 min 45 s, of which 1 min 46 s waiting for log switches); LOGS 125,517 rows in 13 s; BANK_STATEMENTS 935,130 rows in 39 s |
+| Reclaim, dry run | R-000021, R-000041 | 24 s, 25 s | 688 tables, 969 indexes assessed |
+| Reclaim in place | R-000022 | 1 h 27 min 42 s | compaction 1 h 17 min 3 s (about 43 GB written: one LOB table of 8.4 GB four times); 969 indexes rebuilt in 9 min 45 s; the rest 54 s |
+| Reclaim with scratch space | R-000042 | 1 h 19 min 8 s | compaction 37 min 13 s (97 moved, 25 parked: 22.4 GB); the 25 back in 30 min 34 s; indexes 10 min 29 s; the rest 52 s |
+| Reclaim again, compact copy (0.9.2) | R-000061 | 10 min 32 s | nothing moved; indexes 9 min 27 s; the rest 1 min 5 s |
+| Q1 to Q8 in all | | 2 h 59 min | of which the two reclaims 2 h 47 min; 3 h 52 min on the clock |
+
+**Other sets** (details in 12.7):
+
+| Set, database, data | Purge of PAYMENTS | Reclaim of DATA | Full suite |
+|---|---|---|---|
+| G, EPFPG782, SONEPARUAT | 84.7 M rows in 24 min 28 s | - | - |
+| L, EPFPG781, SONEPARUAT | 89.1 M rows in 28 min 53 s (4 x 1 GB logs) | 41.6 to 6.9 GB in 19 min 7 s: compaction 10 min 13 s, parked tables back 3 min 43 s, indexes 4 min 9 s | 1 h 14 min 44 s |
+| N, EPFPG782, SONEPARUAT | 67.5 M rows in 33 min 56 s (3 x 150 MB logs, 8 min 37 s of waits) | in place 41.8 to 17.0 GB in 29 min 15 s; then with scratch space 17.0 to 15.7 GB in 31 min 20 s | - |
+| P, EPFPG783, SONEPARUAT in 4 datafiles | 89.3 M rows in 37 min 52 s (3 x 150 MB logs, 11 min 8 s of waits) | 44.0 to 6.6 GB in 28 min 38 s: 359 parked tables back in 5 min 45 s, indexes 3 min 42 s | 1 h 15 min |
+| K, TANM7883, CLUBMED8 | inside the suite | 18.0 to 9.9 GB in 5 min 10 s; then 9.9 to 9.4 GB in 6 min 32 s | 38 min 51 s |
+| O first run, TANM7883, CLUBMED8 | 11.1 M rows in 6 min 29 s (batches 5 min 21 s, 16 s of waits, 3 x 200 MB logs) | - | - |
+| M, TANM7884, CLUBMEDEPF | inside the suite: T13 in 4 min 47 s | 23.7 to 14.4 GB in 23 min 58 s: compaction 7 min 45 s, parked tables back 1 min 47 s, 1000 indexes (about 5.7 GB) 13 min 8 s | 53 min 52 s |
+
+**Rates measured:**
+
+| What | Rate | From |
+|---|---|---|
+| Purge of PAYMENTS, per row deleted (batches) | 17 to 20 us with online logs that keep up (4 x 1 GB): 180 to 210 M rows an hour. 24 to 29 us with 150 or 200 MB logs: 125 to 150 M rows an hour | G 17.3, L 19.4; N 27.9, P 24.2, Q 25.5 (SONEPARUAT); O 29.0 (CLUBMED8) |
+| Purge, the part that does not grow with the rows deleted | 1 to 2 min a run: the counts (41 s for the 89 M rows of PAYMENTS), temporary indexes, the report | Q |
+| Reclaim, a table that is mostly LOB segments | 6 to 15 MB/s written: 0.4 to 0.9 GB a minute. OPPAYMENTS.DIRECTORY_DISPATCHING 8.4 GB in 13 to 19 min each time (moved 4 times, parked, back); FILE_DISPATCHING 3.5 GB in 4 to 5 min; TRANSMISSION_EXECUTION_AUDIT 2.0 GB in 4 min 30 s to 5 min 20 s | Q6, Q7: 33.5 GB in 62 min 47 s in Q7, 0.53 GB a minute |
+| Reclaim, any other large table | 40 to 140 MB/s: 2.4 to 8.4 GB a minute. PAYMENT_ADDITIONAL_INFO 2.9 GB in 22 s, PAYMENT 1.7 GB in 12 s, PAYMENT_AUDIT 1.2 GB in 10 s, HISTO_REGLEMENT 985 MB in 10 s, HISTO_OPERATION 960 MB in 25 s | Q6, Q7 |
+| Reclaim, a small table | about 1 s to move or to park | L5 (569 in 10 min 13 s), K5, M5 |
+| Reclaim, index rebuilds | 15 to 17 MB/s: about 1 GB a minute on SONEPARUAT (969 indexes, 9.5 to 10 GB in 9 min 27 s to 10 min 29 s, no log switch waits); 0.43 GB a minute on CLUBMEDEPF (1000 indexes, about 5.7 GB in 13 min 8 s) | Q6, Q7, Q9; M5 |
+| Reclaim, the part that does not grow with the bytes | about 1 min for 688 tables and 969 indexes: assessment, accounts, release of the indexes, resize, recompilation, verification. A dry run alone: 25 s | Q |
+
+**How to estimate:**
+- **Purge:** rows to delete (the dry run counts them, and forecasts the deleting time from what earlier purges on that database measured) x the rate per row, plus 1 to 2 min. Small online logs add about a third on SONEPARUAT (12.7).
+- **Reclaim:** 1 min + GB of LOB tables written / 0.5 + GB of other tables written / 5 + GB of indexes after the purge / 1, in minutes. Written: once for a table that moves, twice for a table that is parked and comes back, up to 3 or 4 times in place for a table whose copy comes back to the top. Which tables move, and how large they are after the purge, is in the dry run (TS_ASSESSED, the report's tables).
+- **Check on Q7:** LOB tables 33.5 GB / 0.5 = 67 min, other tables about 23 GB / 5 = 5 min, indexes 10 min, 1 min: about 83 min against 79 min measured. With 0.9.2 (parking ends after the first table, D26): about 20 GB of LOB tables (40 min), 5 GB of other tables (1 min), indexes and the rest (11 min): about 52 min, to be measured in set V.
+- **What decides the time of a reclaim** is therefore not the size of the database but how much LOB data has to be written again: after a heavy purge the LOB tables are small (sets L, P: 19 and 29 min for 41 to 44 GB), after a light one they move almost whole (set Q: 79 to 88 min for the same database).
+
+Not built: a duration forecast in the reclaim's dry run. The rates per table are in EPF_RECLAIM_OBJECT (bytes, started_at, ended_at) once a reclaim ran on the database.
 
 ---
 

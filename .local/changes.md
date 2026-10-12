@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - Durations recorded to estimate larger databases (PLAN.md 12.8, the page's Durations section); the digest lists every step with its duration; Q10 on EPFPG782
+
+Why: asked how long set Q took, the user said "you need to record the durations so we can estimate duration for bigger databases too". The durations were in the digests and scattered through 12.7; nothing gave them per step with what the time bought, or said how to scale them.
+
+Q10 (TQ10.log, 16:20):
+- `run_tests.bat --sys undo.sql SWITCH`: its first run on a database; exit 0, the script's line in the digest. **The switch was skipped:** undo_switch_pfile was still N (the UPDATE of the step was not applied; "the instance starts from a pfile that names undo_tablespace"). The undo datafile stays at 4,096 MB, 3,739 MB free. To run again after the UPDATE.
+- **DATA 35,215 MB with 1,700 MB free, growing by 100 MB:** the 1.7 GB that comes back after each reclaim is free space, 17 steps of the datafile's own increment, until about 5% is free. Not data, not the tool: Oracle extends a datafile that can grow ahead of need. A reclaim's end size is therefore about 5% below where an autoextensible datafile settles.
+
+Changes (documents and test suite; tool version stays 0.9.2):
+- PLAN.md 12.8, new: set Q step by step (2 h 59 min of runs: the purge 10 min, the two reclaims 2 h 47 min), the other sets' purge, reclaim and suite times, the rates measured, and how to estimate. The rates: a purge of PAYMENTS 17 to 20 us per row with logs that keep up, 24 to 29 us with 150 to 200 MB logs; a reclaim writes a table that is mostly LOB segments at 0.4 to 0.9 GB a minute, any other large table at 2.4 to 8.4 GB a minute, rebuilds indexes at about 1 GB a minute, and has about 1 min that does not grow with the bytes. Reclaim, in minutes: 1 + LOB GB written / 0.5 + other GB written / 5 + index GB / 1; on Q7 about 83 min against 79 min measured. What decides a reclaim's time is the LOB data written again, not the size of the database.
+- The status page: section Durations, the same tables.
+- run_tests.ps1, the digest: each run outside the suite has a line `steps:` with every step of its manifest and its duration (those under 1 s counted); a move shown on its own line says how long it took ("10.4 GB -> 8.4 GB in 00:18:46"); the runs after the session end with their number and their time in all.
+- README: the digest.
+
+Checked here: the digest of two made-up run folders (the steps line with a failed step, the move times, the total); the suite parses.
+
+Rule from now on: every reported set's durations go into 12.8 and the page's Durations section.
+
 ## 2026-10-12 - Q9 on EPFPG782 (0.9.2, its first run on a database): a reclaim with scratch space on a compact tablespace parks nothing; DATA is 1.7 GB larger again minutes after each reclaim; the digest shows the free space in each datafile
 
 The digest of Q9 (TQ9.log, generated 15:18; the new digest: summary lines, the reclaim's datafiles, "database now").
