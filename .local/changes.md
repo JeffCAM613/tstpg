@@ -2,6 +2,14 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - Q10 again on EPFPG782: the undo switch on a database started from a pfile gives back 3.4 GB; the new digest lines on a real session
+
+The digest of 16:31 (TQ10.log, replaced) and the listing of the data directory.
+- **The undo switch, with undo_switch_pfile Y** (`run_tests.bat --sys undo.sql SWITCH`, exit 0): UNDO_SWITCH_START, UNDO_SWAP_CREATED (EPF_UNDO_SWAP, 256 MB), UNDO_SWITCHED_OUT, UNDO_DROPPED, UNDO_CREATED (undotbs01.dbf 610.0 MB), UNDO_SWITCHED_BACK, UNDO_SWAP_DROPPED, **UNDO_SWITCHED UNDOTBS1 under the same names, 4.0 GB -> 610.0 MB (3.4 GB given back)**. Open change records: none. The first undo switch on a database started from a pfile, and by hand after a purge that ran on an earlier version.
+- **"database now" against `ls -l`:** the same to the megabyte: data.dbf 36,925,218,816 bytes (35,215 MB), temp01.dbf 3,032 MB, undotbs01.dbf 610 MB, 41,974,012 KB in all (40.03 GB). The listing is no longer needed. (The TEMP line missing from the 16:20 paste was lost in the copy.)
+- **The new digest lines:** `steps:` for each run, the time of each large move, "7 runs after the test session: 03:09:37 in all". The move times confirm 12.8: OPPAYMENTS.DIRECTORY_DISPATCHING 18 min 25 s, 16 min 20 s, 14 min 41 s, 13 min 24 s; FILE_DISPATCHING 4 min 4 s and 4 min 13 s; TRANSMISSION_EXECUTION_AUDIT 4 min 27 s to 4 min 49 s; PAYMENT and PAYMENT_AUDIT 9 s each. The part of a run that does not grow, step by step (12.8).
+- Set Q is complete (Q1 to Q10). Boxes that stay open are those only a run on 0.9.2 shows (the roots per year in T01, the dry run's SIMULATION and RETENTION OPTIONS, TEMP_RESIZED): set V runs the same purge on 0.9.2.
+
 ## 2026-10-12 - Durations recorded to estimate larger databases (PLAN.md 12.8, the page's Durations section); the digest lists every step with its duration; Q10 on EPFPG782
 
 Why: asked how long set Q took, the user said "you need to record the durations so we can estimate duration for bigger databases too". The durations were in the digests and scattered through 12.7; nothing gave them per step with what the time bought, or said how to scale them.

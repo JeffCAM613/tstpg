@@ -1021,12 +1021,13 @@ Every test set's durations are recorded here, with what the time bought (rows de
 | What | Rate | From |
 |---|---|---|
 | Purge of PAYMENTS, per row deleted (batches) | 17 to 20 us with online logs that keep up (4 x 1 GB): 180 to 210 M rows an hour. 24 to 29 us with 150 or 200 MB logs: 125 to 150 M rows an hour | G 17.3, L 19.4; N 27.9, P 24.2, Q 25.5 (SONEPARUAT); O 29.0 (CLUBMED8) |
-| Purge, the part that does not grow with the rows deleted | 1 to 2 min a run: the counts (41 s for the 89 M rows of PAYMENTS), temporary indexes, the report | Q |
+| Purge, the part that does not grow with the rows deleted | 1 to 2 min a run. PAYMENTS (89 M rows): the keys' snapshot 16 to 18 s, the count before 24 to 41 s, the count after 20 s; the space measures 5 s each; the other steps 1 to 6 s | Q (the digest's `steps:`) |
 | Reclaim, a table that is mostly LOB segments | 6 to 15 MB/s written: 0.4 to 0.9 GB a minute. OPPAYMENTS.DIRECTORY_DISPATCHING 8.4 GB in 13 to 19 min each time (moved 4 times, parked, back); FILE_DISPATCHING 3.5 GB in 4 to 5 min; TRANSMISSION_EXECUTION_AUDIT 2.0 GB in 4 min 30 s to 5 min 20 s | Q6, Q7: 33.5 GB in 62 min 47 s in Q7, 0.53 GB a minute |
 | Reclaim, any other large table | 40 to 140 MB/s: 2.4 to 8.4 GB a minute. PAYMENT_ADDITIONAL_INFO 2.9 GB in 22 s, PAYMENT 1.7 GB in 12 s, PAYMENT_AUDIT 1.2 GB in 10 s, HISTO_REGLEMENT 985 MB in 10 s, HISTO_OPERATION 960 MB in 25 s | Q6, Q7 |
 | Reclaim, a small table | about 1 s to move or to park | L5 (569 in 10 min 13 s), K5, M5 |
 | Reclaim, index rebuilds | 15 to 17 MB/s: about 1 GB a minute on SONEPARUAT (969 indexes, 9.5 to 10 GB in 9 min 27 s to 10 min 29 s, no log switch waits); 0.43 GB a minute on CLUBMEDEPF (1000 indexes, about 5.7 GB in 13 min 8 s) | Q6, Q7, Q9; M5 |
-| Reclaim, the part that does not grow with the bytes | about 1 min for 688 tables and 969 indexes: assessment, accounts, release of the indexes, resize, recompilation, verification. A dry run alone: 25 s | Q |
+| Reclaim, the part that does not grow with the bytes | about 1 min for 688 tables and 969 indexes: assessment 16 s, baseline 10 s, release of the indexes 9 s, verification 13 s, the other steps 1 to 3 s. A dry run alone: 25 s | Q (the digest's `steps:`) |
+| The undo switch (6.9) | UNDOTBS1 4.0 GB to 610 MB under the same names, by hand after the purge, on a database started from a pfile (undo_switch_pfile Y); under a minute | Q10 |
 
 **How to estimate:**
 - **Purge:** rows to delete (the dry run counts them, and forecasts the deleting time from what earlier purges on that database measured) x the rate per row, plus 1 to 2 min. Small online logs add about a third on SONEPARUAT (12.7).
