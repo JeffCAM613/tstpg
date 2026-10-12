@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - The flow the user decided after the walkthrough, and a simulator to try it (src\tests\sim)
+
+Why: the user read the walkthrough and decided the flow: two commands (purge, reclaim), each a dry run or not, each getting ready by itself (install, checks, requirements) and asking where a yes or no settles it; the requirements shown with required or optional and what to do; sizes in GB and the disk used while it runs, with its place; a reclaim that measures first and asks; `--non-interactive` with a configuration file for scheduled runs; the question to uninstall after every run; a `--help` that explains purge and reclaim; the menu naming dry run, purge and reclaim; "Duration by step" and "State comparison" in the HTML report. Then: "create a simulation tests. we go through the script interactions so i see if there's anything to change. outputs are just scripted. not actual data. then give me scenarios to test each."
+
+New (test tools; the wrapper and the engine are unchanged):
+- `src\tests\sim\epf_sim.ps1` and `epf_sim.bat`: the simulator. It connects to nothing; every figure is in the script (set Q's database: DATA 41.7 GB, 19.3 M rows before 10 May 2016, 7.0 GB). Actions purge, reclaim, report, status, uninstall, the menu, `--help`; options `--dry-run`, `--cutoff`, `--retention`, `--tns`, `--non-interactive`, `--config`, `--fast`, `--no-open`, `--no-color`; `--sim slow|ready|nobackup|blocked|firstrun|compact|fail` chooses the state the database is found in. Live lines are rewritten in place on a console; a sample report.html goes to `logs\sim\<time>_<run>\` and opens in the browser.
+- `src\tests\sim\scheduled.conf`: the settings of a scheduled run (example values).
+- README (Testing), PLAN.md 13.2 (the flow decided, what is still to settle, the simulator).
+- The status page: set S, twelve scenarios to go through; the Walkthrough's report mock-up with the new section names.
+
+Said to the user, to settle when it is built: "the application can stay in use during a purge" is on the screens as asked and is not shown by a test yet; the database does not know the free space of the server's disk, so the screens give what is needed and where; uninstalling after a run removes the history and the measurements forecasts start from (default: keep); "install first" is played as a check that installs only when the objects are missing or older.
+
+Checked here: every scenario of set S with scripted answers (exit codes 0, 1 for `--sim fail`, 3 when stopped, 4 for a usage error); the reports' HTML is balanced; ASCII only.
+
 ## 2026-10-13 - The user experience first: a walkthrough of five scenarios on the status page; the user's decisions on scope
 
 Why: the user needs to show the tool the next day and asked to focus on the user experience first: "let's do a simulation so I know what it looks like. give different scenarios (what client want to achieve) and see how it plays out. no need to run actual purge. so i know what we need to change." The tests left (sets O and V) become the user's practice with the wrapper.
