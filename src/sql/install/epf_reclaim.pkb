@@ -3719,13 +3719,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
 
     -- Before the rebuilds: each tablespace of the run whose free space is
     -- short of what its rebuilds need (their estimates, each with the extent
-    -- it may need besides, plus the largest once more: the free space is
-    -- scattered, and a rebuild needs extents of its size) grows once, within
-    -- its room. A rebuild that still does not fit grows it again
-    -- (rebuild_index). Returns the tablespaces that grew.
+    -- it may need besides) grows once, within its room, by no more than
+    -- that: what is grown beyond the rebuilds stays as free space below the
+    -- last index when one ends at the top of the file. The largest indexes
+    -- are rebuilt first, into the space just added; a rebuild that still
+    -- does not fit grows the tablespace again (rebuild_index). Returns the
+    -- tablespaces that grew.
     FUNCTION grow_for_rebuilds RETURN SYS.ODCIVARCHAR2LIST IS
         l_need  NUMBER;
-        l_large NUMBER;
         l_count PLS_INTEGER;
         l_free  NUMBER;
         l_grown SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
@@ -3736,19 +3737,17 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                    WHERE r.run_id = g_run.run_id
                    ORDER BY r.tablespace_name) LOOP
             l_need := 0;
-            l_large := 0;
             l_count := 0;
             FOR i IN (SELECT NVL(est_bytes, 0) AS est
                         FROM epfpg.epf_reclaim_object
                        WHERE run_id = g_run.run_id AND unit_type = 'INDEX' AND move_status IN ('RELEASED', 'FAILED')
                          AND source_ts = t.tablespace_name) LOOP
                 l_need := l_need + i.est + extent_for(i.est, t.allocation_type, t.initial_extent);
-                l_large := GREATEST(l_large, i.est);
                 l_count := l_count + 1;
             END LOOP;
             l_free := free_bytes(t.tablespace_name);
-            IF l_count > 0 AND l_need + l_large > l_free THEN
-                IF grow_ts(t.tablespace_name, l_need + l_large - l_free,
+            IF l_count > 0 AND l_need > l_free THEN
+                IF grow_ts(t.tablespace_name, l_need - l_free,
                            'the ' || l_count || ' index rebuilds in it (about ' || b(l_need) || ')') > 0 THEN
                     l_grown.EXTEND;
                     l_grown(l_grown.COUNT) := t.tablespace_name;

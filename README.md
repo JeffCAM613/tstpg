@@ -227,6 +227,8 @@ A purge frees space inside the tables, but the datafiles keep their size. The re
 
 The reclaim changes no row of the application, and no datafile grows above its size at the start (two rare exceptions are reported as warnings).
 
+A datafile that can grow by itself does not stay at exactly the size of its tables and indexes: within minutes of the run Oracle extends such a file ahead of need, until about 5% of it is free. The run therefore passes its efficiency check (R7) when a tablespace ends within 5% of its segments (256 MB for a small one), and warns above that, naming what held the space.
+
 Assess first, then compact:
 
 ```bat

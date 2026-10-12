@@ -468,8 +468,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             END IF;
         END IF;
 
-        -- R7 efficiency: each tablespace ends within max(1 %, 256 MB) of its
-        -- segments plus the margin of its datafiles; otherwise a warning that
+        -- R7 efficiency: each tablespace ends within max(5 %, 256 MB) of its
+        -- segments plus the margin of its datafiles (Oracle itself extends a
+        -- datafile that can grow until about 5 % of it is free, so a tighter
+        -- end does not last); otherwise a warning that
         -- names what stopped it: where the compaction stopped, or, when the
         -- tablespace ends above the size the compaction left it at, the free
         -- space between the parked tables and the indexes that came back.
@@ -492,7 +494,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                        ORDER BY r.tablespace_name) LOOP
                 l_total := l_total + 1;
                 IF t.end_bytes - t.end_segment_bytes - l_margin * NVL(t.file_count, 1)
-                   > GREATEST(t.end_segment_bytes * 0.01, 268435456) THEN
+                   > GREATEST(t.end_segment_bytes * 0.05, 268435456) THEN
                     l_soft := l_soft + 1;
                     l_detail := add_detail(l_detail, t.tablespace_name || ' ' || b(t.end_bytes) || ' for '
                                                      || b(t.end_segment_bytes) || ' of segments: '

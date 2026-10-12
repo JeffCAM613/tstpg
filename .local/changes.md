@@ -2,6 +2,23 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.3: R7 allows 5% above the segments (D27); the datafile grows less before the index rebuilds; the user's questions on scope answered and recorded
+
+Why: the user asked what R7's tolerance is and said "if you mean there's only 5% (not more) extra unused space in ts, then that is fine". Set U had ended 5.4% above its segments (822 MB) with R7 WARN, the compaction having left the tables within 0.2 GB: the 822 MB came from the growth before the index rebuilds (their estimates, each with an extent besides, plus the largest once more: 5.9 GB for rebuilds that took about 5.3 GB), with one index ending at the top of the file. And Oracle adds free space back to a tighter file within minutes (about 5%: sets Q and N).
+
+Changes:
+- epf_report, R7: PASS within max(5 %, 256 MB) of the segments plus the margin (1 % before).
+- epf_reclaim.grow_for_rebuilds: the growth before the rebuilds is the rebuilds' estimates with their extents, without the largest index once more. The largest are rebuilt first, into the space just added; a rebuild that does not fit still grows the tablespace (rebuild_index), and one that fails for space is rebuilt once the growth settings are restored (INDEX_NO_ROOM). Set U's run would have grown the file by 5.6 GB instead of 5.9 GB and ended about 3% above its segments.
+- registry_data.sql: tool version 0.9.3. README: what R7 allows and why. PLAN.md: D27, G5, R7, 13.1.
+
+The user's other questions, answered and recorded in PLAN.md 13.1:
+- A working application: the reclaim is never run beside it (accounts locked, sessions disconnected, the application unavailable until the end). The purge does not lock the accounts and could run while users work; that was never tried, and undo_retention at 60 s during it could fail a long query of the application. Open: whether purges run with the application stopped (a rule, nothing to test) or beside it (one test).
+- A larger test copy: possible in a structured way, not built (keys shifted by an offset per copy through the registry's tables and links; INSERT ... SELECT or the dump imported again with REMAP_DATA).
+- "One version on every source": the 36 tests ran on 0.9.2 on RFS6528 only; the other three sources last ran them on 0.9.1, 0.8.3 and 0.8.0.
+- A container database: the online logs belong to the CDB, skipped from a PDB; the undo tablespace is the PDB's own with local undo and can be tuned there, not with shared undo. Today the SYS parts refuse a CDB, so a purge cannot run in a PDB: to build and test if a client needs it.
+
+Checked here: the packages pass the static checks; not compiled on a database. How to test: sets O and V install 0.9.3; V's reclaim should end with R7 PASS and no INDEX_NO_ROOM line (or, if one appears, the index rebuilt after it).
+
 ## 2026-10-13 - Release readiness assessed; the user experience phase recorded (PLAN.md 13.1, 13.2; the page's Release readiness section); set U's time in all
 
 Why: the user asked for a high-level view of the problems faced, solved and still open, how consistent, reliable and safe the tool is, and how close a release version is; and stated the aim of the next phase: the flow, the instructions, the reports and the outputs easy to understand, live logs and the purge batches in real time on a default run, an HTML report at the end.
