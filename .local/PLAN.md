@@ -1004,6 +1004,8 @@ Every test set's durations are recorded here, with what the time bought (rows de
 | Reclaim again, compact copy (0.9.2) | R-000061 | 10 min 32 s | nothing moved; indexes 9 min 27 s; the rest 1 min 5 s |
 | Q1 to Q8 in all | | 2 h 59 min | of which the two reclaims 2 h 47 min; 3 h 52 min on the clock |
 
+**Set U in all** (EPFPG784, RFS6528, 0.9.2): the suite 1 h 1 min 38 s, the reclaim's dry run 29 s, the reclaim 11 min 55 s: 1 h 14 min 2 s of runs, 1 h 36 min on the clock (16:39 to 18:16).
+
 **Other sets** (details in 12.7):
 
 | Set, database, data | Purge of PAYMENTS | Reclaim of DATA | Full suite |
@@ -1055,8 +1057,59 @@ Not built: a duration forecast in the reclaim's dry run. The rates per table are
 | 7. Hardening | Production-sized clone run, tuning of settings defaults, `tools/` diagnostics, removal of superseded files. | Acceptance 12.3. |
 | 8. Linux wrapper | `bin/epf_purge.sh` (bash; same CLI, prompts, live view, run folder, exit codes). | Same run on Linux produces the same report and manifest. |
 | 9. Docs | Deferred; you write them once the tool is proven. | - |
+| 10. User experience | 13.2: an HTML report at the end of every run, a live view by default, the flow and the wording of the wizard, the requirements and the summaries. Starts once sets O and V pass on 0.9.2 and the engine is frozen (13.1). | A user who never saw the tool runs a purge and a reclaim from the screen alone and reads what happened in the HTML report. |
 
 Each phase is one reviewable pull request on this branch lineage.
+
+### 13.1 Release readiness (assessed 2026-10-13, after set U)
+
+Asked by the user: what was solved, what is still open, how consistent, reliable and safe the tool is, and whether the work can turn to the user experience.
+
+**Solved, with what proves it:**
+
+| Problem faced | Proof |
+|---|---|
+| A purge that deletes exactly what its dry run announced; parity with the old tool | Rows 0.0% off in every set; parity met on 2 October; suite 36 of 36 on 0.9.2 (set U) and on 0.9.1 (set P) |
+| Undo and redo pressure during a purge | Undo held to 4 GB in every purge; given back under the same names by the switch (Q10, and inside the suite in set U); log switch waits measured in every run |
+| A reclaim that got stuck, left a file larger or did not finish (2.2) | DATA down to its segments in one run on four sources: 41.6 to 6.9 GB (L), 23.7 to 14.4 GB (M), 44.0 to 6.6 GB in 4 datafiles (P), 50.1 to 15.5 GB (U); never above the size at the start |
+| An interrupted run | A stop, a killed session, a lost connection, a lost wrapper: restored in the same run or by `reclaim --restore` on four sources (T18C, T18D, T18I, T18J, T18K); a real network drop in set J |
+| Leaving a mess | Online logs and undo back under the same names, the scratch tablespace dropped, `status` says nothing pending, uninstall |
+| Knowing what happened without long logs | The digest: every run with its steps and durations, its summary, the database's files as they are |
+| Disk held during a reclaim with scratch space (D26) | Fixed in 0.9.2: parking ends where it gains nothing, the peak on disk is the size at the start (set U, T18H). After a light purge: set V |
+
+**Open:**
+
+| Open | Why it matters | What closes it |
+|---|---|---|
+| The reclaim after a light purge | 79 to 88 min on SONEPARUAT (set Q): LOB tables written again at 0.5 GB a minute; in place one table moved four times | Set V on 0.9.2; then whether repeated moves in place need a limit |
+| Online logs enlarged by default or on request | Small logs cost 25 to 31% of a purge on SONEPARUAT, 5% on CLUBMED8 | Set O again |
+| R7's tolerance | Set U ended 5% above its segments, where Oracle leaves an autoextensible datafile anyway | The user's decision |
+| ARCHIVELOG mode | Never run: every test database is NOARCHIVELOG. A purge writes about 700 bytes of redo per row deleted (60 GB for 89 M rows) and a reclaim writes most of a tablespace again; the ARCHIVE requirement and the plan of smaller runs exist, unproven | One purge and one reclaim on a copy in ARCHIVELOG mode |
+| A working application | Every test ran on an idle copy. The reclaim locks the accounts and disconnects their sessions (lab tests); a purge beside sessions that work is untested | A purge with sessions working, simulated at least |
+| Size | The largest DATA tested is 50 GB, the largest purge 89 M rows; anything larger is estimated from the rates (12.8) | A production-sized copy (phase 7), or the dry runs of the largest client against the estimate |
+| Scope | The SYS parts (undo tuning, which every purge needs since 0.9.0, and the reclaim) run on a single instance that is not a container database; the wrapper runs on Windows | Written in the README, unless a client needs more |
+| One version on every source | 0.9.2 ran the suite on RFS6528 only; SONEPARUAT last on 0.9.1, CLUBMEDEPF on 0.8.3, CLUBMED8 on 0.8.0 | The release-candidate pass below |
+
+**Judgment:**
+- **Consistent:** yes. Rows exact; sizes forecast within 5 to 20%; times within 5% of the rates measured; four clients' data behave alike.
+- **Reliable:** inside what was tested, yes. The reclaim's core changed in 0.9.2 and has one full suite behind it.
+- **Safe:** by design, yes: nothing starts while a blocking requirement is unmet, every change to the instance is recorded and put back, the accounts are locked while tables move, each run checks itself (P1 to P8, R1 to R9), and an interrupted run is restored. Unproven in ARCHIVELOG mode and beside a working application.
+
+**To a release candidate:** (1) sets O and V pass on 0.9.2; (2) the engine is frozen, fixes only; (3) the suite and one reclaim with that version on all four sources; (4) one run in ARCHIVELOG mode, if a client uses it; (5) the scope written down.
+
+### 13.2 User experience (phase 10)
+
+The user's aim, stated on 2026-10-13: the flow, the instructions, the reports and the outputs easy to understand; on a default run, without --verbose, live logs and the script seen progressing, the purge batches in real time, the reports nicely shown; and at the end an HTML report.
+
+Where it stands: a default run shows each step as it ends, a progress line per batch, the milestones, warnings and a status line; a reclaim shows nothing while a large table moves (18 minutes for one table in set Q); the report is text.
+
+Order proposed (the wrapper and the report only; no change to the engine):
+1. **An HTML report at the end of every run:** one self-contained file in the run folder, opened in the browser: the verdict, what was deleted and given back, sizes before and after, the steps on a time line with their durations, requirements, checks, what to do next. First because it can be built and checked from the run folders at hand.
+2. **The live view:** a header that stays (run, database, step k of n, time elapsed, expected end), the batches as they go, each table of a reclaim as it moves with the time expected from the rates, a sign of life during a long statement.
+3. **The flow and the wording:** the wizard's questions, what each requirement asks and how to meet it, what happens next after each command.
+4. **The summary on screen:** what happened in plain words before the details.
+
+Starts after sets O and V; it can run beside steps 3 to 5 of 13.1.
 
 ---
 

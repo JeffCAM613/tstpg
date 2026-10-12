@@ -2,6 +2,17 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - Release readiness assessed; the user experience phase recorded (PLAN.md 13.1, 13.2; the page's Release readiness section); set U's time in all
+
+Why: the user asked for a high-level view of the problems faced, solved and still open, how consistent, reliable and safe the tool is, and how close a release version is; and stated the aim of the next phase: the flow, the instructions, the reports and the outputs easy to understand, live logs and the purge batches in real time on a default run, an HTML report at the end.
+
+Recorded (documents only):
+- PLAN.md 13.1: what is solved with its proof (the purge and its parity, undo and redo, the reclaim on four sources, interrupted runs, nothing left behind, the digest, the disk held with scratch space); what is open (the reclaim after a light purge, the online logs' default, R7's tolerance, ARCHIVELOG mode never run, a working application, size, scope, one version on every source); the judgment (consistent; reliable inside what was tested; safe by design, unproven in ARCHIVELOG mode and beside a working application); the five steps to a release candidate.
+- PLAN.md 13.2 and phase 10: the user experience, in the order proposed: an HTML report at the end of every run, the live view, the flow and the wording, the summary on screen. After sets O and V; the wrapper and the report only.
+- PLAN.md 12.8 and the page: set U in all, 1 h 14 min 2 s of runs (the suite 1 h 1 min 38 s, the dry run 29 s, the reclaim 11 min 55 s), 1 h 36 min on the clock.
+
+Open with the user: whether a client runs in ARCHIVELOG mode, as a container database, on RAC or with a standby (they decide what must be tested before a release); R7's tolerance.
+
 ## 2026-10-13 - Set U on EPFPG784 (RFS6528, a fourth source, 0.9.2): 36 of 36; DATA 50.1 to 15.5 GB in 11 min 55 s with 3.7 GB of scratch space; R7 WARN, 0.8 GB left by the index rebuilds
 
 The digest of set U (TU.log, session 2026-10-12_163935_EPFPG784, generated 18:20) and the listing of the data directory, which the digest's "database now" matches to the megabyte (data.dbf 15,916 MB, 21.87 GB in all).
