@@ -4,7 +4,7 @@ Newest first. Each entry: date, what changed, why, and how to test when relevant
 
 ## 2026-10-12 - Set Q on EPFPG782 (a light purge of SONEPARUAT, run on 0.9.1): the reclaim with scratch space held 46.1 GB on disk for a tablespace of 36.8 GB; parking that ends when it gains nothing, the scratch datafile shrinking on the way back, the peak on disk reported (0.9.2, fourth commit)
 
-The digest of set Q (TQ.log, session 2026-10-12_090147_EPFPG782). It ran on 0.9.1: 0.9.2 was not pushed yet, so the digest is the earlier one (no summary lines, no "database now", no roots per year in T01) and the undo switch was skipped on this copy started from a pfile. The cutoff used is not in this digest.
+The digest of set Q (TQ.log, session 2026-10-12_090147_EPFPG782). It ran on 0.9.1: 0.9.2 was not pushed yet, so the digest is the earlier one (no summary lines, no "database now", no roots per year in T01) and the undo switch was skipped on this copy started from a pfile. The cutoff was 2016-05-10 (given by the user; this digest does not show it).
 - **Q2:** T01 PASS; logs 3 x 150 MB; OP 6,412 MB, OPPAYMENTS 34,124 MB.
 - **Q4, the dry run** (R-000001, 1 min 25 s): PASS WITH WARNINGS (the redo estimate against 150 MB logs).
 - **Q5, the purge** (R-000002, 10 min 1 s, PASS WITH WARNINGS): **PAYMENTS 18,218,547 rows in 8 min 49 s (a fifth of its 89.3 M)**, 94 batches in 7 min 45 s; LOGS 125,517 rows; BANK_STATEMENTS 935,130 rows. Log switch waits 2 min 5 s of 8 min 24 s in batches (25%). Undo at most 4.0 of 4.0 GB; the undo datafile stayed at 4.0 GB (610 MB before), the switch skipped (pfile, 0.9.1).
