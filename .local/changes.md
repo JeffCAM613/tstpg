@@ -2,6 +2,28 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - The user experience, step 1 in the wrapper: report.html at the end of every run, the next step, a refusal with its way out, --help; the simulator after the user's remarks
+
+Why: the user went through the simulator (set S) and asked for four changes, then: "that's the only changes i need so far after trying all the scenarios. you can start now".
+
+The simulator (src\tests\sim), the four changes:
+- Retention in the examples and as the first way to say what is kept (`--retention 365`; `--cutoff` stays); the scripted figures follow the days kept, 365 days giving set Q's purge; "Other retentions" with rows and GB.
+- The online redo logs: a question in a purge ("Enlarge the online redo logs for this purge"), after what it does and what it costs (4 logs of 1 GB, 3.6 GB more disk while the purge runs, the present ones put back under the same names). `--redo-logs` or REDO_LOGS=Y answers it beforehand; a dry run says a purge will ask.
+- The database is asked for when neither `--tns` nor the configuration file gives it (required with `--non-interactive`).
+- A run without questions is one command that a scheduler of the user's can start: said so in the help and in scheduled.conf; the tool schedules nothing.
+
+The wrapper (tool version stays 0.9.3; the engine is unchanged):
+- New `src\bin\lib\epf_html.ps1`, loaded by epf.ps1: Write-HtmlReport writes report.html in the run folder from manifest.txt, report.txt and console.log (PLAN.md 13.2 lists what it shows). Show-HtmlReport calls it at the end of every purge, preflight and reclaim, prints its path, and opens it when input and output are a console. `--no-open`, OPEN_REPORT=N.
+- After a purge: a line `Next` saying the space is free inside the tables and that `reclaim --dry-run` shows what a reclaim gives back; after a dry run: the purge command with the same scope.
+- A purge refused for a blocking requirement lists the way out of each (BACKUP: a backup, `--backup confirmed` or `--backup none`; UNDO, TEMP, ARCHIVE likewise) and says nothing was changed.
+- `--help` opens with what purge and reclaim are, that a purge alone frees no disk space, that a reclaim needs the database not in use, and three ways to start, with retention in the examples.
+- The suite: T00 also checks epf_html.ps1 and the simulator, and counts the functions of a loaded script as defined.
+- README: report.html, OPEN_REPORT.
+
+Checked here: the five scenarios of the walkthrough through the real wrapper against the stand-in sqlplus each wrote a report.html (balanced HTML; the figures of the run in it); the new lines after a purge, a dry run and a refusal; T00, T01, T06, T07 and the 64 output checks pass. Not run on a database: the first real run shows whether the browser opens and how the report reads with a real report.txt.
+
+How to test: any purge or reclaim on a test copy now ends with `Report  ...\report.html`; open it. The practice runs (sets O and V) will show it on real data.
+
 ## 2026-10-13 - The flow the user decided after the walkthrough, and a simulator to try it (src\tests\sim)
 
 Why: the user read the walkthrough and decided the flow: two commands (purge, reclaim), each a dry run or not, each getting ready by itself (install, checks, requirements) and asking where a yes or no settles it; the requirements shown with required or optional and what to do; sizes in GB and the disk used while it runs, with its place; a reclaim that measures first and asks; `--non-interactive` with a configuration file for scheduled runs; the question to uninstall after every run; a `--help` that explains purge and reclaim; the menu naming dry run, purge and reclaim; "Duration by step" and "State comparison" in the HTML report. Then: "create a simulation tests. we go through the script interactions so i see if there's anything to change. outputs are just scripted. not actual data. then give me scenarios to test each."

@@ -101,6 +101,7 @@ Command-line options override the file. In the wizard, a value in the file is th
 | LOG_DIR | `--log-dir` | Where the run folders go (`logs` by default) |
 | VERBOSE | `--verbose` | Y: every event and the whole report on the console |
 | NO_COLOR | `--no-color` | Y: plain output |
+| OPEN_REPORT | `--no-open` | N: report.html is written and not opened in the browser |
 
 ### Passwords
 
@@ -271,6 +272,7 @@ Every action that works on the database creates a run, such as R-000123, recorde
 | manifest.txt | A key=value summary: status, verdict, exit code, checks |
 | requirements.txt, plan.txt | The requirements and the plan, when the run has them |
 | summary.txt | The summary shown at the end of the run; for a reclaim, also its datafiles at the start and at the end |
+| report.html | The run in a browser: the result in one sentence, the main figures, the modules or tablespaces, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
 | sqlplus_*.log | The output of the SQL*Plus sessions |
 
 Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:

@@ -47,6 +47,9 @@ $script:ExitUsage   = 4
 
 $script:Modes = @('FULL', 'CLOB', 'LOGS', 'CLOB_N_LOGS')
 $script:Width = 80
+
+# The HTML report of a run (Write-HtmlReport).
+. (Join-Path $PSScriptRoot 'epf_html.ps1')
 # Seconds a sqlplus session may take to connect before it is ended and
 # started again (configuration key CONNECT_TIMEOUT_S), and the line it
 # prints once connected (Start-Session).
@@ -181,6 +184,35 @@ function Exit-Tool {
 function Show-Help {
     $text = @'
 EPF Data Purge
+
+What it does
+  PURGE     deletes old rows of the EPF application (payments, logs, bank
+            statements): everything older than the days of data you keep.
+  RECLAIM   compacts the datafiles, so that the space the purge freed goes
+            back to the disk.
+
+Two things to know
+  - A purge alone does not free disk space. The rows are gone, but the
+    datafiles keep their size until a reclaim.
+  - A purge deletes in small batches and does not lock the application's
+    accounts; run it in a quiet period. A reclaim needs the database not in
+    use: the tool locks the application's accounts while it runs.
+  The two can be run apart, also from a scheduler of yours (one command each,
+  with --non-interactive). The purge comes first.
+
+Where to start
+  1. See what a purge would delete, keeping the last 365 days. Nothing is
+     changed:
+       epf_purge.bat purge --dry-run --retention 365
+  2. The whole job, in three commands:
+       epf_purge.bat purge --dry-run --retention 365     what it would do
+       epf_purge.bat purge --retention 365               delete the rows
+       epf_purge.bat reclaim                             free the disk space
+                                                         (database not in use)
+  3. Be guided: the menu asks what you want and the questions that go with it:
+       epf_purge.bat
+  The first time on a database, install the tool's own objects (SYS):
+       epf_purge.bat install
 
 Usage: epf_purge.bat [action] [options]
 
@@ -337,7 +369,10 @@ Output
   that did not pass and the verdict. --verbose (VERBOSE=Y in the
   configuration file) shows every event and the whole report instead.
   console.log in the run folder always has every line, and report.txt the
-  whole report.
+  whole report. report.html shows the run in a browser: the result in one
+  sentence, the main figures, the duration by step, the checks. It opens at
+  the end when somebody is at the console; --no-open (OPEN_REPORT=N in the
+  configuration file) leaves it closed.
 
 Exit codes: 0 PASS, 1 FAIL, 2 PASS WITH WARNINGS, 3 aborted or stopped,
 4 usage or configuration error.
@@ -355,7 +390,7 @@ function Read-Arguments {
     $valueOptions = @('config', 'tns', 'retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup', 'confirm',
                       'log-dir', 'run', 'tablespaces', 'long-conversion', 'max-redo', 'scratch')
     $flagOptions = @('dry-run', 'compact', 'redo-logs', 'undo-tuning', 'yes', 'non-interactive', 'no-color',
-                     'help', 'reclaim', 'resume', 'new', 'close', 'restore', 'verbose')
+                     'help', 'reclaim', 'resume', 'new', 'close', 'restore', 'verbose', 'no-open')
     $i = 0
     while ($i -lt $List.Count) {
         $arg = [string]$List[$i]
@@ -1380,6 +1415,18 @@ function Invoke-ToolRun {
                     $ready = $false
                     Write-Out (' Blocking requirements not met: ' + ($unmet -join ', ') + '. The purge does not start;') 'Red'
                     Write-Out ' REQUIREMENTS in the report lists the ways to meet them.' 'Red'
+                    # The way out of each, as something to do or to add to
+                    # the command.
+                    $ways = @{
+                        'BACKUP'  = 'take an RMAN backup; or add --backup confirmed (a backup exists that RMAN does not know) or --backup none (a copy that can be lost)'
+                        'UNDO'    = 'a smaller --batch-size, room in the undo tablespace, or --confirm UNDO (the DBA confirms it has room)'
+                        'TEMP'    = 'room in the temporary tablespace, or --confirm TEMP (the DBA confirms it has room)'
+                        'ARCHIVE' = 'room in the archive destination, a plan of smaller runs (preflight --max-redo), or --confirm ARCHIVE'
+                    }
+                    foreach ($code in $unmet) {
+                        if ($ways.ContainsKey($code)) { Write-Out ('   ' + $code + ': ' + $ways[$code]) 'Yellow' }
+                    }
+                    Write-Out ' Nothing was changed.' 'Yellow'
                 }
             }
             if ($state.StopRequested) {
@@ -1492,8 +1539,48 @@ function Invoke-ToolRun {
                        $planAfter.NextCutoff + ')')
         }
     }
+    # What comes after a purge that ran: its dry run says how to run it, the
+    # purge itself that the space waits for a reclaim.
+    if ($Action -eq 'PURGE' -and ($status -eq 'SUCCESS' -or $status -eq 'WARNING')) {
+        if (-not $Ctx.DryRun) {
+            Write-Out (' Next    the space is free inside the tables and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
+                       'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)')
+        } elseif ($Ctx.PlanId -eq '') {
+            $how = '--retention ' + $Ctx.Retention
+            if ($Ctx.Cutoff -ne '') { $how = '--cutoff ' + $Ctx.Cutoff }
+            if ($Ctx.Mode -ne 'FULL') { $how = $how + ' --mode ' + $Ctx.Mode }
+            if ($Ctx.Depth -ne 'ALL' -and $Ctx.Mode -ne 'LOGS') { $how = $how + ' --depth ' + $Ctx.Depth }
+            Write-Out (' Next    epf_purge.bat purge ' + $how + ' runs this purge; the dry run changed nothing')
+        }
+    }
+    Show-HtmlReport $state.Folder
     return [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
                               Stopped = $state.Stopped }
+}
+
+# The end of a run in a browser: writes report.html in the run folder
+# (Write-HtmlReport), says where it is, and opens it when somebody is at the
+# console (input and output not redirected) unless --no-open or OPEN_REPORT=N.
+# A report that cannot be written or opened never fails the run.
+function Show-HtmlReport {
+    param([string]$Folder)
+    $path = ''
+    try { $path = Write-HtmlReport $Folder } catch { Write-Log (' report.html was not written: ' + $_.Exception.Message) }
+    if ($path -eq '') { return }
+    $opened = ''
+    $wanted = -not $script:Cli.Flags.ContainsKey('no-open') -and
+              -not ($script:Config.ContainsKey('OPEN_REPORT') -and @('N', 'NO', 'FALSE', '0') -contains $script:Config['OPEN_REPORT'].ToUpper())
+    if ($wanted) {
+        try {
+            if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
+                Start-Process -FilePath $path
+                $opened = '  (opened in your browser)'
+            }
+        } catch {
+            $opened = ''
+        }
+    }
+    Write-Out (' Report  ' + $path + $opened)
 }
 
 # After a preflight: whether a purge can start, and how it follows the plan
@@ -2843,6 +2930,7 @@ function Invoke-ReclaimRun {
     Write-Out ''
     Write-Out ($line + 'total ' + $total + ' . exit ' + $exitCode) $color
     Write-Out (' Report  ' + (Join-Path $state.Folder 'report.txt'))
+    Show-HtmlReport $state.Folder
     return [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
                               Report = $report.Output }
 }

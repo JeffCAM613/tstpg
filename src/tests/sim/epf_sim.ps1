@@ -12,11 +12,17 @@
 #             report | status | uninstall | help
 #           Options
 #             --dry-run         nothing is changed (shown as such)
-#             --cutoff DATE     rows dated before YYYY-MM-DD; or --retention DAYS
-#             --tns NAME        the database alias shown (default EPFPG782)
-#             --non-interactive no question is asked: scheduled runs
-#             --config FILE     TNS, EPF_PASSWORD, SYS_PASSWORD, CUTOFF or
-#                               RETENTION_DAYS, UNINSTALL_AFTER as KEY=VALUE
+#             --retention DAYS  the days of data kept: older rows are purged;
+#                               or --cutoff YYYY-MM-DD
+#             --tns NAME        the database, by its alias; asked for when it
+#                               is not given
+#             --redo-logs       larger online redo logs for the purge, without
+#                               the question
+#             --non-interactive no question is asked: one command that a
+#                               scheduler of the user's can run
+#             --config FILE     TNS, EPF_PASSWORD, SYS_PASSWORD, RETENTION_DAYS
+#                               or CUTOFF, REDO_LOGS, UNINSTALL_AFTER as
+#                               KEY=VALUE
 #             --sim STATE       the state the database is found in:
 #                               slow (default: small online logs, optional),
 #                               ready, nobackup, blocked (no room in TEMP),
@@ -37,8 +43,11 @@ $script:CliArgs = @($args)
 $script:RepoDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $script:Version = '0.9.3'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
-$script:Opt = @{ Action = ''; DryRun = $false; Cutoff = ''; Retention = ''; Tns = 'EPFPG782'; Interactive = $true;
-                 Config = ''; Sim = 'slow'; Fast = $false; Open = $true; Color = $true; Yes = $false }
+$script:Opt = @{ Action = ''; DryRun = $false; Cutoff = ''; Retention = ''; Tns = ''; Interactive = $true;
+                 Config = ''; Sim = 'slow'; Fast = $false; Open = $true; Color = $true; Yes = $false; Redo = $false }
+# The online redo logs are enlarged for this purge (the question, --redo-logs
+# or REDO_LOGS=Y).
+$script:RedoApplied = $false
 $script:Conf = @{}
 $script:Live = $true
 try { $script:Live = -not [Console]::IsOutputRedirected } catch { $script:Live = $false }
@@ -206,18 +215,16 @@ function Show-Progress {
 # The scripted database (set Q's figures: SONEPARUAT, DATA 41.7 GB)
 # ----------------------------------------------------------------------------
 
-# Rows dated before a day, between the points measured or estimated.
-function Get-RowsBefore {
-    param([datetime]$Day)
-    $points = @(@('2012-01-01', 0), @('2015-10-30', 15604000), @('2016-05-10', 19279194), @('2016-12-03', 24112000),
-                @('2018-07-26', 41870000), @('2023-01-01', 80200000), @('2026-10-13', 96248377))
+# Rows older than $Days days, between scripted points: 365 days gives the
+# purge of set Q.
+function Get-RowsOlder {
+    param([double]$Days)
+    $points = @(@(4000, 0), @(565, 15604000), @(365, 19279194), @(165, 24112000), @(30, 41870000), @(0, 96248377))
     $prev = $points[0]
     foreach ($p in $points) {
-        $d = [datetime]::ParseExact($p[0], 'yyyy-MM-dd', $script:Inv)
-        if ($Day -le $d) {
-            $d0 = [datetime]::ParseExact($prev[0], 'yyyy-MM-dd', $script:Inv)
-            if ($d -eq $d0) { return [double]$p[1] }
-            return [double]$prev[1] + ([double]$p[1] - [double]$prev[1]) * ($Day - $d0).TotalDays / ($d - $d0).TotalDays
+        if ($Days -ge $p[0]) {
+            if ($p[0] -eq $prev[0]) { return [double]$p[1] }
+            return [double]$prev[1] + ([double]$p[1] - [double]$prev[1]) * ($prev[0] - $Days) / ($prev[0] - $p[0])
         }
         $prev = $p
     }
@@ -233,10 +240,12 @@ function Get-Scope {
         elseif ($script:Conf.ContainsKey('RETENTION_DAYS')) { $days = $script:Conf['RETENTION_DAYS'] }
     }
     while ($cutoff -eq '' -and $days -eq '') {
-        $a = Read-Answer 'Delete data older than (a number of days, or a date as YYYY-MM-DD)' '30'
+        $a = Read-Answer 'Days of data to keep; older rows are purged (or a date as YYYY-MM-DD)' '30'
         if ($a -match '^\d{4}-\d\d-\d\d$') { $cutoff = $a } elseif ($a -match '^\d+$') { $days = $a }
-        else { Out-Line '   A number of days such as 365, or a date such as 2016-05-10.' 'Yellow' }
+        else { Out-Line '   A number of days such as 365, or a date such as 2025-10-13.' 'Yellow' }
     }
+    $how = '--retention ' + $days
+    if ($cutoff -ne '') { $how = '--cutoff ' + $cutoff }
     if ($cutoff -ne '') {
         $day = [datetime]::MinValue
         if (-not [datetime]::TryParseExact($cutoff, 'yyyy-MM-dd', $script:Inv, [Globalization.DateTimeStyles]::None, [ref]$day)) {
@@ -246,8 +255,10 @@ function Get-Scope {
     } else {
         $day = $today.AddDays(-[int]$days)
     }
-    $rows = Get-RowsBefore $day
-    $scope = @{ Day = $day; Text = $day.ToString('d MMMM yyyy', $script:Inv); Iso = $day.ToString('yyyy-MM-dd'); Rows = $rows }
+    $kept = [int]($today - $day).TotalDays
+    $rows = Get-RowsOlder $kept
+    $scope = @{ Day = $day; Text = $day.ToString('d MMMM yyyy', $script:Inv); Iso = $day.ToString('yyyy-MM-dd'); Rows = $rows
+                Kept = $kept; How = $how }
     $scope.Modules = @(
         @{ Name = 'PAYMENTS';        Rows = [Math]::Round($rows * 18218547 / 19279194); Share = 0.943 },
         @{ Name = 'LOGS';            Rows = [Math]::Round($rows * 125517 / 19279194); Share = 0.003 },
@@ -285,10 +296,10 @@ function Get-Requirements {
         if ($sim -eq 'ready') {
             $list.Add(@{ Name = 'Online redo logs'; Need = 'optional'; Met = $true; Now = '4 x 1 GB: large enough' })
         } else {
-            $list.Add(@{ Name = 'Online redo logs'; Need = 'optional'; Met = $false; Ask = $false
+            $list.Add(@{ Name = 'Online redo logs'; Need = 'optional'; Met = $false; Ask = $false; Redo = $true
                          Now = '3 x 150 MB: smaller than what one batch writes'
                          Risk = 'the purge works, but spends about a quarter of its time waiting for them'
-                         Do = 'add --redo-logs: the tool enlarges them to 4 x 1 GB for the purge and puts them back afterwards' })
+                         Do = 'the tool can enlarge them for the purge: 4 logs of 1 GB in ' + $script:Dir + $script:Opt.Tns + ' (3.6 GB more disk while the purge runs), and the present 3 x 150 MB put back under the same names at its end. Needs SYS' })
         }
     } else {
         $list.Add(@{ Name = 'Recycle bin empty'; Need = 'required'; Met = $true; Now = 'no dropped object in DATA' })
@@ -379,8 +390,27 @@ function Invoke-Checks {
         Out-Wrapped '     What to do: ' ($r.Do + '.')
     }
     Out-Line ''
+    # The online redo logs: a question in a purge, said in a dry run. Without
+    # questions: --redo-logs or REDO_LOGS=Y.
+    $redo = @($advice | Where-Object { $_.ContainsKey('Redo') })
+    if ($redo.Count -gt 0) {
+        $auto = $script:Opt.Redo -or ($script:Conf.ContainsKey('REDO_LOGS') -and $script:Conf['REDO_LOGS'].ToUpper() -eq 'Y')
+        if ($DryRun) {
+            Out-Line '   A purge asks whether to enlarge the online redo logs for its time (--redo-logs says yes beforehand).'
+        } else {
+            $script:RedoApplied = Read-YesNo 'Enlarge the online redo logs for this purge' $true $auto
+            if ($script:RedoApplied) { Out-Line '   The online redo logs will be 4 x 1 GB during the purge, then as they are now.' 'Green' }
+            else { Out-Line '   The online redo logs stay as they are: the purge will be about a quarter slower.' }
+        }
+        Out-Line ''
+    }
     if ($missing.Count -eq 0) {
-        Out-Line ('   Only optional requirements are not met: the ' + $what + ' can run as things are.') 'Yellow'
+        $left = @($advice | Where-Object { -not ($_.ContainsKey('Redo') -and $script:RedoApplied) })
+        if ($left.Count -gt 0) {
+            Out-Line ('   Only optional requirements are not met: the ' + $what + ' can run as things are.') 'Yellow'
+        } else {
+            Out-Line ('   Every requirement is settled: the ' + $what + ' can run.') 'Green'
+        }
         if ($DryRun) {
             if (-not (Read-YesNo 'Go on with the simulation' $true $true)) { return 'STOP' }
         }
@@ -577,10 +607,10 @@ function Invoke-Purge {
     Out-Line ''
     Invoke-Step 2 $of 'Counting what the purge deletes' 77 2.0
     $freed = Format-Gb $scope.Gb
-    $slow = ($script:Opt.Sim -ne 'ready')
+    $slow = ($script:Opt.Sim -ne 'ready' -and -not $script:RedoApplied)
     $notes = New-Object 'System.Collections.Generic.List[string]'
     if ($slow) {
-        $notes.Add('The online redo logs are small (3 x 150 MB): the purge spends about a quarter of its time waiting for them. Add --redo-logs: they are enlarged for the purge and put back afterwards.')
+        $notes.Add('The online redo logs are small (3 x 150 MB): the purge spends about a quarter of its time waiting for them. A purge asks whether to enlarge them for its time; they are put back afterwards.')
     }
     $tsLine = '   Tablespace affected    DATA, 41.7 GB: ' + $script:Dir + $script:Opt.Tns + '/data.dbf'
     $online = '   The application can stay in use during a purge: rows are deleted in small batches.'
@@ -605,18 +635,22 @@ function Invoke-Purge {
         Out-Line ('     Temporary space    about 1.1 GB   ' + $script:Dir + $script:Opt.Tns + '/temp01.dbf        fits in what is allocated')
         Out-Line ('     Temporary indexes  about 1.4 GB   ' + $script:Dir + $script:Opt.Tns + '/epfpg_data01.dbf  1.3 GB more than now')
         Out-Line '     Online redo logs   reused; nothing is kept (NOARCHIVELOG)'
-        Out-Line ('     In all: about 4.7 GB free needed in ' + $script:Dir + $script:Opt.Tns + ' while it runs.') 'White'
+        if ($script:Opt.Sim -ne 'ready') {
+            Out-Line ('                        enlarged for the purge if you say so: 3.6 GB more in ' + $script:Dir + $script:Opt.Tns)
+        }
+        Out-Line ('     In all: about 4.7 GB free needed in ' + $script:Dir + $script:Opt.Tns + ' while it runs') 'White'
+        if ($script:Opt.Sim -ne 'ready') { Out-Line '     (8.3 GB with the larger online redo logs).' 'White' }
         Out-Line ''
-        Out-Line ('   ' + 'Other cutoffs'.PadRight(24) + 'Rows deleted'.PadLeft(14) + 'Space freed (about)'.PadLeft(22)) 'White'
-        $options = New-Object 'System.Collections.Generic.List[datetime]'
-        foreach ($d in @($scope.Day.AddDays(-200), $scope.Day, $scope.Day.AddDays(200), $scope.Day.AddDays(800))) {
-            if ($d -lt [datetime]::ParseExact('2026-10-13', 'yyyy-MM-dd', $script:Inv)) { $options.Add($d) }
+        Out-Line ('   ' + 'Other retentions'.PadRight(24) + 'Rows deleted'.PadLeft(14) + 'Space freed (about)'.PadLeft(22)) 'White'
+        $options = New-Object 'System.Collections.Generic.List[int]'
+        foreach ($d in @(($scope.Kept + 200), $scope.Kept, ($scope.Kept - 200), ($scope.Kept - 335))) {
+            if ($d -gt 0 -and -not $options.Contains([int]$d)) { $options.Add([int]$d) }
         }
         foreach ($d in $options) {
-            $r = Get-RowsBefore $d
+            $r = Get-RowsOlder $d
             $mark = ''
-            if ($d -eq $scope.Day) { $mark = '   (yours)' }
-            Out-Line ('     before ' + $d.ToString('yyyy-MM-dd').PadRight(15) + (Format-Int $r).PadLeft(14) + (Format-Gb ($r * 390.0 / 1073741824)).PadLeft(22) + $mark)
+            if ($d -eq $scope.Kept) { $mark = '   (yours)' }
+            Out-Line ('     ' + ((Format-Int $d) + ' days kept').PadRight(22) + (Format-Int $r).PadLeft(14) + (Format-Gb ($r * 390.0 / 1073741824)).PadLeft(22) + $mark)
         }
         Out-Line ''
         Out-Line $online
@@ -627,7 +661,7 @@ function Invoke-Purge {
         }
         Out-Line ''
         Out-Line '  Nothing was changed.' 'Green'
-        Out-Line ('  Next     epf_purge.bat purge --cutoff ' + $scope.Iso + '          the purge itself')
+        Out-Line ('  Next     epf_purge.bat purge ' + $scope.How + '          the purge itself')
         $folder = Get-RunFolder $label
         $rows = @()
         foreach ($m in $scope.Modules) { $rows += ,@($m.Name, (Format-Int $m.Rows), (Format-Gb ($scope.Gb * $m.Share))) }
@@ -643,7 +677,7 @@ function Invoke-Purge {
                                             @('Temporary indexes', 'about 1.4 GB', ($script:Dir + $script:Opt.Tns + '/epfpg_data01.dbf'), '1.3 GB more')) })
                      Bars = @(); BarsTitle = ''; BarsMax = 1; Steps = @(@('Checking the database', 5), @('Counting what the purge deletes', 77))
                      Compare = @(); CompareTitle = ''; Notes = $notes.ToArray()
-                     Next = 'The purge itself: <code>epf_purge.bat purge --cutoff ' + $scope.Iso + '</code>' }
+                     Next = 'The purge itself: <code>epf_purge.bat purge ' + $scope.How + '</code>' }
         Out-Report (Write-Report $report $folder)
         Invoke-UninstallQuestion
         return 0
@@ -661,8 +695,9 @@ function Invoke-Purge {
     }
     Out-Line ' Ctrl+C stops safely after the current batch.' 'DarkGray'
     Out-Line ''
-    Invoke-Step 3 5 'Protecting the undo tablespace (SYS)' 2
-    Out-Line '         kept under 4.0 GB while rows are deleted; given back at the end'
+    Invoke-Step 3 5 'Preparing the database for the purge (SYS)' 2
+    Out-Line '         undo kept under 4.0 GB while rows are deleted; given back at the end'
+    if ($script:RedoApplied) { Out-Line '         online redo logs 4 x 1 GB for the purge; the present ones put back at the end' }
     Out-Step 4 5 'Deleting' ''
     $done = 0.0
     $k = 0
@@ -678,13 +713,15 @@ function Invoke-Purge {
             Out-Line '  The connection to the database was lost (ORA-03113). Each batch is its own transaction:'
             Out-Line '  the batch that was running was rolled back by the database.'
             Out-Line '  The undo tablespace is put back by the next run, or now by:  epf_purge.bat status'
-            Out-Line ('  To finish the purge, run the same command again:  epf_purge.bat purge --cutoff ' + $scope.Iso)
+            Out-Line ('  To finish the purge, run the same command again:  epf_purge.bat purge ' + $scope.How)
             return 1
         }
         Show-Progress $m.Name $m.Rows 'rows' $sec 39000
         $done += $m.Rows
     }
-    Invoke-Step 5 5 'Putting the undo tablespace back' 6
+    $back = 'Putting the undo tablespace back'
+    if ($script:RedoApplied) { $back = 'Putting the undo tablespace and the online logs back' }
+    Invoke-Step 5 5 $back 6
     $total = $scope.Seconds + 20
     Out-Line ''
     Out-Rule
@@ -711,7 +748,7 @@ function Invoke-Purge {
                  Tiles = @(@('rows deleted', (Format-Int $scope.Rows)), @('freed inside the tables', $freed), @('duration', (Format-Time $total)), @('most undo held', '4.0 GB'))
                  Tables = @(@{ Title = 'What was deleted'; Head = @('Module', 'Rows deleted', 'Time'); Rows = $rows; Numeric = $true; Note = 'Tablespace affected: DATA.' })
                  Bars = @(); BarsTitle = ''; BarsMax = 1
-                 Steps = @(@('Checking the database', 5), @('Counting what the purge deletes', 77), @('Protecting the undo tablespace', 2), @('Deleting', ($scope.Seconds - 60)), @('Putting the undo tablespace back', 6))
+                 Steps = @(@('Checking the database', 5), @('Counting what the purge deletes', 77), @('Preparing the database for the purge', 2), @('Deleting', ($scope.Seconds - 60)), @('Putting the undo tablespace and the logs back', 6))
                  CompareTitle = 'Verification'
                  Compare = @(@('ok', 'No row left before the cutoff', 'counted again after the purge'), @('ok', 'Rows deleted as counted', (Format-Int $scope.Rows) + ' deleted, ' + (Format-Int $scope.Rows) + ' counted'),
                              @('ok', 'No orphan row', '23 links between tables checked'), @('ok', 'Temporary indexes removed', '12 created, 12 dropped'), @('ok', 'Undo tablespace as before', '610 MB, the same names'))
@@ -883,26 +920,33 @@ function Show-Help {
  the requirements. It tells you what is missing and what to do.
 
  Where to start
-   1. See what a purge would delete. Nothing is changed:
-        epf_purge.bat purge --dry-run --cutoff 2016-05-10
+   1. See what a purge would delete, keeping the last 365 days. Nothing is
+      changed:
+        epf_purge.bat purge --dry-run --retention 365
 
    2. The whole job, in three commands:
-        epf_purge.bat purge --dry-run --cutoff 2016-05-10     what it would do
-        epf_purge.bat purge --cutoff 2016-05-10               delete the rows
-        epf_purge.bat reclaim                                 free the disk space
-                                                              (database not in use)
+        epf_purge.bat purge --dry-run --retention 365     what it would do
+        epf_purge.bat purge --retention 365               delete the rows
+        epf_purge.bat reclaim                             free the disk space
+                                                          (database not in use)
 
    3. Be guided: the menu asks what you want and the questions that go with it:
         epf_purge.bat
 
  Options
    --dry-run            show what would happen; change nothing
-   --cutoff YYYY-MM-DD  rows dated before this day; or --retention DAYS
-   --tns NAME           the database, as named in tnsnames.ora
-   --non-interactive    ask nothing: for scheduled runs. Passwords and choices
-                        then come from --config FILE.
+   --retention DAYS     the days of data to keep: older rows are purged
+                        (or --cutoff YYYY-MM-DD: rows dated before that day)
+   --tns NAME           the database, as named in tnsnames.ora; asked for
+                        when it is not given
+   --redo-logs          larger online redo logs during the purge, without
+                        being asked
+   --non-interactive    ask nothing: the whole run in one command, which a
+                        scheduler of yours can start. Passwords and choices
+                        then come from --config FILE. The tool schedules
+                        nothing itself.
    --config FILE        settings as KEY=VALUE: TNS, EPF_PASSWORD, SYS_PASSWORD,
-                        CUTOFF or RETENTION_DAYS, UNINSTALL_AFTER
+                        RETENTION_DAYS or CUTOFF, REDO_LOGS, UNINSTALL_AFTER
    --help               this text
 
  Other actions:  report (of an earlier run)   status (is anything pending?)
@@ -985,6 +1029,7 @@ while ($i -lt $script:CliArgs.Count) {
     if ($name -eq '--dry-run') { $script:Opt.DryRun = $true }
     elseif ($name -eq '--non-interactive') { $script:Opt.Interactive = $false }
     elseif ($name -eq '--yes') { $script:Opt.Yes = $true }
+    elseif ($name -eq '--redo-logs') { $script:Opt.Redo = $true }
     elseif ($name -eq '--fast') { $script:Opt.Fast = $true }
     elseif ($name -eq '--no-open') { $script:Opt.Open = $false }
     elseif ($name -eq '--no-color') { $script:Opt.Color = $false }
@@ -1016,7 +1061,18 @@ if ($script:Opt.Config -ne '') {
         $eq = $t.IndexOf('=')
         if ($eq -gt 0) { $script:Conf[$t.Substring(0, $eq).Trim().ToUpper()] = $t.Substring($eq + 1).Trim() }
     }
-    if ($script:Conf.ContainsKey('TNS')) { $script:Opt.Tns = $script:Conf['TNS'] }
+    if ($script:Opt.Tns -eq '' -and $script:Conf.ContainsKey('TNS')) { $script:Opt.Tns = $script:Conf['TNS'] }
+}
+# The database: --tns, TNS of the configuration file, or asked for.
+if ($script:Opt.Action -ne 'help' -and $script:Opt.Tns -eq '') {
+    if (-not $script:Opt.Interactive) {
+        Out-Line ' The database is required with --non-interactive: --tns NAME, or TNS in the configuration file.' 'Red'
+        exit 4
+    }
+    Out-Line ''
+    while ($script:Opt.Tns -eq '') {
+        $script:Opt.Tns = (Read-Answer 'Database (its alias in tnsnames.ora, such as EPFPG782)').ToUpper()
+    }
 }
 $code = 0
 switch ($script:Opt.Action) {

@@ -608,7 +608,7 @@ function Stop-WrapperTree {
 # defined in it or known to PowerShell, and no "+" takes a list as its right
 # operand ("a" + $x, 'b' is one string: the comma binds tighter than +).
 function Test-Script {
-    param([string]$Path)
+    param([string]$Path, [string[]]$Also = @())
     $name = Split-Path -Leaf $Path
     $tokens = $null
     $errors = $null
@@ -619,6 +619,15 @@ function Test-Script {
     $defined = @{}
     foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
         $defined[$f.Name.ToLower()] = $true
+    }
+    # The functions of the scripts it loads ($Also) are defined for it too.
+    foreach ($other in $Also) {
+        $otherTokens = $null
+        $otherErrors = $null
+        $otherAst = [System.Management.Automation.Language.Parser]::ParseFile($other, [ref]$otherTokens, [ref]$otherErrors)
+        foreach ($f in $otherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $defined[$f.Name.ToLower()] = $true
+        }
     }
     $missing = @()
     foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
@@ -851,7 +860,9 @@ $script:TestList = @(
 
 function Invoke-Suite {
     Invoke-Test 'T00' 'Static checks of the wrapper and of this suite (no database)' {
-        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf.ps1')
+        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf.ps1') @((Join-Path $script:SrcDir 'bin\lib\epf_html.ps1'))
+        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf_html.ps1')
+        Test-Script (Join-Path $script:SrcDir 'tests\sim\epf_sim.ps1')
         Test-Script (Join-Path $script:TestDir 'run_tests.ps1')
     }
 
