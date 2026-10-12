@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - The user experience first: a walkthrough of five scenarios on the status page; the user's decisions on scope
+
+Why: the user needs to show the tool the next day and asked to focus on the user experience first: "let's do a simulation so I know what it looks like. give different scenarios (what client want to achieve) and see how it plays out. no need to run actual purge. so i know what we need to change." The tests left (sets O and V) become the user's practice with the wrapper.
+
+The user's decisions the same day:
+- A purge beside the working application: only if it can be run safely; the reclaim stays a stopped-application operation. To be shown by a test, after the user experience.
+- A test on a copy grown 5 times: yes, after the user experience.
+- A PDB: the tool must work in one too (the online logs skipped); the user can create a container database. After the user experience.
+
+Done (documents only; no code):
+- Five scenarios run through the real wrapper against the stand-in sqlplus, replaying the events and figures of sets Q and U: a dry run, a purge (19.3 M rows), a purge refused for the BACKUP requirement, a reclaim's assessment and the reclaim (50.1 to 15.5 GB), the menu with its questions (the prompts are the wrapper's own, from its code). Nothing was purged.
+- The status page, section Walkthrough: for each scenario what is typed, the screen of today, what gets in the way, and a mock-up of the screen proposed; a mock-up of the HTML report; ten changes proposed with their size, and which four fit a demonstration the next day.
+- PLAN.md 13.1 (the decisions), 13.2 (the walkthrough, what the screens show, the ten changes).
+
+Waiting for the user: which of the ten changes to build, and in which order.
+
 ## 2026-10-13 - 0.9.3: R7 allows 5% above the segments (D27); the datafile grows less before the index rebuilds; the user's questions on scope answered and recorded
 
 Why: the user asked what R7's tolerance is and said "if you mean there's only 5% (not more) extra unused space in ts, then that is fine". Set U had ended 5.4% above its segments (822 MB) with R7 WARN, the compaction having left the tables within 0.2 GB: the 822 MB came from the growth before the index rebuilds (their estimates, each with an extent besides, plus the largest once more: 5.9 GB for rebuilds that took about 5.3 GB), with one index ending at the top of the file. And Oracle adds free space back to a tighter file within minutes (about 5%: sets Q and N).
