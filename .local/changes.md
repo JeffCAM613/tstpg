@@ -2,6 +2,42 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.4: the flow built in the wrapper: the tool gets ready by itself, the requirements as a table with their questions, the screen by default, the menu by goal, one command without prompts; the report says where a purge takes disk
+
+Why: the user, after step 1: "why stop there. please finish the changes." The flow is the one they decided (PLAN.md 13.2) and tried in the simulator.
+
+The wrapper (src\bin\lib):
+- New `epf_screen.ps1`, loaded by epf.ps1: the screen of a run without `--verbose`. Steps by what they do with their time (Start-Flow, Start-FlowStep, Complete-FlowStep); one line per module while rows are deleted, in place on a console (Get-FlowStatus) and its line with its time at the end; what the SYS steps did in a line each (Show-SysResult); the requirements as a table (Show-Requirements); the end of a run in plain words (Show-DryRunEnd, Show-PurgeEnd, Show-ReclaimAssess, Show-ReclaimEnd, Show-PreflightEnd, Show-GoodToKnow). Every event still goes to console.log as `--verbose` shows it; Show-Summary became Write-Summary (summary.txt only).
+- Connect-Tool -Ready: "Getting ready" with sqlplus, the database and the tool's objects; installs them when they are missing and upgrades them when they are older than the scripts (Install-Tool, SYS), after asking, or without asking with `--non-interactive`. Test-DbConnection -WithTool asks SYS whether the account exists (ORA-01017 does not say). The SYS password is asked once in a run (Connect-Sys keeps the connection data).
+- Questions: the database ("Database (its alias in tnsnames.ora, or host:port/service)"), the days of data to keep or a date, and the ones the requirements call for (Read-Requirement, Invoke-Choices, Save-Choices, Invoke-ReclaimChoices). No question any more for mode, depth, dry run, compaction or batch size.
+- `--non-interactive` starts a purge or a reclaim without `--yes`. A purge without prompts needs the days to keep, and continues an open plan only with them or `--yes`. A purge with prompts and no scope option no longer follows a plan no step of which ran (it asks the days to keep).
+- Reclaim: the measurement first in every case (ASSESS run, then COMPACT); the scratch space is the size measured unless `--scratch SIZE` or `--scratch none`; the tablespaces are no longer asked for (`--tablespaces`).
+- The menu: dry run of a purge, purge, dry run of a reclaim, reclaim, report, status, uninstall, quit. Install is no longer in it (a run does it).
+- After a purge or reclaim that ended well: Invoke-UninstallQuestion (UNINSTALL_AFTER).
+- A password asked for while the input is a file or a pipe is read from it (a masked prompt would wait for a keyboard for ever).
+- report.html: tables "Disk used while the purge runs" and "Other retentions"; what comes next is logged for it also without `--verbose`.
+- `--help`, README, the configuration example (RETENTION_DAYS no longer set there, UNINSTALL_AFTER, OPEN_REPORT, RECLAIM_SCRATCH NONE).
+
+The database objects (0.9.4):
+- epf_report.print_disk_need: section DISK WHILE THE PURGE RUNS of a dry run and a preflight, with lines EPF_DISK; a failure to measure is said in the section and never fails the report.
+- epf_report.print_advice: line EPF_ADVICE|REQWHY per requirement.
+- The engine (purge, reclaim, tuning) is unchanged.
+
+The suite (run_tests.ps1):
+- T00 checks epf_screen.ps1 too. T07: `reclaim --non-interactive` and `purge --non-interactive --retention N` are no longer usage errors (they would run); it now checks a retention of 0 and a purge without prompts and without days to keep.
+- T08 (the screen by default): the steps, the table, the estimate, report.html; console.log as before.
+- T08B gives the batch size as an option (no question asks it any more); T10B answers no to the questions; T11 and T16 answer the days to keep and yes (T16 through the menu: 2).
+- The reclaim lab runs its compactions with `--scratch none` where they tested room making without scratch space; Get-Run takes the last run of an action (a compaction's measurement comes first).
+
+Checked here: 28 scenarios through the real wrapper against the stand-in sqlplus, 152 checks on their screens; the wrapper's three files parse and call only defined commands; T00, T06, T07 pass, T08's screen checks and T16 pass against the stand-in; epf_report.pkb passes the static checks (order, declarations, no private function in SQL). Not run on a database yet: the PL/SQL of the new section was not compiled.
+
+How to test (on a test copy; each step ends with `run_tests.bat --digest`):
+1. `src\tests\e2e\run_tests.bat --only T03` installs 0.9.4 (or let step 2 upgrade it: it asks).
+2. `src\bin\epf_purge.bat purge --dry-run --retention 365`: the table, the counts, "Disk used while the purge runs" with file names, "Other retentions", the report in the browser.
+3. `src\bin\epf_purge.bat purge --retention 365`: the questions, the typed yes, the line per module while it deletes, the end.
+4. `src\bin\epf_purge.bat reclaim --dry-run`, then `src\bin\epf_purge.bat reclaim`.
+5. `src\tests\e2e\run_tests.bat --only T07,T08,T08B,T10B,T11,T16` for the suite's side.
+
 ## 2026-10-13 - The user experience, step 1 in the wrapper: report.html at the end of every run, the next step, a refusal with its way out, --help; the simulator after the user's remarks
 
 Why: the user went through the simulator (set S) and asked for four changes, then: "that's the only changes i need so far after trying all the scenarios. you can start now".

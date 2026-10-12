@@ -1401,6 +1401,138 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         END LOOP;
     END print_retention_options;
 
+    -- What a purge takes on disk while it runs, and where: the undo
+    -- tablespace up to the limit undo tuning sets, the work keys in the
+    -- temporary tablespace, the temporary indexes in the tool's tablespace,
+    -- the online redo logs (larger ones when planned) and, in ARCHIVELOG
+    -- mode, the archived logs; then the tablespaces whose tables are purged
+    -- (a dry run: its space baseline). From the requirements the run
+    -- measured; "more than now" is what the files have to grow by. What
+    -- cannot be measured is said so and never fails the report.
+    PROCEDURE print_disk_need IS
+        l_run    NUMBER := g_run.run_id;
+        l_label  VARCHAR2(20) := epf_util.run_label(g_run.run_id);
+        l_count  NUMBER;
+        l_most   NUMBER;
+        l_now    NUMBER;
+        l_free   NUMBER;
+        l_total  NUMBER := 0;
+        l_ts     VARCHAR2(128);
+        l_tool   VARCHAR2(128);
+        l_temp   VARCHAR2(128);
+        l_min    NUMBER;
+        l_logs   NUMBER;
+        l_member VARCHAR2(600);
+        l_last   VARCHAR2(128);
+        l_seg    NUMBER := 0;
+
+        -- The files of a tablespace, the first three by name.
+        FUNCTION files_of(p_ts IN VARCHAR2, p_temp IN BOOLEAN DEFAULT FALSE) RETURN VARCHAR2 IS
+            l_text  VARCHAR2(4000);
+            l_n     PLS_INTEGER := 0;
+            l_names SYS.ODCIVARCHAR2LIST;
+        BEGIN
+            IF p_temp THEN
+                EXECUTE IMMEDIATE 'SELECT file_name FROM dba_temp_files WHERE tablespace_name = :t ORDER BY file_id'
+                    BULK COLLECT INTO l_names USING p_ts;
+            ELSE
+                SELECT file_name BULK COLLECT INTO l_names
+                  FROM dba_data_files
+                 WHERE tablespace_name = p_ts
+                 ORDER BY file_id;
+            END IF;
+            FOR k IN 1 .. l_names.COUNT LOOP
+                l_n := l_n + 1;
+                IF l_n <= 3 THEN
+                    l_text := l_text || CASE WHEN l_n > 1 THEN ', ' END || l_names(k);
+                END IF;
+            END LOOP;
+            RETURN NVL(l_text, p_ts) || CASE WHEN l_n > 3 THEN ' and ' || (l_n - 3) || ' more' END;
+        END files_of;
+
+        PROCEDURE line(p_code IN VARCHAR2, p_what IN VARCHAR2, p_most IN NUMBER, p_more IN NUMBER,
+                       p_where IN VARCHAR2) IS
+        BEGIN
+            put('  ' || l(p_what, 22) || r(b(p_most), 12) || r(b(p_more), 16) || '  ' || p_where);
+            put('EPF_DISK|' || l_label || '|' || p_code || '|' || ROUND(p_most) || '|' || ROUND(p_more) || '|' || p_where);
+            l_total := l_total + NVL(p_more, 0);
+        END line;
+    BEGIN
+        SELECT COUNT(*) INTO l_count FROM epf_requirement WHERE run_id = l_run;
+        IF l_count = 0 THEN
+            RETURN;
+        END IF;
+        title('DISK WHILE THE PURGE RUNS (given back at its end)');
+        put('  ' || l('What', 22) || r('At most', 12) || r('More than now', 16) || '  Where');
+        SELECT MAX(default_tablespace), MAX(temporary_tablespace)
+          INTO l_tool, l_temp
+          FROM dba_users
+         WHERE username = $$PLSQL_UNIT_OWNER;
+        FOR q IN (SELECT req_code, status, needed_bytes, met_by
+                    FROM epf_requirement
+                   WHERE run_id = l_run AND req_code IN ('UNDO', 'TEMP', 'INDEX_SPACE', 'REDO_LOGS', 'ARCHIVE')
+                   ORDER BY CASE req_code WHEN 'UNDO' THEN 1 WHEN 'TEMP' THEN 2 WHEN 'INDEX_SPACE' THEN 3
+                                          WHEN 'REDO_LOGS' THEN 4 ELSE 5 END) LOOP
+            IF q.req_code = 'UNDO' THEN
+                SELECT UPPER(value) INTO l_ts FROM v$parameter WHERE name = 'undo_tablespace';
+                SELECT NVL(SUM(bytes), 0) INTO l_now FROM dba_data_files WHERE tablespace_name = l_ts;
+                l_most := epf_tuning.undo_cap(q.needed_bytes);
+                line('UNDO', 'Undo', l_most, GREATEST(l_most - l_now, 0), files_of(l_ts));
+            ELSIF q.req_code = 'TEMP' AND NVL(q.needed_bytes, 0) > 0 THEN
+                EXECUTE IMMEDIATE 'SELECT NVL(MAX(free_space), 0) FROM dba_temp_free_space WHERE tablespace_name = :t'
+                    INTO l_free USING l_temp;
+                line('TEMP', 'Temporary space', q.needed_bytes, GREATEST(q.needed_bytes - l_free, 0), files_of(l_temp, TRUE));
+            ELSIF q.req_code = 'INDEX_SPACE' AND NVL(q.needed_bytes, 0) > 0 THEN
+                SELECT NVL(SUM(bytes), 0) INTO l_free FROM dba_free_space WHERE tablespace_name = l_tool;
+                line('INDEXES', 'Temporary indexes', q.needed_bytes, GREATEST(q.needed_bytes - l_free, 0), files_of(l_tool));
+            ELSIF q.req_code = 'REDO_LOGS' THEN
+                SELECT COUNT(*), NVL(SUM(bytes), 0), NVL(MIN(bytes), 0) INTO l_logs, l_now, l_min FROM v$log;
+                SELECT MIN(member) INTO l_member FROM v$logfile;
+                -- Larger logs replace the present ones for the purge: both
+                -- exist for a moment.
+                IF g_run.with_redo_logs = 'Y' AND l_min < 1073741824 THEN
+                    line('REDO', 'Online redo logs', 4294967296, 4294967296,
+                         'next to ' || l_member || ': 4 x 1 GB for the purge, the present ' || l_logs || ' put back after it');
+                ELSE
+                    line('REDO', 'Online redo logs', l_now, 0,
+                         l_logs || ' logs reused, the first: ' || l_member
+                         || CASE WHEN q.status = 'NOT_MET' THEN
+                                '; a purge can enlarge them for its time (4 x 1 GB, up to 4.0 GB more)' END);
+                END IF;
+            ELSIF q.req_code = 'ARCHIVE' AND NVL(q.met_by, '-') <> 'NOARCHIVELOG' AND NVL(q.needed_bytes, 0) > 0 THEN
+                line('ARCHIVE', 'Archived logs', q.needed_bytes, q.needed_bytes,
+                     'the archive destination; kept until the DBA backs them up and deletes them');
+            END IF;
+        END LOOP;
+        put('  ' || l('In all', 22) || r(' ', 12) || r(b(l_total), 16) || '  free space needed next to these files');
+        -- The tablespaces of the tables purged, from the space baseline.
+        FOR t IN (SELECT ss.tablespace_name, ss.module_code, SUM(ss.bytes) AS bytes
+                    FROM epf_segment_snap ss
+                   WHERE ss.run_id = l_run AND ss.phase = 'BASELINE'
+                   GROUP BY ss.tablespace_name, ss.module_code
+                   ORDER BY ss.tablespace_name, ss.module_code) LOOP
+            CONTINUE WHEN NOT in_depth(t.module_code);
+            IF l_last IS NOT NULL AND l_last <> t.tablespace_name THEN
+                put('  ' || l('Tablespace purged', 22) || r(b(l_now), 12) || r('-', 16) || '  ' || l_last || ': '
+                    || files_of(l_last) || '; its tables to purge take ' || b(l_seg));
+                l_seg := 0;
+            END IF;
+            IF l_last IS NULL OR l_last <> t.tablespace_name THEN
+                SELECT NVL(SUM(bytes), 0) INTO l_now FROM dba_data_files WHERE tablespace_name = t.tablespace_name;
+            END IF;
+            l_last := t.tablespace_name;
+            l_seg  := l_seg + NVL(t.bytes, 0);
+        END LOOP;
+        IF l_last IS NOT NULL THEN
+            put('  ' || l('Tablespace purged', 22) || r(b(l_now), 12) || r('-', 16) || '  ' || l_last || ': '
+                || files_of(l_last) || '; its tables to purge take ' || b(l_seg));
+            put('  The space is freed inside the tables: the datafiles of these tablespaces keep their size until a reclaim.');
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            put('  Not all of it could be measured: ' || SQLERRM);
+    END print_disk_need;
+
     -- Predicted outcome of a dry run: the first blocking requirement not met
     -- decides where it would fail; otherwise it would complete.
     PROCEDURE print_expected IS
@@ -2165,6 +2297,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             IF g_run.dry_run = 'Y' THEN
                 print_forecast_table('DRY_RUN');
                 print_simulation_notes;
+                print_disk_need;
                 print_retention_options;
                 print_requirements;
                 print_expected;
@@ -2177,6 +2310,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             print_space;
         ELSIF g_run.action = 'PREFLIGHT' THEN
             print_forecast_table('PREFLIGHT');
+            print_disk_need;
             print_retention_options;
             print_requirements;
             print_changes;
@@ -2237,11 +2371,13 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         FOR q IN (SELECT req_code, status, blocking, met_by FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
             put('EPF_ADVICE|REQ|' || q.req_code || '|' || q.status || '|' || q.blocking || '|' || q.met_by);
         END LOOP;
-        -- Texts for the wizard's questions: title and measurement of each
-        -- requirement, and the details of its ways to meet it.
-        FOR q IN (SELECT req_code, title, measured FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
+        -- Texts for the wrapper's table and questions: title and measurement
+        -- of each requirement, why it matters, and the details of its ways
+        -- to meet it.
+        FOR q IN (SELECT req_code, title, measured, why FROM epf_requirement WHERE run_id = p_run_id ORDER BY seq) LOOP
             put('EPF_ADVICE|REQTEXT|' || q.req_code || '|' || REPLACE(q.title, '|', '/') || '|'
                 || REPLACE(q.measured, '|', '/'));
+            put('EPF_ADVICE|REQWHY|' || q.req_code || '|' || REPLACE(q.why, '|', '/'));
         END LOOP;
         FOR o IN (SELECT req_code, option_code, met, detail FROM epf_req_option WHERE run_id = p_run_id
                    ORDER BY req_code, seq) LOOP

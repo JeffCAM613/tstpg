@@ -38,6 +38,10 @@ $script:Config      = @{}
 $script:Database    = $null
 $script:ClockOffset = [TimeSpan]::Zero
 $script:Children    = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
+# The connection as SYS of this run, once made (Connect-Sys), and whether the
+# tool's account exists in the database as SYS found it (INSTALLED, ABSENT).
+$script:SysLogin    = $null
+$script:ToolState   = ''
 
 $script:ExitPass    = 0
 $script:ExitFail    = 1
@@ -48,8 +52,10 @@ $script:ExitUsage   = 4
 $script:Modes = @('FULL', 'CLOB', 'LOGS', 'CLOB_N_LOGS')
 $script:Width = 80
 
-# The HTML report of a run (Write-HtmlReport).
+# The HTML report of a run (Write-HtmlReport), and the screen of a run
+# without --verbose (its steps, the requirements table, its end).
 . (Join-Path $PSScriptRoot 'epf_html.ps1')
+. (Join-Path $PSScriptRoot 'epf_screen.ps1')
 # Seconds a sqlplus session may take to connect before it is ended and
 # started again (configuration key CONNECT_TIMEOUT_S), and the line it
 # prints once connected (Start-Session).
@@ -200,6 +206,11 @@ Two things to know
   The two can be run apart, also from a scheduler of yours (one command each,
   with --non-interactive). The purge comes first.
 
+  Every purge and reclaim gets ready by itself: it finds sqlplus, reaches
+  the database, installs the tool's own objects there when they are missing
+  (or upgrades them; SYS), and checks the requirements. It says what is
+  missing and what to do about it.
+
 Where to start
   1. See what a purge would delete, keeping the last 365 days. Nothing is
      changed:
@@ -211,80 +222,94 @@ Where to start
                                                          (database not in use)
   3. Be guided: the menu asks what you want and the questions that go with it:
        epf_purge.bat
-  The first time on a database, install the tool's own objects (SYS):
-       epf_purge.bat install
 
 Usage: epf_purge.bat [action] [options]
 
 Actions
-  (none)       interactive wizard
-  purge        purge: preflight, purge, report
-  preflight    read-only checks and estimates, and the plan of the purge;
-               changes no data
-  plan         the open plan with its steps (or the latest plan)
-               --close closes the open plan
-  report       report of a run                          --run <id|LATEST>
+  (none)       the menu: dry run of a purge, purge, dry run of a reclaim,
+               reclaim, report, status, uninstall
+  purge        delete the rows older than the days of data to keep: checks,
+               questions, purge, report. --dry-run counts what it would
+               delete and changes nothing
   reclaim      give the space a purge freed back to the disk: the tables of
                the application's tablespaces move within them so that their
                datafiles shrink (SYS; the application accounts are locked
-               meanwhile). --dry-run assesses only; --restore restores what
-               a reclaim that did not finish left pending
+               meanwhile). It measures first (its dry run) and asks.
+               --dry-run measures only; --restore restores what a reclaim
+               that did not finish left pending
+  report       report of a run                          --run <id|LATEST>
   status       state of the active or latest run, pending temporary indexes,
                undo tuning, and what a reclaim left pending
   stop         request a graceful stop of the active run
-  install      install or upgrade the database objects (SYS)
-  uninstall    remove the database objects (SYS)
+  uninstall    remove the tool's objects from the database (SYS)
+  install      install or upgrade the tool's objects (SYS); a purge or a
+               reclaim does it when needed
+  preflight    the checks and estimates of a purge alone, and its plan;
+               changes no data
+  plan         the open plan with its steps (or the latest plan)
+               --close closes the open plan
 
 Options
+  --dry-run            show what would happen; change nothing
+  --retention DAYS     the days of data to keep: older rows are purged.
+                       Asked for when not given; required with
+                       --non-interactive
+  --cutoff YYYY-MM-DD  purge rows dated before this day, instead of --retention
+  --tns NAME           the database: its alias in tnsnames.ora, or
+                       host:port/service (the PDB service in multitenant);
+                       asked for when not given
+  --non-interactive    ask nothing: the whole run in one command, which a
+                       scheduler of yours can start. The database, the
+                       passwords and the retention then come from the
+                       options, the environment or --config FILE; a purge
+                       or a reclaim starts without confirmation. The tool
+                       schedules nothing itself
   --config FILE        configuration file (default src\config\epf_purge.conf);
                        command line values override file values
-  --tns NAME           TNS alias or EZConnect string (PDB service in multitenant)
-  --retention DAYS     default 30
-  --cutoff YYYY-MM-DD  purge rows dated before this day, instead of --retention
-                       (keeps the cutoff of an earlier preflight or dry run)
-  --depth LIST         ALL, or modules separated by commas
+  --redo-logs          larger online redo logs for the purge (4 x 1 GB)
+                       when one batch does not fit, without being asked; the
+                       original groups are put back at the end (SYS). With
+                       --dry-run it is checked as planned; nothing is changed
+  --backup CHOICE      when no recent RMAN backup is found, without being
+                       asked: confirmed (a backup was made another way) or
+                       none (purge without a backup)
+  --confirm LIST       requirements you go on without although the checks
+                       find them not met, without being asked: ARCHIVE, UNDO,
+                       TEMP separated by commas (reclaim: ARCHIVE, TEMP,
+                       RECYCLEBIN)
+  --mode MODE          FULL (default) | CLOB | LOGS | CLOB_N_LOGS
+  --depth LIST         ALL (default), or modules separated by commas
                        (PAYMENTS,LOGS,BANK_STATEMENTS); not used in LOGS mode
-  --mode MODE          FULL | CLOB | LOGS | CLOB_N_LOGS
-  --batch-size N       root rows per transaction, 100-100000; the wizard
-                       offers the preflight's recommendation
-  --dry-run            simulation: exact counts, forecast and expected outcome;
-                       nothing is deleted (reclaim: the assessment only)
-  --backup CHOICE      when no recent RMAN backup is found: confirmed (a backup
-                       was made another way) or none (purge without a backup)
-  --confirm LIST       requirements the DBA confirms are handled although the
-                       preflight finds them not met: ARCHIVE, UNDO, TEMP
-                       separated by commas (reclaim: ARCHIVE, TEMP, RECYCLEBIN)
+  --batch-size N       root rows per transaction, 100-100000 (default: what
+                       the checks recommend)
+  --compact            shrink the purged tables afterwards (purge only)
   --tablespaces LIST   reclaim: tablespaces separated by commas (default: every
                        tablespace holding segments of the application schemas)
-  --scratch SIZE       reclaim: temporary space, such as 2G, for the tables
-                       that cannot move lower: they wait in a tablespace the
-                       reclaim creates next to their tablespace's first
-                       datafile, and come back at the end (default: none)
+  --scratch SIZE       reclaim: the most temporary space, such as 2G, for the
+                       tables that cannot move lower: they wait in a
+                       tablespace the reclaim creates next to their
+                       tablespace's first datafile, and come back at the end
+                       (default: the size its dry run measures; none: no
+                       scratch space)
   --restore            reclaim: move back the parked tables, rebuild the
                        indexes, restore the datafile growth settings and
                        unlock the accounts a reclaim that did not finish left
                        pending
-  --compact            shrink the purged tables afterwards (purge only)
-  --redo-logs          larger online redo logs for the purge (4 x 1 GB)
-                       when one batch does not fit; the original groups
-                       are put back at the end (SYS). With preflight or
-                       --dry-run it is checked as planned; nothing is
-                       changed
   --undo-tuning        accepted, changes nothing: every purge runs with undo
                        tuning (see Undo tuning below)
   --max-redo SIZE      the most redo one run of the plan may write, such as
-                       500M or 20G (preflight, and the wizard's purge): the
-                       plan splits the purge into runs of at most that much,
-                       older data first
+                       500M or 20G (preflight, and a purge with questions):
+                       the plan splits the purge into runs of at most that
+                       much, older data first
   --new                start over: close the open plan (preflight: plan
                        again; purge: run the options given)
   --close              with plan: close the open plan
   --run ID             run for report (default LATEST) and stop (default:
                        the active run); 124 or R-000124
-  --yes                skip the final confirmation (required with
-                       --non-interactive for a purge that deletes, a reclaim,
-                       and uninstall)
-  --non-interactive    never prompt; missing input is an error (exit 4)
+  --yes                skip the typed confirmation of a purge or a reclaim
+                       run with questions (required with --non-interactive
+                       for uninstall and plan --close)
+  --no-open            report.html is written and not opened in the browser
   --log-dir DIR        run folders (default: logs in the tool folder)
   --verbose            show every event, the sessions' waits and the whole
                        report while a run is shown (console.log in the run
@@ -292,16 +317,19 @@ Options
   --no-color           plain output
   --help
 
-Requirements and choices
-  The preflight checks six requirements: archive space, undo, TEMP, index
-  space, redo logs and backup. Run it without --non-interactive and it asks,
-  for each one not met, how to meet it (larger redo logs, a smaller batch,
-  the backup choice, a confirmation by the DBA, or stop), then the batch
-  size, and checks again. The answers are saved with the preflight and its
-  plan: the purges of the plan follow them. Options on the command line
-  (--batch-size, --backup, --confirm, --redo-logs) are choices too. A purge
-  does not start while a blocking requirement (archive, undo, TEMP, backup)
-  is not met. A dry run simulates the purge and predicts its outcome.
+Requirements and questions
+  A purge checks six requirements: room for the archived logs, undo,
+  temporary space, room for its temporary indexes, the online redo logs and
+  a backup. It shows them as a table: required or optional, the state now,
+  and for each one not met what happens and what to do. With questions it
+  then asks: whether to enlarge the online redo logs for its time; whether a
+  backup exists that RMAN does not know; and, for a required one that stays
+  not met, whether to go on anyway (not recommended; the default is no).
+  Without questions the options answer beforehand (--redo-logs, --backup,
+  --confirm, --batch-size), and a purge does not start while a required one
+  is not met. A dry run counts what the purge deletes and predicts its
+  outcome. The answers are saved with the checks and their plan: the purges
+  of the plan follow them.
 
 Undo tuning (every purge; SYS)
   Every row a purge deletes writes undo: 31.7 GB for 89 M rows on one test
@@ -344,29 +372,32 @@ Reclaim
   resized down, until a segment that cannot move (listed in the report) holds
   the top; then the indexes are rebuilt, the growth settings restored and the
   accounts unlocked. No datafile grows above its size at the start. Oracle
-  chooses where a copy goes, and may put it at the top again: with
-  --scratch, such a table, or one that does not fit below, waits in a
-  scratch tablespace while the rest is compacted, then comes back into what
-  is left free; without it, the datafile stops shrinking there. With
-  prompts, the reclaim shows its assessment and asks before anything moves.
+  chooses where a copy goes, and may put it at the top again: such a table,
+  or one that does not fit below, waits in a scratch tablespace while the
+  rest is compacted, then comes back into what is left free (--scratch none:
+  the datafile stops shrinking there instead). Every reclaim measures first
+  (its dry run): what it gives back, the accounts it locks, the scratch
+  space it takes; with questions it then asks before anything moves.
   Ctrl+C stops after the current table; what was changed is restored either
   way, and a later reclaim continues from there.
 
-Environment
-  EPF_PASSWORD         EPFPG password
-  EPF_SYS_PASSWORD     SYS password (install, uninstall, reclaim, and every
-                       purge: undo tuning, --redo-logs)
+Environment and configuration file
+  EPF_PASSWORD         EPFPG password (EPF_PASSWORD in the configuration file)
+  EPF_SYS_PASSWORD     SYS password (SYS_PASSWORD in the configuration file):
+                       reclaim, every purge that deletes (undo tuning,
+                       --redo-logs), install and uninstall
+  UNINSTALL_AFTER=Y in the configuration file removes the tool's objects
+  after a run that ended well; with questions, the run asks.
 
 While a run is shown, Ctrl+C requests a graceful stop: the purge stops after
 its current batch (a reclaim after its current table) and the run ends with
 its report.
 
 Output
-  A run shows the end of each step, its progress, warnings, errors and its
-  milestones (modules purged, tablespaces assessed or compacted), a status
-  line with what runs now, and at the end a summary of its report: the
-  estimate or the simulation, the requirements, the tablespaces, the checks
-  that did not pass and the verdict. --verbose (VERBOSE=Y in the
+  A run shows its steps by what they do, each with its time; while rows are
+  deleted, one line per module with its progress, the rows, the speed and
+  the time left; warnings and errors as they come; and at the end what was
+  done, what to know and what comes next. --verbose (VERBOSE=Y in the
   configuration file) shows every event and the whole report instead.
   console.log in the run folder always has every line, and report.txt the
   whole report. report.html shows the run in a browser: the result in one
@@ -554,40 +585,73 @@ function ConvertFrom-Secure {
     }
 }
 
+# A masked prompt, as a SecureString. A masked prompt needs a keyboard: when
+# the input is a file or a pipe, the line is read from it instead.
+function Read-Masked {
+    param([string]$Text)
+    if (-not [Console]::IsInputRedirected) { return (Read-Host -Prompt (' ' + $Text) -AsSecureString) }
+    $line = Read-Host -Prompt (' ' + $Text)
+    $secure = New-Object System.Security.SecureString
+    if ($null -ne $line) {
+        foreach ($c in $line.ToCharArray()) { $secure.AppendChar($c) }
+    }
+    return $secure
+}
+
 # Password from the environment, the configuration file or a masked prompt
-# (entered twice with -Twice), kept as a SecureString.
+# (entered twice with -Twice), kept as a SecureString. -Optional: Enter
+# alone, or no password given without prompts, returns $null. -Ask: the
+# prompt only (the password given before was refused).
 function Read-Secret {
-    param([string]$Prompt, [string]$EnvName, [string]$ConfigKey, [switch]$Twice)
-    $fromEnv = [Environment]::GetEnvironmentVariable($EnvName)
-    if (-not [string]::IsNullOrEmpty($fromEnv)) { return (ConvertTo-SecureString $fromEnv -AsPlainText -Force) }
-    if ($script:Config.ContainsKey($ConfigKey) -and $script:Config[$ConfigKey] -ne '') {
-        return (ConvertTo-SecureString $script:Config[$ConfigKey] -AsPlainText -Force)
+    param([string]$Prompt, [string]$EnvName, [string]$ConfigKey, [switch]$Twice, [switch]$Optional, [switch]$Ask,
+          [string]$Label = '')
+    if (-not $Ask) {
+        $fromEnv = [Environment]::GetEnvironmentVariable($EnvName)
+        if (-not [string]::IsNullOrEmpty($fromEnv)) { return (ConvertTo-SecureString $fromEnv -AsPlainText -Force) }
+        if ($script:Config.ContainsKey($ConfigKey) -and $script:Config[$ConfigKey] -ne '') {
+            return (ConvertTo-SecureString $script:Config[$ConfigKey] -AsPlainText -Force)
+        }
     }
     if (-not $script:Interactive) {
-        Exit-Tool $script:ExitUsage ('Missing ' + $Prompt + ': set ' + $EnvName + ' (non-interactive).')
+        if ($Optional) { return $null }
+        Exit-Tool $script:ExitUsage ('Missing ' + $Prompt + ': set ' + $EnvName + ' in the environment or ' + $ConfigKey +
+                                     ' in the configuration file (non-interactive).')
     }
+    $text = $Prompt
+    if ($Label -ne '') { $text = $Label }
     while ($true) {
         Clear-Status
-        $first = Read-Host -Prompt (' ' + $Prompt) -AsSecureString
-        if ($first.Length -eq 0) { Write-Out '   a value is required' 'Yellow' -NoLog; continue }
+        $first = Read-Masked $text
+        if ($first.Length -eq 0 -and $Optional) { return $null }
+        if ($first.Length -eq 0) {
+            if ([Console]::IsInputRedirected) { Exit-Tool $script:ExitUsage ('Missing ' + $Prompt + ': the input has no more lines.') }
+            Write-Out '   a value is required' 'Yellow' -NoLog
+            continue
+        }
         if (-not $Twice) { return $first }
-        $second = Read-Host -Prompt (' ' + $Prompt + ' (again)') -AsSecureString
+        $second = Read-Masked ($text + ' (again)')
         if ((ConvertFrom-Secure $first) -ceq (ConvertFrom-Secure $second)) { return $first }
         Write-Out '   the two entries differ' 'Yellow' -NoLog
     }
 }
 
 # Final confirmation of a destructive action: typed "yes", or --yes.
+# -Straight (a purge, a reclaim): a run without prompts goes straight on,
+# as the one command a scheduler starts. $Label: the prompt itself, in
+# place of "$Prompt. Type yes to proceed".
 function Read-Typed {
-    param([string]$Prompt)
+    param([string]$Prompt, [string]$Label = '', [switch]$Straight)
     if ($script:Cli.Flags.ContainsKey('yes')) { return }
     if (-not $script:Interactive) {
+        if ($Straight) { return }
         Exit-Tool $script:ExitUsage ($Prompt + ': --yes is required with --non-interactive.')
     }
+    $text = $Prompt + '. Type yes to proceed'
+    if ($Label -ne '') { $text = $Label }
     Clear-Status
-    $answer = Read-Host -Prompt (' ' + $Prompt + '. Type yes to proceed')
-    Write-Log (' ' + $Prompt + '. Type yes to proceed: ' + $answer)
-    if ($answer -ne 'yes') { Exit-Tool $script:ExitAborted 'Aborted.' }
+    $answer = Read-Host -Prompt (' ' + $text)
+    Write-Log (' ' + $text + ': ' + $answer)
+    if ($answer -ne 'yes') { Exit-Tool $script:ExitAborted 'Stopped: you did not type yes. Nothing was changed.' }
 }
 
 # ----------------------------------------------------------------------------
@@ -769,10 +833,11 @@ function Start-Session {
 }
 
 # Connection test (the only statement the wrapper sends itself): container
-# name and, for EPFPG, the installed tool version. TimedOut: the database did
-# not answer the connection (Start-Session) or the query.
+# name and, for EPFPG, the installed tool version; for SYS with -WithTool,
+# whether the tool's account exists (Version INSTALLED or ABSENT). TimedOut:
+# the database did not answer the connection (Start-Session) or the query.
 function Test-DbConnection {
-    param($Login, [switch]$WithVersion)
+    param($Login, [switch]$WithVersion, [switch]$WithTool)
     $session = Start-Session $Login
     if (-not $session.Ready) {
         $text = ($session.Lines -join "`r`n")
@@ -787,6 +852,8 @@ function Test-DbConnection {
     $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
     if ($WithVersion) {
         $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
+    } elseif ($WithTool) {
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || (SELECT CASE WHEN COUNT(*) > 0 THEN 'INSTALLED' ELSE 'ABSENT' END FROM dba_users WHERE username = 'EPFPG') || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
     } else {
         $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
     }
@@ -1026,6 +1093,13 @@ function Show-Event {
     }
     $text = ' {0} {1} {2,-20} {3}' -f $Field[2], $tag, $Field[5], $Field[7]
     if ($Field[6] -ne '' -and $Field[7].IndexOf($Field[6]) -lt 0) { $text = $text + '  [' + $Field[6] + ']' }
+    # Without --verbose the screen shows the steps of the run (epf_screen.ps1);
+    # console.log has every event as --verbose shows it.
+    if (Test-Flow) {
+        Write-Log $text
+        Show-FlowEvent $Field
+        return
+    }
     if ($Field[3] -eq 'INFO' -and $script:DetailEvents -contains $Field[5]) {
         Write-Log $text
         return
@@ -1118,7 +1192,8 @@ function Show-Progress {
             $State.LastSuspended = Get-Date
         }
     }
-    $text = Get-StatusText $Beats $Steps
+    $text = ''
+    if (Test-Flow) { $text = Get-FlowStatus $Steps } else { $text = Get-StatusText $Beats $Steps }
     if ($text -eq '') {
         Clear-Status
     } elseif ($script:StatusLine) {
@@ -1278,11 +1353,61 @@ function Close-Run {
     return $closeCode
 }
 
+# The steps of a purge, of its dry run or of a preflight on the screen
+# (epf_screen.ps1).
+function Get-PurgeSteps {
+    param([string]$Action, [bool]$DryRun)
+    $check = [pscustomobject]@{ Key = 'CHECK'; Text = 'Checking the database (read-only)'; Header = $false }
+    if ($Action -eq 'PREFLIGHT') { return ,@($check) }
+    if ($DryRun) {
+        return ,@($check, [pscustomobject]@{ Key = 'COUNT'; Text = 'Counting what the purge would delete'; Header = $true })
+    }
+    return ,@($check,
+              [pscustomobject]@{ Key = 'PREPARE'; Text = 'Preparing the database for the purge (SYS)'; Header = $false },
+              [pscustomobject]@{ Key = 'DELETE'; Text = 'Deleting'; Header = $true },
+              [pscustomobject]@{ Key = 'RESTORE'; Text = 'Putting the database back as it was (SYS)'; Header = $false })
+}
+
+# The output of a step run by SYS (undo.sql, redo_logs.sql): every line with
+# --verbose and in the log; on the screen of the steps its warnings and
+# errors and one line of what it did (Show-SysResult), or all of it when the
+# step failed.
+function Show-SysLines {
+    param($Result, [string]$What)
+    if ((Test-Flow) -and $Result.ExitCode -eq 0) {
+        Show-Lines $Result.Output -Indent -Detail
+        Show-SysResult $Result.Output $What
+    } else {
+        Show-Lines $Result.Output -Indent
+    }
+}
+
+# The day before which a purge deletes, as YYYY-MM-DD: its cutoff, or today
+# on the database clock less the retention.
+function Get-CutoffDay {
+    param($Ctx)
+    if ($Ctx.Cutoff -ne '') { return $Ctx.Cutoff }
+    return (Get-Date).Add($script:ClockOffset).Date.AddDays(-1 * [int]$Ctx.Retention).ToString('yyyy-MM-dd')
+}
+
+# The options that say the scope of a purge on the command line.
+function Get-ScopeOptions {
+    param($Ctx)
+    $how = '--retention ' + $Ctx.Retention
+    if ($Ctx.Cutoff -ne '') { $how = '--cutoff ' + $Ctx.Cutoff }
+    if ($Ctx.Mode -ne 'FULL') { $how = $how + ' --mode ' + $Ctx.Mode }
+    if ($Ctx.Depth -ne 'ALL' -and $Ctx.Mode -ne 'LOGS') { $how = $how + ' --depth ' + $Ctx.Depth }
+    return $how
+}
+
 # Runs PREFLIGHT or PURGE as one run: the monitor creates the run and holds its
 # lock; worker sessions run the steps while the monitor shows them live; the
 # monitor ends the run with the report's verdict; the report goes to the
 # console and to the run folder. SYS steps (redo logs, undo tuning) run in
-# their own sessions; undo tuning is restored on every exit path.
+# their own sessions; undo tuning is restored on every exit path. Without
+# --verbose the screen shows the steps of the run and its end in plain words
+# (epf_screen.ps1). -FromWizard: the read-only check a purge with prompts
+# begins with; its end is not shown.
 function Invoke-ToolRun {
     param($Ctx, [string]$Action, [switch]$FromWizard)
     $state = [pscustomobject]@{
@@ -1331,41 +1456,45 @@ function Invoke-ToolRun {
                $cutoffArg, $confirmArg, $redo, $maxRedoArg, (Get-YN $Ctx.NewPlan), $planIdArg, $planStepArg)
     Open-Run $state $begin
     $label = Get-RunLabel $state.RunId
+    if ($null -eq $script:Flow) { Start-Flow (Get-PurgeSteps $Action $Ctx.DryRun) }
 
-    Write-Out ''
-    Write-Out (' EPF Data Purge'.PadRight($script:Width - $label.Length - 4) + 'run ' + $label) 'White'
-    Write-Out (' ' + ('-' * ($script:Width - 1)))
+    Write-Out '' -Detail
+    Write-Out (' EPF Data Purge'.PadRight($script:Width - $label.Length - 4) + 'run ' + $label) 'White' -Detail
+    Write-Out (' ' + ('-' * ($script:Width - 1))) -Detail
     Write-Out (' Database   ' + $script:Database.Container + ', tool version ' + $script:Database.Version +
-               ', ' + $Ctx.Cred.Tns)
+               ', ' + $Ctx.Cred.Tns) -Detail
     $offset = Format-Offset $script:ClockOffset
     if ($offset -ne '') {
-        Write-Out (' Times      database clock (' + $offset + ' from this machine)')
+        Write-Out (' Times      database clock (' + $offset + ' from this machine)') -Detail
     }
-    Write-Out (' Run folder ' + $state.Folder)
+    Write-Out (' Run folder ' + $state.Folder) -Detail
     $period = 'retention ' + $Ctx.Retention + ' days'
     if ($Ctx.Cutoff -ne '') { $period = 'cutoff ' + $Ctx.Cutoff }
     if ($Action -eq 'PURGE') {
         Write-Out (' Purge      mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', ' + $period +
-                   ', batch ' + $batch + ', dry run ' + $dry + ', compact ' + $compact)
+                   ', batch ' + $batch + ', dry run ' + $dry + ', compact ' + $compact) -Detail
     } else {
-        Write-Out (' Preflight  mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', ' + $period + ', batch ' + $batch)
+        Write-Out (' Preflight  mode ' + $Ctx.Mode + ', depth ' + $Ctx.Depth + ', ' + $period + ', batch ' + $batch) -Detail
     }
     $choices = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
-    if ($choices -ne 'none') { Write-Out (' Choices    ' + $choices) }
+    if ($choices -ne 'none') { Write-Out (' Choices    ' + $choices) -Detail }
     if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '') {
         $what = 'step '
         if ($Ctx.DryRun) { $what = 'rehearsal of step ' }
-        Write-Out (' Plan       ' + $Ctx.PlanLabel + ', ' + $what + $Ctx.PlanStep + ' of ' + $Ctx.Plan.Steps)
+        Write-Out (' Plan       ' + $Ctx.PlanLabel + ', ' + $what + $Ctx.PlanStep + ' of ' + $Ctx.Plan.Steps) -Detail
     } elseif ($Action -eq 'PREFLIGHT' -and $Ctx.MaxRedo -ne '') {
-        Write-Out (' Plan       runs of at most ' + (Format-Bytes ([double]$Ctx.MaxRedo)) + ' of redo')
+        Write-Out (' Plan       runs of at most ' + (Format-Bytes ([double]$Ctx.MaxRedo)) + ' of redo') -Detail
     }
+    if (-not $script:Verbose) { Write-Out (' Run ' + $label + '   ' + $state.Folder) 'DarkGray' -NoLog }
 
     $status = 'FAILED'
     $undoApplied = $false
     $redoRan = $false
     $closeCode = $null
+    $advice = $null
+    $refused = $false
     $state.StopKeys = Enable-StopKey
-    if ($state.StopKeys) { Write-Out ' Ctrl+C requests a graceful stop.' -NoLog }
+    if ($state.StopKeys -and $script:Verbose) { Write-Out ' Ctrl+C requests a graceful stop.' -NoLog }
     try {
         # Every run checks the requirements with its own choices. After the
         # wizard's preflight run, its root counts are reused (no second scan).
@@ -1376,7 +1505,10 @@ function Invoke-ToolRun {
             $reuse = $Ctx.PreflightRun -replace '^R-0*', ''
             $title = 'PREFLIGHT  with the choices above; root counts of ' + $Ctx.PreflightRun
         }
-        Write-Section $title
+        Write-Section $title -Detail
+        # On the screen of the steps, the check of a purge whose database was
+        # checked a moment ago (with its questions) is part of its next step.
+        if (-not $Ctx.Checked) { Start-FlowStep 'CHECK' } elseif ($Ctx.DryRun) { Start-FlowStep 'COUNT' } else { Start-FlowStep 'PREPARE' }
         $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'preflight.sql') @([string]$state.RunId, $reuse) $state 'sqlplus_preflight.log'
         Update-LiveView $state
         if ($result.ExitCode -eq 0) {
@@ -1388,6 +1520,18 @@ function Invoke-ToolRun {
             $status = 'FAILED'
             if (Test-SessionFailure $result.Output) { Show-Lines $result.Output -Indent }
             Write-Out ' The preflight found errors; nothing was changed.' 'Red'
+        }
+        if (-not $Ctx.Checked) {
+            if ($preflightOk) { Complete-FlowStep } else { Complete-FlowStep 'FAILED' }
+        }
+        # The requirements as a table. A preflight with prompts shows it with
+        # its questions (Invoke-Choices); a purge whose database was checked a
+        # moment ago has shown it.
+        if ($preflightOk -and -not $script:Verbose -and -not $Ctx.Checked -and
+            -not ($Action -eq 'PREFLIGHT' -and $script:Interactive)) {
+            $advice = Read-Advice $Ctx.Cred $state.RunId
+            $null = Show-Requirements $advice 'PURGE'
+            Write-Out '' -NoLog
         }
 
         # A preflight with prompts: the operator's choices for each
@@ -1410,11 +1554,16 @@ function Invoke-ToolRun {
             # (REQUIREMENTS_NOT_MET) and changes nothing.
             $ready = $true
             if (-not $Ctx.DryRun) {
-                $unmet = Get-Unmet (Read-Advice $Ctx.Cred $state.RunId)
+                if ($null -eq $advice) { $advice = Read-Advice $Ctx.Cred $state.RunId }
+                $unmet = Get-Unmet $advice
                 if ($unmet.Count -gt 0) {
                     $ready = $false
-                    Write-Out (' Blocking requirements not met: ' + ($unmet -join ', ') + '. The purge does not start;') 'Red'
-                    Write-Out ' REQUIREMENTS in the report lists the ways to meet them.' 'Red'
+                    $refused = $true
+                    Write-Out (' Blocking requirements not met: ' + ($unmet -join ', ') + '. The purge does not start;') 'Red' -Detail
+                    Write-Out ' REQUIREMENTS in the report lists the ways to meet them.' 'Red' -Detail
+                    if (-not $script:Verbose) {
+                        Write-Out ' The purge does not start: a required condition is not met. The way past each:' 'Red' -NoLog
+                    }
                     # The way out of each, as something to do or to add to
                     # the command.
                     $ways = @{
@@ -1426,40 +1575,47 @@ function Invoke-ToolRun {
                     foreach ($code in $unmet) {
                         if ($ways.ContainsKey($code)) { Write-Out ('   ' + $code + ': ' + $ways[$code]) 'Yellow' }
                     }
-                    Write-Out ' Nothing was changed.' 'Yellow'
+                    Write-Out ' Nothing was changed.' 'Yellow' -Detail
                 }
             }
             if ($state.StopRequested) {
                 $status = 'STOPPED'
             } elseif (-not $ready) {
-                Write-Section 'PURGE  not started (requirements)'
+                Write-Section 'PURGE  not started (requirements)' -Detail
                 $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'purge.sql') @([string]$state.RunId, '-', '-', '-', '-', '-', '-') $state 'sqlplus_purge.log'
                 Update-LiveView $state
                 if ($result.Output -match 'ORA-\d{5}|SP2-\d{4}') { Show-Lines $result.Output -Indent }
                 $status = 'FAILED'
             } else {
+                if (-not $Ctx.DryRun) { Start-FlowStep 'PREPARE' }
                 # Larger online logs for the purge only when one batch does not
                 # fit in the smallest (the run's own preflight measured it); the
                 # original groups are put back after the purge.
                 if ($Ctx.RedoLogs -and -not $Ctx.DryRun) {
-                    Write-Section 'REDO LOGS (SYS)'
+                    Write-Section 'REDO LOGS (SYS)' -Detail
                     $redoRan = $true
                     $redoArgs = @('-', '-', [string]$state.RunId)
                     $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'redo_logs.sql') $redoArgs $state 'sqlplus_redo_logs.log'
-                    Show-Lines $result.Output -Indent
+                    Show-SysLines $result 'REDO'
                     if ($result.ExitCode -ne 0) { throw 'Redo log sizing failed; the purge was not started.' }
                 }
                 if ($Ctx.UndoTuning -and -not $Ctx.DryRun) {
-                    Write-Section 'UNDO TUNING (SYS)'
+                    Write-Section 'UNDO TUNING (SYS)' -Detail
                     $undoApplied = $true
                     # The growth limit is sized from this run's batch size and the
                     # undo per root estimated by its own preflight.
                     $applyArgs = @('APPLY', [string]$state.RunId, [string]$state.RunId)
                     $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') $applyArgs $state 'sqlplus_undo_apply.log'
-                    Show-Lines $result.Output -Indent
+                    Show-SysLines $result 'UNDO'
                     if ($result.ExitCode -ne 0) { throw 'Undo tuning could not be applied; the purge was not started.' }
                 }
-                Write-Section ('PURGE  depth=' + $Ctx.Depth + '  mode=' + $Ctx.Mode + '  batch=' + $batch)
+                Write-Section ('PURGE  depth=' + $Ctx.Depth + '  mode=' + $Ctx.Mode + '  batch=' + $batch) -Detail
+                if ($Ctx.DryRun) {
+                    Start-FlowStep 'COUNT'
+                } else {
+                    Start-FlowStep 'DELETE'
+                    if ($state.StopKeys) { Write-FlowNote 'Ctrl+C stops safely after the current batch.' 'DarkGray' }
+                }
                 $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'purge.sql') @([string]$state.RunId, '-', '-', '-', '-', '-', '-') $state 'sqlplus_purge.log'
                 Update-LiveView $state
                 switch ($result.ExitCode) {
@@ -1478,25 +1634,32 @@ function Invoke-ToolRun {
         $status = 'FAILED'
     } finally {
         Disable-StopKey $state
+        $ended = 'done'
+        if ($status -eq 'FAILED') { $ended = 'FAILED' } elseif ($status -eq 'STOPPED') { $ended = 'stopped' }
+        if ($undoApplied -or $redoRan) {
+            Complete-FlowStep $ended
+            Start-FlowStep 'RESTORE'
+        }
         if ($undoApplied) {
-            Write-Section 'UNDO TUNING RESTORE (SYS)'
+            Write-Section 'UNDO TUNING RESTORE (SYS)' -Detail
             $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'undo.sql') @('RESTORE') -Patient
             [System.IO.File]::WriteAllText((Join-Path $state.Folder 'sqlplus_undo_restore.log'), $restore.Output, [System.Text.Encoding]::ASCII)
-            Show-Lines $restore.Output -Indent
+            Show-SysLines $restore 'UNDO_BACK'
             if ($restore.ExitCode -ne 0) {
                 Write-Out ' Undo tuning was NOT restored: run src\sql\run\undo.sql RESTORE as SYS.' 'Red'
             }
         }
         if ($redoRan) {
-            Write-Section 'REDO LOGS RESTORE (SYS)'
+            Write-Section 'REDO LOGS RESTORE (SYS)' -Detail
             $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'redo_logs.sql') @('RESTORE') -Patient
             [System.IO.File]::WriteAllText((Join-Path $state.Folder 'sqlplus_redo_restore.log'), $restore.Output, [System.Text.Encoding]::ASCII)
-            Show-Lines $restore.Output -Indent
+            Show-SysLines $restore 'REDO_BACK'
             if ($restore.ExitCode -ne 0) {
                 Write-Out ' The online redo logs were NOT put back: run src\sql\run\redo_logs.sql RESTORE as SYS.' 'Red'
             }
         }
         $closeCode = Close-Run $state $status
+        if ($undoApplied -or $redoRan) { Complete-FlowStep } else { Complete-FlowStep $ended }
     }
 
     Write-Section 'REPORT' -Detail
@@ -1505,7 +1668,7 @@ function Invoke-ToolRun {
     Show-Lines $report.Output -HideMachine -Detail
     $mode = ''
     if ($Ctx.DryRun) { $mode = 'DRY_RUN' }
-    Show-Summary $Action $mode $report.Output $state.Folder
+    Write-Summary $Action $mode $report.Output $state.Folder
     # The requirements and the plan of the run, each in its own file.
     foreach ($part in @(@('REQUIREMENTS', 'requirements.txt'), @('PLAN', 'plan.txt'))) {
         $text = Get-ReportSection $report.Output $part[0]
@@ -1519,54 +1682,98 @@ function Invoke-ToolRun {
     if ($null -eq $exitCode) { $exitCode = $script:ExitFail }
     if ($status -eq 'STOPPED') { $exitCode = $script:ExitAborted }
     $verdict = Write-Manifest $state $Ctx $Action $status $exitCode $report.Output
-    $total = Format-Seconds ([string][int]((Get-Date) - $state.Started).TotalSeconds)
-    $color = 'Green'
-    if ($exitCode -eq $script:ExitWarn -or $exitCode -eq $script:ExitAborted) { $color = 'Yellow' }
-    if ($exitCode -eq $script:ExitFail) { $color = 'Red' }
-    $result = (' RESULT  ' + $verdict + '  (' + $status + ')').PadRight($script:Width - 25)
-    Write-Out ''
-    Write-Out ($result + 'total ' + $total + ' . exit ' + $exitCode) $color
-    Write-Out (' Report  ' + (Join-Path $state.Folder 'report.txt'))
-    if ($Action -eq 'PREFLIGHT' -and -not $FromWizard -and -not $state.Stopped -and $status -ne 'FAILED') {
-        Show-PreflightNext $Ctx $state $report.Output
+    $seconds = ((Get-Date) - $state.Started).TotalSeconds
+    $run = [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
+                              Stopped = $state.Stopped; Report = $report.Output }
+    # The check a purge with prompts begins with: its end is not shown.
+    if ($FromWizard -and -not $script:Verbose) {
+        Show-HtmlReport $state.Folder -Quiet
+        return $run
     }
+    $planLine = ''
+    $planColor = ''
     if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '' -and -not $Ctx.DryRun -and $null -ne $planAfter) {
         if ($planAfter.Status -eq 'DONE') {
-            Write-Out (' Plan    ' + $planAfter.Label + ' is done: every step ran.') 'Green'
+            $planLine = ' Plan    ' + $planAfter.Label + ' is done: every step ran.'
+            $planColor = 'Green'
         } elseif ($planAfter.NextStep -ne '-') {
-            Write-Out (' Plan    ' + $planAfter.Label + ': ' + $planAfter.Done + ' of ' + $planAfter.Steps +
-                       ' steps done. Next: epf_purge.bat purge (step ' + $planAfter.NextStep + ', rows before ' +
-                       $planAfter.NextCutoff + ')')
+            $planLine = ' Plan    ' + $planAfter.Label + ': ' + $planAfter.Done + ' of ' + $planAfter.Steps +
+                        ' steps done. Next: epf_purge.bat purge (step ' + $planAfter.NextStep + ', rows before ' +
+                        $planAfter.NextCutoff + ')'
         }
     }
     # What comes after a purge that ran: its dry run says how to run it, the
-    # purge itself that the space waits for a reclaim.
+    # purge itself that the space waits for a reclaim. In the log either way
+    # (report.html reads it there).
+    $nextLine = ''
     if ($Action -eq 'PURGE' -and ($status -eq 'SUCCESS' -or $status -eq 'WARNING')) {
         if (-not $Ctx.DryRun) {
-            Write-Out (' Next    the space is free inside the tables and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
-                       'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)')
+            $nextLine = ' Next    the space is free inside the tables and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
+                        'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
         } elseif ($Ctx.PlanId -eq '') {
-            $how = '--retention ' + $Ctx.Retention
-            if ($Ctx.Cutoff -ne '') { $how = '--cutoff ' + $Ctx.Cutoff }
-            if ($Ctx.Mode -ne 'FULL') { $how = $how + ' --mode ' + $Ctx.Mode }
-            if ($Ctx.Depth -ne 'ALL' -and $Ctx.Mode -ne 'LOGS') { $how = $how + ' --depth ' + $Ctx.Depth }
-            Write-Out (' Next    epf_purge.bat purge ' + $how + ' runs this purge; the dry run changed nothing')
+            $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' runs this purge; the dry run changed nothing'
         }
     }
+    if ($script:Verbose) {
+        $total = Format-Seconds ([string][int]$seconds)
+        $color = 'Green'
+        if ($exitCode -eq $script:ExitWarn -or $exitCode -eq $script:ExitAborted) { $color = 'Yellow' }
+        if ($exitCode -eq $script:ExitFail) { $color = 'Red' }
+        $result = (' RESULT  ' + $verdict + '  (' + $status + ')').PadRight($script:Width - 25)
+        Write-Out ''
+        Write-Out ($result + 'total ' + $total + ' . exit ' + $exitCode) $color
+        Write-Out (' Report  ' + (Join-Path $state.Folder 'report.txt'))
+        if ($Action -eq 'PREFLIGHT' -and -not $FromWizard -and -not $state.Stopped -and $status -ne 'FAILED') {
+            Show-PreflightNext $Ctx $state $report.Output
+        }
+        if ($planLine -ne '') { Write-Out $planLine $planColor }
+        if ($nextLine -ne '') { Write-Out $nextLine }
+        Show-HtmlReport $state.Folder -Quiet:$FromWizard
+        return $run
+    }
+    if ($planLine -ne '') { Write-Log $planLine }
+    if ($nextLine -ne '') { Write-Log $nextLine }
+    # The end of the run in plain words.
+    if ($Action -eq 'PREFLIGHT') {
+        Show-PreflightEnd $Ctx $report.Output $status
+        if (-not $state.Stopped -and $status -ne 'FAILED') { Show-PreflightNext $Ctx $state $report.Output }
+    } elseif ($Ctx.DryRun) {
+        Show-DryRunEnd $Ctx $report.Output $status
+        if ($status -ne 'FAILED') {
+            # The notes of the expected outcome follow its first line; the
+            # warnings counted by P5 are the ones the requirements say.
+            $notes = @()
+            $expected = Get-ExpectedLines $report.Output
+            for ($i = 1; $i -lt $expected.Count; $i++) { $notes += (Format-Sentence $expected[$i].Trim()) }
+            $checks = Read-Checks $report.Output
+            Show-GoodToKnow @($checks | Where-Object { $_.Id -ne 'P5' -or $_.Status -eq 'FAIL' }) $notes
+            Write-Out '' -NoLog
+            Write-Out '  Nothing was changed.' 'Green' -NoLog
+            if ($Ctx.PlanId -eq '') {
+                Write-Out ('  Next     epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + '     the purge itself') -NoLog
+            } else {
+                Write-Out '  Next     epf_purge.bat purge     the step of the plan this dry run rehearsed' -NoLog
+            }
+        }
+    } else {
+        Show-PurgeEnd $Ctx $report.Output $status (Format-Clock $seconds) -Refused:$refused
+        if ($planLine -ne '') { Write-Out (' ' + $planLine) $planColor -NoLog }
+    }
     Show-HtmlReport $state.Folder
-    return [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
-                              Stopped = $state.Stopped }
+    Write-Out ('  Files    ' + $state.Folder + '   (report.txt, console.log)') 'DarkGray' -NoLog
+    return $run
 }
 
 # The end of a run in a browser: writes report.html in the run folder
 # (Write-HtmlReport), says where it is, and opens it when somebody is at the
 # console (input and output not redirected) unless --no-open or OPEN_REPORT=N.
-# A report that cannot be written or opened never fails the run.
+# A report that cannot be written or opened never fails the run. -Quiet: the
+# report is written only (a run that is a step of another).
 function Show-HtmlReport {
-    param([string]$Folder)
+    param([string]$Folder, [switch]$Quiet)
     $path = ''
     try { $path = Write-HtmlReport $Folder } catch { Write-Log (' report.html was not written: ' + $_.Exception.Message) }
-    if ($path -eq '') { return }
+    if ($path -eq '' -or $Quiet) { return }
     $opened = ''
     $wanted = -not $script:Cli.Flags.ContainsKey('no-open') -and
               -not ($script:Config.ContainsKey('OPEN_REPORT') -and @('N', 'NO', 'FALSE', '0') -contains $script:Config['OPEN_REPORT'].ToUpper())
@@ -1580,7 +1787,7 @@ function Show-HtmlReport {
             $opened = ''
         }
     }
-    Write-Out (' Report  ' + $path + $opened)
+    if ($script:Verbose) { Write-Out (' Report  ' + $path + $opened) } else { Write-Out ('  Report   ' + $path + $opened) }
 }
 
 # After a preflight: whether a purge can start, and how it follows the plan
@@ -1699,46 +1906,193 @@ function Get-ExpectedVersion {
 }
 
 function Get-Tns {
-    return (Get-Input -Name 'tns' -Key 'TNS' -Prompt 'TNS alias or EZConnect (PDB service)' -Hint 'a TNS alias or host:port/service')
+    return (Get-Input -Name 'tns' -Key 'TNS' -Prompt 'Database (its alias in tnsnames.ora, or host:port/service)' `
+                      -Hint 'the alias of the database in tnsnames.ora, or host:port/service: --tns NAME, or TNS in the configuration file')
 }
 
-# Connection as EPFPG. -Soft (the wizard's menu): a failed connection
-# returns $null instead of ending the tool.
-function Connect-Tool {
-    param([switch]$Soft)
-    $tns = Get-Tns
-    $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
-    $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
-    $test = Test-DbConnection $login -WithVersion
-    if ($test.TimedOut) {
-        Exit-Tool $script:ExitFail ('The database did not answer the connection as EPFPG (3 attempts of ' +
-                                    $script:ConnectTimeoutS + ' s): check the network and the listener, then try again.')
+# The start of an action on the screen: the tool, its version and what it is
+# asked.
+function Show-Banner {
+    param([string]$What)
+    $left = ' EPF Data Purge ' + (Get-ExpectedVersion)
+    Write-Out ''
+    Write-Out ($left + $What.PadLeft([Math]::Max(1, $script:Width - $left.Length))) 'White'
+    Write-Out (' ' + ('-' * ($script:Width - 1)))
+}
+
+# 1 when version $A is newer than $B, -1 when it is older, 0 when they are
+# the same (their parts compared as numbers).
+function Compare-Version {
+    param([string]$A, [string]$B)
+    $x = @($A.Split('.'))
+    $y = @($B.Split('.'))
+    for ($i = 0; $i -lt [Math]::Max($x.Count, $y.Count); $i++) {
+        $p = 0
+        $q = 0
+        if ($i -lt $x.Count) { $null = [int]::TryParse($x[$i], [ref]$p) }
+        if ($i -lt $y.Count) { $null = [int]::TryParse($y[$i], [ref]$q) }
+        if ($p -gt $q) { return 1 }
+        if ($p -lt $q) { return -1 }
     }
-    if (-not $test.Ok) {
-        Show-Lines $test.Output -Indent
-        if ($Soft) {
-            Write-Out ' The connection as EPFPG failed: if the tool is not installed yet, choose Install.' 'Yellow'
-            return $null
+    return 0
+}
+
+# Installs or upgrades the tool's objects with install.sql (SYS); the EPFPG
+# account gets the password $Secret. The output of the script is shown with
+# --verbose, or when it fails, which ends the tool. Returns the seconds it
+# took.
+function Install-Tool {
+    param($Sys, [System.Security.SecureString]$Secret)
+    $password = ConvertFrom-Secure $Secret
+    if ($password.Contains('"') -or $password.Contains("'")) {
+        Exit-Tool $script:ExitUsage 'The EPFPG password must not contain quotes.'
+    }
+    $started = Get-Date
+    if ($script:StatusLine) { Show-Status '   Tool in database   installing ...' }
+    $result = Invoke-SqlScript $Sys (Join-Path $script:InstallDir 'install.sql') @('"' + $password + '"')
+    if ($result.ExitCode -ne 0) {
+        Show-Lines $result.Output
+        Exit-Tool $script:ExitFail 'The tool''s objects could not be installed (see above).'
+    }
+    Show-Lines $result.Output -Detail
+    return [int]((Get-Date) - $started).TotalSeconds
+}
+
+# Connection as EPFPG. -Ready (a purge, a reclaim, the menu): the run gets
+# ready by itself and says so: sqlplus, the database, and the tool's own
+# objects, which it installs when they are missing and upgrades when they are
+# of another version than these scripts (SYS). Without -Ready (status,
+# report, stop, plan) a tool that is missing ends the action.
+function Connect-Tool {
+    param([switch]$Ready)
+    if ($Ready) {
+        Write-Out ''
+        Write-Out ' Getting ready' 'White'
+        Write-Out ('   sqlplus            ' + $script:SqlPlus)
+    }
+    $tns = Get-Tns
+    $expected = Get-ExpectedVersion
+    $login = $null
+    $test = $null
+    $secret = $null
+    $installed = ''
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        if ($attempt -gt 1) {
+            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Ask
+        } elseif ($Ready -and $script:Interactive) {
+            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Optional `
+                                  -Label 'EPFPG password (Enter alone if the tool was never installed on this database)'
+        } else {
+            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
         }
-        Exit-Tool $script:ExitUsage 'The connection as EPFPG failed. If the tool is not installed yet, run epf_purge.bat install.'
+        if ($null -ne $secret) {
+            $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
+            $test = Test-DbConnection $login -WithVersion
+            if ($test.TimedOut) {
+                Exit-Tool $script:ExitFail ('The database did not answer the connection as EPFPG (3 attempts of ' +
+                                            $script:ConnectTimeoutS + ' s): check the network and the listener, then try again.')
+            }
+            if ($test.Ok) { break }
+            # An account that does not exist and a wrong password give the
+            # same error: SYS says which it is. Any other error ends here.
+            if (-not $Ready -or $test.Output -notmatch 'ORA-01017') {
+                Show-Lines $test.Output -Indent
+                Exit-Tool $script:ExitUsage ('The connection as EPFPG failed. If the tool is not installed in this database yet, ' +
+                                             'a purge or a reclaim installs it (or epf_purge.bat install).')
+            }
+            Write-Out '   Tool in database   the connection as EPFPG was refused: a wrong password, or the tool is not installed here yet' 'Yellow'
+        }
+        $sys = Connect-Sys $tns -WithTool
+        if ($script:ToolState -ne 'ABSENT') {
+            if (-not $script:Interactive -or $attempt -ge 3) {
+                Exit-Tool $script:ExitUsage 'The tool is installed in this database: the EPFPG password given is not the right one.'
+            }
+            if ($null -eq $secret) {
+                Write-Out '   Tool in database   installed: its EPFPG password is needed' 'Yellow'
+            } else {
+                Write-Out '   Tool in database   installed: the EPFPG password given is not the right one' 'Yellow'
+            }
+            continue
+        }
+        Write-Out ('   Database           ' + $tns + ': connected as SYS (' + $script:Database.Container + ')')
+        Write-Out '   Tool in database   not installed yet' 'Yellow'
+        Write-Out ''
+        Write-Out ' The tool keeps its own objects in the database: an account EPFPG and a'
+        Write-Out ' tablespace EPFPG_DATA, with the history of its runs and what they measured.'
+        Write-Out ' Installing them changes nothing else.'
+        if (-not (Read-YesNo 'Install them now' $true)) {
+            Exit-Tool $script:ExitAborted 'Stopped: the tool is not installed. Nothing was changed.'
+        }
+        $secret = Read-Secret -Prompt 'EPFPG password to set' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Twice `
+                              -Label 'Password to give the EPFPG account'
+        $seconds = Install-Tool $sys $secret
+        $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
+        $test = Test-DbConnection $login -WithVersion
+        if (-not $test.Ok) {
+            Show-Lines $test.Output -Indent
+            Exit-Tool $script:ExitFail 'The tool''s objects were installed, but the connection as EPFPG fails (see above).'
+        }
+        $installed = ' (installed now, ' + (Format-Clock $seconds) + ')'
+        break
     }
     if ($test.Container -eq 'CDB$ROOT') { Exit-Tool $script:ExitUsage 'Connected to CDB$ROOT: use the PDB service.' }
     $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version }
-    Write-Out (' Connected to ' + $test.Container + ', tool version ' + $test.Version)
-    $expected = Get-ExpectedVersion
-    if ($expected -ne '' -and $test.Version -ne $expected) {
-        Write-Out (' The database has tool version ' + $test.Version + ' and these scripts are version ' +
-                   $expected + ': run epf_purge.bat install first.') 'Yellow'
-        if (-not (Read-YesNo 'Continue with the installed version' $false)) { Exit-Tool $script:ExitAborted 'Aborted.' }
+    if (-not $Ready) {
+        Write-Out (' Connected to ' + $test.Container + ', tool version ' + $test.Version)
+        if ($expected -ne '' -and $test.Version -ne $expected) {
+            Write-Out (' The database has tool version ' + $test.Version + ' and these scripts are version ' + $expected +
+                       ': a purge or a reclaim brings it to this version (or epf_purge.bat install).') 'Yellow'
+        }
+        return $login
     }
+    Write-Out ('   Database           ' + $tns + ': connected (' + $test.Container + ')')
+    if ($expected -eq '' -or $test.Version -eq $expected) {
+        Write-Out ('   Tool in database   version ' + $test.Version + $installed)
+        return $login
+    }
+    # Another version than these scripts: the run brings it to theirs.
+    if ((Compare-Version $test.Version $expected) -gt 0) {
+        Write-Out ('   Tool in database   version ' + $test.Version + ', newer than these scripts (' + $expected + ')') 'Yellow'
+        if (-not $script:Interactive) {
+            Exit-Tool $script:ExitUsage ('The tool in the database is newer than these scripts: use the scripts of version ' +
+                                         $test.Version + ', or put this version back with epf_purge.bat install.')
+        }
+        if (-not (Read-YesNo ('Install version ' + $expected + ' of these scripts over it (SYS; the history of the runs is kept)') $false)) {
+            Exit-Tool $script:ExitAborted 'Stopped: the tool in the database is of another version than these scripts. Nothing was changed.'
+        }
+    } else {
+        Write-Out ('   Tool in database   version ' + $test.Version + '; these scripts are version ' + $expected) 'Yellow'
+        if (-not (Read-YesNo 'Upgrade it now (SYS; the history of the runs is kept)' $true)) {
+            Exit-Tool $script:ExitAborted 'Stopped: the tool in the database is of another version than these scripts. Nothing was changed.'
+        }
+    }
+    $sys = Connect-Sys $tns
+    $seconds = Install-Tool $sys $secret
+    $test = Test-DbConnection $login -WithVersion
+    if (-not $test.Ok) {
+        Show-Lines $test.Output -Indent
+        Exit-Tool $script:ExitFail 'The tool''s objects were upgraded, but the connection as EPFPG fails (see above).'
+    }
+    $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version }
+    Write-Out ('   Tool in database   version ' + $test.Version + ' (upgraded now, ' + (Format-Clock $seconds) + ')') 'Green'
     return $login
 }
 
+# Connection as SYS; its password is asked for once in a run. -WithTool: the
+# test also says whether the tool's account exists ($script:ToolState:
+# INSTALLED or ABSENT).
 function Connect-Sys {
-    param([string]$Tns)
-    $secret = Read-Secret -Prompt 'SYS password' -EnvName 'EPF_SYS_PASSWORD' -ConfigKey 'SYS_PASSWORD'
-    $sys = New-Login -User 'sys' -Secret $secret -Tns $Tns -Sysdba
-    $test = Test-DbConnection $sys
+    param([string]$Tns, [switch]$WithTool)
+    $known = ($null -ne $script:SysLogin -and $script:SysLogin.Tns -eq $Tns)
+    if ($known -and -not $WithTool) { return $script:SysLogin }
+    $sys = $script:SysLogin
+    if (-not $known) {
+        $secret = Read-Secret -Prompt 'SYS password' -EnvName 'EPF_SYS_PASSWORD' -ConfigKey 'SYS_PASSWORD'
+        $sys = New-Login -User 'sys' -Secret $secret -Tns $Tns -Sysdba
+    }
+    $test = Test-DbConnection $sys -WithTool:$WithTool
     if ($test.TimedOut) {
         Exit-Tool $script:ExitFail ('The database did not answer the connection as SYS (3 attempts of ' +
                                     $script:ConnectTimeoutS + ' s): check the network and the listener, then try again.')
@@ -1749,7 +2103,25 @@ function Connect-Sys {
     }
     if ($test.Container -eq 'CDB$ROOT') { Exit-Tool $script:ExitUsage 'Connected to CDB$ROOT: use the PDB service.' }
     if ($null -eq $script:Database) { $script:Database = [pscustomobject]@{ Container = $test.Container; Version = '-' } }
+    if ($WithTool) { $script:ToolState = $test.Version }
+    $script:SysLogin = $sys
     return $sys
+}
+
+# Sets the cutoff of $Ctx to the day $Text (YYYY-MM-DD, before today on the
+# database clock) and its retention to the days from that day; ends the tool
+# when it is not such a day ($Label names what was given).
+function Set-Cutoff {
+    param($Ctx, [string]$Text, [string]$Label)
+    $day = [datetime]::MinValue
+    $today = (Get-Date).Add($script:ClockOffset).Date
+    if (-not [datetime]::TryParseExact($Text.Trim(), 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
+                                       [Globalization.DateTimeStyles]::None, [ref]$day)) {
+        Exit-Tool $script:ExitUsage ($Label + ': a date as YYYY-MM-DD, got ' + $Text + '.')
+    }
+    if ($day -ge $today) { Exit-Tool $script:ExitUsage ($Label + ': a day before today, got ' + $Text + '.') }
+    $Ctx.Cutoff = $day.ToString('yyyy-MM-dd')
+    $Ctx.Retention = [string][int]($today - $day).TotalDays
 }
 
 # Parameters of a purge or preflight. With $Plan, the run follows the plan:
@@ -1760,7 +2132,8 @@ function Get-PurgeContext {
     $ctx = [pscustomobject]@{
         Cred = $Login; SysCred = $null; Retention = ''; Cutoff = ''; Depth = ''; Mode = ''; BatchSize = '';
         DryRun = $false; Compact = $false; RedoLogs = $false; UndoTuning = $true; Backup = ''; Confirm = '';
-        PreflightRun = ''; MaxRedo = ''; NewPlan = $false; PlanId = ''; PlanStep = ''; PlanLabel = ''; Plan = $null
+        PreflightRun = ''; MaxRedo = ''; NewPlan = $false; PlanId = ''; PlanStep = ''; PlanLabel = ''; Plan = $null;
+        Checked = $false
     }
     if ($Action -ne 'PURGE') {
         foreach ($name in @('dry-run', 'compact')) {
@@ -1777,17 +2150,28 @@ function Get-PurgeContext {
     if ($null -ne $Plan) {
         Set-PlanScope $ctx $Plan $Action
     } elseif ($cutoff -ne '') {
-        $day = [datetime]::MinValue
-        $today = (Get-Date).Add($script:ClockOffset).Date
-        if (-not [datetime]::TryParseExact($cutoff.Trim(), 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture,
-                                           [Globalization.DateTimeStyles]::None, [ref]$day)) {
-            Exit-Tool $script:ExitUsage ('--cutoff: a date as YYYY-MM-DD, got ' + $cutoff + '.')
-        }
-        if ($day -ge $today) { Exit-Tool $script:ExitUsage ('--cutoff: a day before today, got ' + $cutoff + '.') }
-        $ctx.Cutoff = $day.ToString('yyyy-MM-dd')
-        $ctx.Retention = [string][int]($today - $day).TotalDays
+        Set-Cutoff $ctx $cutoff '--cutoff'
+    } elseif ($script:Cli.Options.ContainsKey('retention')) {
+        $ctx.Retention = Test-Value ([string]$script:Cli.Options['retention']) -Min 1
+        if ($null -eq $ctx.Retention) { Exit-Tool $script:ExitUsage '--retention: invalid value (a whole number of at least 1).' }
     } else {
-        $ctx.Retention = Get-Input -Name 'retention' -Key 'RETENTION_DAYS' -Prompt 'Retention in days' -Default '30' -Min 1
+        # Without prompts a purge deletes only what it was told to: the days
+        # to keep come from the options or the configuration file.
+        $given = Get-Option 'retention' 'RETENTION_DAYS' ''
+        if ($given -eq '' -and -not $script:Interactive -and $Action -eq 'PURGE') {
+            Exit-Tool $script:ExitUsage ('The days of data to keep are required with --non-interactive: --retention DAYS or ' +
+                                         '--cutoff YYYY-MM-DD, or RETENTION_DAYS or CUTOFF in the configuration file.')
+        }
+        $default = '30'
+        if ($given -ne '') { $default = $given }
+        $answer = Read-Value -Prompt 'Days of data to keep; older rows are purged (or a date as YYYY-MM-DD)' -Default $default `
+                             -Pattern '^(\d{1,6}|\d{4}-\d{2}-\d{2})$' -Hint 'a number of days such as 365, or a date such as 2025-10-13'
+        if ($answer.Contains('-')) {
+            Set-Cutoff $ctx $answer 'The date'
+        } else {
+            $ctx.Retention = [string][int]$answer
+            if ([int]$answer -lt 1) { Exit-Tool $script:ExitUsage 'The days of data to keep: a whole number of at least 1.' }
+        }
     }
     $backup = Get-Option 'backup' 'BACKUP' ''
     if ($backup -ne '') {
@@ -1805,12 +2189,22 @@ function Get-PurgeContext {
         $ctx.Confirm = (@($codes | Select-Object -Unique) -join ',')
     }
     if ($null -eq $Plan) {
-        $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
+        # The whole purge unless the options say otherwise: every module,
+        # its rows deleted.
+        $mode = Get-Option 'mode' 'MODE' 'FULL'
+        $ctx.Mode = Test-Value $mode -Allowed $script:Modes
+        if ($null -eq $ctx.Mode) {
+            Exit-Tool $script:ExitUsage ('--mode: invalid value (valid values: ' + ($script:Modes -join ', ') + '), got ' + $mode + '.')
+        }
         if ($ctx.Mode -eq 'LOGS') {
             $ctx.Depth = 'LOGS'
         } else {
-            $ctx.Depth = (Get-Input -Name 'depth' -Key 'DEPTH' -Prompt 'Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS)' `
-                                    -Default 'ALL' -Pattern '^[A-Z_]+(,[A-Z_]+)*$' -Hint 'ALL, or module names separated by commas').ToUpper()
+            $depth = Get-Option 'depth' 'DEPTH' 'ALL'
+            $value = Test-Value $depth -Pattern '^[A-Z_]+(,[A-Z_]+)*$'
+            if ($null -eq $value) {
+                Exit-Tool $script:ExitUsage ('--depth: invalid value (ALL, or module names separated by commas), got ' + $depth + '.')
+            }
+            $ctx.Depth = $value.ToUpper()
         }
     }
     $maxRedo = Get-Option 'max-redo' 'MAX_REDO' ''
@@ -1825,13 +2219,13 @@ function Get-PurgeContext {
         if ($null -eq $ctx.BatchSize) { Exit-Tool $script:ExitUsage 'Batch size: a whole number from 100 to 100000.' }
     }
     if ($Action -eq 'PURGE') {
-        $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('dry-run')
-        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask
+        # A dry run and the compaction of the purged tables are asked for
+        # with their options (or DRY_RUN, COMPACT in the configuration file).
+        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' ''
         if ($ctx.DryRun) {
             if ($script:Cli.Flags.ContainsKey('compact')) { Exit-Tool $script:ExitUsage '--compact does not apply to a dry run.' }
         } else {
-            $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('compact')
-            $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask
+            $ctx.Compact = Get-Choice 'compact' 'COMPACT' ''
         }
     }
     # Applied by a purge that deletes; a preflight or dry run checks the
@@ -2053,26 +2447,27 @@ function Get-ReportSection {
 }
 
 # ----------------------------------------------------------------------------
-# Summary of a report (without --verbose)
+# Summary of a report
 # ----------------------------------------------------------------------------
 
-# The end of a run on the console without --verbose: the parts of its report
-# that matter for the action (console.log and report.txt have the whole
-# report). A preflight: the estimate per module; a dry run: the simulation
-# per module, the retention options and the expected outcome; a reclaim:
-# each tablespace in one line and, for an assessment, the accounts a
-# compaction locks. Then the requirements, unless a purge or compaction found
-# them all met; then the checks in short and the verdict. Not logged. With
-# $Folder, the same lines go to summary.txt there, with or without
-# --verbose, followed for a reclaim by its datafiles at the start and at the
-# end (the test suite's digest reads it).
-function Show-Summary {
-    param([string]$Action, [string]$Mode, [string]$Report, [string]$Folder = '')
+# summary.txt of the run folder: the parts of the report that matter for the
+# action (report.txt has the whole report). A preflight: the estimate per
+# module; a dry run: the simulation per module, the retention options and
+# the expected outcome; a reclaim: each tablespace in one line and, for an
+# assessment, the accounts a compaction locks. Then the requirements, unless
+# a purge or compaction found them all met; then the checks in short and the
+# verdict; for a reclaim, its datafiles at the start and at the end (the
+# test suite's digest reads the file). The screen says the end of the run in
+# plain words (epf_screen.ps1).
+function Write-Summary {
+    param([string]$Action, [string]$Mode, [string]$Report, [string]$Folder)
     $lines = New-Object 'System.Collections.Generic.List[string]'
     if ($Action -eq 'PREFLIGHT') {
         Add-Lines $lines (Get-TableLines $Report 'ESTIMATE')
+        Add-Lines $lines (Get-TableLines $Report 'DISK WHILE THE PURGE RUNS')
     } elseif ($Action -eq 'PURGE' -and $Mode -eq 'DRY_RUN') {
         Add-Lines $lines (Get-TableLines $Report 'SIMULATION')
+        Add-Lines $lines (Get-TableLines $Report 'DISK WHILE THE PURGE RUNS')
         Add-Lines $lines (Get-TableLines $Report 'RETENTION OPTIONS')
         Add-Lines $lines (Get-ExpectedLines $Report)
     } elseif ($Action -eq 'PURGE') {
@@ -2087,21 +2482,8 @@ function Show-Summary {
         Add-Lines $lines $requirements
     }
     Add-Lines $lines (Get-CheckLines $Report)
-    if ($Folder -ne '') {
-        $file = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($line in $lines) { $file.Add($line) }
-        if ($Action -eq 'RECLAIM' -and $Mode -ne 'ASSESS') { Add-Lines $file (Get-TableLines $Report 'DATAFILES') }
-        [System.IO.File]::WriteAllLines((Join-Path $Folder 'summary.txt'), $file.ToArray(), [System.Text.Encoding]::ASCII)
-    }
-    if ($script:Verbose -or $lines.Count -eq 0) { return }
-    Write-Section 'SUMMARY' -NoLog
-    foreach ($line in $lines) {
-        $color = ''
-        if ($line -match '\[FAIL\]| FAIL |VERDICT  FAIL|WOULD FAIL') { $color = 'Red' }
-        elseif ($line -match ' WARN |NOT MET|NOT READY|MAY FAIL|PASS WITH WARNINGS') { $color = 'Yellow' }
-        elseif ($line -match 'VERDICT  PASS') { $color = 'Green' }
-        Write-Out $line $color -NoLog
-    }
+    if ($Action -eq 'RECLAIM' -and $Mode -ne 'ASSESS') { Add-Lines $lines (Get-TableLines $Report 'DATAFILES') }
+    [System.IO.File]::WriteAllLines((Join-Path $Folder 'summary.txt'), $lines.ToArray(), [System.Text.Encoding]::ASCII)
 }
 
 # Adds $Lines to $List, after a blank line when $List has lines already.
@@ -2308,12 +2690,14 @@ function Read-Advice {
     foreach ($line in ($result.Output -split "`r?`n")) {
         if ($line -match '^EPF_ADVICE\|REQ\|([A-Z_]+)\|([A-Z_]+)\|([YN])\|(.*)$') {
             $requirements[$Matches[1]] = [pscustomobject]@{ Status = $Matches[2]; Blocking = $Matches[3]; MetBy = $Matches[4].Trim();
-                                                            Title = $Matches[1]; Measured = '' }
+                                                            Title = $Matches[1]; Measured = ''; Why = '' }
         } elseif ($line -match '^EPF_ADVICE\|REQTEXT\|([A-Z_]+)\|([^|]*)\|(.*)$') {
             if ($requirements.Contains($Matches[1])) {
                 $requirements[$Matches[1]].Title = $Matches[2].Trim()
                 $requirements[$Matches[1]].Measured = $Matches[3].Trim()
             }
+        } elseif ($line -match '^EPF_ADVICE\|REQWHY\|([A-Z_]+)\|(.*)$') {
+            if ($requirements.Contains($Matches[1])) { $requirements[$Matches[1]].Why = $Matches[2].Trim() }
         } elseif ($line -match '^EPF_ADVICE\|OPT\|([A-Z_]+)\|([A-Z_0-9]+)\|([YN])\|(.*)$') {
             $details[$Matches[1] + '.' + $Matches[2]] = $Matches[4].Trim()
         } elseif ($line -match '^EPF_ADVICE\|([A-Z_]+)\|([^|]*)$') {
@@ -2361,15 +2745,15 @@ function Get-BatchDefault {
     $perRoot = [double]0
     if ($Ctx.RedoLogs -and [double]::TryParse($Advice.REDO_PER_ROOT, [ref]$perRoot) -and $perRoot -gt 0) {
         $default = Get-BatchForLog $perRoot 1073741824
-        Write-Out (' Recommended batch size with 1 GB online logs: ' + $default + ' root rows.')
+        Write-Out (' Recommended batch size with 1 GB online logs: ' + $default + ' root rows.') -Detail
     } elseif ([int]::TryParse($Advice.BATCH_SIZE, [ref]$recommended) -and $recommended -gt 0) {
         $default = [Math]::Min(100000, [Math]::Max(100, $recommended))
-        Write-Out (' Recommended batch size: ' + $default + ' root rows (REDO_SUMMARY above).')
+        Write-Out (' Recommended batch size: ' + $default + ' root rows (REDO_SUMMARY above).') -Detail
     }
     $undoMax = 0
     if ([int]::TryParse($Advice.UNDO_MAX_BATCH, [ref]$undoMax) -and $undoMax -gt 0 -and $undoMax -lt $default) {
         $default = [Math]::Max(100, [int]([Math]::Floor($undoMax / 100) * 100))
-        Write-Out (' Batch size limited to ' + $default + ' root rows: the undo tablespace holds 4 batches of that size.')
+        Write-Out (' Batch size limited to ' + $default + ' root rows: the undo tablespace holds 4 batches of that size.') -Detail
     }
     return [string]$default
 }
@@ -2395,132 +2779,158 @@ function Add-Confirm {
     $Ctx.Confirm = (@(@('ARCHIVE', 'UNDO', 'TEMP', 'RECYCLEBIN') | Where-Object { $codes -contains $_ }) -join ',')
 }
 
-# The question for one requirement not met. Sets the answer on $Ctx and
-# returns CHANGED, SAME, or STOP:<what to do next>.
+# The question a requirement not met calls for, a purge in view. Sets the
+# answer on $Ctx and returns CHANGED, SAME, or STOP:<what to do next>.
+#   REDO_LOGS             whether to enlarge the online logs for the purge
+#   BACKUP                whether a backup exists that RMAN does not know;
+#                         otherwise whether to purge without one
+#   UNDO, TEMP, ARCHIVE   whether to go on although it is required and not
+#                         met: not recommended, and the default is no
 function Read-Requirement {
     param($Ctx, $Advice, [string]$Code)
     $item = $Advice.Req[$Code]
-    $label = 'NOT MET'
-    if ($item.Blocking -ne 'Y') { $label = 'NOT MET (slower only)' }
-    Write-Out ''
-    Write-Out (' ' + $Code.PadRight(12) + $item.Title + '  ' + $label) 'Yellow'
-    if ($item.Measured -ne '') { Write-Out ('   ' + $item.Measured) }
-    switch ($Code) {
-        'ARCHIVE' {
-            $fit = ''
-            $detail = [string]$Advice.Details['ARCHIVE.SMALLER_RUNS']
-            if ($detail -match 'cutoff (\d{4}-\d{2}-\d{2})') { $fit = $Matches[1] }
-            $options = @('The DBA confirms the archive destination has room for this purge')
-            if ($fit -ne '') { $options += ('Purge older data first: ' + $detail) }
-            $answer = Read-Option $options 'Stop here: free archive space (or the DBA switches to NOARCHIVELOG), then run the preflight again' 'S'
-            if ($answer -eq '1') { Add-Confirm $Ctx 'ARCHIVE'; return 'CHANGED' }
-            if ($answer -eq '2') { return ('STOP:run the preflight again with --cutoff ' + $fit + ', then purge the rest in a later run.') }
-            return 'STOP:free archive space or have the DBA switch to NOARCHIVELOG, then run the preflight again.'
+    $name = Get-ReqName 'PURGE' $Code $item
+    if ($Code -eq 'REDO_LOGS') {
+        if (Read-YesNo 'Enlarge the online redo logs for this purge' $true) {
+            $Ctx.RedoLogs = $true
+            Write-Out '   The online redo logs will be 4 x 1 GB during the purge, then as they are now.' 'Green'
+            return 'CHANGED'
         }
-        'UNDO' {
-            $undoMax = 0
-            $batch = 0
-            if ([int]::TryParse($Advice.UNDO_MAX_BATCH, [ref]$undoMax) -and [int]::TryParse($Advice.RUN_BATCH, [ref]$batch) -and
-                $undoMax -gt 0 -and $undoMax -lt $batch) {
-                Write-Out ('   A batch of ' + $batch + ' needs more undo than the tablespace holds 4 times; the batch size question offers a smaller one.')
-            }
-            # Undo tuning is part of every purge: what is left is the batch size
-            # or room the DBA gives the undo tablespace.
-            $answer = Read-Option @('A smaller batch: the batch size question below offers one',
-                                    'The DBA confirms the undo tablespace has room for 4 batches') `
-                                  'Stop here: make room in the undo tablespace, then run the preflight again' '1'
-            if ($answer -eq '1') { return 'SAME' }
-            if ($answer -eq '2') { Add-Confirm $Ctx 'UNDO'; return 'CHANGED' }
-            return 'STOP:make room in the undo tablespace, then run the preflight again.'
-        }
-        'TEMP' {
-            $answer = Read-Option @('The DBA confirms TEMP has room for the work keys') `
-                                  'Stop here: add room to TEMP, then run the preflight again' 'S'
-            if ($answer -eq '1') { Add-Confirm $Ctx 'TEMP'; return 'CHANGED' }
-            return 'STOP:add room to TEMP, then run the preflight again.'
-        }
-        'BACKUP' {
-            $answer = Read-Option @('A backup was made another way (storage snapshot, export)', 'Purge without a backup') `
-                                  'Stop here: take a backup, then run the preflight again' 'S'
-            if ($answer -eq '1') { $Ctx.Backup = 'CONFIRMED'; return 'CHANGED' }
-            if ($answer -eq '2') { $Ctx.Backup = 'NONE'; return 'CHANGED' }
-            return 'STOP:take a backup, then run the preflight again.'
-        }
-        'INDEX_SPACE' {
-            $answer = Read-Option @('Continue: a table without its temporary index is scanned once per batch (slower)') `
-                                  'Stop here: add room to the tool tablespace, then run the preflight again' '1'
-            if ($answer -eq '1') { return 'SAME' }
-            return 'STOP:add room to the tool tablespace, then run the preflight again.'
-        }
-        'REDO_LOGS' {
-            $answer = Read-Option @('Enlarge the online logs to 4 x 1 GB for the purge, put back after it (SYS)',
-                                    'Leave them: the batch size below keeps one batch within half a log (slower)') '' '1'
-            if ($answer -eq '1') { $Ctx.RedoLogs = $true; return 'CHANGED' }
-            return 'SAME'
-        }
+        Write-Out '   The online redo logs stay as they are: the purge waits for them at times.'
+        return 'SAME'
     }
-    return 'SAME'
+    if ($item.Blocking -ne 'Y') { return 'SAME' }
+    if ($Code -eq 'BACKUP') {
+        Write-Out '   Backup: a purge cannot be undone; a backup taken just before it is the only way back.' 'Red'
+        if (Read-YesNo 'Is there a backup of this database that RMAN does not know (storage snapshot, export)' $false) {
+            $Ctx.Backup = 'CONFIRMED'
+            return 'CHANGED'
+        }
+        Write-Out '   Not recommended: without a backup, what the purge deletes cannot be brought back.' 'Red'
+        if (Read-YesNo 'Purge without a backup' $false) {
+            $Ctx.Backup = 'NONE'
+            return 'CHANGED'
+        }
+        return 'STOP:take a backup, then run the purge again.'
+    }
+    # Required and not met: going on is the operator's choice.
+    $why = ''
+    if ($item.Why -ne '') { $why = ' ' + $item.Why }
+    Write-Wrapped '   ' ('Not recommended: ' + $name.ToLower() + ' is required and not met.' + $why) 'Red' -Log
+    if (Read-YesNo 'Go on anyway' $false) {
+        Add-Confirm $Ctx $Code
+        return 'CHANGED'
+    }
+    $key = 'PURGE.' + $Code
+    if ($script:ReqActions.ContainsKey($key)) { return ('STOP:' + $script:ReqActions[$key] + '.') }
+    return 'STOP:meet the requirement, then run the purge again.'
 }
 
-# Interactive preflight: one question per requirement not met, then the batch
-# size. The answers are saved with the run and the requirements checked again
-# (choices.sql, no table is scanned) until they are met or the operator keeps
-# the answers. Returns $false when the operator stopped.
+# Saves the choices of $Ctx with the preflight run and checks its
+# requirements again with them (choices.sql, no table is scanned). Returns
+# the findings as they then stand.
+function Save-Choices {
+    param($Ctx, $State)
+    Write-Out '' -Detail
+    Write-Out ' Checking again with these choices ...' -Detail
+    $batchArg = '-'
+    if ($Ctx.BatchSize -ne '') { $batchArg = $Ctx.BatchSize }
+    $backupArg = '-'
+    if ($Ctx.Backup -ne '') { $backupArg = $Ctx.Backup }
+    $confirmArg = '-'
+    if ($Ctx.Confirm -ne '') { $confirmArg = $Ctx.Confirm }
+    $choiceArgs = @([string]$State.RunId, $batchArg, (Get-YN $Ctx.UndoTuning), (Get-YN $Ctx.RedoLogs), $backupArg, $confirmArg)
+    $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'choices.sql') $choiceArgs $State 'sqlplus_choices.log'
+    Update-LiveView $State
+    if ($result.ExitCode -ne 0 -and $result.ExitCode -ne 2) {
+        Show-Lines $result.Output -Indent
+        throw 'The choices could not be saved with the run.'
+    }
+    return (Read-Advice $Ctx.Cred $State.RunId)
+}
+
+# A preflight with prompts: the requirements as a table, then the questions
+# they call for. First the online redo logs, the backup and the other
+# required ones that the batch size does not change; then the batch size the
+# checks recommend when none was given (it follows the answer on the logs);
+# the answers are saved with the run and the requirements checked again
+# (Save-Choices); then what is required and still not met. A dry run asks
+# nothing but whether to go on when something is not met. Returns $false
+# when the operator stopped.
 function Invoke-Choices {
     param($Ctx, $State)
     $advice = Read-Advice $Ctx.Cred $State.RunId
     if ($advice.Req.Count -eq 0) { return $true }
-    $askBatch = ($Ctx.BatchSize -eq '')
     # The run holds the choices it was started with until they are saved.
     $held = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
-    Write-Section 'CHOICES'
-    while ($true) {
-        $unmet = Get-Unmet $advice -All
-        if ($unmet.Count -eq 0) {
-            Write-Out ' Every requirement is met.' 'Green'
-        } else {
-            Write-Out (' Not met: ' + ($unmet -join ', ') + '. One question each; S stops here.')
+    Write-Section 'CHOICES' -Detail
+    $unmet = Show-Requirements $advice 'PURGE'
+    $blocking = @($unmet | Where-Object { $advice.Req[$_].Blocking -eq 'Y' })
+    $optional = @($unmet | Where-Object { $advice.Req[$_].Blocking -ne 'Y' })
+    if ($Ctx.DryRun) {
+        if ($optional -contains 'REDO_LOGS') {
+            Write-Out '   A purge asks whether to enlarge the online redo logs for its time (--redo-logs says yes beforehand).'
         }
-        foreach ($code in $unmet) {
+        if ($blocking.Count -gt 0) {
+            Write-Out '   A purge would ask before it starts. The dry run itself changes nothing.'
+        }
+        if ($unmet.Count -gt 0 -and -not (Read-YesNo 'Go on with the dry run' $true)) {
+            Write-Out ''
+            Write-Out ' Stopped: you chose to stop at the requirements.' 'Yellow'
+            return $false
+        }
+    } else {
+        foreach ($code in @($optional + @($blocking | Where-Object { $_ -ne 'UNDO' }))) {
+            # The larger online logs are chosen already (--redo-logs).
+            if ($code -eq 'REDO_LOGS' -and $Ctx.RedoLogs) { continue }
             $answer = Read-Requirement $Ctx $advice $code
             if ($answer.StartsWith('STOP:')) {
                 Write-Out ''
-                Write-Out (' Stopped: ' + $answer.Substring(5)) 'Yellow'
+                Write-Wrapped ' Stopped: ' $answer.Substring(5) 'Yellow' -Log
                 return $false
             }
         }
-        if ($askBatch) {
-            Write-Out ''
-            $Ctx.BatchSize = Read-Value -Prompt 'Batch size (root rows per transaction)' -Default (Get-BatchDefault $Ctx $advice) -Min 100 -Max 100000
-        }
-        $now = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
-        $changed = ($now -ne $held) -or ($Ctx.BatchSize -ne '' -and $Ctx.BatchSize -ne $advice.RUN_BATCH)
-        if (-not $changed) { return $true }
-        Write-Out ''
-        Write-Out ' Checking again with these choices ...'
-        $batchArg = '-'
-        if ($Ctx.BatchSize -ne '') { $batchArg = $Ctx.BatchSize }
-        $backupArg = '-'
-        if ($Ctx.Backup -ne '') { $backupArg = $Ctx.Backup }
-        $confirmArg = '-'
-        if ($Ctx.Confirm -ne '') { $confirmArg = $Ctx.Confirm }
-        $choiceArgs = @([string]$State.RunId, $batchArg, (Get-YN $Ctx.UndoTuning), (Get-YN $Ctx.RedoLogs), $backupArg, $confirmArg)
-        $result = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'choices.sql') $choiceArgs $State 'sqlplus_choices.log'
-        Update-LiveView $State
-        if ($result.ExitCode -ne 0 -and $result.ExitCode -ne 2) {
-            Show-Lines $result.Output -Indent
-            throw 'The choices could not be saved with the run.'
-        }
-        $held = $now
-        $advice = Read-Advice $Ctx.Cred $State.RunId
-        $blocking = Get-Unmet $advice
-        if ($blocking.Count -eq 0) {
-            Write-Out ' READY with these choices.' 'Green'
-            return $true
-        }
-        Write-Out (' Still not met: ' + ($blocking -join ', ') + '.') 'Yellow'
-        if (-not (Read-YesNo 'Answer again' $true)) { return $true }
     }
+    if ($Ctx.BatchSize -eq '') {
+        $Ctx.BatchSize = Get-BatchDefault $Ctx $advice
+        if (-not $script:Verbose) { Write-Out ('   Batch size: ' + $Ctx.BatchSize + ' top-level rows per transaction, as the checks recommend.') 'DarkGray' -NoLog }
+    }
+    $now = Format-Choices '' $Ctx.UndoTuning $Ctx.RedoLogs $Ctx.Backup $Ctx.Confirm
+    $saved = $false
+    if ($now -ne $held -or $Ctx.BatchSize -ne $advice.RUN_BATCH) {
+        $advice = Save-Choices $Ctx $State
+        $saved = $true
+    }
+    if (-not $Ctx.DryRun) {
+        # What is required and still not met with these choices: the undo
+        # space with this batch size, or one whose answer did not meet it.
+        $left = Get-Unmet $advice
+        foreach ($code in $left) {
+            $answer = Read-Requirement $Ctx $advice $code
+            if ($answer.StartsWith('STOP:')) {
+                Write-Out ''
+                Write-Wrapped ' Stopped: ' $answer.Substring(5) 'Yellow' -Log
+                return $false
+            }
+        }
+        if ($left.Count -gt 0) {
+            $advice = Save-Choices $Ctx $State
+            $saved = $true
+            $left = Get-Unmet $advice
+            if ($left.Count -gt 0) {
+                Write-Out ''
+                Write-Out (' Stopped: still required and not met: ' + ($left -join ', ') + '.') 'Yellow'
+                return $false
+            }
+        }
+        if ($saved) {
+            Write-Out ' READY with these choices.' 'Green' -Detail
+            if (-not $script:Verbose -and $blocking.Count -gt 0) {
+                Write-Out '   Checked again with your answers: the purge can start.' 'Green' -NoLog
+            }
+        }
+    }
+    return $true
 }
 
 # Choices as one line: batch size, undo tuning, redo logs, backup,
@@ -2579,35 +2989,109 @@ function Show-Review {
 # Actions
 # ----------------------------------------------------------------------------
 
-# purge and preflight. -OpenPlan with -PlanKnown: the open plan the wizard
-# has already read.
+# Before the typed confirmation of a purge: what it deletes, from the
+# estimate of the check that came before ($Report, empty when none), and that
+# it cannot be undone.
+function Show-Ready {
+    param($Ctx, [string]$Report)
+    $day = Format-Day (Get-CutoffDay $Ctx)
+    $rows = [double]0
+    $bytes = [double]0
+    $seconds = [double]0
+    if ($Report -ne '') {
+        foreach ($m in (Read-ForecastTable $Report 'ESTIMATE')) { $rows += $m.Rows; $bytes += $m.Bytes; $seconds += $m.Seconds }
+    }
+    $verb = 'deletes'
+    if ($Ctx.Mode -eq 'CLOB') { $verb = 'clears the LOB values of' }
+    Write-Out '' -NoLog
+    Write-Rule
+    if ($rows -gt 0) {
+        $size = ''
+        if ($bytes -gt 0) { $size = ', about ' + (Format-Bytes $bytes) }
+        Write-Wrapped '  ' ('Ready. This ' + $verb + ' about ' + (Format-Count $rows) + ' rows' + $size + ', dated before ' + $day + ' (estimates).') 'White'
+        Write-Wrapped '  ' ((Format-Sentence (Format-About $seconds)) + ' of deleting. It cannot be undone.') 'White'
+    } else {
+        Write-Wrapped '  ' ('Ready. This ' + $verb + ' the rows dated before ' + $day + '. It cannot be undone.') 'White'
+    }
+    if ($Ctx.Mode -ne 'FULL' -or $Ctx.Depth -ne 'ALL') {
+        Write-Out ('  Mode ' + $Ctx.Mode + ', modules ' + $Ctx.Depth + '.') -NoLog
+    }
+    Write-Rule
+}
+
+# After a purge or a reclaim that ended well: the tool's own objects stay in
+# the database for the next run, or are removed (the answer; UNINSTALL_AFTER=Y
+# in the configuration file for a run without prompts). Not asked while a
+# plan of several runs is in progress: it is kept in those objects.
+function Invoke-UninstallQuestion {
+    param([string]$Tns, [string]$Report = '')
+    $plan = Read-PlanLines $Report
+    if ($null -ne $plan -and $plan.Status -eq 'IN_PROGRESS') { return }
+    $auto = Test-ConfigYes 'UNINSTALL_AFTER'
+    if ($script:Interactive) {
+        Write-Out ''
+        Write-Out ' The tool''s own objects stay in the database for the next run: the account EPFPG'
+        Write-Out ' and its tablespace EPFPG_DATA, with the history of the runs and what they'
+        Write-Out ' measured. Removing them frees that space; the next run installs them again, and'
+        Write-Out ' its estimates start from statistics. The reports on this machine stay.'
+        if (-not (Read-YesNo 'Remove the tool from the database now' $auto)) {
+            Write-Out ' Kept.'
+            return
+        }
+    } elseif (-not $auto) {
+        return
+    }
+    $sys = Connect-Sys $Tns
+    $result = Invoke-SqlScript $sys (Join-Path $script:InstallDir 'uninstall.sql')
+    if ($result.ExitCode -ne 0) {
+        Show-Lines $result.Output
+        Write-Out ' The tool was not removed (see above).' 'Red'
+        return
+    }
+    Show-Lines $result.Output -Detail
+    foreach ($line in ($result.Output -split "`r?`n")) {
+        if ($line -match '^\s*WARN\s') { Write-Out (' ' + $line.Trim()) 'Yellow' -NoLog }
+    }
+    Write-Out ' Removed: the account EPFPG with the tool''s objects, and the tablespace EPFPG_DATA.' 'Green'
+}
+
+# purge and preflight. -Wizard (a purge with prompts): the database is
+# checked first, in a read-only preflight run with its questions.
 function Invoke-PurgeAction {
-    param([string]$Action, [switch]$Wizard, $Login = $null, [switch]$FollowPlan, $OpenPlan = $null, [switch]$PlanKnown)
+    param([string]$Action, [switch]$Wizard, [switch]$NoBanner)
     $dry = ($Action -eq 'PURGE' -and $script:Cli.Flags.ContainsKey('dry-run'))
     $newPlan = $script:Cli.Flags.ContainsKey('new')
     if ($script:Cli.Options.ContainsKey('max-redo') -and $Action -eq 'PURGE' -and (-not $Wizard -or $dry)) {
-        Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to the wizard''s purge (its preflight plans the runs).'
+        Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to a purge with prompts (its check plans the runs).'
     }
-    $login = $Login
-    if ($null -eq $login) { $login = Connect-Tool }
+    if (-not $NoBanner) {
+        $what = 'purge'
+        if ($Action -eq 'PREFLIGHT') { $what = 'checks of a purge' } elseif ($dry) { $what = 'purge, dry run' }
+        Show-Banner $what
+    }
+    $login = Connect-Tool -Ready
 
     # The open plan: a purge carries out its next step (a dry run rehearses
     # it), a preflight checks it again. Scope options that differ from it
     # replace a plan with no step run yet. A plan in progress goes on: a
-    # purge of another scope is refused (the wizard asks) unless the
+    # purge of another scope is refused (with prompts it asks) unless the
     # operator starts over (--new); a preflight or dry run of another scope
     # leaves it as it is.
     $plan = $null
-    if (-not $newPlan) {
-        if ($PlanKnown) { $plan = $OpenPlan } else { $plan = Get-OpenPlan $login }
-    }
+    if (-not $newPlan) { $plan = Get-OpenPlan $login }
     $follow = $false
     if ($null -ne $plan) {
-        $follow = $FollowPlan -or (-not (Test-ScopeGiven)) -or (Test-PlanScope $plan)
+        $follow = (-not (Test-ScopeGiven)) -or (Test-PlanScope $plan)
+        # A plan with no step run yet, made by an earlier check, is followed
+        # only when the options say its scope: a purge with prompts asks for
+        # the days to keep.
+        if ($follow -and $Wizard -and $plan.Status -eq 'READY' -and -not (Test-ScopeGiven)) {
+            $follow = $false
+        }
         if (-not $follow -and -not $dry) {
             if ($plan.Status -eq 'READY') {
                 Write-Out (' The open plan ' + $plan.Label + ' has no step run yet; this ' + $Action.ToLower() +
-                           ' with other options replaces it.') 'Yellow'
+                           ' replaces it.') -Detail
             } elseif ($Action -eq 'PREFLIGHT') {
                 Write-Out (' Plan ' + $plan.Label + ' of another scope is in progress: this preflight plans nothing' +
                            ' (preflight --new starts over).') 'Yellow'
@@ -2633,10 +3117,30 @@ function Invoke-PurgeAction {
     if ($follow -and $Action -eq 'PURGE' -and $plan.NextStep -eq '-') {
         Exit-Tool $script:ExitUsage ('Plan ' + $plan.Label + ' has no step left.')
     }
+    # Without prompts a purge deletes only what it is told to: continuing a
+    # plan needs the days to keep (options or configuration file), or --yes.
+    if ($follow -and $Action -eq 'PURGE' -and -not $dry -and -not $script:Interactive -and -not (Test-ScopeGiven) -and
+        -not $script:Cli.Flags.ContainsKey('yes') -and (Get-Option 'retention' 'RETENTION_DAYS' '') -eq '' -and
+        (Get-Option 'cutoff' 'CUTOFF' '') -eq '') {
+        Exit-Tool $script:ExitUsage ('Plan ' + $plan.Label + ' is open: add --yes to continue it without prompts, or give ' +
+                                     '--retention DAYS or --cutoff YYYY-MM-DD.')
+    }
 
     $ctx = Get-PurgeContext $login $Action $plan
     $ctx.NewPlan = $newPlan
+    Start-Flow (Get-PurgeSteps $Action $ctx.DryRun)
+    $day = Format-Day (Get-CutoffDay $ctx)
+    Write-Out ''
+    if ($Action -eq 'PREFLIGHT') {
+        Write-Out (' Checks and estimates of a purge of everything dated before ' + $day + '. Nothing is changed.') 'White'
+    } elseif ($ctx.DryRun) {
+        Write-Out (' Dry run of a purge of everything dated before ' + $day + '. Nothing is changed.') 'White'
+    } else {
+        Write-Out (' Purge of everything dated before ' + $day + '.') 'White'
+    }
+    if ($ctx.Mode -ne 'FULL' -or $ctx.Depth -ne 'ALL') { Write-Out (' Mode ' + $ctx.Mode + ', modules ' + $ctx.Depth + '.') }
 
+    $estimate = ''
     if ($follow -and $Action -eq 'PREFLIGHT') {
         Write-Out ''
         Show-PlanSummary $plan
@@ -2670,18 +3174,21 @@ function Invoke-PurgeAction {
             }
             $plan = Invoke-PlanCheck $ctx $plan
             Set-PlanScope $ctx $plan 'PURGE'
+            $ctx.Checked = $true
         }
     } elseif ($Action -eq 'PURGE' -and $Wizard) {
-        # No plan to follow: the wizard checks the database first (a read-only
-        # preflight with its questions). That preflight plans the purge, and
-        # this run carries out the plan's first step.
-        Write-Section 'CHECKING THE DATABASE (read-only preflight)'
+        # No plan to follow: a purge with prompts checks the database first
+        # (a read-only preflight with its questions). That preflight plans
+        # the purge, and this run carries out the plan's first step.
+        Write-Section 'CHECKING THE DATABASE (read-only preflight)' -Detail
         $advice = Get-Advice $ctx
         $ctx.PreflightRun = Get-RunLabel $advice.Run.RunId
         $ctx.NewPlan = $false
+        $ctx.Checked = $true
+        $estimate = $advice.Run.Report
         if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
         if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
-            Exit-Tool $script:ExitFail ('The preflight ' + $ctx.PreflightRun + ' found errors (see above); nothing was changed.')
+            Exit-Tool $script:ExitFail ('The check ' + $ctx.PreflightRun + ' found errors (see above); nothing was changed.')
         }
         $unmet = Get-Unmet $advice
         if ($unmet.Count -gt 0 -and -not $ctx.DryRun) {
@@ -2691,28 +3198,32 @@ function Invoke-PurgeAction {
         if ($null -ne $plan -and $plan.PreflightRun -eq $ctx.PreflightRun -and $plan.NextStep -ne '-') {
             Set-PlanScope $ctx $plan 'PURGE'
             if ($plan.Steps -gt 1) {
-                Write-Out (' The preflight planned the purge in ' + $plan.Steps + ' runs, older data first; this run carries out step ' +
+                Write-Out (' The purge is planned in ' + $plan.Steps + ' runs, older data first; this run carries out step ' +
                            $plan.NextStep + ': rows before ' + $plan.NextCutoff + '.') 'Yellow'
             }
         }
     }
 
     if ($Action -eq 'PURGE' -and -not $ctx.DryRun -and ($ctx.RedoLogs -or $ctx.UndoTuning)) {
-        if ($script:Interactive) {
-            Write-Out ' Every purge runs with undo tuning, so that the undo tablespace does not grow by tens of GB: it needs SYS.'
+        if ($script:Interactive -and $null -eq $script:SysLogin) {
+            Write-Out ''
+            Write-Out ' A purge needs SYS: it keeps the undo tablespace from growing while rows are deleted.'
         }
         $ctx.SysCred = Connect-Sys $login.Tns
     }
     if ($Action -eq 'PURGE') {
-        Show-Review $ctx $Action
+        if ($script:Verbose) { Show-Review $ctx $Action }
         if (-not $ctx.DryRun) {
-            Read-Typed 'Rows before the cutoff will be deleted, or their LOB values cleared'
-        } elseif ($script:Interactive -and -not $script:Cli.Flags.ContainsKey('yes')) {
-            if (-not (Read-YesNo 'Proceed' $true)) { Exit-Tool $script:ExitAborted 'Aborted.' }
+            if (-not $script:Verbose -and $script:Interactive) { Show-Ready $ctx $estimate }
+            Read-Typed 'Rows before the cutoff will be deleted, or their LOB values cleared' -Label 'Type yes to start the purge' -Straight
+            Write-Out '' -NoLog
         }
     }
     $run = Invoke-ToolRun $ctx $Action
     if ($run.Stopped) { exit $script:ExitAborted }
+    if ($Action -eq 'PURGE' -and ($run.Status -eq 'SUCCESS' -or $run.Status -eq 'WARNING')) {
+        Invoke-UninstallQuestion $login.Tns $run.Report
+    }
     exit $run.ExitCode
 }
 
@@ -2722,9 +3233,9 @@ function Invoke-PurgeAction {
 
 # Options of reclaim, checked before any connection or prompt: the mode
 # (ASSESS with --dry-run, RESTORE with --restore, otherwise COMPACT), the
-# tablespaces, the requirements the DBA confirms and the scratch space for
-# parked tables (RECLAIM_TABLESPACES, RECLAIM_CONFIRM and RECLAIM_SCRATCH in
-# the configuration file).
+# tablespaces, the requirements gone past although not met and the scratch
+# space for parked tables (RECLAIM_TABLESPACES, RECLAIM_CONFIRM and
+# RECLAIM_SCRATCH in the configuration file).
 function Read-ReclaimOptions {
     foreach ($name in @('retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup')) {
         if ($script:Cli.Options.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
@@ -2733,7 +3244,7 @@ function Read-ReclaimOptions {
         if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
     }
     $ctx = [pscustomobject]@{ Cred = $null; SysCred = $null; Mode = 'COMPACT'; Tablespaces = ''; Confirm = ''; Scratch = '';
-                              AssessRun = '' }
+                              AssessRun = ''; NoScratch = $false }
     $dry = $script:Cli.Flags.ContainsKey('dry-run')
     $restore = $script:Cli.Flags.ContainsKey('restore')
     if ($dry -and $restore) { Exit-Tool $script:ExitUsage '--dry-run and --restore cannot be combined.' }
@@ -2762,21 +3273,17 @@ function Read-ReclaimOptions {
         }
         $ctx.Confirm = (@(@('ARCHIVE', 'TEMP', 'RECYCLEBIN') | Where-Object { $codes -contains $_ }) -join ',')
     }
+    # The scratch space: a size is its limit; none: no scratch space; not
+    # given: the size the reclaim measures (Invoke-ReclaimAction).
     $scratch = Get-Option 'scratch' 'RECLAIM_SCRATCH' ''
-    if ($scratch -ne '') {
+    if ($scratch.Trim().ToLower() -eq 'none') {
+        $ctx.NoScratch = $true
+    } elseif ($scratch -ne '') {
         $bytes = ConvertTo-Bytes $scratch
-        if ($null -eq $bytes) { Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, got ' + $scratch + '.') }
+        if ($null -eq $bytes) { Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, or none, got ' + $scratch + '.') }
         $ctx.Scratch = ([long]$bytes).ToString([Globalization.CultureInfo]::InvariantCulture)
     }
     return $ctx
-}
-
-# The scratch space of $Ctx as an option, such as ' --scratch 2048M'; empty
-# when none.
-function Format-ScratchOption {
-    param($Ctx)
-    if ($Ctx.Scratch -eq '') { return '' }
-    return (' --scratch ' + [string][long][Math]::Ceiling([double]$Ctx.Scratch / 1048576) + 'M')
 }
 
 # Tablespace names separated by commas, in capitals without duplicates; $null
@@ -2820,15 +3327,43 @@ function Read-ReclaimTs {
     return ,$list.ToArray()
 }
 
+# The steps of a reclaim on the screen (epf_screen.ps1), and the step each
+# step of the engine belongs to: the measurement (its dry run), then for a
+# compaction what it does to the accounts, the indexes, the tables.
+function Start-ReclaimFlow {
+    param([string]$Mode)
+    $measure = [pscustomobject]@{ Key = 'MEASURE'; Text = 'Measuring what a reclaim gives back (read-only)'; Header = $false }
+    if ($Mode -eq 'ASSESS') {
+        Start-Flow @($measure)
+    } elseif ($Mode -eq 'RESTORE') {
+        Start-Flow @([pscustomobject]@{ Key = 'RESTORE'; Text = 'Restoring what a reclaim left pending'; Header = $true })
+    } else {
+        Start-Flow @($measure,
+                     [pscustomobject]@{ Key = 'LOCK'; Text = 'Measuring again, locking the application accounts'; Header = $false },
+                     [pscustomobject]@{ Key = 'RECORD'; Text = 'Recording the state to compare afterwards'; Header = $false },
+                     [pscustomobject]@{ Key = 'COMPACT'; Text = 'Compacting the tables'; Header = $true },
+                     [pscustomobject]@{ Key = 'RETURN'; Text = 'Bringing back the tables set aside'; Header = $false },
+                     [pscustomobject]@{ Key = 'REBUILD'; Text = 'Rebuilding the indexes'; Header = $false },
+                     [pscustomobject]@{ Key = 'VERIFY'; Text = 'Comparing with the state recorded, unlocking'; Header = $false }) `
+                   @{ 'LOCK_ACCOUNTS' = 'LOCK'; 'BASELINE' = 'RECORD'; 'RELEASE_INDEXES' = 'RECORD'; 'FREEZE_FILES' = 'RECORD';
+                      'COMPACT' = 'COMPACT'; 'RETURN_PARKED' = 'RETURN'; 'REBUILD_INDEXES' = 'REBUILD';
+                      'RESTORE_FILES' = 'VERIFY'; 'RESIZE' = 'VERIFY'; 'RECOMPILE' = 'VERIFY'; 'VERIFY' = 'VERIFY';
+                      'UNLOCK_ACCOUNTS' = 'VERIFY' }
+    }
+}
+
 # One reclaim run in mode $Mode (ASSESS, COMPACT or RESTORE): the monitor
 # (EPFPG) creates the run and holds its lock; the worker session (SYS) runs
 # src\sql\run\reclaim.sql while the monitor shows it live. When the worker
 # session of a compaction or restore ends before the run is finished (killed,
 # connection lost), what it changed is restored in the same run, in a new SYS
 # session. The monitor ends the run with the report's verdict; the report goes
-# to the console and to the run folder.
+# to the run folder, and with --verbose to the console. Without --verbose the
+# screen shows the steps of the run; its end in plain words is the caller's
+# (Show-ReclaimAssess, Show-ReclaimEnd). -Inner: the measurement a compaction
+# begins with.
 function Invoke-ReclaimRun {
-    param($Ctx, [string]$Mode)
+    param($Ctx, [string]$Mode, [switch]$Inner)
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
@@ -2847,38 +3382,50 @@ function Invoke-ReclaimRun {
     $label = Get-RunLabel $state.RunId
     $what = @{ 'ASSESS' = 'assessment (read-only)'; 'COMPACT' = 'compaction in place';
                'RESTORE' = 'restore of what reclaims left pending' }[$Mode]
+    if ($null -eq $script:Flow) { Start-ReclaimFlow $Mode }
 
-    Write-Out ''
-    Write-Out (' EPF Data Purge - reclaim'.PadRight($script:Width - $label.Length - 4) + 'run ' + $label) 'White'
-    Write-Out (' ' + ('-' * ($script:Width - 1)))
+    Write-Out '' -Detail
+    Write-Out (' EPF Data Purge - reclaim'.PadRight($script:Width - $label.Length - 4) + 'run ' + $label) 'White' -Detail
+    Write-Out (' ' + ('-' * ($script:Width - 1))) -Detail
     Write-Out (' Database   ' + $script:Database.Container + ', tool version ' + $script:Database.Version +
-               ', ' + $Ctx.Cred.Tns)
+               ', ' + $Ctx.Cred.Tns) -Detail
     $offset = Format-Offset $script:ClockOffset
     if ($offset -ne '') {
-        Write-Out (' Times      database clock (' + $offset + ' from this machine)')
+        Write-Out (' Times      database clock (' + $offset + ' from this machine)') -Detail
     }
-    Write-Out (' Run folder ' + $state.Folder)
+    Write-Out (' Run folder ' + $state.Folder) -Detail
     if ($Mode -eq 'RESTORE') {
-        Write-Out (' Reclaim    ' + $what)
+        Write-Out (' Reclaim    ' + $what) -Detail
     } elseif ($scopeArg -eq '-') {
-        Write-Out (' Reclaim    ' + $what + ', every candidate tablespace')
+        Write-Out (' Reclaim    ' + $what + ', every candidate tablespace') -Detail
     } else {
-        Write-Out (' Reclaim    ' + $what + ', tablespaces ' + ($Ctx.Tablespaces -replace ',', ', '))
+        Write-Out (' Reclaim    ' + $what + ', tablespaces ' + ($Ctx.Tablespaces -replace ',', ', ')) -Detail
     }
-    if ($confirmArg -ne '-') { Write-Out (' Choices    confirmed by the DBA: ' + $Ctx.Confirm) }
+    if ($confirmArg -ne '-') { Write-Out (' Choices    confirmed by the DBA: ' + $Ctx.Confirm) -Detail }
     if ($scratchArg -ne '-') {
-        Write-Out (' Scratch    up to ' + (Format-Bytes ([double]$Ctx.Scratch)) + ' for the tables parked while the rest is compacted')
+        Write-Out (' Scratch    up to ' + (Format-Bytes ([double]$Ctx.Scratch)) + ' for the tables parked while the rest is compacted') -Detail
     }
-    if ($Mode -eq 'COMPACT' -and $Ctx.AssessRun -ne '') { Write-Out (' Assessed   ' + $Ctx.AssessRun) }
+    if ($Mode -eq 'COMPACT' -and $Ctx.AssessRun -ne '') { Write-Out (' Assessed   ' + $Ctx.AssessRun) -Detail }
+    if (-not $script:Verbose) { Write-Out (' Run ' + $label + '   ' + $state.Folder) 'DarkGray' -NoLog }
 
     $status = 'FAILED'
     $closeCode = $null
     $state.StopKeys = Enable-StopKey
     if ($state.StopKeys -and $Mode -eq 'COMPACT') {
-        Write-Out ' Ctrl+C requests a graceful stop: the compaction ends after the current table, then the indexes, datafiles and accounts are restored.' -NoLog
+        if ($script:Verbose) {
+            Write-Out ' Ctrl+C requests a graceful stop: the compaction ends after the current table, then the indexes, datafiles and accounts are restored.' -NoLog
+        } else {
+            Write-Out ' Ctrl+C stops safely after the current table; everything is put back.' 'DarkGray' -NoLog
+        }
     }
     try {
-        Write-Section ('RECLAIM  ' + $what.ToUpper())
+        Write-Section ('RECLAIM  ' + $what.ToUpper()) -Detail
+        # The steps of a compaction follow the engine's (Start-ReclaimFlow).
+        switch ($Mode) {
+            'ASSESS'  { Start-FlowStep 'MEASURE' }
+            'COMPACT' { Start-FlowStep 'LOCK' }
+            'RESTORE' { Start-FlowStep 'RESTORE' }
+        }
         $result = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, $Mode, $scopeArg, $scratchArg) $state 'sqlplus_reclaim.log'
         Update-LiveView $state
         switch ($result.ExitCode) {
@@ -2893,7 +3440,7 @@ function Invoke-ReclaimRun {
             # changed is restored now, in the same run.
             $status = 'FAILED'
             Write-Out ' The worker session ended before the reclaim finished: what it changed is restored now (SYS).' 'Red'
-            Write-Section 'RECLAIM  RESTORE'
+            Write-Section 'RECLAIM  RESTORE' -Detail
             $restore = Invoke-SqlScript $Ctx.SysCred (Join-Path $script:RunSqlDir 'reclaim.sql') @([string]$state.RunId, 'RESTORE', '-', '-') $state 'sqlplus_reclaim_restore.log'
             Update-LiveView $state
             if ($restore.Output -notmatch 'EPF_RECLAIM_STATUS=') {
@@ -2907,13 +3454,14 @@ function Invoke-ReclaimRun {
     } finally {
         Disable-StopKey $state
         $closeCode = Close-Run $state $status
+        if ($status -eq 'FAILED') { Complete-FlowStep 'FAILED' } elseif ($status -eq 'STOPPED') { Complete-FlowStep 'stopped' } else { Complete-FlowStep }
     }
 
     Write-Section 'REPORT' -Detail
     $report = Invoke-SqlScript $Ctx.Cred (Join-Path $script:RunSqlDir 'report.sql') @([string]$state.RunId) -Patient
     [System.IO.File]::WriteAllText((Join-Path $state.Folder 'report.txt'), $report.Output, [System.Text.Encoding]::ASCII)
     Show-Lines $report.Output -HideMachine -Detail
-    Show-Summary 'RECLAIM' $Mode $report.Output $state.Folder
+    Write-Summary 'RECLAIM' $Mode $report.Output $state.Folder
     $text = Get-ReportSection $report.Output 'REQUIREMENTS'
     if ($text -ne '') {
         [System.IO.File]::WriteAllText((Join-Path $state.Folder 'requirements.txt'), $text, [System.Text.Encoding]::ASCII)
@@ -2922,78 +3470,66 @@ function Invoke-ReclaimRun {
     if ($null -eq $exitCode) { $exitCode = $script:ExitFail }
     if ($status -eq 'STOPPED') { $exitCode = $script:ExitAborted }
     $verdict = Write-Manifest $state $Ctx 'RECLAIM' $status $exitCode $report.Output
-    $total = Format-Seconds ([string][int]((Get-Date) - $state.Started).TotalSeconds)
-    $color = 'Green'
-    if ($exitCode -eq $script:ExitWarn -or $exitCode -eq $script:ExitAborted) { $color = 'Yellow' }
-    if ($exitCode -eq $script:ExitFail) { $color = 'Red' }
-    $line = (' RESULT  ' + $verdict + '  (' + $status + ')').PadRight($script:Width - 25)
-    Write-Out ''
-    Write-Out ($line + 'total ' + $total + ' . exit ' + $exitCode) $color
-    Write-Out (' Report  ' + (Join-Path $state.Folder 'report.txt'))
-    Show-HtmlReport $state.Folder
+    $seconds = ((Get-Date) - $state.Started).TotalSeconds
+    if ($script:Verbose) {
+        $total = Format-Seconds ([string][int]$seconds)
+        $color = 'Green'
+        if ($exitCode -eq $script:ExitWarn -or $exitCode -eq $script:ExitAborted) { $color = 'Yellow' }
+        if ($exitCode -eq $script:ExitFail) { $color = 'Red' }
+        $line = (' RESULT  ' + $verdict + '  (' + $status + ')').PadRight($script:Width - 25)
+        Write-Out ''
+        Write-Out ($line + 'total ' + $total + ' . exit ' + $exitCode) $color
+        Write-Out (' Report  ' + (Join-Path $state.Folder 'report.txt'))
+        Show-HtmlReport $state.Folder -Quiet:$Inner
+    } elseif ($Inner) {
+        Show-HtmlReport $state.Folder -Quiet
+    }
     return [pscustomobject]@{ RunId = $state.RunId; ExitCode = $exitCode; Status = $status; Folder = $state.Folder;
-                              Report = $report.Output }
+                              Report = $report.Output; Seconds = $seconds }
 }
 
-# The question for each blocking requirement the assessment found not met:
-# the DBA confirms it (--confirm), or the reclaim stops; QUOTA cannot be
-# confirmed (the reclaim stops). A requirement that is advice (BACKUP) is
-# shown. Returns $false when the operator stopped.
+# report.html of a run and its folder, on the screen of the steps.
+function Show-RunFiles {
+    param($Run)
+    Show-HtmlReport $Run.Folder
+    Write-Out ('  Files    ' + $Run.Folder + '   (report.txt, console.log)') 'DarkGray' -NoLog
+}
+
+# The question for each requirement of a reclaim that is required and not
+# met, as its measurement found them: whether to go on (the recycle-bin
+# objects are purged; the archive space or TEMP is confirmed). The space
+# quotas cannot be gone past: the reclaim stops. Returns $false when the
+# operator stopped.
 function Invoke-ReclaimChoices {
     param($Ctx, $Advice)
-    $unmet = Get-Unmet $Advice -All
-    if ($unmet.Count -eq 0) { return $true }
-    Write-Section 'CHOICES'
-    foreach ($code in $unmet) {
+    foreach ($code in (Get-Unmet $Advice)) {
         $item = $Advice.Req[$code]
-        $label = 'NOT MET'
-        if ($item.Blocking -ne 'Y') { $label = 'NOT MET (advice)' }
+        $name = Get-ReqName 'RECLAIM' $code $item
+        $key = 'RECLAIM.' + $code
+        $do = 'meet the requirement, then run the reclaim again.'
+        if ($script:ReqActions.ContainsKey($key)) { $do = $script:ReqActions[$key] + '.' }
         Write-Out ''
-        Write-Out (' ' + $code.PadRight(12) + $item.Title + '  ' + $label) 'Yellow'
-        if ($item.Measured -ne '') { Write-Out ('   ' + $item.Measured) }
-        if ($item.Blocking -ne 'Y') {
-            # Scratch space: the size the assessment suggests, or none.
-            if ($code -eq 'SCRATCH' -and $Ctx.Scratch -eq '' -and [string]$Advice.Details['SCRATCH.SIZE'] -match '--scratch (\d+)M') {
-                $size = $Matches[1] + 'M'
-                $answer = Read-Option @('Allow up to ' + $size + ' of scratch space for them (--scratch ' + $size + ')') `
-                                      'Go on without scratch space' 'S'
-                if ($answer -eq '1') {
-                    $Ctx.Scratch = ([long](ConvertTo-Bytes $size)).ToString([Globalization.CultureInfo]::InvariantCulture)
-                }
+        if ($code -eq 'RECYCLEBIN') {
+            Write-Out '   Recycle bin: the reclaim purges the dropped objects of these tablespaces first.' 'Red'
+            Write-Out '   FLASHBACK TABLE ... TO BEFORE DROP can then no longer restore them.' 'Red'
+            if (Read-YesNo 'Purge them and go on' $false) {
+                Add-Confirm $Ctx $code
+                continue
             }
-            continue
+        } elseif ($code -eq 'ARCHIVE' -or $code -eq 'TEMP') {
+            $why = ''
+            if ($item.Why -ne '') { $why = ' ' + $item.Why }
+            Write-Wrapped '   ' ('Not recommended: ' + $name.ToLower() + ' is required and not met.' + $why) 'Red' -Log
+            if (Read-YesNo 'Go on anyway' $false) {
+                Add-Confirm $Ctx $code
+                continue
+            }
+        } else {
+            Write-Out ('   ' + $name + ' is required and not met: the reclaim cannot start.') 'Red'
         }
-        $option = ''
-        $stop = 'the requirement is not met'
-        switch ($code) {
-            'RECYCLEBIN' {
-                $option = 'They may be lost: the compaction purges them first (FLASHBACK TABLE ... TO BEFORE DROP can then no longer restore them)'
-                $stop = 'the DBA purges them (PURGE TABLESPACE <name>), then run the reclaim again'
-            }
-            'ARCHIVE' {
-                $option = 'The DBA confirms the archive destination has room for the redo of the moves and rebuilds'
-                $stop = 'free archive space (back up and delete archived logs), then run the reclaim again'
-            }
-            'TEMP' {
-                $option = 'The DBA confirms TEMP has room for the index rebuilds'
-                $stop = 'add room to TEMP, then run the reclaim again'
-            }
-            'QUOTA' {
-                $stop = 'the DBA gives the owners listed a quota above what they use (ALTER USER <owner> QUOTA ' +
-                        'UNLIMITED ON <tablespace>), then run the reclaim again'
-            }
-        }
-        if ($option -eq '') {
-            Write-Out (' Stopped: ' + $stop + '.') 'Yellow'
-            return $false
-        }
-        $answer = Read-Option @($option) ('Stop here: ' + $stop) 'S'
-        if ($answer -ne '1') {
-            Write-Out ''
-            Write-Out (' Stopped: ' + $stop + '.') 'Yellow'
-            return $false
-        }
-        Add-Confirm $Ctx $code
+        Write-Out ''
+        Write-Wrapped ' Stopped: ' $do 'Yellow' -Log
+        return $false
     }
     return $true
 }
@@ -3025,13 +3561,13 @@ function Show-ReclaimReview {
         Write-Out ('  Scratch       up to ' + (Format-Bytes ([double]$Ctx.Scratch)) + ' for the tables that cannot move lower: ' +
                    'they wait in a scratch tablespace, then come back')
     } else {
-        Write-Out '  Scratch       none: a table that cannot move lower stops its datafile there (--scratch allows parking it)'
+        Write-Out '  Scratch       none: a table that cannot move lower stops its datafile there'
     }
-    if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (handled by the DBA although the assessment finds them not met)') }
+    if ($Ctx.Confirm -ne '') { Write-Out ('  Confirmed     ' + $Ctx.Confirm + '   (gone past although the assessment finds them not met)') }
     Write-Out ('  Assessment    ' + $Ctx.AssessRun)
 }
 
-# After a reclaim run: what can follow.
+# After a reclaim run shown with --verbose: what can follow.
 function Show-ReclaimNext {
     param($Ctx, $Run)
     if ($Run.Status -eq 'STOPPED') { return }
@@ -3045,14 +3581,13 @@ function Show-ReclaimNext {
         if ($Ctx.Tablespaces -ne '') { $scope = ' --tablespaces ' + $Ctx.Tablespaces }
         $confirm = ''
         if ($Ctx.Confirm -ne '') { $confirm = ' --confirm ' + $Ctx.Confirm }
-        $confirm = $confirm + (Format-ScratchOption $Ctx)
         if ((Read-ReclaimTs $Run.Report).Count -eq 0) {
             Write-Out ' Next    nothing to reclaim.'
         } elseif ($unmet.Count -gt 0) {
             # QUOTA cannot be confirmed: only the DBA meets it.
             $confirmable = @($unmet | Where-Object { @('ARCHIVE', 'TEMP', 'RECYCLEBIN') -contains $_ })
             $how = 'meet them'
-            if ($confirmable.Count -gt 0) { $how = $how + ', or the DBA confirms ' + ($confirmable -join ', ') + ' (--confirm)' }
+            if ($confirmable.Count -gt 0) { $how = $how + ', or go past ' + ($confirmable -join ', ') + ' (--confirm, or the questions of a reclaim)' }
             Write-Out (' Next    not ready (' + ($unmet -join ', ') + '): ' + $how + ', then run the reclaim') 'Yellow'
         } else {
             Write-Out (' Next    epf_purge.bat reclaim' + $scope + $confirm + ' compacts them (SYS; the accounts listed ' +
@@ -3063,32 +3598,26 @@ function Show-ReclaimNext {
     }
 }
 
-# reclaim: --dry-run assesses, --restore restores what reclaims left
-# pending, otherwise the compaction. With prompts the compaction is assessed
-# first: the report, a question for each blocking requirement not met, the
-# review and a typed confirmation.
+# reclaim: --restore restores what reclaims left pending; otherwise the
+# reclaim measures first, in a read-only run (its dry run): what it gives
+# back, the accounts it locks, the requirements, the scratch space it takes
+# (the size measured, unless --scratch gives another or none). --dry-run ends
+# there. A compaction with prompts then asks about each required one that is
+# not met and for a typed confirmation; without prompts it goes straight on,
+# and the engine refuses it while a required one is not met.
 function Invoke-ReclaimAction {
-    param($Login = $null)
+    param([switch]$NoBanner)
     $ctx = Read-ReclaimOptions
     $confirmed = $script:Cli.Flags.ContainsKey('yes')
-    if ($ctx.Mode -eq 'COMPACT' -and -not $script:Interactive -and -not $confirmed) {
-        Exit-Tool $script:ExitUsage 'The tables will move: --yes is required with --non-interactive.'
+    if (-not $NoBanner) {
+        $what = @{ 'ASSESS' = 'reclaim, dry run'; 'COMPACT' = 'reclaim'; 'RESTORE' = 'reclaim, restore' }[$ctx.Mode]
+        Show-Banner $what
     }
-    $login = $Login
-    if ($null -eq $login) { $login = Connect-Tool }
+    $login = Connect-Tool -Ready
     $ctx.Cred = $login
-    if ($ctx.Mode -ne 'RESTORE' -and $ctx.Tablespaces -eq '' -and $script:Interactive -and -not $confirmed -and
-        -not $script:Cli.Options.ContainsKey('tablespaces')) {
-        while ($true) {
-            Clear-Status
-            $answer = (Read-Host -Prompt ' Tablespaces to reclaim, separated by commas (Enter: every candidate)').Trim()
-            Write-Log (' Tablespaces to reclaim: ' + $answer)
-            if ($answer -eq '') { break }
-            $ctx.Tablespaces = Test-Tablespaces $answer
-            if ($null -ne $ctx.Tablespaces) { break }
-            $ctx.Tablespaces = ''
-            Write-Out '   tablespace names separated by commas, or Enter for every candidate' 'Yellow' -NoLog
-        }
+    if ($script:Interactive -and $null -eq $script:SysLogin) {
+        Write-Out ''
+        Write-Out ' A reclaim runs as SYS.'
     }
     $ctx.SysCred = Connect-Sys $login.Tns
 
@@ -3100,33 +3629,108 @@ function Invoke-ReclaimAction {
                 Exit-Tool $script:ExitAborted 'Nothing was changed.'
             }
         }
+        Start-ReclaimFlow 'RESTORE'
         $run = Invoke-ReclaimRun $ctx 'RESTORE'
-        Show-ReclaimNext $ctx $run
-        exit $run.ExitCode
-    }
-    if ($ctx.Mode -eq 'ASSESS') {
-        $run = Invoke-ReclaimRun $ctx 'ASSESS'
-        Show-ReclaimNext $ctx $run
-        exit $run.ExitCode
-    }
-    if ($script:Interactive -and -not $confirmed) {
-        # The assessment first, in its own read-only run.
-        $assess = Invoke-ReclaimRun $ctx 'ASSESS'
-        $script:LogFile = $null
-        $ctx.AssessRun = Get-RunLabel $assess.RunId
-        if ($assess.Status -eq 'STOPPED') { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
-        if ($assess.Status -eq 'FAILED') {
-            Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see above); nothing was changed.')
+        if ($script:Verbose) {
+            Show-ReclaimNext $ctx $run
+        } else {
+            Show-ReclaimEnd $run.Report $run.Status (Format-Clock $run.Seconds) 'RESTORE'
+            Show-RunFiles $run
         }
-        $spaces = Read-ReclaimTs $assess.Report
-        if ($spaces.Count -eq 0) { Exit-Tool $script:ExitPass 'No tablespace to reclaim; nothing was changed.' }
-        $advice = Read-Advice $ctx.Cred $assess.RunId
-        if (-not (Invoke-ReclaimChoices $ctx $advice)) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
-        Show-ReclaimReview $ctx $spaces
+        exit $run.ExitCode
     }
-    Read-Typed 'The tables will move and their indexes will be rebuilt; the accounts listed are locked meanwhile'
+
+    Write-Out ''
+    if ($ctx.Mode -eq 'ASSESS') {
+        Write-Out ' Dry run of a reclaim: what it would give back to the disk. Nothing is changed.' 'White'
+    } else {
+        Write-Out ' Reclaim: compacting the datafiles to give disk space back.' 'White'
+    }
+    if ($ctx.Tablespaces -ne '') { Write-Out (' Tablespaces: ' + ($ctx.Tablespaces -replace ',', ', ') + '.') }
+    Start-ReclaimFlow $ctx.Mode
+    $assess = Invoke-ReclaimRun $ctx 'ASSESS' -Inner:($ctx.Mode -eq 'COMPACT')
+    $spaces = Read-ReclaimTs $assess.Report
+    $measured = ($assess.Status -eq 'SUCCESS' -or $assess.Status -eq 'WARNING')
+    $advice = $null
+    $file = ''
+    $taken = ''
+    if ($measured) {
+        $advice = Read-Advice $ctx.Cred $assess.RunId
+        # The scratch space: the size measured, unless one was given or none
+        # is wanted.
+        if ($ctx.Scratch -eq '' -and -not $ctx.NoScratch) {
+            $size = Get-ScratchAdvice $advice
+            if ($size -ne '') { $ctx.Scratch = ([long](ConvertTo-Bytes $size)).ToString([Globalization.CultureInfo]::InvariantCulture) }
+        }
+        if ($ctx.Scratch -ne '') { $taken = Format-Bytes ([double]$ctx.Scratch) }
+        if ($advice.Req.Contains('SCRATCH') -and $advice.Req['SCRATCH'].Measured -match 'its datafile: ([^;]+)') { $file = $Matches[1].Trim() }
+    }
+
+    if ($ctx.Mode -eq 'ASSESS') {
+        if ($script:Verbose) {
+            Show-ReclaimNext $ctx $assess
+        } else {
+            if ($measured) {
+                $null = Show-Requirements $advice 'RECLAIM' $taken
+                Show-ReclaimAssess $assess.Report $spaces $ctx.Scratch $file
+                $checks = Read-Checks $assess.Report
+                Show-GoodToKnow @($checks | Where-Object { $_.Status -eq 'FAIL' -or ($_.Status -eq 'WARN' -and $_.Id -ne 'P5') })
+                Write-Out '' -NoLog
+                Write-Out '  Nothing was changed.' 'Green' -NoLog
+                if ($spaces.Count -gt 0) {
+                    $scope = ''
+                    if ($ctx.Tablespaces -ne '') { $scope = ' --tablespaces ' + $ctx.Tablespaces }
+                    Write-Out ('  Next     epf_purge.bat reclaim' + $scope + '     the reclaim itself (it measures again, then asks)') -NoLog
+                    Write-Log (' Next    epf_purge.bat reclaim' + $scope + ' is the reclaim itself: it measures again, then asks; the database must not be in use meanwhile')
+                }
+            } else {
+                Write-Out '' -NoLog
+                Write-Out '  The measurement did not finish: see the errors above. Nothing was changed.' 'Red' -NoLog
+            }
+            Show-RunFiles $assess
+        }
+        if ($measured) { Invoke-UninstallQuestion $login.Tns }
+        exit $assess.ExitCode
+    }
+
+    # The log of the compaction starts with its own run folder.
+    $script:LogFile = $null
+    $ctx.AssessRun = Get-RunLabel $assess.RunId
+    if ($assess.Status -eq 'STOPPED') { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+    if (-not $measured) {
+        Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see above); nothing was changed.')
+    }
+    if ($spaces.Count -eq 0) { Exit-Tool $script:ExitPass 'No tablespace to reclaim; nothing was changed.' }
+    if (-not $script:Verbose) {
+        $null = Show-Requirements $advice 'RECLAIM' $taken
+        Show-ReclaimAssess $assess.Report $spaces $ctx.Scratch $file
+    }
+    # Without prompts a required one that is not met is not gone past: the
+    # engine refuses the compaction, which records it.
+    $refused = (-not ($script:Interactive -and -not $confirmed)) -and (Get-Unmet $advice).Count -gt 0
+    if ($script:Interactive -and -not $confirmed) {
+        if (-not (Invoke-ReclaimChoices $ctx $advice)) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+        if ($script:Verbose) { Show-ReclaimReview $ctx $spaces }
+        Write-Out '' -NoLog
+    } elseif (-not $script:Verbose) {
+        Write-Out '' -NoLog
+        if ($refused) {
+            Write-Out ('  Required and not met: ' + ((Get-Unmet $advice) -join ', ') + '. The reclaim does not start; --confirm goes past ARCHIVE, TEMP or RECYCLEBIN.') 'Red' -NoLog
+        } else {
+            Write-Out '  No question (--non-interactive or --yes): the reclaim starts.' 'DarkGray' -NoLog
+        }
+    }
+    Read-Typed 'The tables will move and their indexes will be rebuilt; the accounts listed are locked meanwhile' `
+               -Label 'The application is not available until the reclaim ends. Type yes to start it' -Straight
+    Write-Out '' -NoLog
     $run = Invoke-ReclaimRun $ctx 'COMPACT'
-    Show-ReclaimNext $ctx $run
+    if ($script:Verbose) {
+        Show-ReclaimNext $ctx $run
+    } else {
+        Show-ReclaimEnd $run.Report $run.Status (Format-Clock $run.Seconds) 'COMPACT' -Refused:$refused
+        Show-RunFiles $run
+    }
+    if ($run.Status -eq 'SUCCESS' -or $run.Status -eq 'WARNING') { Invoke-UninstallQuestion $login.Tns }
     exit $run.ExitCode
 }
 
@@ -3147,11 +3751,23 @@ function Invoke-SimpleScript {
     exit $result.ExitCode
 }
 
+# install: installs or upgrades the tool's objects (SYS); a purge or a
+# reclaim does it by itself when needed. uninstall: removes them, after
+# saying what goes and a typed confirmation.
 function Invoke-InstallAction {
-    param([switch]$Uninstall)
+    param([switch]$Uninstall, [switch]$NoBanner)
+    if (-not $NoBanner) {
+        if ($Uninstall) { Show-Banner 'uninstall' } else { Show-Banner 'install' }
+    }
     $tns = Get-Tns
     $sys = Connect-Sys $tns
     if ($Uninstall) {
+        if ($script:Interactive) {
+            Write-Out ''
+            Write-Out ' This removes the tool''s own objects from the database: the account EPFPG and'
+            Write-Out ' its tablespace EPFPG_DATA, with the history of the runs. The application''s'
+            Write-Out ' data is not touched, and the reports on this machine stay.'
+        }
         Read-Typed 'The EPFPG schema and the EPFPG_DATA tablespace will be removed'
         $result = Invoke-SqlScript $sys (Join-Path $script:InstallDir 'uninstall.sql')
     } else {
@@ -3165,78 +3781,53 @@ function Invoke-InstallAction {
     exit $result.ExitCode
 }
 
-# The menu. With an open plan it shows the plan and offers to continue it,
-# check it again, rehearse its next step or start over; without one, a
-# purge (the wizard's preflight plans it first) or a preflight. Reclaim is
-# offered in both.
+# The menu, by what the operator wants to do. Each choice then gets ready by
+# itself (the database, the tool's objects) and asks its own questions.
 function Start-Wizard {
+    Show-Banner 'menu'
     Write-Out ''
-    Write-Out ' EPF Data Purge' 'White'
-    Write-Out (' ' + ('-' * ($script:Width - 1)))
-    $login = Connect-Tool -Soft
-    $plan = $null
-    $known = $false
-    if ($null -ne $login) {
-        $plan = Get-OpenPlan $login
-        $known = $true
-    }
-    if ($null -ne $plan) {
-        Write-Out ''
-        Show-PlanSummary $plan
-        Write-Out ''
-        $next = ''
-        if ($plan.NextStep -ne '-') { $next = ' (step ' + $plan.NextStep + ' of ' + $plan.Steps + ': rows before ' + $plan.NextCutoff + ')' }
-        Write-Out ('  1  Continue the plan' + $next)
-        Write-Out '  2  Check the plan again (read-only preflight with its choices)'
-        Write-Out '  3  Rehearse the next step (dry run)'
-        Write-Out '  4  Start over (a new preflight; the plan is closed, its completed steps stay done)'
-        Write-Out '  5  Reclaim disk space (SYS; assessed first)'
-        Write-Out '  6  Report of a run'
-        Write-Out '  7  Status'
-        Write-Out '  8  Install or upgrade (SYS)'
-        Write-Out '  9  Uninstall (SYS)'
-        $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7', '8', '9')
-        switch ($choice) {
-            '1' { Invoke-PurgeAction 'PURGE' -Wizard -Login $login -FollowPlan -OpenPlan $plan -PlanKnown }
-            '2' { Invoke-PurgeAction 'PREFLIGHT' -Login $login -FollowPlan -OpenPlan $plan -PlanKnown }
-            '3' {
-                $script:Cli.Flags['dry-run'] = $true
-                Invoke-PurgeAction 'PURGE' -Wizard -Login $login -FollowPlan -OpenPlan $plan -PlanKnown
-            }
-            '4' {
-                $script:Cli.Flags['new'] = $true
-                Invoke-PurgeAction 'PREFLIGHT' -Login $login
-            }
-            '5' { Invoke-ReclaimAction $login }
-            '6' {
-                $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
-                Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST') $login
-            }
-            '7' { Invoke-SimpleScript 'status.sql' @() $login }
-            '8' { Invoke-InstallAction }
-            '9' { Invoke-InstallAction -Uninstall }
-        }
-        return
-    }
-    Write-Out '  1  Purge (a read-only preflight checks the database and plans the purge first)'
-    Write-Out '  2  Preflight only (read-only)'
-    Write-Out '  3  Reclaim disk space (SYS; assessed first)'
-    Write-Out '  4  Report of a run'
-    Write-Out '  5  Status'
-    Write-Out '  6  Install or upgrade (SYS)'
-    Write-Out '  7  Uninstall (SYS)'
-    $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7')
+    Write-Out ' What do you want to do?' 'White'
+    Write-Out '   1  Dry run of a purge     shows what a purge would delete; changes nothing'
+    Write-Out '   2  Purge                  deletes old rows; a reclaim is needed afterwards to'
+    Write-Out '                             free disk space'
+    Write-Out '   3  Dry run of a reclaim   shows how much disk space a reclaim would give back;'
+    Write-Out '                             changes nothing'
+    Write-Out '   4  Reclaim                compacts the datafiles to free disk space; the'
+    Write-Out '                             database must not be in use meanwhile'
+    Write-Out '   5  Report of an earlier run'
+    Write-Out '   6  Status: is anything left pending?'
+    Write-Out '   7  Uninstall: remove the tool''s objects from the database'
+    Write-Out '   Q  Quit'
+    $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7', 'Q')
     switch ($choice) {
-        '1' { Invoke-PurgeAction 'PURGE' -Wizard -Login $login -PlanKnown:$known }
-        '2' { Invoke-PurgeAction 'PREFLIGHT' -Login $login -PlanKnown:$known }
-        '3' { Invoke-ReclaimAction $login }
-        '4' {
-            $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
-            Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST') $login
+        '1' {
+            $script:Cli.Flags['dry-run'] = $true
+            Invoke-PurgeAction 'PURGE' -Wizard -NoBanner
         }
-        '5' { Invoke-SimpleScript 'status.sql' @() $login }
-        '6' { Invoke-InstallAction }
-        '7' { Invoke-InstallAction -Uninstall }
+        '2' {
+            # The purge itself, whatever DRY_RUN of the configuration file says.
+            $script:Cli.Flags.Remove('dry-run')
+            $script:Config['DRY_RUN'] = 'N'
+            Invoke-PurgeAction 'PURGE' -Wizard -NoBanner
+        }
+        '3' {
+            $script:Cli.Flags['dry-run'] = $true
+            Invoke-ReclaimAction -NoBanner
+        }
+        '4' {
+            $script:Cli.Flags.Remove('dry-run')
+            Invoke-ReclaimAction -NoBanner
+        }
+        '5' {
+            $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
+            Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST')
+        }
+        '6' { Invoke-SimpleScript 'status.sql' @() }
+        '7' { Invoke-InstallAction -Uninstall -NoBanner }
+        'Q' {
+            Write-Out ' Nothing done.'
+            exit $script:ExitPass
+        }
     }
 }
 
@@ -3299,8 +3890,9 @@ function Invoke-Main {
         if ($script:Cli.Flags.ContainsKey('restore')) { Exit-Tool $script:ExitUsage '--restore applies to reclaim.' }
         if ($script:Cli.Options.ContainsKey('scratch')) { Exit-Tool $script:ExitUsage '--scratch applies to reclaim.' }
     }
-    if ($script:Cli.Options.ContainsKey('scratch') -and $null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['scratch']))) {
-        Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, got ' + $script:Cli.Options['scratch'] + '.')
+    if ($script:Cli.Options.ContainsKey('scratch') -and ([string]$script:Cli.Options['scratch']).Trim().ToLower() -ne 'none' -and
+        $null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['scratch']))) {
+        Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, or none, got ' + $script:Cli.Options['scratch'] + '.')
     }
     if ($script:Cli.Flags.ContainsKey('new') -and @('purge', 'preflight') -notcontains $action) {
         Exit-Tool $script:ExitUsage '--new applies to purge and preflight (the wizard''s menu offers to start over).'

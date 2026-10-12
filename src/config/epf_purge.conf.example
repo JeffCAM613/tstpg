@@ -3,11 +3,13 @@
 # ============================================================================
 # Copy to src\config\epf_purge.conf (git-ignored) or pass another file with
 # --config FILE. One KEY=VALUE per line; lines starting with # are comments.
-# Command line options override these values. In the wizard, a value here is
-# the default of its question; with --non-interactive it is the answer.
+# Command line options override these values. With prompts, a value here is
+# the default of its question (the database, the days to keep) or its answer
+# (a yes or no); with --non-interactive it is the answer.
 # ============================================================================
 
-# Connection: TNS alias or EZConnect string (PDB service in multitenant).
+# The database: its alias in tnsnames.ora, or host:port/service (the PDB
+# service in multitenant). Asked for when neither this nor --tns gives it.
 TNS=localhost:1521/EPFPDB
 # Seconds a sqlplus session may take to connect, 10-3600. A session that has
 # not connected by then is ended and started again, 3 attempts in all;
@@ -19,19 +21,22 @@ TNS=localhost:1521/EPFPDB
 # unknown alias ends the attempts at once.
 #RECONNECT_S=600
 
-# Purge parameters. While a plan is open, a purge or preflight without
-# --retention, --cutoff, --mode or --depth on the command line follows the
-# plan instead.
-RETENTION_DAYS=30
-# Or a cutoff date instead of the retention: rows dated before this day.
-# Used only when no --retention is given.
+# The days of data to keep: older rows are purged. A purge asks for them when
+# neither this nor --retention gives them; a purge without prompts
+# (--non-interactive) does not start without them. While a plan is open, a
+# purge without --retention, --cutoff, --mode or --depth on the command line
+# follows the plan instead.
+#RETENTION_DAYS=365
+# Or a cutoff date instead: rows dated before this day are purged. Used only
+# when no --retention is given.
 #CUTOFF=2025-10-01
 # FULL | CLOB | LOGS | CLOB_N_LOGS
 MODE=FULL
 # ALL, or modules separated by commas: PAYMENTS,LOGS,BANK_STATEMENTS
 DEPTH=ALL
-# Root rows per transaction, 100-100000. Leave unset to use the preflight's
-# recommendation in the wizard, or the batch_size_default setting otherwise.
+# Root rows per transaction, 100-100000. Leave unset to use what the checks
+# recommend (a purge with prompts), or the batch_size_default setting
+# otherwise.
 #BATCH_SIZE=1000
 
 # Y or N.
@@ -39,50 +44,64 @@ DRY_RUN=N
 # Shrink the purged tables afterwards (purge only, not with a dry run).
 COMPACT=N
 # Larger online redo logs for the purge (4 x 1 GB) when one batch does not
-# fit in them; the original groups are put back at the end (SYS).
+# fit in them; the original groups are put back at the end (SYS). Y answers
+# the question of a purge beforehand.
 REDO_LOGS=N
-# Lower undo_retention and limit the growth of the undo tablespace (4 GB by
-# default, setting undo_cap_mb) for the purge; both restored at the end (SYS).
-# With a preflight or a dry run it is checked as planned; nothing is applied.
+# Accepted and ignored: every purge runs with undo tuning (undo kept 60 s and
+# the growth of the undo tablespace limited, 4 GB by default, setting
+# undo_cap_mb; both restored at the end; SYS).
 UNDO_TUNING=N
 
-# Requirements (checked by the preflight before every purge).
+# Requirements (checked before every purge). These answer their questions
+# beforehand; a purge without prompts does not start while a required one is
+# not met.
 # When no RMAN database backup newer than 24 hours is found: CONFIRMED (a
 # backup was made another way) or NONE (purge without a backup).
 #BACKUP=CONFIRMED
-# Requirements the DBA confirms are handled although the preflight finds them
-# not met: ARCHIVE, UNDO, TEMP separated by commas.
+# Requirements to go on without although the checks find them not met:
+# ARCHIVE, UNDO, TEMP separated by commas.
 #CONFIRM=ARCHIVE
 
 # Plan of smaller runs: the most redo one run may write, such as 500M or 20G
-# (preflight, and the wizard's purge). The preflight then plans the purge in
-# runs of at most that much, older data first.
+# (preflight, and a purge with prompts). The purge is then planned in runs of
+# at most that much, older data first.
 #MAX_REDO=20G
 
 # Reclaim (SYS): the tablespaces to compact, separated by commas; unset for
 # every tablespace holding segments of the application schemas.
 #RECLAIM_TABLESPACES=DATA
-# Requirements of a reclaim the DBA confirms are handled although the
-# assessment finds them not met: ARCHIVE, TEMP, RECYCLEBIN (the compaction
-# then purges the recycle-bin objects of its tablespaces first).
+# Requirements of a reclaim to go on without although its measurement finds
+# them not met: ARCHIVE, TEMP, RECYCLEBIN (the compaction then purges the
+# recycle-bin objects of its tablespaces first).
 #RECLAIM_CONFIRM=TEMP
-# Scratch space a reclaim may use, such as 2G, for the tables that cannot move
-# lower (their copy lands back at the top, or they do not fit below): they
-# wait in a tablespace the reclaim creates next to their tablespace's first
-# datafile, and come back at the end; the tablespace is then dropped. Unset:
-# none, and such a table stops its datafile there.
+# The most scratch space a reclaim may use, such as 2G, for the tables that
+# cannot move lower (their copy lands back at the top, or they do not fit
+# below): they wait in a tablespace the reclaim creates next to their
+# tablespace's first datafile, and come back at the end; the tablespace is
+# then dropped. Unset: the size the reclaim measures. NONE: no scratch space,
+# and such a table stops its datafile there.
 #RECLAIM_SCRATCH=2G
 
-# Output. A run shows the end of each step, its progress, warnings, errors,
-# milestones and a status line, then a summary of its report; VERBOSE=Y (or
-# --verbose) shows every event and the whole report instead. console.log in
-# the run folder has every line either way.
+# After a purge or a reclaim that ended well: Y removes the tool's own
+# objects from the database (the account EPFPG and its tablespace, with the
+# history of the runs); the next run installs them again. With prompts, the
+# run asks, and this is the default answer.
+#UNINSTALL_AFTER=N
+
+# Output. A run shows its steps by what they do, the progress of each module
+# while rows are deleted, warnings and errors, then its end in plain words;
+# VERBOSE=Y (or --verbose) shows every event and the whole report instead.
+# console.log in the run folder has every line either way. report.html of
+# the run folder opens in the browser at the end when somebody is at the
+# console; OPEN_REPORT=N (or --no-open) leaves it closed.
 #LOG_DIR=D:\epf\logs
 VERBOSE=N
 NO_COLOR=N
+#OPEN_REPORT=N
 
 # Passwords are read from the environment (EPF_PASSWORD, EPF_SYS_PASSWORD) or
-# a masked prompt. They may be set here, which is discouraged: the file is
-# then as sensitive as the passwords.
+# a masked prompt. A run without prompts that a scheduler starts may read
+# them here: the file is then as sensitive as the passwords, so keep it where
+# only the account that runs the tool can read it.
 #EPF_PASSWORD=
 #SYS_PASSWORD=

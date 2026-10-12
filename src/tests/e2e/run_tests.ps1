@@ -753,13 +753,16 @@ function Write-Note {
     else { Write-TestLog ('  note ' + $Text + ': no') 'Yellow' }
 }
 
+# The run of $Action a wrapper call made: the last one (a reclaim that
+# compacts begins with its measurement, a run of its own).
 function Get-Run {
     param($Result, [string]$Action)
+    $found = $null
     foreach ($run in $Result.Runs) {
-        if ($run.ContainsKey('action') -and $run['action'] -eq $Action) { return $run }
+        if ($run.ContainsKey('action') -and $run['action'] -eq $Action) { $found = $run }
     }
-    Add-Check $false ('a ' + $Action + ' run folder with manifest.txt was written')
-    return $null
+    if ($null -eq $found) { Add-Check $false ('a ' + $Action + ' run folder with manifest.txt was written') }
+    return $found
 }
 
 function Assert-Manifest {
@@ -860,8 +863,10 @@ $script:TestList = @(
 
 function Invoke-Suite {
     Invoke-Test 'T00' 'Static checks of the wrapper and of this suite (no database)' {
-        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf.ps1') @((Join-Path $script:SrcDir 'bin\lib\epf_html.ps1'))
-        Test-Script (Join-Path $script:SrcDir 'bin\lib\epf_html.ps1')
+        $lib = Join-Path $script:SrcDir 'bin\lib'
+        Test-Script (Join-Path $lib 'epf.ps1') @((Join-Path $lib 'epf_html.ps1'), (Join-Path $lib 'epf_screen.ps1'))
+        Test-Script (Join-Path $lib 'epf_html.ps1')
+        Test-Script (Join-Path $lib 'epf_screen.ps1') @((Join-Path $lib 'epf.ps1'))
         Test-Script (Join-Path $script:SrcDir 'tests\sim\epf_sim.ps1')
         Test-Script (Join-Path $script:TestDir 'run_tests.ps1')
     }
@@ -1048,7 +1053,7 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T07' 'Usage errors: exit 4, nothing changed' {
-        foreach ($case in @(@('purge', '--bogus'), @('reclaim', '--non-interactive'),
+        foreach ($case in @(@('purge', '--bogus'),
                             @('reclaim', '--non-interactive', '--dry-run', '--restore'),
                             @('reclaim', '--non-interactive', '--dry-run', '--confirm', 'UNDO'),
                             @('reclaim', '--non-interactive', '--dry-run', '--tablespaces', 'A-B'),
@@ -1067,28 +1072,37 @@ function Invoke-Suite {
                             @('purge', '--non-interactive', '--cutoff', '2025-13-01'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--backup', 'maybe'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--confirm', 'BACKUP'),
-                            @('purge', '--non-interactive', '--retention', $script:Retention))) {
+                            @('purge', '--non-interactive', '--retention', '0'),
+                            @('purge', '--non-interactive'))) {
             $r = Invoke-Wrapper $case
             Assert-Exit $r @(4)
             Add-Check ($r.Runs.Count -eq 0) 'no run created'
         }
-        Assert-Match $r '--yes is required with --non-interactive'
+        # A purge without prompts deletes only what it is told to: the days to
+        # keep, or --yes to continue an open plan.
+        Assert-Match $r '(are required with --non-interactive|add --yes)'
     }
 
     Invoke-Test 'T08' 'Preflight through the wrapper: the output by default, every line in console.log' {
         $r = Invoke-Wrapper @('preflight', '--non-interactive', '--retention', $script:Retention) -TimeoutMin 30 -Brief
         Assert-Exit $r @(0, 2)
-        Assert-Match $r 'REDO_LOGS'
-        Assert-Match $r 'PREFLIGHT UNDO DONE'
-        Assert-Match $r '(?m)^ SUMMARY +\d\d:\d\d:\d\d'
-        Assert-Match $r 'ESTIMATE \(rows before the cutoff'
-        Assert-Match $r 'REQUIREMENTS'
-        Assert-Match $r ' RESULT  (READY|NOT READY)'
-        Assert-Match $r '(?m)^ VERDICT  '
+        # The screen by default: the tool gets ready, the step with its time,
+        # the requirements as a table, the estimate, what comes next.
+        Assert-Match $r '(?m)^ Getting ready'
+        Assert-Match $r 'Tool in database +version '
+        Assert-Match $r 'Checking the database \(read-only\) +done +\d+:\d\d'
+        Assert-Match $r 'Requirement +Needed +Now'
+        Assert-Match $r 'Online redo logs +optional +(ok|NOT MET)'
+        Assert-Match $r 'Backup +required +(ok|NOT MET|not needed)'
+        Assert-Match $r 'Rows to delete +Space freed'
+        Assert-Match $r 'Nothing was changed'
+        Assert-Match $r '(?m)^ +Report +\S.*report\.html'
         Assert-NoMatch $r 'ROOTS_ELIGIBLE'
         Assert-NoMatch $r 'STEP_START'
+        Assert-NoMatch $r 'STEP_END'
         Assert-NoMatch $r 'RETENTION OPTIONS'
         Assert-NoMatch $r '(?m)^ STEPS'
+        Assert-NoMatch $r '(?m)^ SUMMARY '
         Assert-NoMatch $r '(?m)^EPF_REQ\|'
         Assert-NoMatch $r $script:ChoicesSection
         $run = Get-Run $r 'PREFLIGHT'
@@ -1100,7 +1114,10 @@ function Invoke-Suite {
                                    ' RESULT  (READY|NOT READY)')) {
                 Add-Check ($text -match $pattern) ('console.log contains /' + $pattern + '/')
             }
-            Add-Check ($text -notmatch '(?m)^ SUMMARY ') 'console.log does not contain the summary'
+            Add-Check ($text -notmatch 'Requirement +Needed +Now') 'console.log does not contain the screen''s table'
+            foreach ($file in @('report.txt', 'report.html', 'summary.txt', 'manifest.txt')) {
+                Add-Check (Test-Path -LiteralPath (Join-Path (Join-Path $script:RunsDir $run['folder']) $file)) ($file + ' is in the run folder')
+            }
         }
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
         Assert-Manifest $run 'requirements_ready' '^(Y|N)$'
@@ -1110,23 +1127,23 @@ function Invoke-Suite {
         if ($null -ne $run) { $script:State.PreflightRun = $run['run'] }
     }
 
-    Invoke-Test 'T08B' 'Preflight with questions: choices saved, a dry run follows them' {
+    Invoke-Test 'T08B' 'Preflight with prompts: choices saved with its plan, a dry run follows them' {
         # One day more than the suite's retention: no other purge of the
         # suite has this scope, so none follows these choices.
         $retention = [string]([int]$script:Retention + 1)
         # With these options (and undo tuning, part of every purge) every
-        # requirement is met: the only question is the batch size.
+        # requirement is met: no question is asked, and the choices given are
+        # saved with the preflight and its plan.
         $r = Invoke-Wrapper @('preflight', '--retention', $retention, '--mode', 'LOGS', '--redo-logs',
-                              '--backup', 'none') -Answers @('200') -TimeoutMin 30
+                              '--backup', 'none', '--batch-size', '200') -TimeoutMin 30
         Assert-Exit $r @(0, 2)
         Assert-Match $r $script:ChoicesSection
-        Assert-Match $r 'READY with these choices'
+        Assert-Match $r 'Requirement +Needed +Now'
         Assert-Match $r 'Next    epf_purge.bat purge'
         $saved = ''
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'batch_size' '^200$'
         Assert-Manifest $run 'requirements_ready' '^Y$'
-        Assert-Manifest $run 'step.PREFLIGHT.CHOICES.-' '^DONE'
         Assert-Manifest $run 'plan' '^P-\d+$'
         Assert-Manifest $run 'plan_steps' '^1$'
         if ($null -ne $run) { $saved = $run['run'] }
@@ -1182,7 +1199,7 @@ function Invoke-Suite {
         Assert-Manifest $run 'check.P5' '^(PASS|WARN)'
     }
 
-    Invoke-Test 'T10B' 'Requirements gate: a purge without a backup choice does not start; S stops the preflight questions' {
+    Invoke-Test 'T10B' 'Requirements gate: a purge without a backup choice does not start; no to its questions stops the preflight' {
         # With backup_max_age_h 0 no RMAN backup counts as recent; the
         # original value is put back whatever happens.
         $setting = ''
@@ -1207,12 +1224,14 @@ function Invoke-Suite {
             Assert-Manifest $run 'req.BACKUP' '^NOT_MET\|Y\|'
             Assert-Manifest $run 'requirements_ready' '^N$'
             Assert-Manifest $run 'step.PURGE.PREPARE.-' '^SKIPPED'
-            # The preflight's questions: S at the first one stops; nothing is
-            # saved and the exit code is 3.
-            $r = Invoke-Wrapper @('preflight', '--retention', $script:Retention, '--mode', 'LOGS') -Answers @('S', 'S', 'S') -TimeoutMin 30
+            # The preflight's questions: no to the larger online logs (when
+            # it asks), no to a backup made another way, no to a purge without
+            # a backup: it stops; nothing is saved and the exit code is 3.
+            $r = Invoke-Wrapper @('preflight', '--retention', $script:Retention, '--mode', 'LOGS') -Answers @('N', 'N', 'N', 'N') -TimeoutMin 30
             Assert-Exit $r @(3)
             Assert-Match $r $script:ChoicesSection
-            Assert-Match $r 'Stopped: '
+            Assert-Match $r 'Backup +required +NOT MET'
+            Assert-Match $r 'Stopped: take a backup'
             Assert-NoMatch $r 'Checking again with these choices'
             # A preflight that did not end leaves no plan to follow.
             Assert-Manifest (Get-Run $r 'PREFLIGHT') 'plan_status' '^CLOSED$'
@@ -1244,19 +1263,19 @@ function Invoke-Suite {
                 Assert-Match $s 'Stop requested'
             }
         }
-        # Wizard answers: retention, mode, dry run, compact; in the preflight's
-        # CHOICES the batch size (Enter: the recommendation for 1 GB logs);
-        # final confirmation. --redo-logs, --backup none and undo tuning (part
-        # of every purge, without --undo-tuning) meet the requirements, so no
-        # other question is asked.
-        $answers = @($script:Retention, 'FULL', 'N', 'N', '', 'yes')
+        # Answers: the days of data to keep, then the typed confirmation.
+        # --redo-logs, --backup none and undo tuning (part of every purge,
+        # without --undo-tuning) meet the requirements, so no question is
+        # asked about them; the batch size is the recommendation for 1 GB
+        # logs. The purge is stopped: it does not ask about removing the tool.
+        $answers = @($script:Retention, 'yes')
         $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
         Assert-Exit $r @(3)
         Assert-Match $r 'CHECKING THE DATABASE'
-        # The wizard's preflight asks its questions (here only the batch size)
-        # and checks again with the answers.
+        # The check a purge with prompts begins with takes the recommended
+        # batch size and checks again with it.
         Assert-Match $r $script:ChoicesSection
         Assert-Match $r 'READY with these choices'
         Assert-Match $r 'Recommended batch size with 1 GB online logs'
@@ -1554,9 +1573,9 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T16' 'BANK_STATEMENTS purge through the menu wizard (redo sizing already done)' {
-        # Menu answers: 1 Purge, retention, mode, dry run, compact, batch size (in
-        # the preflight's CHOICES), confirmation.
-        $answers = @('1', $script:Retention, 'FULL', 'N', 'N', '', 'yes')
+        # Menu answers: 2 Purge, the days of data to keep, the typed
+        # confirmation, and no to removing the tool afterwards.
+        $answers = @('2', $script:Retention, 'yes', 'N')
         $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)
@@ -1630,14 +1649,15 @@ function Invoke-Suite {
     Invoke-Test 'T18B' 'Reclaim lab: compaction in place; requirement gate, room making, R1-R9, everything restored' {
         $before = Read-Lab (Invoke-Lab 'CHECK')
         if ($before.RecycleBin -gt 0) {
-            # The recycle-bin object is not confirmed: nothing starts.
-            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA') -TimeoutMin 30
+            # The recycle-bin object is not confirmed: the measurement runs,
+            # the compaction is refused and nothing starts.
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', 'EPF_RT_DATA', '--scratch', 'none') -TimeoutMin 30
             Assert-Exit $r @(1)
             Assert-Match $r 'REQUIREMENTS_NOT_MET'
             Assert-LabSame $before (Read-Lab (Invoke-Lab 'CHECK')) -SameSize
         }
-        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                            -TimeoutMin 60 -StopOnTimeout
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                              '--scratch', 'none') -TimeoutMin 60 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         # Confirmed: the recycle-bin object is purged before the datafile
         # stops growing.
@@ -1688,8 +1708,8 @@ function Invoke-Suite {
         }
         try {
             Set-TestPause 120
-            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', 'none') -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
             Add-Check ((Get-TestPause) -eq '0') 'the compaction set reclaim_test_pause_s back to 0'
         } finally {
             Set-TestPause 0
@@ -1723,8 +1743,8 @@ function Invoke-Suite {
         }
         try {
             Set-TestPause 120
-            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', 'none') -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
             Add-Check ((Get-TestPause) -eq '0') 'the compaction set reclaim_test_pause_s back to 0'
         } finally {
             Set-TestPause 0
@@ -1851,8 +1871,8 @@ function Invoke-Suite {
         }
         try {
             Set-TestPause 120
-            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN') `
-                                -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
+            $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', 'EPF_RT_DATA', '--confirm', 'RECYCLEBIN',
+                                  '--scratch', 'none') -TimeoutMin 60 -OnLine $onLine -StopOnTimeout
         } finally {
             Set-TestPause 0
         }
@@ -1977,7 +1997,7 @@ function Invoke-Suite {
         $q = Invoke-Lab 'QUOTA' -Layout 2
         Assert-Exit $q @(0)
         Assert-Match $q 'LAB\|QUOTA\|DONE'
-        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--yes', '--tablespaces', $spaces) -TimeoutMin 60 -StopOnTimeout
+        $r = Invoke-Wrapper @('reclaim', '--non-interactive', '--tablespaces', $spaces, '--scratch', 'none') -TimeoutMin 60 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         $run = Get-Run $r 'RECLAIM'
         Assert-Manifest $run 'reclaim_mode' '^COMPACT$'

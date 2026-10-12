@@ -93,6 +93,38 @@ function Write-HtmlReport {
     $reportPath = Join-Path $Folder 'report.txt'
     if (Test-Path -LiteralPath $reportPath) { $reportLines = @(Get-Content -LiteralPath $reportPath) }
     $when = ''
+    # What a purge takes on disk while it runs (EPF_DISK lines) and the other
+    # retentions of a dry run or preflight (the rows of RETENTION OPTIONS).
+    $disk = New-Object 'System.Collections.Generic.List[object]'
+    $options = New-Object 'System.Collections.Generic.List[object]'
+    $diskNames = @{ 'UNDO' = 'Undo'; 'TEMP' = 'Temporary space'; 'INDEXES' = 'Temporary indexes'; 'REDO' = 'Online redo logs';
+                    'ARCHIVE' = 'Archived logs' }
+    $inOptions = $false
+    foreach ($line in $reportLines) {
+        if ($line -match '^ RETENTION OPTIONS') {
+            $inOptions = $true
+        } elseif ($line -match '^ [A-Z]') {
+            $inOptions = $false
+        }
+        if ($line -match '^EPF_DISK\|[^|]*\|([A-Z_]+)\|(\d*)\|(\d*)\|(.*)$') {
+            $name = $Matches[1]
+            if ($diskNames.ContainsKey($name)) { $name = $diskNames[$name] }
+            $most = 0.0
+            $more = 0.0
+            $null = [double]::TryParse($Matches[2], [ref]$most)
+            $null = [double]::TryParse($Matches[3], [ref]$more)
+            $disk.Add(@{ Name = $name; Most = $most; More = $more; Where = $Matches[4].Trim() })
+        } elseif ($inOptions -and $line -match '^  ([\d,]+)\s+(\d{4}-\d\d-\d\d)\s+[\d,]+\s+([\d,]+|-)(.*)$') {
+            $days = $Matches[1]
+            $cutoff = $Matches[2]
+            $count = $Matches[3]
+            $rest = $Matches[4]
+            $sizes = @([regex]::Matches($rest, '\d+(?:\.\d+)? [KMGT]?B') | ForEach-Object { $_.Value })
+            $freed = ''
+            if ($sizes.Count -gt 0) { $freed = $sizes[$sizes.Count - 1] }
+            $options.Add(@{ Days = $days; Cutoff = $cutoff; Rows = $count; Freed = $freed; Yours = $rest.Contains('(requested)') })
+        }
+    }
     foreach ($line in $reportLines) {
         if ($line -match '^EPF_CHECK\|[^|]*\|([^|]*)\|[^|]*\|[^|]*\|(.*)$' -and $checks.ContainsKey($Matches[1])) {
             $checks[$Matches[1]].Title = $Matches[2].Trim()
@@ -270,6 +302,26 @@ summary{cursor:pointer;font-weight:600}.foot{color:var(--muted);font-size:.88rem
         foreach ($x in $forecasts) {
             $null = $h.Append('<tr><td>' + $x.Name + '</td><td class="n">' + $x.Rows + '</td><td class="n">' + (ConvertTo-HtmlText $x.Freed) + '</td><td class="n">' + $x.Time +
                               '</td><td class="n">' + (ConvertTo-HtmlText $x.Redo) + '</td><td class="n">' + (ConvertTo-HtmlText $x.Undo) + '</td></tr>')
+        }
+        $null = $h.Append('</tbody></table></div></div>')
+    }
+    if ($disk.Count -gt 0) {
+        $null = $h.Append('<div class="card"><h2>Disk used while the purge runs</h2><div class="tw"><table><thead><tr><th>What</th><th class="n">At most</th><th class="n">More than now</th><th>Where</th></tr></thead><tbody>')
+        $sum = 0.0
+        foreach ($x in $disk) {
+            $sum += $x.More
+            $null = $h.Append('<tr><td>' + $x.Name + '</td><td class="n">' + (Format-HtmlBytes $x.Most) + '</td><td class="n">' + (Format-HtmlBytes $x.More) +
+                              '</td><td>' + (ConvertTo-HtmlText $x.Where) + '</td></tr>')
+        }
+        $null = $h.Append('</tbody></table></div><div class="muted">In all ' + (Format-HtmlBytes $sum) + ' of free space needed next to these files; given back at the end of the purge. ' +
+                          'The datafiles of the tables purged keep their size until a reclaim.</div></div>')
+    }
+    if ($options.Count -gt 1) {
+        $null = $h.Append('<div class="card"><h2>Other retentions</h2><div class="tw"><table><thead><tr><th>Days of data kept</th><th>Rows dated before</th><th class="n">Rows deleted</th><th class="n">Space freed (about)</th></tr></thead><tbody>')
+        foreach ($x in $options) {
+            $mark = ''
+            if ($x.Yours) { $mark = ' (this run)' }
+            $null = $h.Append('<tr><td>' + $x.Days + $mark + '</td><td>' + $x.Cutoff + '</td><td class="n">' + $x.Rows + '</td><td class="n">' + $x.Freed + '</td></tr>')
         }
         $null = $h.Append('</tbody></table></div></div>')
     }
