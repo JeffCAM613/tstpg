@@ -2505,9 +2505,11 @@ function Invoke-SysScript {
 # The database as it is now, for the digest (SYS, read-only): how the
 # instance started, the tool installed and what it left open, the online
 # logs, every datafile and temporary file with its size, and their total: what
-# a listing of the data directory shows. One line saying why when it cannot
-# be read (no configuration, no SYS password at hand, no connection); the
-# digest never asks for a password.
+# a listing of the data directory shows; and what a listing does not, the
+# free space inside each datafile and the step it grows by (a datafile above
+# its segments after a reclaim: free space Oracle added, or data). One line
+# saying why when it cannot be read (no configuration, no SYS password at
+# hand, no connection); the digest never asks for a password.
 function Get-DbState {
     if ($script:Tns -eq '') { return @('-- database now: not read (no test.conf)') }
     if ($script:SysPw -eq '' -or $null -eq $script:SqlPlus) {
@@ -2520,7 +2522,7 @@ function Get-DbState {
         "DECLARE l_v VARCHAR2(100); l_p VARCHAR2(2000); l_s VARCHAR2(10); l_n NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''tool_version''' INTO l_v; EXECUTE IMMEDIATE 'SELECT LISTAGG(item || '' x'' || n, '', '') WITHIN GROUP (ORDER BY item) FROM (SELECT item, COUNT(*) AS n FROM epfpg.epf_instance_change WHERE restored_at IS NULL GROUP BY item)' INTO l_p; EXECUTE IMMEDIATE 'SELECT MAX(value) FROM epfpg.epf_setting WHERE name = ''undo_switch_pfile''' INTO l_s; SELECT COUNT(*) INTO l_n FROM dba_objects WHERE owner = 'EPFPG' AND status <> 'VALID'; DBMS_OUTPUT.PUT_LINE('STATE|db|tool ' || l_v || ', ' || CASE WHEN l_n = 0 THEN 'EPFPG objects valid' ELSE l_n || ' EPFPG objects INVALID' END || ', open change records: ' || NVL(l_p, 'none') || ', undo_switch_pfile ' || NVL(l_s, '-')); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('STATE|db|tool not installed'); END;",
         '/',
         "SELECT 'STATE|log|group ' || l.group# || ' ' || ROUND(l.bytes / 1048576) || ' MB ' || (SELECT LISTAGG(SUBSTR(f.member, GREATEST(INSTR(f.member, '/', -1), INSTR(f.member, '\', -1)) + 1), ' ') WITHIN GROUP (ORDER BY f.member) FROM v`$logfile f WHERE f.group# = l.group#) FROM v`$log l ORDER BY l.group#;",
-        "SELECT 'STATE|file|' || RPAD(tablespace_name, 12) || ' ' || RPAD(SUBSTR(file_name, GREATEST(INSTR(file_name, '/', -1), INSTR(file_name, '\', -1)) + 1), 26) || ' ' || LPAD(ROUND(bytes / 1048576), 8) || ' MB' FROM (SELECT tablespace_name, file_name, bytes, file_id, 1 AS kind FROM dba_data_files UNION ALL SELECT tablespace_name, file_name, bytes, file_id, 2 FROM dba_temp_files) ORDER BY kind, tablespace_name, file_id;",
+        "SELECT 'STATE|file|' || RPAD(tablespace_name, 12) || ' ' || RPAD(SUBSTR(file_name, GREATEST(INSTR(file_name, '/', -1), INSTR(file_name, '\', -1)) + 1), 26) || ' ' || LPAD(ROUND(bytes / 1048576), 8) || ' MB' || CASE WHEN kind = 1 THEN ', ' || ROUND(free_bytes / 1048576) || ' MB free' END || CASE WHEN autoextensible = 'YES' THEN ', grows by ' || ROUND(next_bytes / 1048576) || ' MB' ELSE ', does not grow' END FROM (SELECT d.tablespace_name, d.file_name, d.bytes, d.file_id, 1 AS kind, d.autoextensible, d.increment_by * d.bytes / NULLIF(d.blocks, 0) AS next_bytes, (SELECT NVL(SUM(f.bytes), 0) FROM dba_free_space f WHERE f.file_id = d.file_id) AS free_bytes FROM dba_data_files d UNION ALL SELECT t.tablespace_name, t.file_name, t.bytes, t.file_id, 2, t.autoextensible, t.increment_by * t.bytes / NULLIF(t.blocks, 0), NULL FROM dba_temp_files t) ORDER BY kind, tablespace_name, file_id;",
         "SELECT 'STATE|db|total ' || ROUND(((SELECT SUM(bytes) FROM dba_data_files) + (SELECT NVL(SUM(bytes), 0) FROM dba_temp_files) + (SELECT SUM(bytes * members) FROM v`$log) + (SELECT NVL(SUM(block_size * file_size_blks), 0) FROM v`$controlfile)) / 1073741824, 2) || ' GB in datafiles, temporary files, online logs and control files' FROM dual;",
         'EXIT')
     $answer = @()

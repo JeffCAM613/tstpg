@@ -1925,7 +1925,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                     FROM epf_event
                    WHERE run_id = g_run.run_id AND event_code = 'DISK_PEAK'
                    ORDER BY event_id) LOOP
-            put('  On disk: ' || e.message);
+            put('  On disk: ' || REPLACE(e.message, ' on disk during the run', ' during the run'));
         END LOOP;
         put('  Tables: tables that move with their LOB segments; Indexes: released and rebuilt; Pins: segments that '
             || 'stay (a datafile cannot shrink below the highest of them).');

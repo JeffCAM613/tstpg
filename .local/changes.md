@@ -2,6 +2,22 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-12 - Q9 on EPFPG782 (0.9.2, its first run on a database): a reclaim with scratch space on a compact tablespace parks nothing; DATA is 1.7 GB larger again minutes after each reclaim; the digest shows the free space in each datafile
+
+The digest of Q9 (TQ9.log, generated 15:18; the new digest: summary lines, the reclaim's datafiles, "database now").
+- **0.9.2 compiles:** `tool 0.9.2, EPFPG objects valid`.
+- **Q9, the reclaim with 22.5 GB of scratch space allowed** (R-000061, 10 min 32 s, PASS WITH WARNINGS: PUBLIC_DML): R1 to R9 PASS, R7 PASS (32.7 GB for 32.6 GB of segments). **Nothing parked, no table moved:** `FILE_DONE data.dbf stops at 23.6 GB: its highest block belongs to OPPAYMENTS.WEB_LOG (0 B free below: parking it would not make DATA smaller)`. The compaction took 0 s; the 10 minutes are the 969 indexes released and rebuilt (9 min 27 s, log switch waits 00:00:00). `DISK_PEAK at most 34.4 GB on disk during the run (its size at the start)`. On 0.9.1 this run would have filled the scratch space.
+- The steps COMPACT and REBUILD_INDEXES end with their log switch waits (none); RETURN_PARKED says them when tables came back.
+- **DATA 1.7 GB larger again after each reclaim.** Q7 ended at 32.7 GB (12:53); Q9 found it at 34.4 GB (14:50) and ended at 32.7 GB again (15:00:59); at 15:18 the file was 35,215 MB, 34.4 GB again. Nothing of the tool ran in between but the digest (read-only). Twice the same size, about 5% above the end; after set N, 15.7 GB had become 16.55 GB, also about 5%. The likely cause is Oracle itself: a datafile that can grow is extended in the background (the space management coordinator, SMCO) once its tablespace has less than about 5% free, and a reclaim leaves none. To confirm: the free space of DATA now (about 1.7 GB free means it is that, not data). So the size a reclaim reports at its end is not where an autoextensible datafile stays: Oracle adds about 5% of free space back within minutes.
+- Still as the purge on 0.9.1 left it: the undo datafile at 4,096 MB (610 MB before; SIZE_UNDO open, undo_switch_pfile N). TEMP 3,032 MB: as after set N, no open record of the tool.
+- The pasted text skips from 10:31 to 12:06 (the end of Q6 and the start of Q7, which TQ.log has) and its columns are single-spaced: lost in the copy, not by the digest (logs\digest.txt has all of it).
+
+Changes (test suite and report wording; tool version stays 0.9.2):
+- The digest's "database now": each datafile with its free space and the step it grows by ("DATA data.dbf 35215 MB, 1730 MB free, grows by 100 MB"), each temporary file with its step.
+- The report's `On disk:` line no longer says "on disk" twice.
+
+How to test: `run_tests.bat --digest` again on EPFPG782 (Q10) shows DATA's free space. Q10 also gives back the undo the purge left: setting undo_switch_pfile Y, then `run_tests.bat --sys undo.sql SWITCH`, the first run of `--sys` and of the switch on a database started from a pfile.
+
 ## 2026-10-12 - Set Q on EPFPG782 (a light purge of SONEPARUAT, run on 0.9.1): the reclaim with scratch space held 46.1 GB on disk for a tablespace of 36.8 GB; parking that ends when it gains nothing, the scratch datafile shrinking on the way back, the peak on disk reported (0.9.2, fourth commit)
 
 The digest of set Q (TQ.log, session 2026-10-12_090147_EPFPG782). It ran on 0.9.1: 0.9.2 was not pushed yet, so the digest is the earlier one (no summary lines, no "database now", no roots per year in T01) and the undo switch was skipped on this copy started from a pfile. The cutoff was 2016-05-10 (given by the user; this digest does not show it).
