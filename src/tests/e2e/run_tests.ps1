@@ -2168,7 +2168,7 @@ function Format-Placement {
 # line (the ones that did not pass, and R7 and R8, with their detail), and its
 # key events, one line each; a move (UNIT_MOVED) with its placement
 # (MOVE_PLACEMENT). Of the moves, the first 10 and the last 40 when there are
-# more. $Brief (a run of a test that passed): of the events only where each
+# more than 60 (leaving out fewer than 10 lines saves nothing). $Brief (a run of a test that passed): of the events only where each
 # datafile stopped, the result per tablespace, a stop, warnings and errors.
 function Add-DigestRun {
     param($Out, [string]$Folder, [string]$Test, [bool]$Brief = $false)
@@ -2405,7 +2405,7 @@ function Add-DigestRun {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($isMove[$i]) {
             $seen++
-            if ($moves -gt 50 -and $seen -gt 10 -and $seen -le $moves - 40) { $skipped++; continue }
+            if ($moves -gt 60 -and $seen -gt 10 -and $seen -le $moves - 40) { $skipped++; continue }
         }
         if ($skipped -gt 0) { $Out.Add(' ... ' + $skipped + ' more lines of moves in console.log'); $skipped = 0 }
         $Out.Add(' ' + $lines[$i])

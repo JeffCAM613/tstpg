@@ -2,6 +2,25 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - Set U on EPFPG784 (RFS6528, a fourth source, 0.9.2): 36 of 36; DATA 50.1 to 15.5 GB in 11 min 55 s with 3.7 GB of scratch space; R7 WARN, 0.8 GB left by the index rebuilds
+
+The digest of set U (TU.log, session 2026-10-12_163935_EPFPG784, generated 18:20) and the listing of the data directory, which the digest's "database now" matches to the megabyte (data.dbf 15,916 MB, 21.87 GB in all).
+- **U2, U3, the suite on 0.9.2:** 36 of 36 in 1 h 1 min 38 s. T01: logs 3 x 150 MB, a pfile; OP 15,579 MB, OPPAYMENTS 32,959 MB (48.5 GB of application data, more than SONEPARUAT's 40.5 GB); the roots per year of the five root tables (117,335 bulk payments, dated 2018 to 2024). T13: PAYMENTS 10,057,792 rows in 3 min 59 s, batches 3 min 30 s (20.9 us per row), no log switch waits with 4 x 1 GB; **the undo switch ran inside the suite** (475 MB before and after), on a database started from a pfile. T18D, T18I: marked for kill first (ORA-00031). T18J, T18K: the restore waited for the worker's call.
+- **T18H on 0.9.2:** RT_TOP parked (104 MB), then `FILE_DONE ... (100.4 MB free below, which the 104.0 MB parked take when they come back: parking more would not make EPF_RT_DATA smaller)`; back with 12.3 MB of growth; 216.0 MB for 207.6 MB of segments, 6 of 6 moved. DISK_PEAK 469.0 MB (341.0 MB and 128.0 MB in the scratch tablespace), the moment the table was copied.
+- **U4, the dry run** (R-000093, 29 s): DATA 50.1 GB in one datafile, highest block at 47.7 GB, 21.8 GB of segments; 738 tables move (15.8 GB, about 10.3 GB after), 1000 indexes (6.0 GB); forecast 16.3 GB; scratch size suggested 8448M; READY. The schema of the CLUBMED copies (738 tables, 1000 indexes).
+- **U5, the reclaim** (R-000094, 11 min 55 s, PASS WITH WARNINGS: R7): **DATA 50.1 to 15.5 GB (34.6 GB given back), 14.7 GB of segments.** R1 to R6, R8, R9 PASS; 45 tables moved, 30 parked.
+  - The purge had emptied the large LOB tables (OPPAYMENTS.DIRECTORY_DISPATCHING, FILE_DISPATCHING, TRANSMISSION_EXECUTION_AUDIT: 1.3 to 1.7 GB each down to 192 KB); their copies came back to the top and were parked in a second each, which took DATA from 47.7 to 15.7 GB in 8 seconds.
+  - **Parking ended where it gains nothing** (D26, its first run on application data): with 3.7 GB parked, the tables with free space inside them that fit moved first (MAKING_ROOM "... parking it would not make DATA smaller", 15 tables), then `FILE_DONE data.dbf stops at 9.4 GB ... (3.7 GB free below, which the 3.7 GB parked take when they come back)`. The 30 came back in 54 s, the last parked first, into that free space: DATA grew by 155 MB only (9.4 to 9.6 GB). Scratch space: 3.7 GB of the 8.3 GB allowed (set M, the same kind of data on 0.8.3: 8.0 GB, full).
+  - `DISK_PEAK at most 50.1 GB on disk during the run (its size at the start)`. No log switch waits in any step.
+  - **R7 WARN, 15.5 GB for 14.7 GB:** the datafile grew once by 5.9 GB for the 1000 index rebuilds (estimated at 5.7 GB plus the largest once more), the rebuilds took less and one ended at the top of the file: 822 MB free below it, which the last resize cannot give back. Not from the compaction, which left the tables within 0.2 GB of their size.
+  - Oracle added nothing afterwards: 15,916 MB with 822 MB free at 18:20 and the same at 18:35. With about 5% free already, the datafile is not extended (set Q: 0 free, then 1.7 GB added). So the 0.8 GB is what the file would hold a few minutes later in any case.
+- Left as designed: the undo datafile at 865 MB (475 MB before): the later purges of the suite grew it by 390 MB, under the 1 GB from which a purge switches. TEMP 3,502 MB, no open record.
+- Durations and rates: PLAN.md 12.8 and the page (suite, dry run, reclaim step by step; 20.9 us per row; index rebuilds 0.7 to 0.8 GB a minute; the reclaim's estimate 11 min against 11 min 55 s).
+
+Open question for the user: R7 allows max(1 %, 256 MB) above the segments; an autoextensible datafile settles about 5% above them by Oracle's own doing. Either R7 allows 5%, or the index rebuilds grow the file in smaller steps (the free space then stays small and the file ends tight, at the price of more resizes).
+
+Changes (test suite only): the digest leaves lines of moves out only beyond 60 (it left out one of 51).
+
 ## 2026-10-12 - Q10 again on EPFPG782: the undo switch on a database started from a pfile gives back 3.4 GB; the new digest lines on a real session
 
 The digest of 16:31 (TQ10.log, replaced) and the listing of the data directory.
