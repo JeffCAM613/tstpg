@@ -1762,6 +1762,8 @@ function Invoke-Suite {
         Assert-Match $r 'UNIT_PARKED +EPF_RT\.RT_TOP'
         Assert-Match $r 'UNIT_RETURNED +EPF_RT\.RT_TOP'
         Assert-Match $r 'SCRATCH_DROPPED +EPF_PARK_\d+'
+        # The most the run held on disk, its scratch tablespace included.
+        Assert-Match $r 'DISK_PEAK +at most \S+ \S+ on disk during the run'
         $run = Get-Run $r 'RECLAIM'
         Assert-Manifest $run 'status' '^(SUCCESS|WARNING)$'
         foreach ($check in @('R1', 'R2', 'R3', 'R4', 'R9')) { Assert-Manifest $run ('check.' + $check) '^PASS' }
@@ -2090,7 +2092,7 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
                           'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
-                          'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT')
+                          'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK')
 $script:DigestPurge = @('MODULE_END', 'DISK_USE', 'REDO_WAITS', 'STOP_HONORED')
 # The wrapper's lines that say why a run failed (Add-DigestRun): errors of
 # its sessions, lost connections, the monitor, an early end and its restore.
@@ -2238,7 +2240,7 @@ function Add-DigestRun {
     if ([string]$manifest['action'] -eq 'PURGE') { $codes = $script:DigestPurge }
     if ($Brief) {
         $codes = @('FILE_DONE', 'RECLAIM_RESULT', 'STOP_HONORED', 'UNIT_PARKED', 'UNIT_RETURNED', 'PARK_FAILED',
-                   'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'RETURN_GREW', 'RETURN_FAILED', 'SCRATCH_KEPT')
+                   'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'RETURN_GREW', 'RETURN_FAILED', 'SCRATCH_KEPT', 'DISK_PEAK')
     }
     # The key events as entries: a move with its placement; a run of growths
     # of one datafile as one; a room making said again left out.

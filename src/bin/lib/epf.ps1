@@ -976,7 +976,7 @@ $script:MilestoneEvents = @('PURGE_SCOPE', 'PLAN', 'PLAN_STEP', 'REQUIREMENTS', 
                             'UNDO_RETENTION_RESTORED', 'UNDO_GROWTH_RESTORED', 'TS_ASSESSED', 'NO_TARGET',
                             'ACCOUNT_LOCKED', 'ACCOUNT_UNLOCKED', 'INDEXES_RELEASED', 'RECYCLEBIN_PURGED',
                             'SCRATCH_CREATED', 'SCRATCH_DROPPED', 'UNIT_PARKED', 'UNIT_RETURNED', 'COMPACT_DONE',
-                            'FILE_DONE', 'FILE_RESIZED', 'RECLAIM_RESULT', 'WORKER_RUNNING', 'WORKER_ENDED')
+                            'FILE_DONE', 'FILE_RESIZED', 'RECLAIM_RESULT', 'DISK_PEAK', 'WORKER_RUNNING', 'WORKER_ENDED')
 
 # EV|event_id|HH24:MI:SS|severity|phase|event_code|owner.object|message
 function Show-Event {
@@ -2166,6 +2166,8 @@ function Get-ReclaimLines {
         }
         $out.Add($line)
     }
+    # The most a compaction held on disk, its scratch tablespace included.
+    if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { $out.Add('  ' + 'On disk'.PadRight(22) + ' ' + $Matches[1]) }
     return ,$out.ToArray()
 }
 

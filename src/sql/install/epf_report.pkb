@@ -1920,6 +1920,13 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 || r(' ', 7) || r(b(l_fc), 12) || r(CASE WHEN l_ended THEN b(l_end) END, 12) || r(' ', 12)
                 || r(CASE WHEN l_ended THEN b(GREATEST(l_start - l_end, 0)) END, 12));
         END IF;
+        -- The most a compaction held on disk, its scratch tablespace included.
+        FOR e IN (SELECT message
+                    FROM epf_event
+                   WHERE run_id = g_run.run_id AND event_code = 'DISK_PEAK'
+                   ORDER BY event_id) LOOP
+            put('  On disk: ' || e.message);
+        END LOOP;
         put('  Tables: tables that move with their LOB segments; Indexes: released and rebuilt; Pins: segments that '
             || 'stay (a datafile cannot shrink below the highest of them).');
         FOR t IN (SELECT tablespace_name, status, start_bytes, end_bytes, peak_bytes, est_final_bytes, unit_count,

@@ -53,6 +53,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     g_park_ts    VARCHAR2(128);
     g_park_off   VARCHAR2(1000);
     g_park_first BOOLEAN := FALSE;
+    -- Parking stops once compacting further could give back less than this
+    -- share of the tablespace (left_to_gain).
+    c_park_gain  CONSTANT NUMBER := 0.01;
+    -- The most the datafiles of the run's tablespaces and of its scratch
+    -- tablespace held together, and what made it up (track_disk; DISK_PEAK
+    -- at the end of a compaction).
+    g_disk_peak  NUMBER := 0;
+    g_disk_text  VARCHAR2(400);
 
     -- Fingerprints of the objects a compaction may affect, read once the
     -- accounts are locked and before any object changes (baseline), and again
@@ -238,6 +246,60 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     ELSE 64 * c_mb END;
     END extent_for;
 
+    -- Seconds this session has waited for log switches so far ('log file
+    -- switch (checkpoint incomplete)' and the like): a move writes redo, and
+    -- a full online log can be reused only once Oracle has checkpointed it.
+    -- NULL when it cannot be read.
+    FUNCTION switch_wait RETURN NUMBER IS
+        l_micro NUMBER;
+    BEGIN
+        EXECUTE IMMEDIATE q'[SELECT NVL(SUM(time_waited_micro), 0) FROM v$session_event
+                              WHERE sid = SYS_CONTEXT('USERENV', 'SID') AND event LIKE 'log file switch%']'
+            INTO l_micro;
+        RETURN l_micro / 1000000;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END switch_wait;
+
+    -- The end of a step's message that says how long the session waited for
+    -- log switches since p_from (switch_wait at the start of the step); NULL
+    -- when the waits cannot be read.
+    FUNCTION waits_since(p_from IN NUMBER) RETURN VARCHAR2 IS
+        l_now NUMBER := switch_wait;
+    BEGIN
+        IF l_now IS NULL OR p_from IS NULL THEN
+            RETURN NULL;
+        END IF;
+        RETURN '; log switch waits ' || epfpg.epf_util.fmt_duration(GREATEST(l_now - p_from, 0));
+    END waits_since;
+
+    -- The datafiles of the run's tablespaces and of its scratch tablespace
+    -- together, now: the largest total of the run is kept with what made it
+    -- up (DISK_PEAK at the end of a compaction). Called where the total is
+    -- at its highest: a table just copied to the scratch tablespace and not
+    -- yet released where it was, a datafile just grown, a table just back.
+    PROCEDURE track_disk IS
+        l_data    NUMBER;
+        l_scratch NUMBER := 0;
+    BEGIN
+        SELECT NVL(SUM(d.bytes), 0)
+          INTO l_data
+          FROM dba_data_files d
+         WHERE d.tablespace_name IN (SELECT t.tablespace_name
+                                       FROM epfpg.epf_reclaim_ts t
+                                      WHERE t.run_id = g_run.run_id);
+        IF g_park_ts IS NOT NULL THEN
+            l_scratch := ts_bytes(g_park_ts);
+        END IF;
+        IF l_data + l_scratch > g_disk_peak THEN
+            g_disk_peak := l_data + l_scratch;
+            g_disk_text := b(l_data) || ' in its tablespaces'
+                           || CASE WHEN l_scratch > 0 THEN ' and ' || b(l_scratch) || ' in ' || g_park_ts END
+                           || ', at ' || TO_CHAR(epfpg.epf_util.now_ts, 'HH24:MI:SS');
+        END IF;
+    END track_disk;
+
     -- Records the largest size tablespace p_ts reached during the run.
     PROCEDURE track_peak(p_ts IN VARCHAR2) IS
         l_now NUMBER := ts_bytes(p_ts);
@@ -246,6 +308,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
            SET peak_bytes = GREATEST(NVL(peak_bytes, 0), l_now)
          WHERE run_id = g_run.run_id AND tablespace_name = p_ts;
         COMMIT;
+        track_disk;
     END track_peak;
 
     -- Resizes every datafile of p_ts down to the end of its highest extent
@@ -1839,7 +1902,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             add_opt('SCRATCH', 'SIZE', 1, g_scratch > 0, 'Allow scratch space for the run',
                     '--scratch SIZE, for example --scratch ' || TRIM(TO_CHAR(l_suggest / c_mb)) || 'M (the largest table '
                     || 'that moves and half of all that moves, plus a tenth); free disk for it next to ' || l_first
-                    || '''s first datafile');
+                    || '''s first datafile. A limit: the scratch datafile holds only what is parked, parking ends once '
+                    || 'it would not make the tablespace smaller, and the file shrinks as the tables come back');
         END IF;
         COMMIT;
     END check_requirements;
@@ -2793,6 +2857,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         say(epfpg.epf_log.c_info, 'SCRATCH_CREATED',
             l_name || ': ' || NVL(l_file, 'an Oracle managed file') || ', ' || b(l_size) || ', up to ' || b(l_max)
             || ', for the tables parked while their tablespaces are compacted; dropped at the end');
+        track_disk;
         RETURN TRUE;
     END open_scratch;
 
@@ -2978,6 +3043,9 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     || ' [' || l_sql || ']', p_owner => l_owner, p_object => l_table, p_ora => ABS(l_code));
                 RETURN FALSE;
         END;
+        -- Its copy is in the scratch tablespace and the datafiles it left are
+        -- not resized yet: the most the two hold together.
+        track_disk;
         refresh_item(p_item, l_owner, l_table, l_new);
         l_names := unit_segments(l_owner, l_table);
         SELECT NVL(SUM(s.bytes), 0)
@@ -3222,9 +3290,14 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- Step RETURN_PARKED, first of the restore path: every table a reclaim
     -- parked and did not move back yet, this run's and an earlier one's,
     -- moves back (return_unit), then the scratch tablespaces left empty are
-    -- dropped (drop_scratch). p_count returns the tables moved back, p_failed
-    -- those still parked.
+    -- dropped (drop_scratch). The last one parked comes back first: it lies
+    -- at the end of the scratch datafile, which is resized down after each
+    -- table, so that the scratch datafile shrinks while the datafiles the
+    -- tables come back to grow, and the two never hold more on disk together
+    -- than when the last table was parked. p_count returns the tables moved
+    -- back, p_failed those still parked.
     PROCEDURE return_parked(p_count OUT PLS_INTEGER, p_failed OUT PLS_INTEGER) IS
+        l_freed NUMBER;
     BEGIN
         p_count := 0;
         p_failed := 0;
@@ -3232,9 +3305,16 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                     FROM epfpg.epf_reclaim_park
                    WHERE returned_at IS NULL
                    GROUP BY run_id, item_id, owner, table_name
-                   ORDER BY run_id, item_id) LOOP
+                   ORDER BY run_id, MAX(parked_at) DESC, item_id DESC) LOOP
             IF return_unit(u.run_id, u.item_id, u.owner, u.table_name, u.park_ts) THEN
                 p_count := p_count + 1;
+                BEGIN
+                    l_freed := trim_ts(u.park_ts, 0, FALSE);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        -- The scratch datafile keeps its size until it is dropped.
+                        NULL;
+                END;
             ELSE
                 p_failed := p_failed + 1;
             END IF;
@@ -3303,6 +3383,45 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         RETURN g_stopped;
     END stop_now;
 
+    -- Bytes of the tables of p_ts parked now, which come back to it.
+    FUNCTION parked_from(p_ts IN VARCHAR2) RETURN NUMBER IS
+        l_bytes NUMBER;
+    BEGIN
+        SELECT NVL(SUM(after_bytes), 0)
+          INTO l_bytes
+          FROM epfpg.epf_reclaim_object
+         WHERE run_id = g_run.run_id AND unit_type IN ('TABLE', 'IOT') AND source_ts = p_ts AND move_status = 'PARKED';
+        RETURN l_bytes;
+    END parked_from;
+
+    -- What compacting p_ts further can still give back, with p_free free in
+    -- it, p_back parked that comes back to it and unit p_top at the top of a
+    -- datafile: the free space beyond what the parked tables take on their
+    -- way back, plus the free space inside p_top and inside the tables not
+    -- moved yet that are too large to move within p_free (the ones that fit
+    -- move there first, room_maker). The free space inside a table counts
+    -- from a tenth of the table, as for room_maker, or from c_park_gain of
+    -- the tablespace: estimates a little below the size of many tables do
+    -- not add up to a gain. The parked tables fill the free space when they
+    -- come back: with less free than parked, the datafiles end at the size
+    -- of their tables whatever else is emptied from the top.
+    FUNCTION left_to_gain(p_ts IN VARCHAR2, p_free IN NUMBER, p_back IN NUMBER, p_top IN NUMBER) RETURN NUMBER IS
+        l_inside NUMBER;
+        l_min    NUMBER := c_park_gain * ts_bytes(p_ts);
+    BEGIN
+        SELECT NVL(SUM(CASE WHEN (u.item_id = p_top OR u.est > p_free)
+                                 AND u.bytes - u.est >= GREATEST(c_mb, LEAST(0.1 * u.bytes, l_min))
+                            THEN u.bytes - u.est END), 0)
+          INTO l_inside
+          FROM (SELECT i.item_id, SUM(i.bytes) AS bytes, SUM(NVL(i.est_bytes, i.bytes)) AS est
+                  FROM epfpg.epf_ts_inventory i
+                  JOIN epfpg.epf_reclaim_object o ON o.run_id = i.run_id AND o.item_id = i.item_id
+                 WHERE i.run_id = g_run.run_id AND i.tablespace_name = p_ts AND i.handler = 'MOVE'
+                   AND o.unit_type IN ('TABLE', 'IOT') AND o.move_status IN ('PENDING', 'STAYED')
+                 GROUP BY i.item_id) u;
+        RETURN GREATEST(p_free - p_back, 0) + l_inside;
+    END left_to_gain;
+
     -- Compacts tablespace p_ts (step COMPACT, scope p_ts): the unit holding
     -- the highest block of a datafile moves down, until every datafile stops
     -- or a stop is requested. When it does not fit in the free space, the
@@ -3314,7 +3433,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- when the scratch space allows, otherwise room is made for it once more
     -- and it moves again when it fits in the free space as it is, or its
     -- datafile is done. With setting reclaim_test_park (tests only) the first
-    -- unit picked is parked. A stop request is honored before every move.
+    -- unit picked is parked. With scratch space, the compaction of a datafile
+    -- also ends once more of it would give back less than c_park_gain of the
+    -- tablespace (left_to_gain): the parked tables take the free space when
+    -- they come back, so parking or moving what holds the top would only
+    -- write it twice; the tables with free space inside them that fit below
+    -- still move first. A stop request is honored before every move.
     -- Units not reached are STAYED (below a segment that stays), or SKIPPED
     -- after a stop request; parked units wait for the restore path.
     PROCEDURE compact_ts(p_ts IN VARCHAR2) IS
@@ -3324,6 +3448,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_maker  NUMBER;
         l_need   NUMBER;
         l_free   NUMBER;
+        l_back   NUMBER;
+        l_waits  NUMBER := switch_wait;
         l_target NUMBER;
         l_units  NUMBER;
         l_bytes  NUMBER;
@@ -3360,6 +3486,29 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             IF g_park_first THEN
                 g_park_first := FALSE;
                 CONTINUE WHEN park_unit(p_ts, l_item, 'the first table picked (setting reclaim_test_park)');
+            END IF;
+            -- With scratch space, when the unit would be parked or tables
+            -- are parked already: nothing left to gain ends its datafile.
+            l_back := parked_from(p_ts);
+            IF NVL(g_scratch, 0) > 0 AND g_park_off IS NULL
+               AND (l_back > 0 OR l_was = 'MOVED' OR l_need > l_free)
+               AND left_to_gain(p_ts, l_free, l_back, l_item) < c_park_gain * ts_bytes(p_ts) THEN
+                l_maker := room_maker(p_ts, l_free, l_item);
+                IF l_maker IS NOT NULL THEN
+                    say(epfpg.epf_log.c_info, 'MAKING_ROOM',
+                        l_owner || '.' || l_name || ' holds the top of ' || p_ts || ' and parking it would not make '
+                        || p_ts || ' smaller: a table with free space inside it moves first');
+                    move_unit(p_ts, l_maker, NULL);
+                    CONTINUE;
+                END IF;
+                l_why := b(l_free) || ' free below'
+                         || CASE WHEN l_back > 0
+                                 THEN ', which the ' || b(l_back) || ' parked take when they come back: parking more'
+                                 ELSE ': parking it' END
+                         || ' would not make ' || p_ts || ' smaller';
+                l_done(l_file) := TRUE;
+                file_done(l_file, l_owner, l_name, l_why);
+                CONTINUE;
             END IF;
             IF l_was = 'MOVED' THEN
                 -- Its copy came back to the top.
@@ -3440,7 +3589,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                                                    END || '; datafiles ' || b(l_start) || ' -> ' || b(ts_bytes(p_ts))
                                                 || ' before the indexes are rebuilt');
         epfpg.epf_log.step_end('DONE', l_moved || ' of ' || l_units || ' tables moved'
-                                       || CASE WHEN l_parked > 0 THEN ', ' || l_parked || ' parked' END);
+                                       || CASE WHEN l_parked > 0 THEN ', ' || l_parked || ' parked' END
+                                       || waits_since(l_waits));
     END compact_ts;
 
     -- ------------------------------------------------------------------
@@ -3826,6 +3976,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
     -- events; datafiles at POST_RECLAIM.
     PROCEDURE finish_ts IS
         l_end    NUMBER;
+        l_first  NUMBER;
+        l_last   NUMBER;
         l_hwm    NUMBER;
         l_seg    NUMBER;
         l_moved  NUMBER;
@@ -3863,6 +4015,19 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
                 || ' of ' || l_units || ' tables moved',
                 p_bytes => t.start_bytes - l_end);
         END LOOP;
+        -- The most a compaction held on disk: its tablespaces and its scratch
+        -- tablespace together (a restore alone did not see the compaction).
+        SELECT NVL(SUM(start_bytes), 0), NVL(SUM(end_bytes), 0)
+          INTO l_first, l_last
+          FROM epfpg.epf_reclaim_ts
+         WHERE run_id = g_run.run_id;
+        IF g_mode = 'COMPACT' AND l_first > 0 THEN
+            say(epfpg.epf_log.c_info, 'DISK_PEAK',
+                'at most ' || b(GREATEST(g_disk_peak, l_first)) || ' on disk during the run'
+                || CASE WHEN g_disk_peak > l_first THEN ' (' || g_disk_text || ')' ELSE ' (its size at the start)' END
+                || '; ' || b(l_first) || ' at the start, ' || b(l_last) || ' at the end',
+                p_bytes => GREATEST(g_disk_peak, l_first));
+        END IF;
     END finish_ts;
 
     -- The restore path, run whenever the run changed something and also for
@@ -3879,6 +4044,7 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         l_failed   PLS_INTEGER;
         l_message  VARCHAR2(400);
         l_baseline NUMBER;
+        l_waits    NUMBER;
         l_why      VARCHAR2(100) := CASE WHEN g_stopped THEN 'not moved: stop requested'
                                        WHEN g_mode = 'RESTORE' THEN 'not moved: the compaction was interrupted'
                                        ELSE 'not moved: the compaction ended after an error' END;
@@ -3889,10 +4055,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         COMMIT;
         BEGIN
             epfpg.epf_log.step_start('RETURN_PARKED');
+            l_waits := switch_wait;
             return_parked(l_count, l_failed);
             epfpg.epf_log.step_end(CASE WHEN l_failed > 0 THEN 'FAILED' ELSE 'DONE' END,
                                    l_count || ' parked tables moved back'
-                                   || CASE WHEN l_failed > 0 THEN ', ' || l_failed || ' still parked' END);
+                                   || CASE WHEN l_failed > 0 THEN ', ' || l_failed || ' still parked' END
+                                   || CASE WHEN l_count > 0 THEN waits_since(l_waits) END);
         EXCEPTION
             WHEN OTHERS THEN
                 fail_step(SQLCODE, SQLERRM, DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
@@ -3903,10 +4071,12 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
             IF p_adopt THEN
                 add_pending_indexes;
             END IF;
+            l_waits := switch_wait;
             rebuild_indexes(l_count, l_failed);
             epfpg.epf_log.step_end(CASE WHEN l_failed > 0 THEN 'FAILED' ELSE 'DONE' END,
                                    l_count || ' indexes rebuilt' || CASE WHEN l_failed > 0 THEN ', ' || l_failed
-                                                                                               || ' failed' END);
+                                                                                               || ' failed' END
+                                   || CASE WHEN l_count > 0 THEN waits_since(l_waits) END);
         EXCEPTION
             WHEN OTHERS THEN
                 fail_step(SQLCODE, SQLERRM, DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
@@ -4224,6 +4394,8 @@ CREATE OR REPLACE PACKAGE BODY epf_reclaim AS
         g_parked := 0;
         g_park_ts := NULL;
         g_park_off := NULL;
+        g_disk_peak := 0;
+        g_disk_text := NULL;
         epfpg.epf_log.set_phase(c_phase);
         EXECUTE IMMEDIATE 'ALTER SESSION SET ddl_lock_timeout = '
                           || TO_CHAR(TRUNC(NVL(epfpg.epf_util.setting_num('ddl_lock_timeout_s'), 30)));
