@@ -2,6 +2,33 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.6: the screen of a real purge on TANM7883 read line by line; --reclaim answered with the command to type
+
+Why: the user, after a purge that was not a dry run (R-000004 on TANM7883, 0.9.5): "I cant ever run reclaim even after a non dry run purge", with the screen of the purge and of `src\bin\epf_purge.bat purge --reclaim --dry-run`, which answered "--reclaim is not available in this version: run epf_purge.bat reclaim after the purge." The reclaim is the command `epf_purge.bat reclaim`; the answer read as if something were still missing. The pasted screen also showed faults the replays had not, because the stand-in did not print what the engine prints there.
+
+The wrapper (epf.ps1):
+- `--reclaim` (the option of the previous tool) now answers with the command to type: `epf_purge.bat reclaim`, or `epf_purge.bat reclaim --dry-run` when `--dry-run` was given. Exit 4 as before.
+- Show-Ready: when the checks counted the top-level records and none is old enough, the sentence before the typed yes says that there is nothing to purge (an earlier purge may have taken them) in place of "This deletes everything dated before".
+- The line "Plan P-... is done: every step ran." is kept for a plan of several runs and for `--verbose`; a purge in one run does not mention its plan.
+
+The screen (epf_screen.ps1):
+- Show-SysResult took the last line of undo.sql APPLY for an error, because it names one ("UNDO_APPLIED  Undo tuning is active until undo_restore: long queries of other sessions may fail with ORA-01555 meanwhile"), and showed it in red with its code. A line of the step that begins with its code is no longer an error; UNDO_APPLIED is among the events the step says itself (one line: "undo kept 60 s ...").
+- The compaction of a purge has no scope: its line began with " : ". It is now "25 tables compacted, 0 skipped" with its time (a reclaim keeps "DATA: ...").
+- PLAN_STEP "step 1 of 1 done; the plan is done" is not shown.
+- The end of a purge: with no row deleted and no failed check it says "Nothing to purge: no row dated before <day> was found", then that the space an earlier purge freed is still inside the tables and that a reclaim gives it back. The space freed is read from P7 as the engine prints it ("used A -> B, freed C"): the screen expected the stand-in's wording and never showed the figure on a database. The hint before the command ends with "To see how much:".
+- "Good to know": a check that passes with a note says what the note means before what it measured ($script:CheckSays: P1, P2, P4, P7, P8, R7, R8). P4 was shown as "Orphans on registry links: 21 links (13 by FK, 8 scanned)", which reads as if the purge had left orphans; it is a note only when orphans existed before the purge and it added none, and says so. The time waiting for the online logs is said only when the engine says larger logs would save some of it.
+- A note longer than the window is wrapped by the tool, never by the console.
+
+Not explained: the pasted screen repeats the lines of step 2 three times. The wrapper writes each of them once. The line taken for an error was wider than a window of 120 columns and sat right above the line rewritten in place; with it gone and notes wrapped, the cause may be gone too. To be watched on the next run.
+
+Not explained either: that purge deleted nothing (its checks passed, so nothing old enough was left). The digest of 08:16 shows every root still there, so either an earlier purge ran in between or this one found nothing it should have found. The digest of the runs since 08:16 tells which.
+
+The stand-in and the replays, so that these are seen offline: undo.sql APPLY prints UNDO_APPLIED and the run logs it; the purge logs PLAN_STEP; the checks of the reports have the engine's titles and values (P1 "0 in 25 tables", P2 "Processed = eligible at start", P3 "Retention safety", P4 "Orphans on registry links", P6 "N created, M still present", P7 "used A -> B, freed C"); new scenarios `empty` (nothing old enough, compaction asked for) and `reclaimopt`.
+
+tool_version 0.9.6: no PL/SQL changed; the next run on a database with 0.9.5 asks to upgrade (SYS), as after any update of the files.
+
+How to test: `src\bin\epf_purge.bat reclaim --dry-run`, then `src\bin\epf_purge.bat reclaim`; `src\tests\e2e\run_tests.bat --digest` after it.
+
 ## 2026-10-13 - Documents: the README as a user guide, the reference behind it, and scenarios to walk through without a database
 
 Why: the user: "Generate a user friendly readme file for this. includes what purge and reclaim does (highlevel), how to use and parameters. like a usage guide. started usage and advandce usage." Then: "then write scenarios document in md so I can dicuss the flow/demo of the tool with out needed to run on any instance during the discussion i have later. so the input and outputs. like how we have it in our tests when simulaing user experience."

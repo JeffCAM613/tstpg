@@ -42,8 +42,21 @@ $script:SysNotes = @('REDO_GROUP_KEPT', 'REDO_FILE_KEPT', 'UNDO_APPLIED', 'UNDO_
                      'UNDO_SWITCH_PENDING', 'UNDO_SWITCH_SKIPPED', 'UNDO_SIZE_KEPT', 'TEMP_SIZE_KEPT')
 
 # Events the steps prepared by SYS print themselves (undo.sql, redo_logs.sql).
+# What a check that passes with a note means, for "Good to know" (the checks
+# of epf_report: the purge's P1 to P8, the reclaim's R1 to R9). The value the
+# check measured follows.
+$script:CheckSays = @{
+    'P1' = 'Rows old enough to purge are left, because the purge did not run to its end'
+    'P2' = 'The rows processed are not exactly those counted at the start'
+    'P4' = 'Some rows already had no parent row before the purge, and the purge added none (the report lists them under "Orphans on registry links")'
+    'P7' = 'Part of the space measured inside the tables is an estimate'
+    'P8' = 'Not every purged table was compacted'
+    'R7' = 'A tablespace ends above the size of its tables and indexes'
+    'R8' = 'Not every table moved'
+}
+
 $script:SysEvents = @('REDO_ENLARGED', 'REDO_UNCHANGED', 'REDO_RESTORED', 'UNDO_RETENTION_SET', 'UNDO_GROWTH_LIMITED',
-                      'UNDO_RETENTION_RESTORED', 'UNDO_GROWTH_RESTORED', 'UNDO_CAP')
+                      'UNDO_RETENTION_RESTORED', 'UNDO_GROWTH_RESTORED', 'UNDO_CAP', 'UNDO_APPLIED')
 
 # The names of the requirements, and what to do about each one not met.
 $script:ReqNames = @{
@@ -285,6 +298,10 @@ function Write-FlowLine {
     param($Note)
     if ($Note.Label -ne '') {
         Write-Wrapped ('         ' + $Note.Label) $Note.Text $Note.Color
+    } elseif ($Note.Text.Length + 9 -gt (Get-WrapWidth)) {
+        # Never wider than the window: a line the console wraps by itself
+        # sits badly above a line rewritten in place.
+        Write-Wrapped '         ' $Note.Text $Note.Color 11
     } else {
         Write-Out ('         ' + $Note.Text) $Note.Color -NoLog
     }
@@ -407,7 +424,10 @@ function Show-FlowEvent {
             $what = ([string]$Matches[4]) -replace '; log switch waits 00:00:00$', ''
             if ($what -eq '') { return }
             if ($step -eq 'COMPACT') {
-                Write-FlowNote (($scope + ': ' + $what).PadRight(64) + $time.PadLeft(5)) 'Green'
+                # A reclaim compacts a tablespace; a purge, its own tables.
+                $text = $what
+                if ($scope -ne '') { $text = $scope + ': ' + $what }
+                Write-FlowNote ($text.PadRight(64) + $time.PadLeft(5)) 'Green'
             } else {
                 Write-FlowNote $what
             }
@@ -497,8 +517,9 @@ function Show-FlowEvent {
         Write-Wrapped '         ' $message
         return
     }
-    if ($code -eq 'PLAN_STEP' -or ($code -eq 'PLAN' -and $message -notmatch ': one run')) {
-        Write-FlowNote $message
+    # A purge in one run has a plan of one step: nothing to say about it.
+    if ($code -eq 'PLAN_STEP' -or $code -eq 'PLAN') {
+        if ($message -notmatch ': one run' -and $message -notmatch 'step 1 of 1 ') { Write-FlowNote $message }
         return
     }
     if ($code -eq 'STOP_HONORED' -or $code -eq 'STOP_REQUESTED') {
@@ -548,7 +569,9 @@ function Show-FlowEvent {
 function Show-SysResult {
     param([string]$Output, [string]$What)
     foreach ($line in ($Output -split "`r?`n")) {
-        if ($line -match 'ORA-\d{5}|SP2-\d{4}') {
+        # An error of Oracle or of sqlplus; not a line of the step that names
+        # one ("UNDO_APPLIED  ... may fail with ORA-01555 meanwhile").
+        if ($line -match 'ORA-\d{5}|SP2-\d{4}' -and $line -notmatch '^\s+[A-Z]+_[A-Z_]+\s') {
             Write-FlowNote $line.Trim() 'Red'
         } elseif ($What.EndsWith('_BACK') -and $line -match '^\s+([A-Z][A-Z_]+)\s+(\S.*)$' -and $script:SysNotes -contains $Matches[1]) {
             Write-FlowNote $Matches[2].Trim() 'Yellow'
@@ -906,7 +929,11 @@ function Show-GoodToKnow {
         Write-Out ('  Failed checks (' + $failed.Count + ')') 'Red' -NoLog
         foreach ($c in $failed) { Write-Wrapped '   - ' ($c.Title + ': ' + $c.Value) 'Red' }
     }
-    $items = @($Checks | Where-Object { $_.Status -eq 'WARN' } | ForEach-Object { $_.Title + ': ' + $_.Value }) + @($Notes | Where-Object { $_ -ne '' })
+    # A check with a note says in plain words what its note means
+    # ($script:CheckSays), then what it measured; otherwise its own title.
+    $items = @($Checks | Where-Object { $_.Status -eq 'WARN' } | ForEach-Object {
+                   if ($script:CheckSays.ContainsKey($_.Id)) { $script:CheckSays[$_.Id] + ': ' + $_.Value } else { $_.Title + ': ' + $_.Value }
+               }) + @($Notes | Where-Object { $_ -ne '' })
     if ($items.Count -gt 0) {
         Write-Out '' -NoLog
         Write-Out ('  Good to know (' + $items.Count + ')') 'Yellow' -NoLog
@@ -1048,16 +1075,26 @@ function Show-PurgeEnd {
         $color = 'Green'
         if ($failed.Count -gt 0) { $color = 'Red' }
         Write-Rule $color
-        Write-Wrapped '  DONE   ' ((Format-Sentence $what) + ' in ' + $Total + '. ' + (Get-CheckSentence $checks)) $color
-        Write-Rule $color
-        $freed = ''
-        foreach ($c in $checks) {
-            if ($c.Id -eq 'P7' -and $c.Value -match '^(\d+(?:\.\d+)? [KMGT]?B) freed') { $freed = $Matches[1] }
-        }
-        if ($freed -ne '') {
-            Write-Wrapped '  ' ($freed + ' is now free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim):')
+        if ($rows -eq 0 -and $failed.Count -eq 0) {
+            # Nothing was old enough: said as such, with what may still be
+            # worth doing (an earlier purge freed space a reclaim gives back).
+            Write-Wrapped '  DONE   ' ('Nothing to purge: no row dated before ' + (Format-Day (Get-CutoffDay $Ctx)) + ' was found (' + $Total +
+                                       '). ' + (Get-CheckSentence $checks)) $color
+            Write-Rule $color
+            Write-Wrapped '  ' 'If an earlier purge deleted rows, their space is still inside the tables: a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:'
         } else {
-            Write-Wrapped '  ' 'The space is free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim):'
+            Write-Wrapped '  DONE   ' ((Format-Sentence $what) + ' in ' + $Total + '. ' + (Get-CheckSentence $checks)) $color
+            Write-Rule $color
+            # P7: "used 7.5 GB -> 1.4 GB, freed 6.1 GB".
+            $freed = ''
+            foreach ($c in $checks) {
+                if ($c.Id -eq 'P7' -and $c.Value -match 'freed (\d+(?:\.\d+)? [KMGT]?B)') { $freed = $Matches[1] }
+            }
+            if ($freed -ne '') {
+                Write-Wrapped '  ' ($freed + ' is now free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:')
+            } else {
+                Write-Wrapped '  ' 'The space is free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:'
+            }
         }
         Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
     } elseif ($Status -eq 'STOPPED') {
@@ -1077,8 +1114,10 @@ function Show-PurgeEnd {
     # The warnings P5 counts are the notes of the run, shown as they came.
     $notes = @()
     if ($null -ne $script:Flow) { $notes += $script:Flow.Notes.ToArray() }
+    # The time the batches waited for the online logs, when larger logs would
+    # save some of it (the engine says so in its WAITS line).
     foreach ($line in (Get-DiskLines $Report)) {
-        if ($line -match '^ WAITS\s+(.+)$') { $notes += ('Time waiting for the online redo logs: ' + $Matches[1]) }
+        if ($line -match '^ WAITS\s+(.+larger online logs.+)$') { $notes += ('Time waiting for the online redo logs: ' + $Matches[1]) }
     }
     Show-GoodToKnow @($checks | Where-Object { $_.Id -ne 'P5' -or $_.Status -eq 'FAIL' }) $notes
 }

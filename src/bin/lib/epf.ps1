@@ -1736,7 +1736,9 @@ function Invoke-ToolRun {
     }
     $planLine = ''
     $planColor = ''
-    if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '' -and -not $Ctx.DryRun -and $null -ne $planAfter) {
+    # A purge in one run has a plan of one step: nothing to say about it.
+    if ($Action -eq 'PURGE' -and $Ctx.PlanId -ne '' -and -not $Ctx.DryRun -and $null -ne $planAfter -and
+        ($script:Verbose -or [int]$planAfter.Steps -gt 1)) {
         if ($planAfter.Status -eq 'DONE') {
             $planLine = ' Plan    ' + $planAfter.Label + ' is done: every step ran.'
             $planColor = 'Green'
@@ -3132,13 +3134,21 @@ function Show-Ready {
     $day = Format-Day (Get-CutoffDay $Ctx)
     $roots = [double]0
     $seconds = [double]0
+    $counted = $false
     if ($Report -ne '') {
-        foreach ($m in (Read-ForecastTable $Report 'ESTIMATE')) { $roots += $m.Roots; $seconds += $m.Seconds }
+        foreach ($m in (Read-ForecastTable $Report 'ESTIMATE')) { $roots += $m.Roots; $seconds += $m.Seconds; $counted = $true }
     }
     $verb = 'deletes'
     if ($Ctx.Mode -eq 'CLOB') { $verb = 'empties the large values (LOB columns) of' }
     Write-Out '' -NoLog
     Write-Rule
+    if ($counted -and $roots -eq 0) {
+        # The checks counted the top-level records, and none is old enough.
+        Write-Wrapped '  ' ('Ready, but there is nothing to purge: no top-level record is dated before ' + $day +
+                           '. An earlier purge may have taken them. This run would delete nothing.') 'Yellow'
+        Write-Rule
+        return
+    }
     if ($roots -gt 0) {
         Write-Wrapped '  ' ('Ready. This ' + $verb + ' everything dated before ' + $day + ': ' + (Format-Count $roots) +
                            ' top-level records, with the rows under them (a dry run counts those).') 'White'
@@ -4007,8 +4017,13 @@ function Invoke-Main {
         $script:ReconnectS = [int]$seconds
     }
 
+    # The reclaim was an option of the purge in the previous tool. It is a
+    # command of its own: the answer is the command to type.
     if ($script:Cli.Flags.ContainsKey('reclaim')) {
-        Exit-Tool $script:ExitUsage '--reclaim is not available in this version: run epf_purge.bat reclaim after the purge.'
+        $command = 'epf_purge.bat reclaim'
+        if ($script:Cli.Flags.ContainsKey('dry-run')) { $command = 'epf_purge.bat reclaim --dry-run' }
+        Exit-Tool $script:ExitUsage ('--reclaim is not an option: the reclaim is a command of its own, not part of purge. Type this instead:' +
+                                     [Environment]::NewLine + '     ' + $command)
     }
     if ($script:Cli.Flags.ContainsKey('resume')) {
         Exit-Tool $script:ExitUsage '--resume is not needed: a new reclaim continues from the current state of the datafiles.'

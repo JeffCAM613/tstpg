@@ -41,7 +41,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:CliArgs = @($args)
 $script:RepoDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
-$script:Version = '0.9.5'
+$script:Version = '0.9.6'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:Opt = @{ Action = ''; DryRun = $false; Cutoff = ''; Retention = ''; Tns = ''; Interactive = $true;
                  Config = ''; Sim = 'slow'; Fast = $false; Open = $true; Color = $true; Yes = $false; Redo = $false }

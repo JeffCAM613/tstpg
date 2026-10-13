@@ -122,7 +122,7 @@ At the question for the EPFPG password, press Enter alone. The run then asks for
  > Password to give the EPFPG account:
  > Password to give the EPFPG account (again):
    Database           EPFDB: connected (EPFDB)
-   Tool in database   version 0.9.5 (installed now, 0:02)
+   Tool in database   version 0.9.6 (installed now, 0:02)
 ```
 
 The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.
@@ -136,7 +136,7 @@ src\bin\epf_purge.bat purge --dry-run --retention 365
 The dry run asks for the database and the EPFPG password, then what the purge should do. Each choice is shown with the tables it works on in your database, their size today and a rough estimate of what it frees. Press Enter twice to take everything old in every module:
 
 ```text
- -- Mode: what is done to the rows dated before 13 Oct 2025 --------------------
+ -- Mode: what is done to the rows dated before 13 October 2025 ----------------
    Mode             Tables   Size now   Frees (about)   What it does
    FULL                 25    22.0 GB          6.9 GB   deletes the rows, in the modules chosen next
    CLOB                  6    13.8 GB          1.6 GB   keeps the rows, empties their large values
@@ -159,7 +159,7 @@ It then checks the database, counts the rows, and says what a purge would do:
 
 ```text
  ===============================================================================
-  A purge would delete 19,279,194 rows, about 7.0 GB, dated before 13 Oct 2025.
+  A purge would delete 19,279,194 rows, about 7.0 GB, dated before 13 October 2025.
   It would take about 8 minutes of deleting, and would complete as things are.
  ===============================================================================
    What                  Rows to delete   Space freed (about)    Deleting
@@ -201,8 +201,8 @@ The purge asks the same questions, plus whether it is a dry run (no) and whether
    Backup                            required   ok
 
  ===============================================================================
-  Ready. This deletes everything dated before 13 Oct 2025: 197,409 top-level records, with the rows
-  under them (a dry run counts those).
+  Ready. This deletes everything dated before 13 October 2025: 197,409 top-level records, with the
+  rows under them (a dry run counts those).
   About 8 minutes of deleting. It cannot be undone.
  ===============================================================================
  > Type yes to start the purge: yes
@@ -217,11 +217,15 @@ The purge asks the same questions, plus whether it is a dry run (no) and whether
   DONE   19,279,194 rows deleted in 10:01. The checks passed, with 1 note.
  ===============================================================================
   7.0 GB is now free inside the tables. The datafiles keep their size until a reclaim gives it back
-  to the disk (the database must not be in use during a reclaim):
+  to the disk (the database must not be in use during a reclaim). To see how much:
       epf_purge.bat reclaim --dry-run
 ```
 
 A required condition that is not met is a strong warning. Going on is your choice, and the default answer is no.
+
+When nothing is old enough (an earlier purge took it), the purge says so before the typed `yes` and at its end, in place of a count of zero.
+
+The reclaim is a command of its own, not an option of purge: `src\bin\epf_purge.bat reclaim`, as in step 3.
 
 ### Step 3: give the space back to the disk
 
