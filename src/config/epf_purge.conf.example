@@ -41,8 +41,11 @@ DEPTH=ALL
 
 # Y or N.
 DRY_RUN=N
-# Shrink the purged tables afterwards (purge only, not with a dry run).
-COMPACT=N
+# Accepted and ignored: every purge that deletes compacts the tables it
+# purged afterwards, so that the space of the deleted rows can be used again
+# (the tables with at least 20 % free inside them, setting
+# compact_min_free_pct).
+#COMPACT=Y
 # Larger online redo logs for the purge (4 x 1 GB) when one batch does not
 # fit in them; the original groups are put back at the end (SYS). Y answers
 # the question of a purge beforehand.

@@ -22,6 +22,7 @@ $script:StepWords = @{
     'PREPARE' = 'preparing'; 'SPACE_BASELINE' = 'measuring the space used'; 'SNAPSHOT_KEYS' = 'listing the rows';
     'COUNT_BEFORE' = 'counting the rows'; 'TEMP_INDEXES' = 'creating temporary indexes'; 'PROCESS_BATCHES' = 'deleting';
     'COUNT_AFTER' = 'counting what is left'; 'SPACE_POST_PURGE' = 'measuring the space freed'; 'CLEANUP' = 'cleaning up';
+    'SPACE_POST_COMPACT' = 'measuring the space again';
     'ASSESS' = 'measuring the tablespaces'; 'LOCK_ACCOUNTS' = 'locking the accounts'; 'BASELINE' = 'recording the state';
     'RELEASE_INDEXES' = 'releasing the indexes'; 'FREEZE_FILES' = 'holding the datafiles'; 'COMPACT' = 'moving tables';
     'RETURN_PARKED' = 'bringing tables back'; 'REBUILD_INDEXES' = 'rebuilding indexes';
@@ -245,10 +246,11 @@ function Get-FlowLine {
 }
 
 # Starts the step $Key (ending the one that runs); a step that is not of this
-# flow, or that runs already, changes nothing. A step of a reclaim that its
-# engine passed over is said not needed.
+# flow, or that runs already, changes nothing. A step that the engine passed
+# over gets a line that says so: $Gap, "not needed" for a step that had
+# nothing to do, "not run" when the run stopped or failed before it.
 function Start-FlowStep {
-    param([string]$Key)
+    param([string]$Key, [string]$Gap = 'not needed')
     if (-not (Test-Flow)) { return }
     $n = Get-FlowIndex $Key
     $f = $script:Flow
@@ -256,7 +258,7 @@ function Start-FlowStep {
     if ($f.Open) { Complete-FlowStep }
     if ($f.Map.Count -gt 0 -and $f.N -gt 0) {
         for ($k = $f.N + 1; $k -lt $n; $k++) {
-            Write-Out (Get-FlowLine 'not needed' '' $k).TrimEnd() 'DarkGray' -NoLog
+            Write-Out (Get-FlowLine $Gap '' $k).TrimEnd() 'DarkGray' -NoLog
         }
     }
     $f.N = $n
@@ -370,6 +372,9 @@ function Get-FlowStatus {
             $words = [string]$f.Rebuilt + ' of ' + $f.Indexes + ' indexes rebuilt'
         } elseif ($engine[2] -eq 'RETURN_PARKED' -and $f.Parked -gt 0) {
             $words = [string]$f.Returned + ' of ' + $f.Parked + ' tables back'
+        } elseif ($engine[2] -eq 'COMPACT' -and ($engine[3] -eq '' -or $engine[3] -eq '-')) {
+            # The compaction of a purge: its own tables, shrunk one by one.
+            $words = 'giving the space of the deleted rows back to the tablespace'
         } elseif ($engine[2] -eq 'COMPACT') {
             $words = $engine[3] + ': ' + $engine[4] + ' tables moved so far'
             if ($f.Parked -gt 0) { $words = $words + ', ' + $f.Parked + ' set aside' }
@@ -423,11 +428,13 @@ function Show-FlowEvent {
             $time = Format-Clock (ConvertTo-Seconds $Matches[3])
             $what = ([string]$Matches[4]) -replace '; log switch waits 00:00:00$', ''
             if ($what -eq '') { return }
-            if ($step -eq 'COMPACT') {
-                # A reclaim compacts a tablespace; a purge, its own tables.
-                $text = $what
-                if ($scope -ne '') { $text = $scope + ': ' + $what }
-                Write-FlowNote ($text.PadRight(64) + $time.PadLeft(5)) 'Green'
+            if ($step -eq 'COMPACT' -and $scope -ne '') {
+                # A reclaim compacts a tablespace under its heading, with its time.
+                Write-FlowNote (($scope + ': ' + $what).PadRight(64) + $time.PadLeft(5)) 'Green'
+            } elseif ($step -eq 'COMPACT' -and $what -match '^0 tables compacted, 0 skipped') {
+                # A purge compacts the tables it purged that have enough free
+                # space inside (setting compact_min_free_pct): here none has.
+                Write-FlowNote 'nothing to compact: no table has enough free space inside after this purge'
             } else {
                 Write-FlowNote $what
             }
@@ -1049,7 +1056,7 @@ function Show-DryRunEnd {
                    (Format-Clock $m.Seconds).PadLeft(12)) -NoLog
     }
     Write-Out '' -NoLog
-    Write-Wrapped '   ' 'The space is freed inside the tables: the datafiles keep their size until a reclaim gives it back to the disk.'
+    Write-Wrapped '   ' 'A purge compacts the tables it purged, so the database can use that space again. The disk gets it back with a reclaim: the datafiles keep their size until then.'
     Show-ReportBlock $Report 'DISK WHILE THE PURGE RUNS' 'Disk used while the purge runs (given back at its end)'
     Show-RetentionOptions $Report
 }
@@ -1081,20 +1088,28 @@ function Show-PurgeEnd {
             Write-Wrapped '  DONE   ' ('Nothing to purge: no row dated before ' + (Format-Day (Get-CutoffDay $Ctx)) + ' was found (' + $Total +
                                        '). ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
-            Write-Wrapped '  ' 'If an earlier purge deleted rows, their space is still inside the tables: a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:'
+            Write-Wrapped '  ' 'If an earlier purge deleted rows, the disk does not have their space back yet: the datafiles keep their size until a reclaim (the database must not be in use during a reclaim). To see how much a reclaim gives back:'
         } else {
             Write-Wrapped '  DONE   ' ((Format-Sentence $what) + ' in ' + $Total + '. ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
-            # P7: "used 7.5 GB -> 1.4 GB, freed 6.1 GB".
+            # P7: "used 7.5 GB -> 1.4 GB, freed 6.1 GB"; P8: "9 tables
+            # compacted, 0 skipped, 5.6 GB returned". Where the space is now
+            # depends on whether tables were compacted (none when the purge
+            # only empties large values, or when no table has enough free
+            # space inside).
             $freed = ''
+            $compacted = 0
             foreach ($c in $checks) {
                 if ($c.Id -eq 'P7' -and $c.Value -match 'freed (\d+(?:\.\d+)? [KMGT]?B)') { $freed = $Matches[1] }
+                if ($c.Id -eq 'P8' -and $c.Value -match '^(\d+) tables compacted') { $compacted = [int]$Matches[1] }
             }
-            if ($freed -ne '') {
-                Write-Wrapped '  ' ($freed + ' is now free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:')
-            } else {
-                Write-Wrapped '  ' 'The space is free inside the tables. The datafiles keep their size until a reclaim gives it back to the disk (the database must not be in use during a reclaim). To see how much:'
+            $first = 'The space of what was purged is free inside the tables.'
+            if ($freed -ne '') { $first = $freed + ' is now free inside the tables.' }
+            if ($compacted -gt 0) {
+                $first = 'The purged tables were compacted: the database can use the space of the deleted rows again.'
+                if ($freed -ne '') { $first = $freed + ' was freed, and the purged tables were compacted: the database can use that space again.' }
             }
+            Write-Wrapped '  ' ($first + ' The disk does not have it back yet: the datafiles keep their size until a reclaim (the database must not be in use during a reclaim). To see how much a reclaim gives back:')
         }
         Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
     } elseif ($Status -eq 'STOPPED') {

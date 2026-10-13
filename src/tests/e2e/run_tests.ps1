@@ -842,7 +842,7 @@ $script:TestList = @(
     'T12B PAYMENTS dry run: the simulation T13 is compared with',
     'T13  PAYMENTS purge to the end, non-interactive, undo tuning; forecast against result; log switch waits',
     'T13B Plan of smaller runs: LOGS in steps (--max-redo); continue, refuse, rehearse, close',
-    'T14  LOGS purge with compaction, non-interactive, undo tuning without the option',
+    'T14  LOGS purge, non-interactive: compaction and undo tuning without their options',
     'T15  BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive',
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
     'T17  Reports through the wrapper: latest, and the stopped run',
@@ -1062,11 +1062,9 @@ function Invoke-Suite {
                             @('preflight', '--non-interactive', '--scratch', '1G'),
                             @('reclaim', '--non-interactive', '--dry-run', '--retention', '30'),
                             @('preflight', '--non-interactive', '--tablespaces', 'USERS'),
-                            @('preflight', '--non-interactive', '--compact'),
                             @('plan', '--non-interactive', '--new'), @('status', '--non-interactive', '--close'),
                             @('purge', '--non-interactive', '--max-redo', '1G'),
                             @('preflight', '--non-interactive', '--max-redo', 'ten'),
-                            @('purge', '--non-interactive', '--dry-run', '--compact'),
                             @('purge', '--non-interactive', '--batch-size', '50'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--cutoff', '2025-01-01'),
                             @('purge', '--non-interactive', '--cutoff', '2025-13-01'),
@@ -1263,13 +1261,14 @@ function Invoke-Suite {
                 Assert-Match $s 'Stop requested'
             }
         }
-        # Answers: the days of data to keep, the mode, dry run (no), compact
-        # (no), then the typed confirmation. --redo-logs, --backup none and
+        # Answers: the days of data to keep, the mode, dry run (no), then the
+        # typed confirmation (the compaction is not asked: every purge that
+        # deletes ends with it). --redo-logs, --backup none and
         # undo tuning (part of every purge, without --undo-tuning) meet the
         # requirements, so no question is asked about them; the batch size is
         # the recommendation for 1 GB logs. The purge is stopped: it does not
         # ask about removing the tool.
-        $answers = @($script:Retention, 'FULL', 'N', 'N', 'yes')
+        $answers = @($script:Retention, 'FULL', 'N', 'yes')
         $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
@@ -1545,10 +1544,12 @@ function Invoke-Suite {
         Assert-Match $r ('PLAN ' + [regex]::Escape($label) + '  CLOSED: 1 of ' + $steps + ' steps done')
     }
 
-    Invoke-Test 'T14' 'LOGS purge with compaction, non-interactive, undo tuning without the option' {
-        # No --undo-tuning: every purge runs with it (SYS), and it meets UNDO.
+    Invoke-Test 'T14' 'LOGS purge, non-interactive: compaction and undo tuning without their options' {
+        # No --undo-tuning and no --compact: every purge that deletes runs
+        # with undo tuning (SYS), which meets UNDO, and ends with the
+        # compaction of the tables it purged.
         $r = Invoke-Wrapper @('purge', '--non-interactive', '--yes', '--retention', $script:Retention, '--mode', 'LOGS',
-                              '--compact', '--backup', 'none') -TimeoutMin 90 -StopOnTimeout
+                              '--backup', 'none') -TimeoutMin 90 -StopOnTimeout
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'PURGE COMPACT DONE'
         Assert-Match $r 'UNDO TUNING \(SYS\)'
@@ -1575,9 +1576,9 @@ function Invoke-Suite {
 
     Invoke-Test 'T16' 'BANK_STATEMENTS purge through the menu wizard (redo sizing already done)' {
         # Menu answers: 2 Purge (so no question on a dry run), the days of
-        # data to keep, the mode, compact (no), the typed confirmation, and
-        # no to removing the tool afterwards.
-        $answers = @('2', $script:Retention, 'FULL', 'N', 'yes', 'N')
+        # data to keep, the mode, the typed confirmation, and no to removing
+        # the tool afterwards.
+        $answers = @('2', $script:Retention, 'FULL', 'yes', 'N')
         $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)

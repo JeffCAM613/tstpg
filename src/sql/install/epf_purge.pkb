@@ -2099,7 +2099,7 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             RETURN FALSE;
     END capture_space;
 
-    -- Optional compaction (with_compact = Y, purge-only runs): shrinks the
+    -- Compaction (every purge that deletes: with_compact = Y): shrinks the
     -- registry tables of the deleting modules whose table segment has at least
     -- compact_min_free_pct of free space after the purge (POST_PURGE, ASSM
     -- measurement), largest free space first. Per table: row movement enabled

@@ -235,8 +235,8 @@ Actions
   (none)       the menu: dry run of a purge, purge, dry run of a reclaim,
                reclaim, report, status, uninstall
   purge        delete the rows older than the days of data to keep: checks,
-               questions, purge, report. --dry-run counts what it would
-               delete and changes nothing
+               questions, purge, compaction of the purged tables, report.
+               --dry-run counts what it would delete and changes nothing
   reclaim      give the space a purge freed back to the disk: the tables of
                the application's tablespaces move within them so that their
                datafiles shrink (SYS; the application accounts are locked
@@ -260,7 +260,7 @@ Options
   --retention DAYS     the days of data to keep: older rows are purged.
                        Asked for when not given; required with
                        --non-interactive
-  --mode, --depth, --dry-run, --compact
+  --mode, --depth, --dry-run
                        asked for too when not given (the batch size is not:
                        it is what the checks recommend)
   --cutoff YYYY-MM-DD  purge rows dated before this day, instead of --retention
@@ -294,7 +294,9 @@ Options
                        (PAYMENTS,LOGS,BANK_STATEMENTS); not used in LOGS mode
   --batch-size N       root rows per transaction, 100-100000 (default: what
                        the checks recommend)
-  --compact            shrink the purged tables afterwards (purge only)
+  --compact            accepted, changes nothing: every purge that deletes
+                       compacts the tables it purged afterwards, so that
+                       the space of the deleted rows can be used again
   --tablespaces LIST   reclaim: tablespaces separated by commas (default: every
                        tablespace holding segments of the application schemas)
   --scratch SIZE       reclaim: the most temporary space, such as 2G, for the
@@ -1408,7 +1410,16 @@ function Get-PurgeSteps {
     return ,@($check,
               [pscustomobject]@{ Key = 'PREPARE'; Text = 'Preparing the database for the purge (SYS)'; Header = $false },
               [pscustomobject]@{ Key = 'DELETE'; Text = 'Deleting'; Header = $true },
+              [pscustomobject]@{ Key = 'COMPACT'; Text = 'Compacting the purged tables'; Header = $false },
               [pscustomobject]@{ Key = 'RESTORE'; Text = 'Putting the database back as it was (SYS)'; Header = $false })
+}
+
+# The step of the screen an engine step of a purge belongs to: the compaction
+# begins when the engine says so; the other steps are started by the wrapper.
+function Get-PurgeMap {
+    param([string]$Action, [bool]$DryRun)
+    if ($Action -eq 'PURGE' -and -not $DryRun) { return @{ 'COMPACT' = 'COMPACT' } }
+    return @{}
 }
 
 # The output of a step run by SYS (undo.sql, redo_logs.sql): every line with
@@ -1461,7 +1472,7 @@ function Invoke-ToolRun {
     $dry = 'N'
     if ($Ctx.DryRun) { $dry = 'Y' }
     $compact = 'N'
-    if ($Ctx.Compact -and $Action -eq 'PURGE') { $compact = 'Y' }
+    if ($Ctx.Compact -and $Action -eq 'PURGE' -and -not $Ctx.DryRun) { $compact = 'Y' }
     $batch = 'default'
     $batchArg = '-'
     if ($Ctx.BatchSize -ne '') {
@@ -1499,7 +1510,7 @@ function Invoke-ToolRun {
                $cutoffArg, $confirmArg, $redo, $maxRedoArg, (Get-YN $Ctx.NewPlan), $planIdArg, $planStepArg)
     Open-Run $state $begin
     $label = Get-RunLabel $state.RunId
-    if ($null -eq $script:Flow) { Start-Flow (Get-PurgeSteps $Action $Ctx.DryRun) }
+    if ($null -eq $script:Flow) { Start-Flow (Get-PurgeSteps $Action $Ctx.DryRun) (Get-PurgeMap $Action $Ctx.DryRun) }
 
     Write-Out '' -Detail
     Write-Out (' EPF Data Purge'.PadRight($script:Width - $label.Length - 4) + 'run ' + $label) 'White' -Detail
@@ -1682,7 +1693,10 @@ function Invoke-ToolRun {
         if ($status -eq 'FAILED') { $ended = 'FAILED' } elseif ($status -eq 'STOPPED') { $ended = 'stopped' }
         if ($undoApplied -or $redoRan) {
             Complete-FlowStep $ended
-            Start-FlowStep 'RESTORE'
+            # A purge that stopped or failed did not reach its compaction.
+            $gap = 'not needed'
+            if ($ended -ne 'done') { $gap = 'not run' }
+            Start-FlowStep 'RESTORE' $gap
         }
         if ($undoApplied) {
             Write-Section 'UNDO TUNING RESTORE (SYS)' -Detail
@@ -1754,7 +1768,7 @@ function Invoke-ToolRun {
     $nextLine = ''
     if ($Action -eq 'PURGE' -and ($status -eq 'SUCCESS' -or $status -eq 'WARNING')) {
         if (-not $Ctx.DryRun) {
-            $nextLine = ' Next    the space is free inside the tables and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
+            $nextLine = ' Next    the purged tables were compacted and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
                         'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
         } elseif ($Ctx.PlanId -eq '') {
             $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' runs this purge; the dry run changed nothing'
@@ -2227,10 +2241,8 @@ function Get-PurgeContext {
         PreflightRun = ''; MaxRedo = ''; NewPlan = $false; PlanId = ''; PlanStep = ''; PlanLabel = ''; Plan = $null;
         Checked = $false
     }
-    if ($Action -ne 'PURGE') {
-        foreach ($name in @('dry-run', 'compact')) {
-            if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge only.') }
-        }
+    if ($Action -ne 'PURGE' -and $script:Cli.Flags.ContainsKey('dry-run')) {
+        Exit-Tool $script:ExitUsage '--dry-run applies to purge only.'
     }
     # A cutoff date instead of the retention: a purge on a later day keeps the
     # cutoff of its preflight or dry run. Retention then shows the days to it.
@@ -2336,17 +2348,13 @@ function Get-PurgeContext {
         if ($null -eq $ctx.BatchSize) { Exit-Tool $script:ExitUsage 'Batch size: a whole number from 100 to 100000.' }
     }
     if ($Action -eq 'PURGE') {
-        # A dry run or not, and the compaction of the purged tables: asked
-        # for when the options do not say (the menu has said which of a dry
-        # run and a purge it is).
+        # A dry run or not: asked for when the options do not say (the menu
+        # has said which of a dry run and a purge it is). Every purge that
+        # deletes compacts the tables it purged afterwards: --compact and
+        # COMPACT are accepted and decide nothing.
         $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('dry-run') -and -not $script:GoalChosen
         $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask -Title 'Dry run'
-        if ($ctx.DryRun) {
-            if ($script:Cli.Flags.ContainsKey('compact')) { Exit-Tool $script:ExitUsage '--compact does not apply to a dry run.' }
-        } else {
-            $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('compact')
-            $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask -Title 'Compaction'
-        }
+        $ctx.Compact = -not $ctx.DryRun
     }
     # Applied by a purge that deletes; a preflight or dry run checks the
     # requirements as if they were applied. Undo tuning is part of every
@@ -3155,8 +3163,14 @@ function Show-Ready {
     } else {
         Write-Wrapped '  ' ('Ready. This ' + $verb + ' everything dated before ' + $day + '.') 'White'
     }
+    # The compaction follows every purge that deletes rows (not one that
+    # only empties large values).
+    $then = ''
+    if ($Ctx.Mode -ne 'CLOB') { $then = ', then the purged tables are compacted' }
     if ($seconds -gt 0) {
-        Write-Wrapped '  ' ((Format-Sentence (Format-About $seconds)) + ' of deleting. It cannot be undone.') 'White'
+        Write-Wrapped '  ' ((Format-Sentence (Format-About $seconds)) + ' of deleting' + $then + '. It cannot be undone.') 'White'
+    } elseif ($then -ne '') {
+        Write-Wrapped '  ' 'The purged tables are compacted afterwards. It cannot be undone.' 'White'
     } else {
         Write-Out '  It cannot be undone.' 'White' -NoLog
     }
@@ -3274,7 +3288,7 @@ function Invoke-PurgeAction {
 
     $ctx = Get-PurgeContext $login $Action $plan
     $ctx.NewPlan = $newPlan
-    Start-Flow (Get-PurgeSteps $Action $ctx.DryRun)
+    Start-Flow (Get-PurgeSteps $Action $ctx.DryRun) (Get-PurgeMap $Action $ctx.DryRun)
     $day = Format-Day (Get-CutoffDay $ctx)
     Write-Out ''
     if ($Action -eq 'PREFLIGHT') {

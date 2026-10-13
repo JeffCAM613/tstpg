@@ -43,7 +43,7 @@ The mode says what is done to the rows; the depth says in which modules (PAYMENT
 
 A purge works in batches: each batch is one transaction, committed before the next one starts. It does not lock the application's accounts.
 
-The space a purge frees stays inside the tables: the datafiles keep their size. The [reclaim](#reclaim-disk-space) gives that space back to the disk.
+Every purge that deletes ends by compacting the tables it purged, so the space of the deleted rows goes back to their tablespace, where the database can use it again. The datafiles keep their size: the [reclaim](#reclaim-disk-space) gives that space back to the disk.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ A required one that is not met is a strong warning, and going on is your choice:
 
 More options for the purge:
 
-- `--compact` shrinks the purged tables afterwards (tables with at least 20 % free inside them).
+- The compaction is part of every purge that deletes, after its last module: the tables it purged that have at least 20 % of free space inside them (setting compact_min_free_pct) are shrunk, largest free space first. Row movement is enabled for the time of the shrink and put back; the table is shrunk online, then its indexes and LOB segments where Oracle allows it. A table Oracle cannot shrink (index-organized, compressed, with a LONG column or a function-based index) is skipped, and the report says why. A dry run does not compact, nor does a purge that was stopped (the run that carries on does). `--compact` is accepted and changes nothing.
 - `--redo-logs` gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).
 - `--mode` and `--depth` limit the purge to some modules, or to emptying LOB values (see [What it does](#what-it-does)).
 
@@ -128,7 +128,7 @@ src\bin\epf_purge.bat purge
 
 ## Reclaim disk space
 
-A purge frees space inside the tables, but the datafiles keep their size. The reclaim compacts the application's tablespaces in place and shrinks their datafiles:
+A purge frees space inside the tablespaces, but the datafiles keep their size. The reclaim compacts the application's tablespaces in place and shrinks their datafiles:
 
 1. It locks the application's accounts and disconnects their sessions. **The application is unavailable until the end of the run.**
 2. It records the row counts and a fingerprint of the objects, releases the indexes of the tables that will move (they are rebuilt at the end), and stops the datafiles from growing.
@@ -220,7 +220,7 @@ The tunables are rows of the table EPFPG.EPF_SETTING. An upgrade keeps the value
 | archive_margin_pct | 20 | Margin added to the redo estimate for ARCHIVE |
 | undo_cap_mb | 4096 | Undo growth limit with undo tuning |
 | undo_switch_min_mb | 1024 | After a purge, the undo tablespace is switched when its datafiles are still this much above their size before |
-| compact_min_free_pct | 20 | `--compact` shrinks the tables with at least this share free |
+| compact_min_free_pct | 20 | The compaction at the end of a purge shrinks the tables with at least this share free |
 | reclaim_margin_mb | 64 | Free space a reclaim leaves at the end of each datafile |
 | reclaim_growth_mb | 0 | How far a reclaim may grow a datafile above its size at the start |
 | disconnect_timeout_s | 300 | Seconds a reclaim waits for sessions to end before it disconnects them at once |

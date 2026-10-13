@@ -245,10 +245,9 @@ CREATE OR REPLACE PACKAGE BODY epf_control AS
             RAISE_APPLICATION_ERROR(-20121, 'Unknown action: ' || p_action
                                             || '. Valid values: PURGE, RECLAIM, PREFLIGHT');
         END IF;
-        IF l_compact = 'Y' AND (l_action <> 'PURGE' OR l_dry_run = 'Y' OR l_reclaim = 'Y') THEN
-            RAISE_APPLICATION_ERROR(-20127, 'Compaction (with_compact=Y) applies to purge runs that are not dry runs '
-                                            || 'and do not reclaim.');
-        END IF;
+        -- Every purge that deletes compacts the tables it purged afterwards;
+        -- no other run does. p_with_compact is accepted and does not decide.
+        l_compact := CASE WHEN l_action = 'PURGE' AND l_dry_run = 'N' AND l_reclaim = 'N' THEN 'Y' ELSE 'N' END;
         IF l_undo = 'Y' AND l_action NOT IN ('PURGE', 'PREFLIGHT') THEN
             RAISE_APPLICATION_ERROR(-20127, 'Undo tuning (with_undo_tuning=Y) applies to purge and preflight runs.');
         END IF;

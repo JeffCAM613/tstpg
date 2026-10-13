@@ -66,7 +66,7 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
 --   scanned. Space inside segments is captured with epf_space (BASELINE, and
 --   POST_PURGE unless dry run).
 --
--- Compaction (with_compact = Y, purge-only runs, step COMPACT)
+-- Compaction (every purge that deletes: with_compact = Y, step COMPACT)
 --   Registry tables of deleting modules whose table segment has at least
 --   compact_min_free_pct free after the purge are shrunk (row movement
 --   enabled and restored, SHRINK SPACE COMPACT, SHRINK SPACE CASCADE or the

@@ -2,6 +2,31 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.7: the compaction is part of every purge that deletes: no option, no question
+
+Why: the user: "compact should not be optional. it always run after purges. i see no reason to skip it." (decision D28, PLAN.md 6.7).
+
+The engine:
+- `epf_control.start_run` sets with_compact to Y for every PURGE that is not a dry run and does not reclaim, and to N for every other run; p_with_compact is accepted and decides nothing (it used to raise -20127 for a dry run). So a purge started by hand or by the suite compacts too.
+- The report: P8 of a run without compaction says "dry run" or "no purge" in place of "not requested".
+
+The wrapper:
+- No question "Compaction", and `--compact` / COMPACT are accepted and ignored (also with a dry run and for a preflight, where they were usage errors).
+- The screen of a purge has five steps: the compaction is step 4, "Compacting the purged tables", started when the engine starts it, with one line of what it did ("9 tables compacted, 0 skipped"; "nothing to compact: no table has enough free space inside after this purge" when none qualifies). A purge that stopped or failed shows the step as "not run".
+- The sentence before the typed yes says "About N minutes of deleting, then the purged tables are compacted." The end says that the purged tables were compacted and that the database can use the space again, when tables were compacted (P8), and in every case that the disk does not have it back until a reclaim. A dry run says that a purge compacts the tables it purged.
+- report.html: the space freed is read from P7 as the engine prints it ("used A -> B, freed C"); it expected the stand-in's wording, as the screen did until 0.9.6.
+- --help, the configuration example (COMPACT is no longer a key to set), README, docs\REFERENCE.md, docs\SCENARIOS.md.
+
+The suite: T11 and T16 no longer answer the compaction question; T14 runs without `--compact` and still expects the compaction ("LOGS purge, non-interactive: compaction and undo tuning without their options"); the two usage errors with `--compact` are gone from T07. Every purge of the suite now compacts: T13 and the others take longer by the time of their shrink.
+
+What it costs, said to the user: the time and the redo of the shrink are not in the forecast of a purge, and in ARCHIVELOG mode that redo is archived on top of what the ARCHIVE requirement counts. Not measured in ARCHIVELOG.
+
+tool_version 0.9.7: epf_control and epf_report changed; the next run upgrades the objects (SYS).
+
+Checked here: 39 scenarios through the real wrapper against the stand-in sqlplus, whose purge replays now end with the COMPACT step and P8 as the engine prints it (355 checks on their screens: five steps, no compaction question, the step "not run" after a stop, nothing to compact for a purge that only empties large values); the suite's T00, T01, T06 and T07 against the stand-in; the static checks of epf_control. Not compiled on a database.
+
+How to test: a purge on a copy that still has rows to purge; its screen has five steps and no question about the compaction; the digest shows "PURGE COMPACT DONE" and P8 PASS or WARN.
+
 ## 2026-10-13 - 0.9.6: the screen of a real purge on TANM7883 read line by line; --reclaim answered with the command to type
 
 Why: the user, after a purge that was not a dry run (R-000004 on TANM7883, 0.9.5): "I cant ever run reclaim even after a non dry run purge", with the screen of the purge and of `src\bin\epf_purge.bat purge --reclaim --dry-run`, which answered "--reclaim is not available in this version: run epf_purge.bat reclaim after the purge." The reclaim is the command `epf_purge.bat reclaim`; the answer read as if something were still missing. The pasted screen also showed faults the replays had not, because the stand-in did not print what the engine prints there.

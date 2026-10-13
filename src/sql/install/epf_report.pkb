@@ -807,7 +807,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
 
         -- P8 compaction
         IF g_run.with_compact = 'N' OR l_no_purge THEN
-            add_check('P8', 'SKIP', 'Compaction', 'not requested');
+            add_check('P8', 'SKIP', 'Compaction', CASE WHEN g_run.dry_run = 'Y' THEN 'dry run' ELSE 'no purge' END);
         ELSE
             SELECT COUNT(CASE WHEN event_code = 'COMPACTED' THEN 1 END),
                    COUNT(CASE WHEN event_code IN ('COMPACT_SKIPPED', 'COMPACT_FAILED') THEN 1 END),

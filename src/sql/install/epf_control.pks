@@ -39,7 +39,10 @@ CREATE OR REPLACE PACKAGE epf_control AUTHID DEFINER AS
     -- planned (with_undo_tuning Y, whatever p_with_undo_tuning says): a purge
     -- that deletes starts only once the caller applied it (epf_tuning, SYS);
     -- PREFLIGHT and dry runs check the requirements as if it were applied;
-    -- p_with_undo_tuning Y for another action is an error. p_backup_choice: CONFIRMED or NONE, how the
+    -- p_with_undo_tuning Y for another action is an error. Every purge that
+    -- deletes compacts the tables it purged afterwards (with_compact Y,
+    -- whatever p_with_compact says); a dry run and the other actions do not.
+    -- p_backup_choice: CONFIRMED or NONE, how the
     -- operator meets the BACKUP requirement without a recent RMAN backup.
     -- p_confirm: blocking requirements the operator confirms are handled
     -- although the preflight finds them not met, separated by commas: ARCHIVE,

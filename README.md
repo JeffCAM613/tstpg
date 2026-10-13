@@ -20,7 +20,7 @@ The tool does two jobs. Each has a dry run, which shows the result and changes n
 
 | | Purge | Reclaim |
 |---|---|---|
-| **What it does** | Deletes the old rows of the application: everything older than the days of data you keep | Compacts the datafiles, so that the space the purge freed goes back to the disk |
+| **What it does** | Deletes the old rows of the application: everything older than the days of data you keep. It then compacts the tables it purged | Compacts the datafiles, so that the space the purge freed goes back to the disk |
 | **Its dry run** | Counts what would be deleted, the space it frees and the time it takes | Measures how much disk space would come back |
 | **The application meanwhile** | Its accounts are not locked. Run the purge in a quiet period | Not available: its accounts are locked until the reclaim ends |
 | **Can it be undone** | No. Have a backup first | Nothing to undo: it changes no row of the application |
@@ -94,7 +94,7 @@ Start with choice 1: it changes nothing. The steps below are the same four choic
 | Step | Command | What it does |
 |---|---|---|
 | 1 | `src\bin\epf_purge.bat purge --dry-run --retention 365` | Shows what a purge would delete, keeping the last 365 days. Changes nothing |
-| 2 | `src\bin\epf_purge.bat purge --retention 365` | Deletes those rows |
+| 2 | `src\bin\epf_purge.bat purge --retention 365` | Deletes those rows, then compacts the tables it purged |
 | 3 | `src\bin\epf_purge.bat reclaim --dry-run` | Shows how much disk space would come back. Changes nothing |
 | 3 | `src\bin\epf_purge.bat reclaim` | Gives that space back to the disk. The application is not available meanwhile |
 
@@ -122,7 +122,7 @@ At the question for the EPFPG password, press Enter alone. The run then asks for
  > Password to give the EPFPG account:
  > Password to give the EPFPG account (again):
    Database           EPFDB: connected (EPFDB)
-   Tool in database   version 0.9.6 (installed now, 0:02)
+   Tool in database   version 0.9.7 (installed now, 0:02)
 ```
 
 The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.
@@ -182,13 +182,14 @@ Nothing was changed. Try other numbers of days the same way.
 src\bin\epf_purge.bat purge --retention 365
 ```
 
-The purge asks the same questions, plus whether it is a dry run (no) and whether to compact the purged tables afterwards (no, the default, is fine when a reclaim follows). Then:
+The purge asks the same questions, plus whether it is a dry run (no). Then:
 
 1. **It checks the database** and shows its requirements as a table: each one is required or optional, with its state now, and for each one not met what happens and what to do.
 2. **It asks what the requirements call for.** For example whether to enlarge the online redo logs for the time of the purge when they are small (the default is yes; they are put back at the end), or whether a backup exists when it found none.
 3. **It shows what it is about to delete and waits** for you to type `yes`. Nothing is deleted before that.
 4. **It deletes**, in small batches, and shows one line per module with the progress, the speed and the time left.
-5. **It puts the database back as it was** (what it changed for the purge: the undo settings, the online redo logs) and ends with the result.
+5. **It compacts the tables it purged**, so that the database can use the space of the deleted rows again. This is part of every purge: there is nothing to ask for.
+6. **It puts the database back as it was** (what it changed for the purge: the undo settings, the online redo logs) and ends with the result.
 
 ```text
    Requirement                       Needed     Now
@@ -203,21 +204,24 @@ The purge asks the same questions, plus whether it is a dry run (no) and whether
  ===============================================================================
   Ready. This deletes everything dated before 13 October 2025: 197,409 top-level records, with the
   rows under them (a dry run counts those).
-  About 8 minutes of deleting. It cannot be undone.
+  About 8 minutes of deleting, then the purged tables are compacted. It cannot be undone.
  ===============================================================================
  > Type yes to start the purge: yes
 
- 2 of 4  Preparing the database for the purge (SYS)                done    0:11
- 3 of 4  Deleting
+ 2 of 5  Preparing the database for the purge (SYS)                done    0:11
+ 3 of 5  Deleting
          PAYMENTS         [##########..........]  50%   9,109,274 rows . 39,149 rows a second . 3:50 left
  ...
- 4 of 4  Putting the database back as it was (SYS)                 done    0:04
+ 4 of 5  Compacting the purged tables                              done    2:41
+         9 tables compacted, 0 skipped
+ 5 of 5  Putting the database back as it was (SYS)                 done    0:04
 
  ===============================================================================
-  DONE   19,279,194 rows deleted in 10:01. The checks passed, with 1 note.
+  DONE   19,279,194 rows deleted in 12:42. The checks passed, with 1 note.
  ===============================================================================
-  7.0 GB is now free inside the tables. The datafiles keep their size until a reclaim gives it back
-  to the disk (the database must not be in use during a reclaim). To see how much:
+  7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
+  disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
+  not be in use during a reclaim). To see how much a reclaim gives back:
       epf_purge.bat reclaim --dry-run
 ```
 
@@ -300,7 +304,7 @@ src\bin\epf_purge.bat purge --dry-run --cutoff 2024-01-01 --mode CLOB
 src\bin\epf_purge.bat purge --retention 90 --mode LOGS
 ```
 
-`--compact` shrinks the purged tables afterwards, which returns the freed space to their tablespace. It does not shrink the datafiles: that is the reclaim.
+Every purge that deletes ends by compacting the tables it purged (those with at least 20 % of free space inside them): the space of the deleted rows goes back to their tablespace, where the database can use it again. That is not disk space yet: the datafiles keep their size until the reclaim. A purge that only empties large values (mode CLOB) has no table to compact.
 
 ### Run without questions
 
@@ -456,7 +460,7 @@ They also apply to `preflight`. "Asked" means: a run with questions asks when th
 | `--cutoff YYYY-MM-DD` | CUTOFF | Instead of the retention: purge the rows dated before this day |
 | `--mode MODE` | MODE | FULL, CLOB, LOGS or CLOB_N_LOGS (see [Choose what is purged](#choose-what-is-purged)). Asked (FULL) |
 | `--depth LIST` | DEPTH | ALL, or modules separated by commas: PAYMENTS, LOGS, BANK_STATEMENTS. Not used with the mode LOGS. Asked (ALL) |
-| `--compact` | COMPACT | Shrink the purged tables afterwards. Asked (no) |
+| `--compact` | COMPACT | Accepted and ignored: every purge that deletes compacts the tables it purged afterwards |
 | `--batch-size N` | BATCH_SIZE | Top-level rows per transaction, 100 to 100000. By default what the checks recommend; never asked |
 | `--redo-logs` | REDO_LOGS | Larger online redo logs for the time of the purge (4 x 1 GB) when one batch does not fit in them; the original ones are put back at the end. Asked (yes); without questions, only with this option. Not in a pluggable database |
 | `--backup CHOICE` | BACKUP | When no recent RMAN backup is found: `confirmed` (a backup was made another way) or `none` (purge without a backup). Asked |
@@ -511,7 +515,7 @@ They also apply to `preflight`. "Asked" means: a run with questions asks when th
 | A purge was interrupted: the window was closed, the connection dropped | Run the same command again: it goes on from where it stopped. What was deleted stays deleted |
 | A reclaim was interrupted, or the application's accounts are still locked | `src\bin\epf_purge.bat reclaim --restore` puts everything back and unlocks the accounts |
 | You are not sure whether something is left pending | `src\bin\epf_purge.bat status` says so. The [reference](docs/REFERENCE.md#status-and-recovery) lists what clears each thing |
-| The datafiles are as large as before the purge | That is expected: the space is free inside the tables. Run the reclaim |
+| The datafiles are as large as before the purge | That is expected: the space is free for the database to use again, not yet given back to the disk. Run the reclaim |
 | A datafile is a little larger again some minutes after a reclaim | Oracle adds about 5% of free space back to a datafile that can grow. Nothing to do |
 | During a purge, a long query of another session fails with ORA-01555 | The purge keeps undo for 60 seconds only while it runs. Purge in a quiet period |
 

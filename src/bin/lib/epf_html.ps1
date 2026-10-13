@@ -223,9 +223,9 @@ function Write-HtmlReport {
     } elseif ($action -eq 'PURGE') {
         $lead = '<strong>' + $rowsText + ' rows deleted</strong>'
         if ($scope -ne '') { $lead = $lead + ' (' + $scope + ')' }
-        $lead = $lead + '. The space is free inside the tables; the datafiles keep their size until a reclaim.'
+        $lead = $lead + '. The purged tables were compacted; the datafiles keep their size until a reclaim.'
         $tiles.Add(@('rows deleted', $rowsText))
-        if ($checks.ContainsKey('P7') -and $checks['P7'].Value -match '^(\S+ \S+) freed') { $tiles.Add(@('freed inside the tables', $Matches[1])) }
+        if ($checks.ContainsKey('P7') -and $checks['P7'].Value -match 'freed (\d+(?:\.\d+)? [KMGT]?B)') { $tiles.Add(@('space freed', $Matches[1])) }
         if ($waits -match 'log switches (\d+:\d\d:\d\d) of \d+:\d\d:\d\d in batches \((\d+)%\)') { $tiles.Add(@('waiting for the online redo logs', ($Matches[2] + '%'))) }
     } elseif ($action -eq 'PREFLIGHT') {
         $lead = '<strong>The database was checked and the purge estimated.</strong> Nothing was changed.'
