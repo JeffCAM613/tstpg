@@ -1,12 +1,16 @@
 # ============================================================================
-# EPF Data Purge - Command line, wizard and live view
+# EPF Data Purge - Command line, menu, questions and live view
 # ============================================================================
 # Purpose : Implementation of epf_purge.bat. Reads the command line and the
-#           configuration file, collects every input before the first change
-#           (wizard), runs the entry scripts of src\sql\run in sqlplus sessions
-#           fed through standard input (passwords are never placed on a
-#           command line, in a file or in a child environment), shows the run
-#           live, writes the run folder and returns the exit code.
+#           configuration file, gets ready by itself (sqlplus, the database,
+#           the tool's objects), asks what it cannot find and what the
+#           requirements call for before the first change, runs the entry
+#           scripts of src\sql\run in sqlplus sessions fed through standard
+#           input (passwords are never placed on a command line, in a file
+#           it writes or in a child environment), shows the run live
+#           (epf_screen.ps1; every event with --verbose), writes the run
+#           folder with its HTML report (epf_html.ps1) and returns the exit
+#           code.
 # Usage   : epf_purge.bat [action] [options]      (epf_purge.bat --help)
 # Requires: Windows PowerShell 5.1; sqlplus.exe in PATH or in ORACLE_HOME\bin.
 # Exit    : 0 PASS, 1 FAIL, 2 PASS WITH WARNINGS, 3 aborted or stopped,
@@ -357,12 +361,13 @@ Plan of smaller runs
   space (ARCHIVELOG) or --max-redo cannot take its redo at once, older data
   first. purge without --retention, --cutoff, --mode or --depth carries out
   the next step of the open plan with its choices (--dry-run rehearses it);
-  preflight checks the plan again, and the wizard does so first when the
-  last check is older than 8 hours or found requirements not met. A purge
-  with other options is refused while a plan is in progress (the wizard
-  asks); --new starts over. A plan with no step run yet is replaced by a
-  run with other options. Between runs in ARCHIVELOG the DBA backs up and
-  deletes the archived logs.
+  preflight checks the plan again, and a purge with prompts does so first
+  when the last check is older than 8 hours or found requirements not met.
+  A purge with other options is refused while a plan is in progress (with
+  prompts it asks); --new starts over. A plan with no step run yet is
+  replaced by a run with other options. Without prompts, a purge continues
+  an open plan only with --yes or with the days to keep given. Between runs
+  in ARCHIVELOG the DBA backs up and deletes the archived logs.
 
 Reclaim
   A purge frees space inside the tables; the datafiles keep their size. The
@@ -1497,7 +1502,8 @@ function Invoke-ToolRun {
     if ($state.StopKeys -and $script:Verbose) { Write-Out ' Ctrl+C requests a graceful stop.' -NoLog }
     try {
         # Every run checks the requirements with its own choices. After the
-        # wizard's preflight run, its root counts are reused (no second scan).
+        # check a purge with prompts begins with, its root counts are reused
+        # (no second scan).
         $preflightOk = $true
         $reuse = '-'
         $title = 'PREFLIGHT'
@@ -3895,11 +3901,11 @@ function Invoke-Main {
         Exit-Tool $script:ExitUsage ('--scratch: a size such as 500M or 4G, or none, got ' + $script:Cli.Options['scratch'] + '.')
     }
     if ($script:Cli.Flags.ContainsKey('new') -and @('purge', 'preflight') -notcontains $action) {
-        Exit-Tool $script:ExitUsage '--new applies to purge and preflight (the wizard''s menu offers to start over).'
+        Exit-Tool $script:ExitUsage '--new applies to purge and preflight.'
     }
     if ($script:Cli.Options.ContainsKey('max-redo')) {
         if ($null -ne $action -and @('purge', 'preflight') -notcontains $action) {
-            Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to the wizard''s purge.'
+            Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to a purge with prompts.'
         }
         if ($null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['max-redo']))) {
             Exit-Tool $script:ExitUsage ('--max-redo: a size such as 500M or 20G, got ' + $script:Cli.Options['max-redo'] + '.')

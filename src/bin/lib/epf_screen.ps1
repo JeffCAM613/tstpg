@@ -194,7 +194,7 @@ function Start-Flow {
     $script:Flow = [pscustomobject]@{
         Steps = @($Steps); Map = $Map; N = 0; Started = (Get-Date); Open = $false;
         Module = ''; Phase = ''; Batch = $null; EngineStep = ''; EngineScope = '';
-        Rebuilt = 0; Indexes = 0; Rows = [double]0; PurgeEnd = '';
+        Rebuilt = 0; Indexes = 0; Parked = 0; Returned = 0; Rows = [double]0; PurgeEnd = '';
         Pending = (New-Object 'System.Collections.Generic.List[object]');
         Notes = (New-Object 'System.Collections.Generic.List[string]');
         Errors = (New-Object 'System.Collections.Generic.List[string]')
@@ -289,7 +289,8 @@ function Write-FlowNote {
 function Get-ModuleLine {
     param($Batch)
     $text = '         ' + ([string]$Batch.Module).PadRight(16) + ' ' + (Get-Bar $Batch.Pct) + ' ' +
-            ('{0,3}%' -f [int][Math]::Floor($Batch.Pct)) + '   ' + $Batch.Rows + ' rows'
+            ('{0,3}%' -f [int][Math]::Floor($Batch.Pct))
+    if ($Batch.Rows -ne '') { $text = $text + '   ' + $Batch.Rows + ' rows' }
     if ($Batch.Rate -ne '') { $text = $text + ' . ' + $Batch.Rate + ' rows a second' }
     if ($Batch.Left -gt 0) { $text = $text + ' . ' + (Format-Clock $Batch.Left) + ' left' }
     return $text
@@ -318,6 +319,8 @@ function Get-FlowStatus {
     }
     $elapsed = Format-Clock ((Get-Date) - $f.Started).TotalSeconds
     if ($f.Steps[$f.N - 1].Header) {
+        # Under a heading the line says what the engine does now, or nothing.
+        if ($null -eq $engine) { return '' }
         $text = '         '
         if ($f.Module -ne '') { $text = $text + $f.Module.PadRight(16) + ' ' }
     } else {
@@ -327,9 +330,12 @@ function Get-FlowStatus {
         $words = $engine[2].ToLower().Replace('_', ' ')
         if ($script:StepWords.ContainsKey($engine[2])) { $words = $script:StepWords[$engine[2]] }
         if ($engine[2] -eq 'REBUILD_INDEXES' -and $f.Indexes -gt 0) {
-            $words = (Get-Bar (100.0 * $f.Rebuilt / $f.Indexes)) + ' ' + $f.Rebuilt + ' of ' + $f.Indexes + ' indexes rebuilt'
+            $words = [string]$f.Rebuilt + ' of ' + $f.Indexes + ' indexes rebuilt'
+        } elseif ($engine[2] -eq 'RETURN_PARKED' -and $f.Parked -gt 0) {
+            $words = [string]$f.Returned + ' of ' + $f.Parked + ' tables back'
         } elseif ($engine[2] -eq 'COMPACT') {
             $words = $engine[3] + ': ' + $engine[4] + ' tables moved so far'
+            if ($f.Parked -gt 0) { $words = $words + ', ' + $f.Parked + ' set aside' }
         } elseif ($engine[3] -ne '' -and $engine[3] -ne '-' -and $engine[3] -ne $f.Module) {
             $words = $words + ' (' + $engine[3] + ')'
         }
@@ -363,7 +369,7 @@ function Show-FlowEvent {
         } elseif ($step -eq 'PROCESS_BATCHES') {
             $f.Module = $scope
             $f.Phase = 'deleting'
-            $f.Batch = [pscustomobject]@{ Module = $scope; Pct = [double]0; Rows = '0'; Rate = ''; Left = 0 }
+            $f.Batch = [pscustomobject]@{ Module = $scope; Pct = [double]0; Rows = ''; Rate = ''; Left = 0 }
         } elseif ($step -eq 'REBUILD_INDEXES') {
             $f.Rebuilt = 0
         }
@@ -432,6 +438,14 @@ function Show-FlowEvent {
     }
     if ($code -eq 'INDEX_REBUILT') {
         $f.Rebuilt = $f.Rebuilt + 1
+        return
+    }
+    if ($code -eq 'UNIT_PARKED') {
+        $f.Parked = $f.Parked + 1
+        return
+    }
+    if ($code -eq 'UNIT_RETURNED') {
+        $f.Returned = $f.Returned + 1
         return
     }
     if ($code -eq 'INDEXES_RELEASED' -and $message -match '^(\d[\d,]*) indexes released') {
