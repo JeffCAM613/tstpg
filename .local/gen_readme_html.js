@@ -1,111 +1,138 @@
-// Builds docs/README.html from README.md (the Markdown subset the README uses:
-// headings, paragraphs, lists, fenced code, tables, inline code, bold, links).
+// Builds the web pages of docs\ from the Markdown documents: README.md (the
+// user guide), docs/REFERENCE.md and docs/SCENARIOS.md. It reads the Markdown
+// subset they use: headings, paragraphs, lists, fenced code, tables, inline
+// code, bold, links. A link from one document to another goes to its page.
 // Usage: node .local\gen_readme_html.js
 const fs = require('fs');
 const path = require('path');
 const repo = path.join(__dirname, '..');
-const md = fs.readFileSync(path.join(repo, 'README.md'), 'ascii').replace(/\r\n/g, '\n');
+const docs = [
+  { source: 'README.md', target: 'README.html', kicker: 'User guide' },
+  { source: 'docs/REFERENCE.md', target: 'REFERENCE.html', kicker: 'Reference' },
+  { source: 'docs/SCENARIOS.md', target: 'SCENARIOS.html', kicker: 'Scenarios' }
+];
 
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const slug = (s) => s.toLowerCase().replace(/[^a-z0-9 _-]/g, '').trim().replace(/ /g, '-');
-const anchors = [];
 
-function inline(text) {
-  const codes = [];
-  let s = text.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return '\u0000' + (codes.length - 1) + '\u0000'; });
-  s = esc(s);
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, href) => {
-    // Anchors are checked once the page is built; a link to a file of the
-    // repository is made relative to docs/.
-    if (href.startsWith('#')) anchors.push(href.slice(1));
-    else if (!/^[a-z]+:/.test(href)) href = '../' + href;
-    return '<a href="' + href + '">' + t + '</a>';
-  });
-  s = s.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + esc(codes[+i]) + '</code>');
-  return s;
-}
+// One document as the parts of its page: title, intro, navigation, body, the
+// sections it links to in itself (anchors) and in the other pages (cross).
+function parse(doc) {
+  const md = fs.readFileSync(path.join(repo, doc.source), 'ascii').replace(/\r\n/g, '\n');
+  const inDocs = doc.source.startsWith('docs/');
+  const anchors = [];
+  const cross = [];
 
-const lines = md.split('\n');
-const out = [];
-const toc = [];
-let i = 0;
-let title = '';
-let intro = '';
-while (i < lines.length) {
-  const line = lines[i];
-  if (line.trim() === '') { i++; continue; }
-  let m;
-  if ((m = /^(#{1,3}) (.*)$/.exec(line))) {
-    const level = m[1].length;
-    const text = m[2];
-    if (level === 1) { title = text; i++; continue; }
-    if (level === 2 && text === 'Contents') {
-      // The contents list becomes the page's navigation; its links are checked.
-      i++;
-      while (i < lines.length && (lines[i].trim() === '' || lines[i].startsWith('- '))) {
-        for (const a of lines[i].matchAll(/\]\(#([^)]+)\)/g)) anchors.push(a[1]);
+  function inline(text) {
+    const codes = [];
+    let s = text.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return '\u0000' + (codes.length - 1) + '\u0000'; });
+    s = esc(s);
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, href) => {
+      if (href.startsWith('#')) {
+        // Checked once the page is built.
+        anchors.push(href.slice(1));
+      } else if (!/^[a-z]+:/.test(href)) {
+        // Another document: its page, which lies next to this one. Any other
+        // file of the repository: relative to docs/.
+        const other = /^(?:docs\/|\.\.\/)?([A-Za-z_]+)\.md(#.*)?$/.exec(href);
+        const page = other ? docs.find((d) => path.basename(d.source, '.md') === other[1]) : null;
+        if (page) {
+          href = page.target + (other[2] || '');
+          if (other[2]) cross.push({ page: page.target, anchor: other[2].slice(1) });
+        } else if (!inDocs) {
+          href = '../' + href;
+        }
+      }
+      return '<a href="' + href + '">' + t + '</a>';
+    });
+    s = s.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + esc(codes[+i]) + '</code>');
+    return s;
+  }
+
+  const lines = md.split('\n');
+  const out = [];
+  const toc = [];
+  let i = 0;
+  let title = '';
+  let intro = '';
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '') { i++; continue; }
+    let m;
+    if ((m = /^(#{1,3}) (.*)$/.exec(line))) {
+      const level = m[1].length;
+      const text = m[2];
+      if (level === 1) { title = text; i++; continue; }
+      if (level === 2 && text === 'Contents') {
+        // The contents list becomes the page's navigation; its links are checked.
         i++;
+        while (i < lines.length && (lines[i].trim() === '' || lines[i].startsWith('- '))) {
+          for (const a of lines[i].matchAll(/\]\(#([^)]+)\)/g)) anchors.push(a[1]);
+          i++;
+        }
+        continue;
+      }
+      const id = slug(text);
+      if (level === 2) toc.push({ id, text, subs: [] });
+      else if (toc.length) toc[toc.length - 1].subs.push({ id, text });
+      out.push('<h' + level + ' id="' + id + '">' + inline(text) + '<a class="anchor" href="#' + id + '" aria-label="Link to this section">#</a></h' + level + '>');
+      i++;
+      continue;
+    }
+    if (line.startsWith('```')) {
+      const lang = line.slice(3).trim();
+      const body = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith('```')) { body.push(lines[i]); i++; }
+      i++;
+      const labels = { bat: 'Command', powershell: 'PowerShell', sql: 'SQL' };
+      if (labels[lang]) {
+        out.push('<div class="code"><div class="code-head"><span>' + labels[lang] + '</span>' +
+                 '<button class="copy" type="button">Copy</button></div><pre><code>' + esc(body.join('\n')) + '</code></pre></div>');
+      } else {
+        out.push('<div class="code"><pre class="plain"><code>' + esc(body.join('\n')) + '</code></pre></div>');
       }
       continue;
     }
-    const id = slug(text);
-    if (level === 2) toc.push({ id, text, subs: [] });
-    else if (toc.length) toc[toc.length - 1].subs.push({ id, text });
-    out.push('<h' + level + ' id="' + id + '">' + inline(text) + '<a class="anchor" href="#' + id + '" aria-label="Link to this section">#</a></h' + level + '>');
-    i++;
-    continue;
-  }
-  if (line.startsWith('```')) {
-    const lang = line.slice(3).trim();
-    const body = [];
-    i++;
-    while (i < lines.length && !lines[i].startsWith('```')) { body.push(lines[i]); i++; }
-    i++;
-    const labels = { bat: 'Command', powershell: 'PowerShell', sql: 'SQL' };
-    if (labels[lang]) {
-      out.push('<div class="code"><div class="code-head"><span>' + labels[lang] + '</span>' +
-               '<button class="copy" type="button">Copy</button></div><pre><code>' + esc(body.join('\n')) + '</code></pre></div>');
-    } else {
-      out.push('<div class="code"><pre class="plain"><code>' + esc(body.join('\n')) + '</code></pre></div>');
+    if (line.startsWith('|')) {
+      const rows = [];
+      while (i < lines.length && lines[i].startsWith('|')) { rows.push(lines[i]); i++; }
+      const cells = (r) => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+      const head = cells(rows[0]);
+      const body = rows.slice(2).map(cells);
+      out.push('<div class="table-wrap"><table><thead><tr>' + head.map((h) => '<th>' + inline(h) + '</th>').join('') +
+               '</tr></thead><tbody>' + body.map((r) => '<tr>' + r.map((c, k) => '<td data-label="' + esc(head[k].replace(/`/g, '')) + '">' + inline(c) + '</td>').join('') + '</tr>').join('') +
+               '</tbody></table></div>');
+      continue;
     }
-    continue;
+    if (line.startsWith('- ')) {
+      const items = [];
+      while (i < lines.length && lines[i].startsWith('- ')) { items.push(lines[i].slice(2)); i++; }
+      out.push('<ul>' + items.map((t) => '<li>' + inline(t) + '</li>').join('') + '</ul>');
+      continue;
+    }
+    if (/^\d+\. /.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(lines[i].replace(/^\d+\. /, '')); i++; }
+      out.push('<ol>' + items.map((t) => '<li>' + inline(t) + '</li>').join('') + '</ol>');
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== '' && !/^(#|```|\||- |\d+\. )/.test(lines[i])) { para.push(lines[i]); i++; }
+    const text = para.join(' ');
+    // The Markdown says where its page is; the page does not.
+    if (/also available as a web page/.test(text)) continue;
+    if (!intro) { intro = text; continue; }
+    out.push('<p>' + inline(text) + '</p>');
   }
-  if (line.startsWith('|')) {
-    const rows = [];
-    while (i < lines.length && lines[i].startsWith('|')) { rows.push(lines[i]); i++; }
-    const cells = (r) => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
-    const head = cells(rows[0]);
-    const body = rows.slice(2).map(cells);
-    out.push('<div class="table-wrap"><table><thead><tr>' + head.map((h) => '<th>' + inline(h) + '</th>').join('') +
-             '</tr></thead><tbody>' + body.map((r) => '<tr>' + r.map((c, k) => '<td data-label="' + esc(head[k].replace(/`/g, '')) + '">' + inline(c) + '</td>').join('') + '</tr>').join('') +
-             '</tbody></table></div>');
-    continue;
-  }
-  if (line.startsWith('- ')) {
-    const items = [];
-    while (i < lines.length && lines[i].startsWith('- ')) { items.push(lines[i].slice(2)); i++; }
-    out.push('<ul>' + items.map((t) => '<li>' + inline(t) + '</li>').join('') + '</ul>');
-    continue;
-  }
-  if (/^\d+\. /.test(line)) {
-    const items = [];
-    while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(lines[i].replace(/^\d+\. /, '')); i++; }
-    out.push('<ol>' + items.map((t) => '<li>' + inline(t) + '</li>').join('') + '</ol>');
-    continue;
-  }
-  const para = [];
-  while (i < lines.length && lines[i].trim() !== '' && !/^(#|```|\||- |\d+\. )/.test(lines[i])) { para.push(lines[i]); i++; }
-  const text = para.join(' ');
-  if (/docs\/README\.html/.test(text)) continue;
-  if (!intro) { intro = text; continue; }
-  out.push('<p>' + inline(text) + '</p>');
-}
 
-const nav = '<nav class="toc" aria-label="Contents"><p class="toc-title">Contents</p><ol>' +
-  toc.map((t) => '<li><a href="#' + t.id + '">' + inline(t.text) + '</a>' +
-    (t.subs.length ? '<ol>' + t.subs.map((s) => '<li><a href="#' + s.id + '">' + inline(s.text) + '</a></li>').join('') + '</ol>' : '') +
-    '</li>').join('') + '</ol></nav>';
+  const nav = '<nav class="toc" aria-label="Contents"><p class="toc-title">Contents</p><ol>' +
+    toc.map((t) => '<li><a href="#' + t.id + '">' + inline(t.text) + '</a>' +
+      (t.subs.length ? '<ol>' + t.subs.map((s) => '<li><a href="#' + s.id + '">' + inline(s.text) + '</a></li>').join('') + '</ol>' : '') +
+      '</li>').join('') + '</ol></nav>';
+  return { title, intro: inline(intro), nav, body: out.join('\n'), anchors, cross, sections: toc.length };
+}
 
 const css = `
 :root {
@@ -246,20 +273,32 @@ document.querySelectorAll('.copy').forEach(function (button) {
 })();
 `;
 
-const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n' +
-  '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
-  '<title>' + esc(title) + '</title>\n' +
-  '<!-- Generated from README.md by .local/gen_readme_html.js: change the README, then run it again. -->\n' +
-  '<style>' + css + '</style>\n</head>\n<body>\n<div class="layout">\n' +
-  '<header class="top">\n<p class="kicker">User guide</p>\n<h1>' + esc(title) + '</h1>\n<p class="intro">' + inline(intro) + '</p>\n</header>\n' +
-  nav + '\n<main>\n' + out.join('\n') + '\n</main>\n' +
-  '<footer>This page is the HTML version of README.md in the tool\'s folder.</footer>\n' +
-  '</div>\n<script>' + js + '</script>\n</body>\n</html>\n';
-
-if (/[^\x00-\x7F]/.test(html)) { throw new Error('non-ASCII in the page'); }
-const ids = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
-const missing = [...new Set(anchors)].filter((a) => !ids.has(a));
-if (missing.length) { throw new Error('links to missing sections: #' + missing.join(', #')); }
+// The pages, each checked: ASCII only, and every link to a section finds it,
+// in its own page or in another.
+const ids = {};
+const crosses = [];
 fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
-fs.writeFileSync(path.join(repo, 'docs', 'README.html'), html, 'ascii');
-console.log('docs/README.html: ' + html.length + ' characters, ' + toc.length + ' sections');
+for (const doc of docs) {
+  if (!fs.existsSync(path.join(repo, doc.source))) { console.log(doc.source + ': not there, skipped'); continue; }
+  const p = parse(doc);
+  const others = docs.filter((d) => d !== doc && fs.existsSync(path.join(repo, d.source)))
+    .map((d) => '<a href="' + d.target + '">' + d.kicker + '</a>').join(' &middot; ');
+  const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
+    '<title>' + esc(p.title) + '</title>\n' +
+    '<!-- Generated from ' + doc.source + ' by .local/gen_readme_html.js: change that file, then run it again. -->\n' +
+    '<style>' + css + '</style>\n</head>\n<body>\n<div class="layout">\n' +
+    '<header class="top">\n<p class="kicker">' + doc.kicker + '</p>\n<h1>' + esc(p.title) + '</h1>\n<p class="intro">' + p.intro + '</p>\n</header>\n' +
+    p.nav + '\n<main>\n' + p.body + '\n</main>\n' +
+    '<footer>This page is the HTML version of ' + doc.source + ' in the tool\'s folder.' + (others ? ' See also: ' + others + '.' : '') + '</footer>\n' +
+    '</div>\n<script>' + js + '</script>\n</body>\n</html>\n';
+  if (/[^\x00-\x7F]/.test(html)) { throw new Error(doc.source + ': non-ASCII in the page'); }
+  ids[doc.target] = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
+  const missing = [...new Set(p.anchors)].filter((a) => !ids[doc.target].has(a));
+  if (missing.length) { throw new Error(doc.source + ': links to missing sections: #' + missing.join(', #')); }
+  for (const c of p.cross) crosses.push({ from: doc.source, page: c.page, anchor: c.anchor });
+  fs.writeFileSync(path.join(repo, 'docs', doc.target), html, 'ascii');
+  console.log('docs/' + doc.target + ': ' + html.length + ' characters, ' + p.sections + ' sections');
+}
+const lost = crosses.filter((c) => ids[c.page] && !ids[c.page].has(c.anchor)).map((c) => c.from + ' -> ' + c.page + '#' + c.anchor);
+if (lost.length) { throw new Error('links to missing sections of another page: ' + lost.join('; ')); }

@@ -1,263 +1,373 @@
 # EPF Data Purge
 
-EPF Data Purge removes old data from the EPF application's schemas (OP, OPPAYMENTS and OPREPORTS), and can give the disk space it frees back to the disk. It checks the database before it changes anything, can simulate a purge first, splits a large purge into smaller runs, and records every run with a report and a verdict.
+EPF Data Purge removes old data from the EPF application's database and gives the disk space it frees back to the disk. It checks the database before it changes anything, can show what it would do before it does it, and ends every run with a report.
 
 This guide is also available as a web page: [docs/README.html](docs/README.html).
 
 ## Contents
 
 - [What it does](#what-it-does)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Configure](#configure)
-- [Run it](#run-it)
-- [Purge](#purge)
-- [Large purges: a plan of smaller runs](#large-purges-a-plan-of-smaller-runs)
-- [Reclaim disk space](#reclaim-disk-space)
-- [Stop a run](#stop-a-run)
-- [Runs, reports and logs](#runs-reports-and-logs)
-- [Status and recovery](#status-and-recovery)
-- [Settings](#settings)
-- [SQL*Plus scripts](#sqlplus-scripts)
-- [Command reference](#command-reference)
-- [Repository layout](#repository-layout)
-- [Testing](#testing)
+- [Before you start](#before-you-start)
+- [Getting started](#getting-started)
+- [Advanced usage](#advanced-usage)
+- [Parameters](#parameters)
+- [If something goes wrong](#if-something-goes-wrong)
+- [More detail](#more-detail)
 
 ## What it does
 
-The data is grouped in three modules. Each module has root tables with a date column. A root row is eligible when its date is before the cutoff, and its whole tree of dependent rows goes with it.
+The tool does two jobs. Each has a dry run, which shows the result and changes nothing.
 
-| Module | What it holds | Root tables (date column) |
+| | Purge | Reclaim |
 |---|---|---|
-| PAYMENTS | Bulk payments with all their dependent records, and file integrations | OPPAYMENTS.BULK_PAYMENT (VALUE_DATE), OPPAYMENTS.FILE_INTEGRATION (INTEGRATION_DATE) |
-| LOGS | Functional audit trail and technical logs | OPPAYMENTS.AUDIT_TRAIL (AUDIT_TIMESTAMP), OP.SPEC_TRT_LOG (DTLOG) |
-| BANK_STATEMENTS | Bank statement dispatching | OPPAYMENTS.FILE_DISPATCHING (DATE_RECEPTION) |
+| **What it does** | Deletes the old rows of the application: everything older than the days of data you keep | Compacts the datafiles, so that the space the purge freed goes back to the disk |
+| **Its dry run** | Counts what would be deleted, the space it frees and the time it takes | Measures how much disk space would come back |
+| **The application meanwhile** | Its accounts are not locked. Run the purge in a quiet period | Not available: its accounts are locked until the reclaim ends |
+| **Can it be undone** | No. Have a backup first | Nothing to undo: it changes no row of the application |
+| **Passwords** | EPFPG (the tool's own account) and SYS | SYS |
 
-The cutoff is today minus the days of data to keep (`--retention DAYS`; a purge asks for them when they are not given), or a date given with `--cutoff YYYY-MM-DD`. A root that a kept row still references is left, with its tree, for a later run.
+Two things to know:
 
-The mode decides what happens to the eligible rows:
+- **A purge alone does not free disk space.** The rows are gone, but the datafiles keep their size until a reclaim.
+- **The purge comes first, the reclaim after.** They can be run on different days: the purge in a quiet period, the reclaim when the application can be stopped.
 
-| Mode | Effect |
+The data a purge works on is in three groups, called modules:
+
+| Module | What it holds |
 |---|---|
-| FULL | Deletes the eligible rows of the modules chosen with `--depth` (ALL by default). |
-| CLOB | Keeps the rows and empties their large text and binary values (LOB columns). |
-| LOGS | Deletes the eligible rows of the LOGS module only: the same as FULL with `--depth LOGS`. The depth is not asked for then. |
-| CLOB_N_LOGS | Deletes the eligible rows of the LOGS module, and empties the LOB values of the other modules. |
+| PAYMENTS | Bulk payments with all their dependent records, and file integrations |
+| LOGS | The functional audit trail and the technical logs |
+| BANK_STATEMENTS | Bank statement dispatching |
 
-The mode says what is done to the rows; the depth says in which modules (PAYMENTS, LOGS, BANK_STATEMENTS, or ALL). LOGS is the name of a module, and also of the mode that is a shorthand for that module alone.
+You say how many days of data to keep. With 365, everything dated more than 365 days ago is purged. A record that newer data still refers to stays, and goes with a later purge.
 
-A purge works in batches: each batch is one transaction, committed before the next one starts. It does not lock the application's accounts.
+By default a purge deletes the old rows of all three modules. It can also be limited to some modules, or keep the rows and only empty their large values (documents, messages): see [Choose what is purged](#choose-what-is-purged).
 
-The space a purge frees stays inside the tables: the datafiles keep their size. The [reclaim](#reclaim-disk-space) gives that space back to the disk.
+## Before you start
 
-## Requirements
+You need:
 
-- A Windows machine with Windows PowerShell 5.1 and an Oracle client: `sqlplus.exe` in the PATH or in `%ORACLE_HOME%\bin`, and a TNS alias or an EZConnect string for the database.
-- Oracle Database 12.2 or later (developed on 19c). In a multitenant database, connect to the PDB service.
-- The SYS password (AS SYSDBA) to install, upgrade and uninstall the tool's objects, to reclaim, and for every purge that deletes (its [undo tuning](#undo-tuning-every-purge), and the larger online redo logs). A dry run of a purge needs only the tool's own account, EPFPG, which the install creates.
-- For a reclaim: a single-instance database (not RAC).
-- Best run from a machine on the database's own network rather than through a VPN. Every step opens a sqlplus session, and a long reclaim depends on its connection until the end: a dropped connection ends the run, which then restores what it changed. Short drops are retried for 10 minutes (`RECONNECT_S`).
+- A Windows machine with Windows PowerShell 5.1 and an Oracle client (`sqlplus.exe` in the PATH or in `%ORACLE_HOME%\bin`), best on the database's own network rather than through a VPN.
+- The database: its alias in tnsnames.ora, or `host:port/service`.
+- The SYS password. It is asked for the first time on a database, for every purge that deletes, and for every reclaim.
+- A backup taken shortly before a purge. The tool looks for an RMAN backup of the last 24 hours, and asks when it finds none.
+- For a reclaim: a time when nobody uses the application.
 
-## Install
+The database is Oracle 12.2 or later (the tool was built and tested on 19c), single instance. A purge that deletes does not yet run in a pluggable database of a container database, nor on RAC.
 
-There is nothing to install by hand. Every purge and every reclaim gets ready by itself and says so:
+Nothing has to be installed by hand: the first run on a database does it (see [The first time on a database](#the-first-time-on-a-database)).
 
-```text
- Getting ready
-   sqlplus            C:\oracle\product\19.0.0\client_1\bin\sqlplus.exe
-   Database           EPFPDB: connected (EPFPDB)
-   Tool in database   version 0.9.5
+Open a Command Prompt or a PowerShell window in the tool's folder. Every command of this guide is typed there.
+
+## Getting started
+
+### The menu
+
+The simplest way in is the command alone:
+
+```bat
+src\bin\epf_purge.bat
 ```
 
-- **The first time on a database** the tool's own objects are missing. The run says so, explains what they are (an account EPFPG and a tablespace EPFPG_DATA next to the application's data, with the tool's tables and packages), and asks whether to install them. It then asks for the SYS password and for the password to give the EPFPG account (twice), and goes on with what it was asked. At the question for the EPFPG password, press Enter alone when the tool was never installed there.
-- **After an update of these scripts** the objects in the database are of an older version: the run asks whether to upgrade them (SYS). The run history and the settings you changed are kept.
-- Without prompts (`--non-interactive`), both are done without asking, with the passwords of the environment or the configuration file (see [Passwords](#passwords)).
+It asks what you want to do, then the questions that go with your choice:
 
-`src\bin\epf_purge.bat install --tns EPFPDB` does the same by hand, and ends with `EPFPG objects valid, tool version <version>`.
+```text
+ What do you want to do?
+   1  Dry run of a purge     shows what a purge would delete; changes nothing
+   2  Purge                  deletes old rows; a reclaim is needed afterwards to
+                             free disk space
+   3  Dry run of a reclaim   shows how much disk space a reclaim would give back;
+                             changes nothing
+   4  Reclaim                compacts the datafiles to free disk space; the
+                             database must not be in use meanwhile
+   5  Report of an earlier run
+   6  Status: is anything left pending?
+   7  Uninstall: remove the tool's objects from the database
+   Q  Quit
+ > Choice [1]:
+```
 
-To remove the tool: `src\bin\epf_purge.bat uninstall` drops the EPFPG account and the EPFPG_DATA tablespace, with the history of the runs. A purge or a reclaim that ended well also asks whether to remove them (the default is to keep them); `UNINSTALL_AFTER=Y` in the configuration file answers yes for runs without prompts. The reports on the machine stay either way, and the next run installs the objects again.
+Every question stands under a line with its name and waits at a prompt marked `>`. The value in brackets is the default: press Enter to take it.
 
-## Configure
+Start with choice 1: it changes nothing. The steps below are the same four choices as commands:
 
-Copy `src\config\epf_purge.conf.example` to `src\config\epf_purge.conf` and set at least `TNS`. The example file describes every key. Another file can be given with `--config FILE`.
-
-Command-line options override the file. With prompts, a value in the file is the default answer of its question (the database, the days to keep) or the answer itself (a yes or no such as `REDO_LOGS`); with `--non-interactive`, it is the answer.
-
-| Key | Option | Meaning |
+| Step | Command | What it does |
 |---|---|---|
-| TNS | `--tns` | The database: its alias in tnsnames.ora, or host:port/service. Asked for when not given |
-| RETENTION_DAYS | `--retention` | Days of data to keep: older rows are purged. Asked for when not given; required for a purge without prompts |
-| CUTOFF | `--cutoff` | Instead of the retention: purge rows dated before this day |
-| MODE | `--mode` | FULL, CLOB, LOGS or CLOB_N_LOGS. Asked for when not given (FULL by default) |
-| DEPTH | `--depth` | ALL, or modules separated by commas. Asked for when not given (ALL by default) |
-| BATCH_SIZE | `--batch-size` | Root rows per transaction, 100 to 100000. By default, with prompts: what the checks recommend |
-| DRY_RUN | `--dry-run` | Y: show what would happen, change nothing. A purge asks when the option is not given (the menu has asked already) |
-| COMPACT | `--compact` | Y: shrink the purged tables afterwards. A purge that deletes asks when the option is not given |
-| REDO_LOGS | `--redo-logs` | Y: larger online redo logs (4 x 1 GB) for the purge when one batch does not fit, without being asked; the original groups are put back at the end (SYS) |
-| UNDO_TUNING | `--undo-tuning` | Accepted and ignored: every purge runs with [undo tuning](#undo-tuning-every-purge) |
-| BACKUP | `--backup` | Without a recent RMAN backup, without being asked: CONFIRMED (a backup was made another way) or NONE |
-| CONFIRM | `--confirm` | Requirements to go on without although they are not met, without being asked: ARCHIVE, UNDO, TEMP |
-| MAX_REDO | `--max-redo` | The most redo one run may write, such as 20G: the purge is split into runs |
-| RECLAIM_TABLESPACES | `--tablespaces` | Reclaim: the tablespaces to compact |
-| RECLAIM_CONFIRM | `--confirm` | Reclaim: ARCHIVE, TEMP, RECYCLEBIN |
-| RECLAIM_SCRATCH | `--scratch` | Reclaim: the most scratch space for the tables that cannot move lower, such as 3G. By default the size the reclaim measures; NONE: no scratch space |
-| UNINSTALL_AFTER | | Y: after a purge or a reclaim that ended well, the tool's objects are removed from the database. With prompts, the run asks |
-| LOG_DIR | `--log-dir` | Where the run folders go (`logs` by default) |
-| VERBOSE | `--verbose` | Y: every event and the whole report on the console |
-| NO_COLOR | `--no-color` | Y: plain output |
-| OPEN_REPORT | `--no-open` | N: report.html is written and not opened in the browser |
+| 1 | `src\bin\epf_purge.bat purge --dry-run --retention 365` | Shows what a purge would delete, keeping the last 365 days. Changes nothing |
+| 2 | `src\bin\epf_purge.bat purge --retention 365` | Deletes those rows |
+| 3 | `src\bin\epf_purge.bat reclaim --dry-run` | Shows how much disk space would come back. Changes nothing |
+| 3 | `src\bin\epf_purge.bat reclaim` | Gives that space back to the disk. The application is not available meanwhile |
 
-### Passwords
+### The first time on a database
 
-The tool never places a password on a command line or in a file it writes. It reads the passwords from the environment variables EPF_PASSWORD (EPFPG) and EPF_SYS_PASSWORD (SYS), or from EPF_PASSWORD and SYS_PASSWORD in the configuration file, or asks for them without showing them. A configuration file that holds them is as sensitive as the passwords: keep it where only the account that runs the tool can read it.
+Every run gets ready by itself: it finds sqlplus, reaches the database and looks for the tool's own objects there. The first time they are missing. The run says so and asks whether to install them: an account EPFPG and a tablespace EPFPG_DATA, beside the application's data, with the history of the runs and what they measured. Installing them changes nothing else.
 
-With `--non-interactive` the tool cannot ask. Set both variables first, once per PowerShell window. This line asks for both passwords without showing them; the command history keeps only the line:
-
-```powershell
-$env:EPF_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'EPFPG password' -AsSecureString)).Password; $env:EPF_SYS_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'SYS password' -AsSecureString)).Password
-```
-
-When you are done (closing the window does the same):
-
-```powershell
-Remove-Item Env:EPF_PASSWORD, Env:EPF_SYS_PASSWORD
-```
-
-## Run it
-
-There are two things to do, and each can be a dry run:
-
-| | Dry run (changes nothing) | For real |
-|---|---|---|
-| **Purge**: delete the old rows | `epf_purge.bat purge --dry-run --retention 365` | `epf_purge.bat purge --retention 365` |
-| **Reclaim**: give the freed space back to the disk | `epf_purge.bat reclaim --dry-run` | `epf_purge.bat reclaim` |
-
-A purge alone frees no disk space: the rows are gone, and the datafiles keep their size until a reclaim. A purge deletes in small batches and does not lock the application's accounts (run it in a quiet period); a reclaim needs the database not in use, and locks those accounts while it runs. The purge comes first.
-
-- **The menu.** `src\bin\epf_purge.bat` without an action asks what you want: a dry run of a purge, a purge, a dry run of a reclaim, a reclaim, the report of an earlier run, the status, or the removal of the tool.
-- **Commands.** `src\bin\epf_purge.bat <action> [options]`. `src\bin\epf_purge.bat --help` explains purge and reclaim, then lists every action and option.
-- **One command without prompts.** With `--non-interactive` nothing is asked: the database, the passwords and the days to keep come from the options, the environment or `--config FILE`, and the purge or the reclaim starts without confirmation. This is the command a scheduler of yours can start; the tool schedules nothing itself. For example `epf_purge.bat purge --non-interactive --config D:\epf\nightly.conf`.
-
-Every run asks what its options do not say: the database, the passwords and the days of data to keep; for a purge also the mode, the modules (depth), whether it is a dry run and whether to compact the purged tables afterwards. Only the batch size is never asked: it is what the checks recommend, unless `--batch-size` gives one.
-
-Each question stands under a divider with its name, and its prompt is marked `>`. The questions on the mode and the depth show what each choice works on in this database with the cutoff given: the tables, their size today and a rough estimate of what the choice frees (that size by the share of top-level records dated before the cutoff; a dry run replaces it by a count). The tables are listed once, largest first, with their large values in brackets (the part the mode CLOB empties), and the tables of the tool's list that this database does not have are named:
+At the question for the EPFPG password, press Enter alone. The run then asks for the SYS password, and for the password to give the new EPFPG account:
 
 ```text
- -- Mode: what is done to the rows dated before 13 Oct 2025 --------------------
-   Mode             Tables   Size now   Frees (about)   What it does
-   FULL                 25     7.5 GB          6.1 GB   deletes the rows, in the modules chosen next
-   CLOB                  6     3.4 GB          2.9 GB   keeps the rows, empties their large values
-   LOGS                  3     1.1 GB        310.0 MB   same as FULL with the module LOGS alone
-   CLOB_N_LOGS           8     4.2 GB          3.1 GB   CLOB, and deletes the rows of module LOGS
+ -- The tool's own account (EPFPG) ---------------------------------------------
+ > EPFPG password (Enter alone if the tool was never installed on this database):
 
-   The tables, largest first. In brackets: the large values of a table (LOB columns: documents,
-   messages), the part that CLOB empties.
-   PAYMENTS         20 tables, 3.6 GB
-       PAYMENT_ADDITIONAL_INFO               1.2 GB
-       TRANSMISSION_EXECUTION_AUDIT        640.0 MB   [520.0 MB]
-       ...
-   Not in this database, and skipped: APPROBATION_EXECUTION_OPT, WORKFLOW_EXECUTION_OPT.
- > Mode (FULL, CLOB, LOGS, CLOB_N_LOGS) [FULL]:
+ -- SYS password ---------------------------------------------------------------
+ > SYS password:
+   Database           EPFDB: connected as SYS (EPFDB)
+   Tool in database   not installed yet
+
+ -- Install the tool -----------------------------------------------------------
+   The tool keeps its own objects in the database: an account EPFPG and a tablespace EPFPG_DATA,
+   with the history of its runs and what they measured. Installing them changes nothing else.
+ > Install them now (Y/N) [Y]:
+
+ -- Password of the new account ------------------------------------------------
+ > Password to give the EPFPG account:
+ > Password to give the EPFPG account (again):
+   Database           EPFDB: connected (EPFDB)
+   Tool in database   version 0.9.5 (installed now, 0:02)
 ```
 
-The screen shows the steps of the run by what they do, each with its time. While rows are deleted there is one line per module, with its progress, the rows, the speed and the time left:
+The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.
 
-```text
- 1 of 4  Checking the database (read-only)                         done    0:05
- 2 of 4  Preparing the database for the purge (SYS)                done    0:02
-         undo kept 60 s and its tablespace under 4.0 GB while rows are deleted; put back at the end
- 3 of 4  Deleting
-         PAYMENTS         [##########..........]  50%   9,109,274 rows . 39,149 rows a second . 3:50 left
-```
-
-Warnings and errors are shown as they come. At the end the run says in plain words what was done, what to know and what comes next, and opens its report in the browser (see [Runs, reports and logs](#runs-reports-and-logs)). `--verbose` shows every event and the whole text report instead; console.log in the run folder has every line either way. Ctrl+C asks for a graceful stop (see [Stop a run](#stop-a-run)).
-
-## Purge
-
-### 1. Dry run
+### Step 1: see what a purge would delete
 
 ```bat
 src\bin\epf_purge.bat purge --dry-run --retention 365
 ```
 
-A dry run checks the database, counts exactly what a purge would delete, and changes nothing. It shows:
+The dry run asks for the database and the EPFPG password, then what the purge should do. Each choice is shown with the tables it works on in your database, their size today and a rough estimate of what it frees. Press Enter twice to take everything old in every module:
 
-- the requirements as a table (below);
-- the rows to delete and the space freed, per module, and how long the deleting would take;
-- the disk a purge takes while it runs and where: the undo tablespace up to its limit, the temporary space, the temporary indexes and the online redo logs, each with its file, what it uses at most and the extra disk it needs (what its file has to grow by, beyond its size today), then the tablespaces whose tables are purged;
-- the same figures for other retentions, as examples, so that the days to keep can be chosen by the space they free; any number of days can be tried the same way;
-- whether the purge would complete as things are, and the command that runs it.
+```text
+ -- Mode: what is done to the rows dated before 13 Oct 2025 --------------------
+   Mode             Tables   Size now   Frees (about)   What it does
+   FULL                 25    22.0 GB          6.9 GB   deletes the rows, in the modules chosen next
+   CLOB                  6    13.8 GB          1.6 GB   keeps the rows, empties their large values
+   LOGS                  3     1.2 GB         24.6 MB   same as FULL with the module LOGS alone
+   CLOB_N_LOGS           8    14.6 GB          1.6 GB   CLOB, and deletes the rows of module LOGS
+   ...
+ > Mode (FULL, CLOB, LOGS, CLOB_N_LOGS) [FULL]:
 
-### 2. Purge
+ -- Depth: in which modules (mode FULL) ----------------------------------------
+   Module           Tables   Size now   Frees (about)   What it holds
+   ALL                  25    22.0 GB          6.9 GB   every module
+   PAYMENTS             20     8.9 GB          6.5 GB   Bulk payments with all dependent records,
+                                                        and file integrations
+   LOGS                  3     1.2 GB         24.6 MB   Functional audit trail and technical logs
+   BANK_STATEMENTS       2    11.9 GB        389.9 MB   Bank statement dispatching
+ > Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS) [ALL]:
+```
+
+It then checks the database, counts the rows, and says what a purge would do:
+
+```text
+ ===============================================================================
+  A purge would delete 19,279,194 rows, about 7.0 GB, dated before 13 Oct 2025.
+  It would take about 8 minutes of deleting, and would complete as things are.
+ ===============================================================================
+   What                  Rows to delete   Space freed (about)    Deleting
+   PAYMENTS                  18,218,547                6.6 GB        7:40
+   LOGS                         125,517               21.0 MB        0:04
+   BANK_STATEMENTS              935,130              380.0 MB        0:33
+```
+
+Below that it shows:
+
+- the disk a purge uses while it runs, file by file, with the extra disk each needs (given back at the end of the purge);
+- the same figures for other numbers of days, as examples, so that the days to keep can be chosen by the space they free;
+- the command that runs the purge itself, and where the report is.
+
+Nothing was changed. Try other numbers of days the same way.
+
+### Step 2: purge
 
 ```bat
 src\bin\epf_purge.bat purge --retention 365
 ```
 
-The purge asks what its options do not say (the mode, the modules, whether it is a dry run, whether to compact afterwards), checks the database, shows the requirements and asks the questions they call for, shows what it is about to delete (the top-level records and the time; a dry run counts the rows) and asks you to type `yes`. It then deletes in batches and ends with its checks and its report. Without prompts, every answer comes from the options or the configuration file and nothing is confirmed:
+The purge asks the same questions, plus whether it is a dry run (no) and whether to compact the purged tables afterwards (no, the default, is fine when a reclaim follows). Then:
 
-```bat
-src\bin\epf_purge.bat purge --non-interactive --retention 365 --redo-logs
+1. **It checks the database** and shows its requirements as a table: each one is required or optional, with its state now, and for each one not met what happens and what to do.
+2. **It asks what the requirements call for.** For example whether to enlarge the online redo logs for the time of the purge when they are small (the default is yes; they are put back at the end), or whether a backup exists when it found none.
+3. **It shows what it is about to delete and waits** for you to type `yes`. Nothing is deleted before that.
+4. **It deletes**, in small batches, and shows one line per module with the progress, the speed and the time left.
+5. **It puts the database back as it was** (what it changed for the purge: the undo settings, the online redo logs) and ends with the result.
+
+```text
+   Requirement                       Needed     Now
+   Undo space                        required   ok
+   Temporary space                   required   ok
+   Online redo logs                  optional   NOT MET
+       What happens: Small online logs fill every few seconds and the purge waits on each switch.
+       Slower, not a failure.
+       What to do:   the tool can enlarge them for the purge ...
+   Backup                            required   ok
+
+ ===============================================================================
+  Ready. This deletes everything dated before 13 Oct 2025: 197,409 top-level records, with the rows
+  under them (a dry run counts those).
+  About 8 minutes of deleting. It cannot be undone.
+ ===============================================================================
+ > Type yes to start the purge: yes
+
+ 2 of 4  Preparing the database for the purge (SYS)                done    0:11
+ 3 of 4  Deleting
+         PAYMENTS         [##########..........]  50%   9,109,274 rows . 39,149 rows a second . 3:50 left
+ ...
+ 4 of 4  Putting the database back as it was (SYS)                 done    0:04
+
+ ===============================================================================
+  DONE   19,279,194 rows deleted in 10:01. The checks passed, with 1 note.
+ ===============================================================================
+  7.0 GB is now free inside the tables. The datafiles keep their size until a reclaim gives it back
+  to the disk (the database must not be in use during a reclaim):
+      epf_purge.bat reclaim --dry-run
 ```
 
-A purge without prompts deletes only what it is told to: the days to keep must be given (`--retention`, `--cutoff`, or the configuration file).
+A required condition that is not met is a strong warning. Going on is your choice, and the default answer is no.
 
-### The requirements and their questions
-
-Every purge, and every dry run, checks six requirements and shows them as a table: whether each is required or optional, its state now with what was measured, and for each one not met what happens and what to do.
-
-| Requirement | Needed | What it checks | With prompts | Without prompts |
-|---|---|---|---|---|
-| Room for the archived logs (ARCHIVE) | required | In ARCHIVELOG mode, the archive destination has room for the purge's redo, plus 20 % | Go on anyway? (not recommended) | `--confirm ARCHIVE`, or a [plan of smaller runs](#large-purges-a-plan-of-smaller-runs) |
-| Undo space (UNDO) | required | The undo tablespace holds four batches within the limit [undo tuning](#undo-tuning-every-purge) sets | A batch size that fits is taken; otherwise: go on anyway? | `--batch-size`, or `--confirm UNDO` |
-| Temporary space (TEMP) | required | The temporary tablespace holds the purge's work keys | Go on anyway? (not recommended) | `--confirm TEMP` |
-| Backup (BACKUP) | required | An RMAN database backup newer than 24 hours | Is there a backup RMAN does not know? If not: purge without a backup? | `--backup confirmed` or `--backup none` |
-| Room for the temporary indexes (INDEX_SPACE) | optional | EPFPG_DATA holds the temporary indexes the purge creates | Nothing is asked: the purge is only slower | |
-| Online redo logs (REDO_LOGS) | optional | One batch fits in an online redo log (otherwise the purge waits for them at times) | Enlarge them for this purge? (4 x 1 GB, put back at its end). Not asked in a pluggable database | `--redo-logs` (not used in a pluggable database) |
-
-In a pluggable database the online redo logs belong to the container database: the tool neither asks about them nor enlarges them there, and says so.
-
-A required one that is not met is a strong warning, and going on is your choice: the default answer is no. Without prompts nothing is gone past unless its option says so: the purge does not start, says which requirement stops it and the option that goes past it, and changes nothing. A dry run asks nothing about them; when something is not met it says so and asks whether to go on.
-
-More options for the purge:
-
-- `--compact` shrinks the purged tables afterwards (tables with at least 20 % free inside them).
-- `--redo-logs` gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).
-- `--mode` and `--depth` limit the purge to some modules, or to emptying LOB values (see [What it does](#what-it-does)).
-
-The end of a purge says how long the batches waited for log switches, for example `log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB`. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs could save.
-
-### The checks alone (preflight)
+### Step 3: give the space back to the disk
 
 ```bat
-src\bin\epf_purge.bat preflight --retention 365
+src\bin\epf_purge.bat reclaim --dry-run
+src\bin\epf_purge.bat reclaim
 ```
 
-The preflight is the first step of every purge, run alone: it validates the tool's table registry against the database, counts the top-level records old enough to purge (the roots; a dry run counts the rows under them), estimates the redo, undo and time of the purge, checks the requirements with their questions, and plans the purge. It changes nothing. The answers are saved with the plan, and the purges of the plan follow them.
+The dry run measures and changes nothing. It says what the reclaim gives back, which accounts it locks, and the disk it uses meanwhile:
 
-### Undo tuning (every purge)
+```text
+ ===============================================================================
+  A reclaim takes DATA from 50.1 GB to about 16.3 GB: 33.8 GB back to the disk.
+ ===============================================================================
+  The database must not be in use meanwhile: the application accounts KDCM, OP, OPPAYMENTS,
+  OPREPORTS, SUPER are locked and their sessions disconnected until it ends.
 
-Every purge runs with undo tuning, and needs the SYS password for it. Why:
+   DATA              today  [##############################]  50.1 GB
+                     after  [#########.....................]  about 16.3 GB
+                     738 tables move, 1000 indexes are rebuilt, 2 segments stay where they are
+```
 
-- Every row a purge deletes writes undo, about half as much as its redo: 31.7 GB for 89 M rows on one test copy.
-- Oracle keeps committed undo for undo_retention (900 s by default), and with autoextensible undo datafiles for as long as the longest call runs. A purge is one long call, so the undo tablespace grows by tens of GB (27.6 GB in one purge without tuning).
-- A datafile does not shrink by itself: Oracle keeps the size an undo, temporary or data file grew to. Undo retention only says how long old undo is kept inside the undo tablespace.
+The reclaim itself measures again, shows the same, and waits for you to type `yes`. It then locks the application's accounts, compacts the tables, rebuilds the indexes, compares everything with what it recorded at the start, and unlocks the accounts:
 
-For the purge, undo tuning sets undo_retention to 60 s (in memory only) and caps the undo tablespace at the largest of its size, 4 GB (setting undo_cap_mb) and 4 batches of undo. Each batch commits, so the purge reuses its own undo instead of growing the tablespace. It does not slow the purge.
+```text
+ ===============================================================================
+  DONE   DATA went from 50.1 GB to 15.5 GB: 34.6 GB given back to the disk.
+         11:55. The application accounts are unlocked. The checks passed, with 1 note.
+ ===============================================================================
+```
 
-At the end it restores undo_retention and the cap, and gives back what the undo datafiles and the temporary tablespaces grew: the temporary tablespaces at once, the undo datafiles as far as Oracle has released their extents. Oracle keeps undo extents for hours (18 hours after the purges, one test database could only go from 5.4 to 4.6 GB), so when the undo datafiles are still more than 1 GB (setting undo_switch_min_mb) above their size before, the undo tablespace is switched:
+A reclaim takes time with the amount of data it has to move, from minutes to more than an hour. It changes no row of the application: the row counts and the objects are compared before and after.
 
-1. A small undo tablespace, EPF_UNDO_SWAP (256 MB, next to the undo datafile), becomes the instance's undo tablespace.
-2. Once none of the original's undo segments is in use, the original is dropped with its datafiles and created again: the same tablespace name, the same file names, each file at its size before and with its growth settings. On Oracle-managed files and ASM, Oracle names the files.
-3. It becomes the undo tablespace again, and EPF_UNDO_SWAP is dropped with its file.
+### After a run
 
-Nothing is renamed, run after run. The switch takes a few seconds; the original is created small and then resized, so the moment without it is well under a second. It is not done with a standby database. On an instance started from a pfile that names undo_tablespace it is skipped, since a crash in that moment would need the pfile edited before the next startup; the setting undo_switch_pfile (Y) accepts that. An spfile follows each step, and a pfile that does not name undo_tablespace takes whichever undo tablespace exists. It waits up to 5 minutes (setting undo_switch_wait_s) for the transactions of other sessions to end; otherwise it is skipped and says why. Each step is recorded first: a switch that stops part way is carried on by `src/sql/run/undo.sql SWITCH`, the next restore or the next purge, and `status` shows it. `undo.sql SWITCH <size_mb>` switches by hand, such as on a database a tool grew before.
+- **The report** opens in the browser at the end of every run: the result in one sentence, the main figures, the time of each step, the checks. `src\bin\epf_purge.bat report` shows the latest one again.
+- **The run folder** `logs\<date>_<time>_R-000123` keeps it, with the text report and every line of the run (report.html, report.txt, console.log).
+- **The tool's objects**: a purge or a reclaim that ended well asks whether to remove them from the database. The default is to keep them: the next run is then ready at once.
 
-While it is applied, a long query of another session can fail with ORA-01555 (snapshot too old): run purges in a quiet window. An undo tablespace with RETENTION GUARANTEE has to be set to NOGUARANTEE by the DBA first.
+### Stop a run
 
-## Large purges: a plan of smaller runs
+Press Ctrl+C in the window of the run, or, from another window:
 
-When the archive destination (ARCHIVELOG mode) cannot take the whole purge's redo at once, or when `--max-redo SIZE` limits it, the preflight plans several runs, older data first.
+```bat
+src\bin\epf_purge.bat stop
+```
+
+A purge stops after its current batch: what was deleted stays deleted, nothing is half done, and the same command goes on from there. A reclaim stops after its current table and puts everything back: indexes, datafile settings, accounts.
+
+## Advanced usage
+
+### Choose what is purged
+
+**How far back.** `--retention DAYS` keeps that many days, counted from today. `--cutoff YYYY-MM-DD` gives the day itself instead: rows dated before it are purged.
+
+**What is done to the old rows**, with `--mode`:
+
+| Mode | What it does |
+|---|---|
+| FULL | Deletes the old rows, in the modules chosen with `--depth`. The default |
+| CLOB | Keeps the rows and empties their large values (LOB columns: documents, messages) |
+| LOGS | Deletes the old rows of the module LOGS only. The same as FULL with `--depth LOGS` |
+| CLOB_N_LOGS | Both: empties the large values of the other modules, and deletes the old rows of the module LOGS |
+
+**In which modules**, with `--depth`: `ALL` (the default), or names separated by commas, such as `PAYMENTS,LOGS`.
+
+The mode says what is done, the depth says where. LOGS is the name of a module, and also of the mode that is a shorthand for that module alone.
+
+```bat
+src\bin\epf_purge.bat purge --dry-run --retention 730 --depth PAYMENTS,BANK_STATEMENTS
+src\bin\epf_purge.bat purge --dry-run --cutoff 2024-01-01 --mode CLOB
+src\bin\epf_purge.bat purge --retention 90 --mode LOGS
+```
+
+`--compact` shrinks the purged tables afterwards, which returns the freed space to their tablespace. It does not shrink the datafiles: that is the reclaim.
+
+### Run without questions
+
+With `--non-interactive` nothing is asked: every answer comes from the options, the environment or the configuration file, and the purge or the reclaim starts without confirmation. This is the command a scheduler of yours can start. The tool schedules nothing itself.
+
+```bat
+src\bin\epf_purge.bat purge --non-interactive --tns EPFDB --retention 365 --redo-logs
+src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
+```
+
+- A purge without questions deletes only what it is told to: the days to keep must be given (`--retention`, `--cutoff`, or the configuration file).
+- The first run on a database installs the tool's objects without asking, and a run after an update upgrades them.
+- When a required condition is not met, the run does not start: it changes nothing, names the condition, and gives the option that goes past it (see [When a requirement is not met](#when-a-requirement-is-not-met)).
+- The exit code says how it ended (see [Exit codes](#exit-codes)).
+
+### Passwords
+
+The tool never puts a password on a command line or in a file it writes. Without questions it reads them from:
+
+| Password | Environment variable | Key of the configuration file |
+|---|---|---|
+| EPFPG, the tool's own account | EPF_PASSWORD | EPF_PASSWORD |
+| SYS | EPF_SYS_PASSWORD | SYS_PASSWORD |
+
+In a PowerShell window, this line asks for both without showing them and keeps them for that window only:
+
+```powershell
+$env:EPF_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'EPFPG password' -AsSecureString)).Password; $env:EPF_SYS_PASSWORD = [Net.NetworkCredential]::new('', (Read-Host 'SYS password' -AsSecureString)).Password
+```
+
+A configuration file that holds passwords is as sensitive as they are: keep it where only the account that runs the tool can read it.
+
+### A configuration file
+
+Copy `src\config\epf_purge.conf.example` to `src\config\epf_purge.conf`, or give another file with `--config FILE`. It holds one `KEY=VALUE` per line, and the example describes every key:
+
+```text
+TNS=EPFDB
+RETENTION_DAYS=365
+MODE=FULL
+DEPTH=ALL
+REDO_LOGS=Y
+OPEN_REPORT=N
+```
+
+- An option on the command line wins over the file.
+- With questions, a value of the file is the default answer of its question (the database, the days to keep), or the answer itself for a yes or no.
+- Without questions, it is the answer.
+
+A whole purge as one command, such as a nightly job:
+
+```bat
+src\bin\epf_purge.bat purge --non-interactive --config D:\epf\nightly.conf
+```
+
+### When a requirement is not met
+
+Every purge checks six requirements before it starts, and a reclaim checks its own. With questions the run asks. Without questions these options answer beforehand:
+
+| Requirement not met | What it means | Option that answers |
+|---|---|---|
+| Online redo logs (optional) | They are small: the purge works, but waits for them at times | `--redo-logs` enlarges them for the purge and puts them back at the end |
+| Backup | No RMAN backup of the last 24 hours was found | `--backup confirmed` when a backup was made another way; `--backup none` to purge without one |
+| Room for the archived logs, undo space, temporary space | The purge may run out of room | `--confirm ARCHIVE`, `--confirm UNDO`, `--confirm TEMP` go on anyway. Not recommended: make room instead |
+| Recycle bin (reclaim) | Dropped objects lie in the tablespaces to compact | `--confirm RECYCLEBIN` lets the reclaim purge them first: they can then no longer be restored |
+
+The table of the requirements, on the screen and in the report, says for each one what was measured and what to do. The [reference](docs/REFERENCE.md#the-requirements-and-their-questions) has every requirement in detail.
+
+### A large purge in several runs
+
+When one purge would write more redo than the archive destination can take (a database in ARCHIVELOG mode), or more than you allow with `--max-redo`, the tool plans it in several runs, older data first:
 
 ```bat
 src\bin\epf_purge.bat preflight --retention 365 --max-redo 20G
@@ -265,190 +375,154 @@ src\bin\epf_purge.bat plan
 src\bin\epf_purge.bat purge
 ```
 
-- `purge`, without scope options, carries out the next step of the open plan; `purge --dry-run` rehearses it.
-- `preflight` checks the plan again; a purge with prompts does so itself when the last check is older than 8 hours or found requirements not met.
-- Without prompts, `purge` continues an open plan only with `--yes` or with the days to keep given (options or configuration file).
-- In ARCHIVELOG mode, back up and delete the archived logs between runs.
-- While a plan is in progress, a purge with other options is refused; `--new` starts over (the steps already done stay done). `plan --close` closes the plan.
+`preflight` runs the checks of a purge alone and makes the plan, `plan` shows its steps, and each `purge` without other options carries out the next step. Back up and delete the archived logs between runs. More in the [reference](docs/REFERENCE.md#large-purges-a-plan-of-smaller-runs).
 
-## Reclaim disk space
+### More control over a reclaim
 
-A purge frees space inside the tables, but the datafiles keep their size. The reclaim compacts the application's tablespaces in place and shrinks their datafiles:
-
-1. It locks the application's accounts and disconnects their sessions. **The application is unavailable until the end of the run.**
-2. It records the row counts and a fingerprint of the objects, releases the indexes of the tables that will move (they are rebuilt at the end), and stops the datafiles from growing.
-3. Repeatedly, the table holding the highest block of a datafile moves into free space lower down, and the datafile is cut down to its new end.
-4. It rebuilds the indexes, restores the datafiles' growth settings, resizes each datafile to its highest block plus 64 MB of free space, recompiles what became invalid, counts the rows again and unlocks the accounts.
-
-The reclaim changes no row of the application, and no datafile grows above its size at the start (two rare exceptions are reported as warnings).
-
-A datafile that can grow by itself does not stay at exactly the size of its tables and indexes: within minutes of the run Oracle extends such a file ahead of need, until about 5% of it is free. The run therefore passes its efficiency check (R7) when a tablespace ends within 5% of its segments (256 MB for a small one), and warns above that, naming what held the space.
-
-```bat
-src\bin\epf_purge.bat reclaim --dry-run
-src\bin\epf_purge.bat reclaim
-```
-
-Every reclaim measures first, in a read-only run (its dry run): what it gives back to the disk, tablespace by tablespace, the accounts it locks, the requirements, and the scratch space it takes with the file it creates for it. `--dry-run` ends there. With prompts, the reclaim then asks about each required one that is not met, and asks you to type `yes` before anything moves. Without prompts (`reclaim --non-interactive`) it goes straight on, and does not start while a required one is not met.
-
-Options:
-
-- `--tablespaces DATA,INDX` limits the reclaim to those tablespaces. By default it takes every tablespace holding segments of the application's schemas.
-- `--confirm RECYCLEBIN` lets it purge the recycle bin of those tablespaces first, without being asked; without it, recycle-bin objects stop a reclaim without prompts before any change. `--confirm ARCHIVE` and `--confirm TEMP` work as for a purge.
-- `--scratch SIZE`, such as `--scratch 3G`, sets the limit of the scratch tablespace; by default it is the size the reclaim measures, and `--scratch none` runs without scratch space. Oracle chooses where the copy of a moved table goes, and may put it back at the top of the file; a table may also not fit lower down. With scratch space, such a table waits in a scratch tablespace (created next to its tablespace's datafile) while the rest is compacted, then comes back into the space left free, and the scratch tablespace is dropped. Without it, the datafile stops shrinking at that table. Parking ends once it would not make the tablespace smaller: the parked tables take the free space when they come back, so with less free space than is parked, emptying more of the top would only write tables twice (FILE_DONE says so); the tables with free space inside them that fit below still move first. The tables come back last parked first and the scratch datafile is resized down after each, so the scratch datafile shrinks while the tablespace grows again. The result says the most the run held on disk, scratch space included (`On disk`, event DISK_PEAK), and the steps that write say how long they waited for log switches. The dry run shows where the scratch datafile would go and suggests a size: the largest table that moves and half of all that moves, plus a tenth. The scratch datafile grows only as far as the tables parked need, up to that size. A table that does not fit in what is left is reported with the size that would have taken it; once the scratch space is full, no more table is parked in that run (SCRATCH_FULL, with the size that would have taken the next one), and the tables that cannot move lower stay where they are.
-
-The measurement checks these requirements, shown as a table like those of a purge: the recycle bin, the room for the archived logs, the temporary space and the space quotas of the owners are required (the quotas cannot be gone past: the owners need a space quota where their tables are written again); a backup is optional, and the scratch space is taken by the reclaim itself.
-
-Some segments cannot move: partitioned tables, queue tables, tables with a LONG column, and a few other kinds. They stay where they are, the assessment lists them, and a datafile cannot shrink below the highest of them.
-
-If a reclaim is interrupted, what it changed is undone: at once after Ctrl+C or `stop`; in the same run when its session is lost; otherwise by `src\bin\epf_purge.bat reclaim --restore`. `status` shows anything left pending.
-
-## Stop a run
-
-Press Ctrl+C in the window that shows the run, or, from another window:
-
-```bat
-src\bin\epf_purge.bat stop
-```
-
-A purge stops after its current batch, a reclaim after its current table. The run then ends with its report, with status STOPPED and exit code 3. Run the purge again to continue: the rows already deleted stay deleted.
-
-## Runs, reports and logs
-
-Every action that works on the database creates a run, such as R-000123, recorded in the EPFPG tables, and a folder `logs\<date>_<time>_R-000123`:
-
-| File | Content |
+| Option | What it does |
 |---|---|
-| console.log | Every line of the run as `--verbose` shows it: every event and the whole report |
-| report.txt | The run's report: parameters, steps, results, checks and verdict |
-| manifest.txt | A key=value summary: status, verdict, exit code, checks |
-| requirements.txt, plan.txt | The requirements and the plan, when the run has them |
-| summary.txt | The report in short: the estimate or the simulation, the disk a purge takes while it runs, the requirements, the tablespaces, the checks that did not pass and the verdict; for a reclaim, also its datafiles at the start and at the end |
-| report.html | The run in a browser: the result in one sentence, the main figures, the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
-| sqlplus_*.log | The output of the SQL*Plus sessions |
+| `--tablespaces DATA,INDX` | Compacts these tablespaces only. By default: every tablespace that holds the application's data |
+| `--scratch 3G` | Sets the most scratch space the reclaim may take. `--scratch none` runs without |
+| `--confirm RECYCLEBIN` | Purges the dropped objects of those tablespaces first, without asking |
+| `--restore` | Puts back what a reclaim that did not finish left pending, and unlocks the accounts |
 
-Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:
+Scratch space: a table that cannot move lower in its datafile waits in a scratch tablespace, which the reclaim creates next to that datafile and removes at the end. The dry run says how much it takes and where, so that the disk can be checked first. Apart from it, no datafile grows above its size at the start.
+
+### Earlier runs and the state of the database
 
 ```bat
 src\bin\epf_purge.bat report
 src\bin\epf_purge.bat report --run 123
-```
-
-The first shows the latest run. Runs older than 180 days (setting history_retention_days) are removed from the database when a new run starts; the run folders stay until you delete them.
-
-| Exit code | Meaning |
-|---|---|
-| 0 | PASS |
-| 1 | FAIL |
-| 2 | PASS WITH WARNINGS |
-| 3 | Aborted or stopped |
-| 4 | Usage or configuration error (nothing was changed) |
-
-## Status and recovery
-
-```bat
 src\bin\epf_purge.bat status
 ```
 
-The status shows the active run, or the latest one, with its steps and last events, and anything left pending:
+`report` shows the report of the latest run, or of the run given. `status` shows the run in progress, or the latest one, and anything a run left pending.
 
-| Left pending | Cleared by |
-|---|---|
-| Temporary indexes of an interrupted purge | The next purge drops them. |
-| Undo tuning still active | The purge restores it at its end; otherwise `src/sql/run/undo.sql RESTORE` as SYS (see [SQL*Plus scripts](#sqlplus-scripts)). |
-| An undo switch not finished (another session's transaction still held the original) | `src/sql/run/undo.sql SWITCH` as SYS carries it on; the next purge does too. |
-| Online redo logs replaced for a purge | The purge puts the original groups back at its end; otherwise `src/sql/run/redo_logs.sql RESTORE` as SYS. |
-| Undo or temporary space a purge or reclaim made Oracle add (information) | Given back as far as Oracle allows at the end of the run, undo by a switch when more than 1 GB stays; the rest by `src/sql/run/undo.sql RESTORE`, or all of the undo at once by `undo.sql SWITCH`, as SYS. |
-| Reclaim changes: datafile growth stopped, indexes still unusable, accounts still locked, tables still parked, a scratch tablespace | `src\bin\epf_purge.bat reclaim --restore`; a new reclaim restores them too. |
+On the screen, `--verbose` shows every event and the whole report instead of the short view. `--no-open` writes report.html without opening it, and `--log-dir DIR` puts the run folders elsewhere.
 
-## Settings
-
-The tunables are rows of the table EPFPG.EPF_SETTING. An upgrade keeps the values you changed. The ones most often changed:
-
-| Setting | Default | Meaning |
-|---|---|---|
-| app_schemas | OP,OPPAYMENTS,OPREPORTS | The application's schemas; the tablespaces they use are reclaim candidates |
-| retention_days_default | 30 | Retention in days when none is given |
-| batch_size_default | 1000 | Root rows per batch when none is given |
-| history_retention_days | 180 | Runs older than this are removed when a new run starts |
-| backup_max_age_h | 24 | An RMAN backup newer than this meets BACKUP |
-| archive_margin_pct | 20 | Margin added to the redo estimate for ARCHIVE |
-| undo_cap_mb | 4096 | Undo growth limit with undo tuning |
-| undo_switch_min_mb | 1024 | After a purge, the undo tablespace is switched when its datafiles are still this much above their size before |
-| compact_min_free_pct | 20 | `--compact` shrinks the tables with at least this share free |
-| reclaim_margin_mb | 64 | Free space a reclaim leaves at the end of each datafile |
-| reclaim_growth_mb | 0 | How far a reclaim may grow a datafile above its size at the start |
-| disconnect_timeout_s | 300 | Seconds a reclaim waits for sessions to end before it disconnects them at once |
-
-To change one, connected as EPFPG:
-
-```sql
-UPDATE epfpg.epf_setting SET value = '365' WHERE name = 'retention_days_default';
-COMMIT;
-```
-
-## SQL*Plus scripts
-
-The tool runs the scripts of `src\sql\run`. Some of them can be run directly in SQL*Plus, from the tool's folder:
-
-| Script | Connect as | Purpose |
-|---|---|---|
-| `report.sql <run_id or LATEST>` | EPFPG | The report of a run |
-| `status.sql` | EPFPG | The status, as `epf_purge.bat status` |
-| `scope.sql <YYYY-MM-DD>` | EPFPG | What a purge covers with that cutoff, as `EPF_SCOPE` lines: the tables of each module with their sizes, and the rows of each root with those dated before the cutoff. Read-only; the questions on the mode and the depth show it |
-| `stop.sql <run_id or ACTIVE>` | EPFPG | A graceful stop |
-| `preflight.sql NEW` | EPFPG | A standalone preflight with the default parameters |
-| `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand (APPLY before `purge.sql`, which does not start without it); RESTORE also gives back what undo and temp grew |
-| `undo.sql SWITCH [<size_mb>]` | SYS AS SYSDBA | Creates the undo tablespace again under the same names: each datafile at its size before the purge, or at `size_mb`. Also carries on a switch that stopped part way |
-| `redo_logs.sql RESTORE` | SYS AS SYSDBA | Puts back the online redo log groups replaced for a purge |
-| `redo_logs.sql SET <size_mb> <groups>` | SYS AS SYSDBA | Sets the online redo logs to that many groups of that size and keeps them so, such as `SET 200 3` for the size they had before another tool enlarged them. New groups take the lowest free numbers (group 1 is redo01.log); the others are dropped once Oracle no longer needs them, with their files |
-
-For example (SQL*Plus asks for the password):
+### Remove the tool from the database
 
 ```bat
-sqlplus -L -S "epfpg@EPFPDB" @src/sql/run/report.sql LATEST
-sqlplus -L "sys@EPFPDB AS SYSDBA" @src/sql/run/undo.sql RESTORE
+src\bin\epf_purge.bat uninstall
 ```
 
-## Command reference
+This removes the account EPFPG and its tablespace EPFPG_DATA, with the history of the runs. The application's data is not touched, and the reports on the machine stay. The next purge or reclaim installs the objects again.
 
-`src\bin\epf_purge.bat --help` prints the complete reference.
+## Parameters
+
+Usage: `src\bin\epf_purge.bat [action] [options]`. `src\bin\epf_purge.bat --help` prints all of it.
+
+### Actions
 
 | Action | What it does |
 |---|---|
 | (none) | The menu |
-| `purge` | Checks, questions, purge and report; `--dry-run` counts what it would delete and changes nothing |
-| `reclaim` | Gives the freed space back to the disk, after measuring; `--dry-run` measures only, `--restore` restores what a reclaim left pending |
-| `report` | The report of a run: `--run ID`, the latest by default |
-| `status` | The state of the active or latest run, and anything left pending |
-| `stop` | A graceful stop of the active run |
+| `purge` | Deletes the rows older than the days of data to keep: checks, questions, purge, report. With `--dry-run` it counts what it would delete and changes nothing |
+| `reclaim` | Gives the space a purge freed back to the disk (SYS; the application's accounts are locked meanwhile). It measures first and asks. With `--dry-run` it measures only; with `--restore` it puts back what a reclaim that did not finish left pending |
+| `report` | Shows the report of a run: the latest, or `--run ID` |
+| `status` | Shows the run in progress or the latest one, and anything left pending |
+| `stop` | Asks the run in progress to stop cleanly |
+| `preflight` | The checks and estimates of a purge alone, and its plan. Changes no data |
+| `plan` | Shows the open plan of a purge in several runs; `--close` closes it |
+| `install` | Installs or upgrades the tool's objects in the database (SYS). A purge or a reclaim does it when needed |
 | `uninstall` | Removes the tool's objects from the database (SYS) |
-| `install` | Installs or upgrades them (SYS); a purge or a reclaim does it when needed |
-| `preflight` | The checks and estimates of a purge alone, and its plan |
-| `plan` | The open plan with its steps; `--close` closes it |
 
-General options: `--config FILE`, `--tns NAME`, `--non-interactive` (ask nothing; a purge or a reclaim starts without confirmation), `--yes` (skip the typed confirmation of a run with prompts; required with `--non-interactive` for `uninstall` and `plan --close`), `--no-open`, `--log-dir DIR`, `--verbose`, `--no-color`, `--help`.
+### Options of every action
 
-## Repository layout
+| Option | Configuration key | What it does |
+|---|---|---|
+| `--tns NAME` | TNS | The database: its alias in tnsnames.ora, or `host:port/service`. Asked for when not given |
+| `--config FILE` | | The configuration file. By default `src\config\epf_purge.conf` |
+| `--non-interactive` | | Ask nothing. A purge or a reclaim starts without confirmation |
+| `--yes` | | Skip the typed `yes` of a run with questions. Required with `--non-interactive` for `uninstall` and `plan --close` |
+| `--verbose` | VERBOSE | Show every event and the whole report on the screen |
+| `--no-color` | NO_COLOR | Plain output, without colours |
+| `--no-open` | OPEN_REPORT=N | Write report.html without opening it in the browser |
+| `--log-dir DIR` | LOG_DIR | Where the run folders go. By default `logs` in the tool's folder |
+| `--help` | | Explain purge and reclaim, then list every action and option |
 
-```text
-src\bin\epf_purge.bat    the tool (its code is in src\bin\lib: epf.ps1, the screen in
-                         epf_screen.ps1, the HTML report in epf_html.ps1)
-src\config\              the configuration example
-src\sql\install\         installer, tables and packages of the EPFPG schema
-src\sql\run\             the SQL*Plus scripts the tool runs
-src\tests\               end-to-end tests, test labs and the parity check
-docs\README.html         this guide as a web page
-legacy\                  the previous tool, kept for reference
-logs\                    run folders (not part of the repository)
-```
+### Options of a purge
 
-## Testing
+They also apply to `preflight`. "Asked" means: a run with questions asks when the option is not given, and Enter takes the value shown.
 
-The end-to-end test suite runs every feature against a test database, and changes it: it purges every module, clears LOB values, compacts tables, enlarges the online redo logs during the purges (put back after each) and changes undo_retention during them. Its reclaim tests work on tablespaces they create and remove. Run it only on a copy that can be discarded.
+| Option | Configuration key | What it does |
+|---|---|---|
+| `--dry-run` | DRY_RUN | Show what would happen and change nothing. Asked (no) |
+| `--retention DAYS` | RETENTION_DAYS | The days of data to keep: older rows are purged. Asked; required without questions |
+| `--cutoff YYYY-MM-DD` | CUTOFF | Instead of the retention: purge the rows dated before this day |
+| `--mode MODE` | MODE | FULL, CLOB, LOGS or CLOB_N_LOGS (see [Choose what is purged](#choose-what-is-purged)). Asked (FULL) |
+| `--depth LIST` | DEPTH | ALL, or modules separated by commas: PAYMENTS, LOGS, BANK_STATEMENTS. Not used with the mode LOGS. Asked (ALL) |
+| `--compact` | COMPACT | Shrink the purged tables afterwards. Asked (no) |
+| `--batch-size N` | BATCH_SIZE | Top-level rows per transaction, 100 to 100000. By default what the checks recommend; never asked |
+| `--redo-logs` | REDO_LOGS | Larger online redo logs for the time of the purge (4 x 1 GB) when one batch does not fit in them; the original ones are put back at the end. Asked (yes); without questions, only with this option. Not in a pluggable database |
+| `--backup CHOICE` | BACKUP | When no recent RMAN backup is found: `confirmed` (a backup was made another way) or `none` (purge without a backup). Asked |
+| `--confirm LIST` | CONFIRM | Go on although these requirements are not met: ARCHIVE, UNDO, TEMP, separated by commas. Asked (no) |
+| `--max-redo SIZE` | MAX_REDO | The most redo one run may write, such as `500M` or `20G`: the purge is planned in several runs |
+| `--new` | | Start over: close the open plan and follow the options given |
+| `--undo-tuning` | UNDO_TUNING | Accepted and ignored: every purge keeps undo in check for its time (see [undo tuning](docs/REFERENCE.md#undo-tuning-every-purge)) |
 
-1. Copy `src\tests\e2e\test.conf.example` to `src\tests\e2e\test.conf`, and set TNS, EXPECTED_DB and DESTRUCTIVE_OK=YES.
-2. Run `src\tests\e2e\run_tests.bat` for the whole suite (about 3 hours), or a part of it, such as `src\tests\e2e\run_tests.bat --only T18A,T18B`.
-3. `src\tests\e2e\run_tests.bat --digest` writes a short summary of the last test session and of the runs after it to `logs\digest.txt` and copies it to the clipboard: each run with its checks, every step with its duration, key events (a large move with the time it took), restore lines and summary, and the time of the runs in all. With the SYS password at hand (EPF_SYS_PASSWORD, or SYS_PASSWORD in test.conf) it adds the database as it is now: how the instance started, the tool installed and whether its objects are valid, the online logs, and every datafile and temporary file with its size, the free space inside it and the step it grows by.
-4. `src\tests\e2e\run_tests.bat --sys redo_logs.sql SET 200 3` runs a SYS script of `src\sql\run` (`redo_logs.sql`, `undo.sql`) on the test database of test.conf with the arguments that follow, as typed in SQL*Plus, after checking the database name. Its output is shown and kept in `logs\sys\`, and the digest lists what the script did. Test steps use it in place of SQL*Plus by hand, so that the digest carries them too.
-5. `src\tests\sim\epf_sim.bat` plays the screens and questions of a purge and a reclaim with scripted figures, as they were designed before the tool followed them: it connects to nothing and needs no database. `epf_sim.bat --help` lists what it takes; `--sim` chooses the state the database is found in (a requirement not met, the tool not installed, a run that fails). It writes a sample `report.html` under `logs\sim\`.
+### Options of a reclaim
+
+| Option | Configuration key | What it does |
+|---|---|---|
+| `--dry-run` | | Measure what a reclaim gives back and change nothing |
+| `--tablespaces LIST` | RECLAIM_TABLESPACES | The tablespaces to compact, separated by commas. By default every tablespace that holds the application's data |
+| `--scratch SIZE` | RECLAIM_SCRATCH | The most scratch space, such as `3G`; `none` for no scratch space. By default the size the dry run measures |
+| `--confirm LIST` | RECLAIM_CONFIRM | Go on although these requirements are not met: ARCHIVE, TEMP, RECYCLEBIN |
+| `--restore` | | Put back what a reclaim that did not finish left pending: the tables set aside, the indexes, the datafile settings, the locked accounts |
+
+### Options of report, stop and plan
+
+| Option | What it does |
+|---|---|
+| `--run ID` | The run, as `124` or `R-000124`. For `report`: by default the latest. For `stop`: by default the run in progress |
+| `--close` | With `plan`: close the open plan |
+
+### Keys of the configuration file only
+
+| Key | What it does |
+|---|---|
+| EPF_PASSWORD, SYS_PASSWORD | The passwords, for runs without questions (see [Passwords](#passwords)) |
+| UNINSTALL_AFTER | Y: after a purge or a reclaim that ended well, remove the tool's objects from the database. With questions, the run asks |
+| CONNECT_TIMEOUT_S | Seconds a connection may take, 10 to 3600 (120 by default). It is tried 3 times |
+| RECONNECT_S | Seconds a run keeps trying while the network or the database does not answer, 60 to 86400 (600 by default) |
+
+### Exit codes
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Done, every check passed |
+| 1 | Failed, or not started because a required condition is not met |
+| 2 | Done, with warnings |
+| 3 | Stopped, or you answered no |
+| 4 | A mistake in the command or the configuration. Nothing was changed |
+
+## If something goes wrong
+
+| What you see | What to do |
+|---|---|
+| `sqlplus.exe was not found` | Install an Oracle client, or add its `bin` folder to the PATH (or set ORACLE_HOME) |
+| The connection as EPFPG is refused | Either the password is wrong, or the tool was never installed on this database: press Enter alone at the EPFPG password and the run installs it (SYS) |
+| "The purge does not start: a required condition is not met" | Nothing was changed. The screen names the condition and the way past it (see [When a requirement is not met](#when-a-requirement-is-not-met)) |
+| A purge was interrupted: the window was closed, the connection dropped | Run the same command again: it goes on from where it stopped. What was deleted stays deleted |
+| A reclaim was interrupted, or the application's accounts are still locked | `src\bin\epf_purge.bat reclaim --restore` puts everything back and unlocks the accounts |
+| You are not sure whether something is left pending | `src\bin\epf_purge.bat status` says so. The [reference](docs/REFERENCE.md#status-and-recovery) lists what clears each thing |
+| The datafiles are as large as before the purge | That is expected: the space is free inside the tables. Run the reclaim |
+| A datafile is a little larger again some minutes after a reclaim | Oracle adds about 5% of free space back to a datafile that can grow. Nothing to do |
+| During a purge, a long query of another session fails with ORA-01555 | The purge keeps undo for 60 seconds only while it runs. Purge in a quiet period |
+
+When you ask for help, send the run folder: `console.log` has every line of the run and `report.txt` the whole report.
+
+## More detail
+
+The [reference](docs/REFERENCE.md) has what lies behind this guide:
+
+- [How a purge chooses its rows](docs/REFERENCE.md#what-it-does): the root tables and their date columns.
+- [The requirements and their questions](docs/REFERENCE.md#the-requirements-and-their-questions), and [undo tuning](docs/REFERENCE.md#undo-tuning-every-purge): what every purge changes for its time and puts back.
+- [How a reclaim works](docs/REFERENCE.md#reclaim-disk-space), with its scratch space.
+- [Runs, reports and logs](docs/REFERENCE.md#runs-reports-and-logs): the files of a run folder.
+- [Status and recovery](docs/REFERENCE.md#status-and-recovery): what can be left pending and what clears it.
+- [Settings](docs/REFERENCE.md#settings) kept in the database, and the [SQL*Plus scripts](docs/REFERENCE.md#sqlplus-scripts).
+- [Testing](docs/REFERENCE.md#testing): the test suite and the simulator.
+
+[Scenarios](docs/SCENARIOS.md) walks through the tool screen by screen, without a database: what is typed and what the tool answers, in the everyday cases and when something is not as it should be.
