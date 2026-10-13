@@ -2,6 +2,31 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.4 before its first run: mode, depth, dry run and compaction are questions again; no enlargement of the online redo logs in a pluggable database; the screen read against the engine's own messages
+
+Why: the user, on the summary of the flow: "mode, depth, dry run, and compaction should be questions still. only batch size is auto from those. please verify your implementation then i'll test on small databses for faster tests. enlarge the online redo logs (default yes); -- should check if pbd and no option to enlarge if so."
+
+The questions (epf.ps1, Get-PurgeContext):
+- A purge asks the mode and the depth when their options are not given, each after two lines that say what the values mean; then whether it is a dry run (not with `--dry-run`, and not from the menu, whose choice has said it: $script:GoalChosen) and, for a purge that deletes, whether to compact the purged tables afterwards. The batch size stays what the checks recommend.
+- The suite: T11 answers the days to keep, FULL, N, N, yes; T16 answers 2, the days to keep, FULL, N, yes, N.
+
+A pluggable database:
+- Test-DbConnection also reads SYS_CONTEXT('USERENV', 'CON_ID'); above 1 is a pluggable database ($script:Database.Pdb), said in "Getting ready".
+- There the question about the online redo logs is not asked, `--redo-logs` and REDO_LOGS=Y are not used (a line says so), the requirements table says the logs belong to the container, and print_disk_need says the same in the report.
+- Not changed: undo tuning refuses a container database (epf_tuning.check_instance), so a purge that deletes does not run in a pluggable database yet. Nothing was run in a pluggable database: the check was only played against the stand-in.
+
+Verification against the engine's code (the stand-in sqlplus had its own, simpler messages; it now prints the engine's):
+- BATCH_PROGRESS: batches are written with thousands separators ("batch 1,200/9,400") and the unit is "rows" or "LOB values"; the screen read neither, so a module of 1,000 batches or more, and any LOB-clearing mode, had no live line.
+- MODULE_END: a module that is stopped or fails says STOPPED or FAILED where the screen expected DONE; its rows were not counted and the end said "0 rows". The line of such a module now shows its progress, its rows and the word.
+- A preflight's ESTIMATE has no rows and no space freed (it counts the roots only): the sentence before the typed yes says the top-level records and the time, and the preflight's screen shows the report's own ESTIMATE and RETENTION OPTIONS. A table the screen cannot read is shown as the report prints it, never as a failure.
+- RETENTION OPTIONS: the space freed is the third size after the rows; a preflight's redo was taken for it.
+- The SYS steps print "CODE message" without a severity, and a step that puts things back logs no event: their lines that say something was left as it was (an undo switch skipped or pending, undo or temp space kept, a redo group kept) are now shown, and "created again" is said only for UNDO_SWITCHED.
+- RUN_END is no longer shown as a note.
+
+Checked here: 34 scenarios through the real wrapper (219 checks on their screens), now also a pluggable database, a stopped purge with batches by the thousand, a LOB-clearing purge, an undo switch done and one skipped, the preflight alone; T00, T06, T07 pass, T08's screen checks, T11's and T16's answers go through against the stand-in. Still not run on a database.
+
+How to test: as below (set X on the status page); a purge now asks the mode, the depth, dry run and compaction before its checks.
+
 ## 2026-10-13 - 0.9.4: the flow built in the wrapper: the tool gets ready by itself, the requirements as a table with their questions, the screen by default, the menu by goal, one command without prompts; the report says where a purge takes disk
 
 Why: the user, after step 1: "why stop there. please finish the changes." The flow is the one they decided (PLAN.md 13.2) and tried in the simulator.

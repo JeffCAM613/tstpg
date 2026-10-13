@@ -86,11 +86,11 @@ Command-line options override the file. With prompts, a value in the file is the
 | TNS | `--tns` | The database: its alias in tnsnames.ora, or host:port/service. Asked for when not given |
 | RETENTION_DAYS | `--retention` | Days of data to keep: older rows are purged. Asked for when not given; required for a purge without prompts |
 | CUTOFF | `--cutoff` | Instead of the retention: purge rows dated before this day |
-| MODE | `--mode` | FULL (the default), CLOB, LOGS or CLOB_N_LOGS |
-| DEPTH | `--depth` | ALL (the default), or modules separated by commas |
+| MODE | `--mode` | FULL, CLOB, LOGS or CLOB_N_LOGS. Asked for when not given (FULL by default) |
+| DEPTH | `--depth` | ALL, or modules separated by commas. Asked for when not given (ALL by default) |
 | BATCH_SIZE | `--batch-size` | Root rows per transaction, 100 to 100000. By default, with prompts: what the checks recommend |
-| DRY_RUN | `--dry-run` | Y: show what would happen, change nothing |
-| COMPACT | `--compact` | Y: shrink the purged tables afterwards |
+| DRY_RUN | `--dry-run` | Y: show what would happen, change nothing. A purge asks when the option is not given (the menu has asked already) |
+| COMPACT | `--compact` | Y: shrink the purged tables afterwards. A purge that deletes asks when the option is not given |
 | REDO_LOGS | `--redo-logs` | Y: larger online redo logs (4 x 1 GB) for the purge when one batch does not fit, without being asked; the original groups are put back at the end (SYS) |
 | UNDO_TUNING | `--undo-tuning` | Accepted and ignored: every purge runs with [undo tuning](#undo-tuning-every-purge) |
 | BACKUP | `--backup` | Without a recent RMAN backup, without being asked: CONFIRMED (a backup was made another way) or NONE |
@@ -136,7 +136,7 @@ A purge alone frees no disk space: the rows are gone, and the datafiles keep the
 - **Commands.** `src\bin\epf_purge.bat <action> [options]`. `src\bin\epf_purge.bat --help` explains purge and reclaim, then lists every action and option.
 - **One command without prompts.** With `--non-interactive` nothing is asked: the database, the passwords and the days to keep come from the options, the environment or `--config FILE`, and the purge or the reclaim starts without confirmation. This is the command a scheduler of yours can start; the tool schedules nothing itself. For example `epf_purge.bat purge --non-interactive --config D:\epf\nightly.conf`.
 
-Every run asks only what it cannot find: the database when `--tns` and the configuration file do not give it, the passwords, the days of data to keep.
+Every run asks what its options do not say: the database, the passwords and the days of data to keep; for a purge also the mode, the modules (depth), whether it is a dry run and whether to compact the purged tables afterwards. Only the batch size is never asked: it is what the checks recommend, unless `--batch-size` gives one.
 
 The screen shows the steps of the run by what they do, each with its time. While rows are deleted there is one line per module, with its progress, the rows, the speed and the time left:
 
@@ -172,7 +172,7 @@ A dry run checks the database, counts exactly what a purge would delete, and cha
 src\bin\epf_purge.bat purge --retention 365
 ```
 
-The purge checks the database, shows the requirements and asks the questions they call for, shows what it is about to delete and asks you to type `yes`. It then deletes in batches and ends with its checks and its report. Without prompts, every answer comes from the options or the configuration file and nothing is confirmed:
+The purge asks what its options do not say (the mode, the modules, whether it is a dry run, whether to compact afterwards), checks the database, shows the requirements and asks the questions they call for, shows what it is about to delete (the top-level records and the time; a dry run counts the rows) and asks you to type `yes`. It then deletes in batches and ends with its checks and its report. Without prompts, every answer comes from the options or the configuration file and nothing is confirmed:
 
 ```bat
 src\bin\epf_purge.bat purge --non-interactive --retention 365 --redo-logs
@@ -191,7 +191,9 @@ Every purge, and every dry run, checks six requirements and shows them as a tabl
 | Temporary space (TEMP) | required | The temporary tablespace holds the purge's work keys | Go on anyway? (not recommended) | `--confirm TEMP` |
 | Backup (BACKUP) | required | An RMAN database backup newer than 24 hours | Is there a backup RMAN does not know? If not: purge without a backup? | `--backup confirmed` or `--backup none` |
 | Room for the temporary indexes (INDEX_SPACE) | optional | EPFPG_DATA holds the temporary indexes the purge creates | Nothing is asked: the purge is only slower | |
-| Online redo logs (REDO_LOGS) | optional | One batch fits in an online redo log (otherwise the purge waits for them at times) | Enlarge them for this purge? (4 x 1 GB, put back at its end) | `--redo-logs` |
+| Online redo logs (REDO_LOGS) | optional | One batch fits in an online redo log (otherwise the purge waits for them at times) | Enlarge them for this purge? (4 x 1 GB, put back at its end). Not asked in a pluggable database | `--redo-logs` (not used in a pluggable database) |
+
+In a pluggable database the online redo logs belong to the container database: the tool neither asks about them nor enlarges them there, and says so.
 
 A required one that is not met is a strong warning, and going on is your choice: the default answer is no. Without prompts nothing is gone past unless its option says so: the purge does not start, says which requirement stops it and the option that goes past it, and changes nothing. A dry run asks nothing about them; when something is not met it says so and asks whether to go on.
 
@@ -209,7 +211,7 @@ The end of a purge says how long the batches waited for log switches, for exampl
 src\bin\epf_purge.bat preflight --retention 365
 ```
 
-The preflight is the first step of every purge, run alone: it validates the tool's table registry against the database, counts the eligible rows, estimates the redo, undo and time of the purge, checks the requirements with their questions, and plans the purge. It changes nothing. The answers are saved with the plan, and the purges of the plan follow them.
+The preflight is the first step of every purge, run alone: it validates the tool's table registry against the database, counts the top-level records old enough to purge (the roots; a dry run counts the rows under them), estimates the redo, undo and time of the purge, checks the requirements with their questions, and plans the purge. It changes nothing. The answers are saved with the plan, and the purges of the plan follow them.
 
 ### Undo tuning (every purge)
 

@@ -46,6 +46,8 @@ $script:Children    = New-Object 'System.Collections.Generic.List[System.Diagnos
 # tool's account exists in the database as SYS found it (INSTALLED, ABSENT).
 $script:SysLogin    = $null
 $script:ToolState   = ''
+# The menu has said whether the purge is a dry run: it is not asked again.
+$script:GoalChosen  = $false
 
 $script:ExitPass    = 0
 $script:ExitFail    = 1
@@ -258,6 +260,9 @@ Options
   --retention DAYS     the days of data to keep: older rows are purged.
                        Asked for when not given; required with
                        --non-interactive
+  --mode, --depth, --dry-run, --compact
+                       asked for too when not given (the batch size is not:
+                       it is what the checks recommend)
   --cutoff YYYY-MM-DD  purge rows dated before this day, instead of --retention
   --tns NAME           the database: its alias in tnsnames.ora, or
                        host:port/service (the PDB service in multitenant);
@@ -273,7 +278,10 @@ Options
   --redo-logs          larger online redo logs for the purge (4 x 1 GB)
                        when one batch does not fit, without being asked; the
                        original groups are put back at the end (SYS). With
-                       --dry-run it is checked as planned; nothing is changed
+                       --dry-run it is checked as planned; nothing is changed.
+                       Not in a pluggable database: its online redo logs
+                       belong to the container, and are neither asked about
+                       nor enlarged
   --backup CHOICE      when no recent RMAN backup is found, without being
                        asked: confirmed (a backup was made another way) or
                        none (purge without a backup)
@@ -839,7 +847,8 @@ function Start-Session {
 
 # Connection test (the only statement the wrapper sends itself): container
 # name and, for EPFPG, the installed tool version; for SYS with -WithTool,
-# whether the tool's account exists (Version INSTALLED or ABSENT). TimedOut:
+# whether the tool's account exists (Version INSTALLED or ABSENT); Pdb:
+# connected to a pluggable database (container id above 1). TimedOut:
 # the database did not answer the connection (Start-Session) or the query.
 function Test-DbConnection {
     param($Login, [switch]$WithVersion, [switch]$WithTool)
@@ -850,17 +859,17 @@ function Test-DbConnection {
             $session.Process.WaitForExit()
             $text = $text + "`r`n" + $session.Errors.Result
         }
-        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $session.TimedOut }
+        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $session.TimedOut; Pdb = $false }
     }
     $process = $session.Process
     $in = $process.StandardInput
     $in.WriteLine('SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF')
     if ($WithVersion) {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM epfpg.epf_setting WHERE name = 'tool_version';")
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || value || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') || '|' || SYS_CONTEXT('USERENV', 'CON_ID') FROM epfpg.epf_setting WHERE name = 'tool_version';")
     } elseif ($WithTool) {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || (SELECT CASE WHEN COUNT(*) > 0 THEN 'INSTALLED' ELSE 'ABSENT' END FROM dba_users WHERE username = 'EPFPG') || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '|' || (SELECT CASE WHEN COUNT(*) > 0 THEN 'INSTALLED' ELSE 'ABSENT' END FROM dba_users WHERE username = 'EPFPG') || '|' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') || '|' || SYS_CONTEXT('USERENV', 'CON_ID') FROM dual;")
     } else {
-        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') FROM dual;")
+        $in.WriteLine("SELECT 'EPF_CONNECTED|' || SYS_CONTEXT('USERENV', 'CON_NAME') || '||' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') || '|' || SYS_CONTEXT('USERENV', 'CON_ID') FROM dual;")
     }
     $in.WriteLine('EXIT')
     $in.Close()
@@ -868,22 +877,25 @@ function Test-DbConnection {
     if (-not $process.WaitForExit($script:ConnectTimeoutS * 1000)) {
         try { $process.Kill() } catch { Write-Out (' ' + $_.Exception.Message) 'Yellow' }
         Write-Out (' No answer to the connection test from ' + $Login.Tns + ' within ' + $script:ConnectTimeoutS + ' s.') 'Yellow'
-        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = ''; TimedOut = $true }
+        return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = ''; TimedOut = $true; Pdb = $false }
     }
     $process.WaitForExit()
     $text = ($session.Lines -join "`r`n") + "`r`n" + $out.Result + $session.Errors.Result
     $received = Get-Date
     foreach ($line in ($text -split "`r?`n")) {
-        if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|(.*)$') {
+        if ($line -match '^EPF_CONNECTED\|([^|]*)\|([^|]*)\|([^|]*)\|?(.*)$') {
             $container = $Matches[1]
             $version = $Matches[2].Trim()
+            $conId = 0
+            $null = [int]::TryParse($Matches[4].Trim(), [ref]$conId)
             $dbTime = [datetime]::ParseExact($Matches[3].Trim(), 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
             # Database clock minus this machine's clock, to the minute.
             $script:ClockOffset = [TimeSpan]::FromMinutes([Math]::Round(($dbTime - $received).TotalMinutes))
-            return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text; TimedOut = $false }
+            return [pscustomobject]@{ Ok = $true; Container = $container; Version = $version; Output = $text; TimedOut = $false;
+                                      Pdb = ($conId -gt 1) }
         }
     }
-    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $false }
+    return [pscustomobject]@{ Ok = $false; Container = ''; Version = ''; Output = $text; TimedOut = $false; Pdb = $false }
 }
 
 # "+06:00" for a clock offset; empty when the clocks agree.
@@ -2044,7 +2056,7 @@ function Connect-Tool {
         break
     }
     if ($test.Container -eq 'CDB$ROOT') { Exit-Tool $script:ExitUsage 'Connected to CDB$ROOT: use the PDB service.' }
-    $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version }
+    $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version; Pdb = $test.Pdb }
     if (-not $Ready) {
         Write-Out (' Connected to ' + $test.Container + ', tool version ' + $test.Version)
         if ($expected -ne '' -and $test.Version -ne $expected) {
@@ -2053,7 +2065,9 @@ function Connect-Tool {
         }
         return $login
     }
-    Write-Out ('   Database           ' + $tns + ': connected (' + $test.Container + ')')
+    $kind = ''
+    if ($test.Pdb) { $kind = ', a pluggable database' }
+    Write-Out ('   Database           ' + $tns + ': connected (' + $test.Container + $kind + ')')
     if ($expected -eq '' -or $test.Version -eq $expected) {
         Write-Out ('   Tool in database   version ' + $test.Version + $installed)
         return $login
@@ -2081,7 +2095,7 @@ function Connect-Tool {
         Show-Lines $test.Output -Indent
         Exit-Tool $script:ExitFail 'The tool''s objects were upgraded, but the connection as EPFPG fails (see above).'
     }
-    $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version }
+    $script:Database = [pscustomobject]@{ Container = $test.Container; Version = $test.Version; Pdb = $test.Pdb }
     Write-Out ('   Tool in database   version ' + $test.Version + ' (upgraded now, ' + (Format-Clock $seconds) + ')') 'Green'
     return $login
 }
@@ -2108,7 +2122,7 @@ function Connect-Sys {
         Exit-Tool $script:ExitUsage 'The connection as SYS failed.'
     }
     if ($test.Container -eq 'CDB$ROOT') { Exit-Tool $script:ExitUsage 'Connected to CDB$ROOT: use the PDB service.' }
-    if ($null -eq $script:Database) { $script:Database = [pscustomobject]@{ Container = $test.Container; Version = '-' } }
+    if ($null -eq $script:Database) { $script:Database = [pscustomobject]@{ Container = $test.Container; Version = '-'; Pdb = $test.Pdb } }
     if ($WithTool) { $script:ToolState = $test.Version }
     $script:SysLogin = $sys
     return $sys
@@ -2195,22 +2209,24 @@ function Get-PurgeContext {
         $ctx.Confirm = (@($codes | Select-Object -Unique) -join ',')
     }
     if ($null -eq $Plan) {
-        # The whole purge unless the options say otherwise: every module,
-        # its rows deleted.
-        $mode = Get-Option 'mode' 'MODE' 'FULL'
-        $ctx.Mode = Test-Value $mode -Allowed $script:Modes
-        if ($null -eq $ctx.Mode) {
-            Exit-Tool $script:ExitUsage ('--mode: invalid value (valid values: ' + ($script:Modes -join ', ') + '), got ' + $mode + '.')
+        # What to do with the old rows, and of which modules: asked for when
+        # the options do not say.
+        if ($script:Interactive -and -not $script:Cli.Options.ContainsKey('mode')) {
+            Write-Out ''
+            Write-Out ' Mode: FULL deletes the old rows. CLOB keeps the rows and empties their large'
+            Write-Out ' values (LOB columns). LOGS deletes the logs only. CLOB_N_LOGS deletes the logs'
+            Write-Out ' and empties the large values of the other modules.'
         }
+        $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
         if ($ctx.Mode -eq 'LOGS') {
             $ctx.Depth = 'LOGS'
         } else {
-            $depth = Get-Option 'depth' 'DEPTH' 'ALL'
-            $value = Test-Value $depth -Pattern '^[A-Z_]+(,[A-Z_]+)*$'
-            if ($null -eq $value) {
-                Exit-Tool $script:ExitUsage ('--depth: invalid value (ALL, or module names separated by commas), got ' + $depth + '.')
+            if ($script:Interactive -and -not $script:Cli.Options.ContainsKey('depth')) {
+                Write-Out ' Modules: PAYMENTS (bulk payments, file integrations), LOGS (audit trail,'
+                Write-Out ' technical logs), BANK_STATEMENTS (bank statement dispatching).'
             }
-            $ctx.Depth = $value.ToUpper()
+            $ctx.Depth = (Get-Input -Name 'depth' -Key 'DEPTH' -Prompt 'Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS)' `
+                                    -Default 'ALL' -Pattern '^[A-Z_]+(,[A-Z_]+)*$' -Hint 'ALL, or module names separated by commas').ToUpper()
         }
     }
     $maxRedo = Get-Option 'max-redo' 'MAX_REDO' ''
@@ -2225,19 +2241,28 @@ function Get-PurgeContext {
         if ($null -eq $ctx.BatchSize) { Exit-Tool $script:ExitUsage 'Batch size: a whole number from 100 to 100000.' }
     }
     if ($Action -eq 'PURGE') {
-        # A dry run and the compaction of the purged tables are asked for
-        # with their options (or DRY_RUN, COMPACT in the configuration file).
-        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' ''
+        # A dry run or not, and the compaction of the purged tables: asked
+        # for when the options do not say (the menu has said which of a dry
+        # run and a purge it is).
+        $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('dry-run') -and -not $script:GoalChosen
+        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask
         if ($ctx.DryRun) {
             if ($script:Cli.Flags.ContainsKey('compact')) { Exit-Tool $script:ExitUsage '--compact does not apply to a dry run.' }
         } else {
-            $ctx.Compact = Get-Choice 'compact' 'COMPACT' ''
+            $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('compact')
+            $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask
         }
     }
     # Applied by a purge that deletes; a preflight or dry run checks the
     # requirements as if they were applied. Undo tuning is part of every
     # purge (--undo-tuning and UNDO_TUNING are accepted and change nothing).
     $ctx.RedoLogs = Get-Choice 'redo-logs' 'REDO_LOGS' ''
+    # The online redo logs of a pluggable database belong to its container:
+    # they are not enlarged from here.
+    if ($ctx.RedoLogs -and $script:Database.Pdb) {
+        $ctx.RedoLogs = $false
+        Write-Out ' --redo-logs is not used in a pluggable database: its online redo logs belong to the container database.' 'Yellow'
+    }
     $ctx.UndoTuning = $true
     return $ctx
 }
@@ -2415,7 +2440,7 @@ function Invoke-PlanCheck {
     $check.DryRun = $false
     $check.Compact = $false
     $check.NewPlan = $false
-    Write-Section 'CHECKING THE PLAN AGAIN (read-only preflight)'
+    Write-Section 'CHECKING THE PLAN AGAIN (read-only preflight)' -Detail
     $advice = Get-Advice $check
     if ($advice.Run.Stopped) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
     if ($advice.ERRORS -ne '0' -or $advice.Run.ExitCode -eq $script:ExitFail) {
@@ -2874,7 +2899,7 @@ function Invoke-Choices {
     $blocking = @($unmet | Where-Object { $advice.Req[$_].Blocking -eq 'Y' })
     $optional = @($unmet | Where-Object { $advice.Req[$_].Blocking -ne 'Y' })
     if ($Ctx.DryRun) {
-        if ($optional -contains 'REDO_LOGS') {
+        if ($optional -contains 'REDO_LOGS' -and -not $script:Database.Pdb) {
             Write-Out '   A purge asks whether to enlarge the online redo logs for its time (--redo-logs says yes beforehand).'
         }
         if ($blocking.Count -gt 0) {
@@ -2887,8 +2912,9 @@ function Invoke-Choices {
         }
     } else {
         foreach ($code in @($optional + @($blocking | Where-Object { $_ -ne 'UNDO' }))) {
-            # The larger online logs are chosen already (--redo-logs).
-            if ($code -eq 'REDO_LOGS' -and $Ctx.RedoLogs) { continue }
+            # The larger online logs are chosen already (--redo-logs); in a
+            # pluggable database they are the container's and stay as they are.
+            if ($code -eq 'REDO_LOGS' -and ($Ctx.RedoLogs -or $script:Database.Pdb)) { continue }
             $answer = Read-Requirement $Ctx $advice $code
             if ($answer.StartsWith('STOP:')) {
                 Write-Out ''
@@ -2996,28 +3022,31 @@ function Show-Review {
 # ----------------------------------------------------------------------------
 
 # Before the typed confirmation of a purge: what it deletes, from the
-# estimate of the check that came before ($Report, empty when none), and that
-# it cannot be undone.
+# estimate of the check that came before ($Report, empty when none): the
+# top-level records and the time (the rows are counted by a dry run), and
+# that it cannot be undone.
 function Show-Ready {
     param($Ctx, [string]$Report)
     $day = Format-Day (Get-CutoffDay $Ctx)
-    $rows = [double]0
-    $bytes = [double]0
+    $roots = [double]0
     $seconds = [double]0
     if ($Report -ne '') {
-        foreach ($m in (Read-ForecastTable $Report 'ESTIMATE')) { $rows += $m.Rows; $bytes += $m.Bytes; $seconds += $m.Seconds }
+        foreach ($m in (Read-ForecastTable $Report 'ESTIMATE')) { $roots += $m.Roots; $seconds += $m.Seconds }
     }
     $verb = 'deletes'
-    if ($Ctx.Mode -eq 'CLOB') { $verb = 'clears the LOB values of' }
+    if ($Ctx.Mode -eq 'CLOB') { $verb = 'empties the large values (LOB columns) of' }
     Write-Out '' -NoLog
     Write-Rule
-    if ($rows -gt 0) {
-        $size = ''
-        if ($bytes -gt 0) { $size = ', about ' + (Format-Bytes $bytes) }
-        Write-Wrapped '  ' ('Ready. This ' + $verb + ' about ' + (Format-Count $rows) + ' rows' + $size + ', dated before ' + $day + ' (estimates).') 'White'
+    if ($roots -gt 0) {
+        Write-Wrapped '  ' ('Ready. This ' + $verb + ' everything dated before ' + $day + ': ' + (Format-Count $roots) +
+                           ' top-level records, with the rows under them (a dry run counts those).') 'White'
+    } else {
+        Write-Wrapped '  ' ('Ready. This ' + $verb + ' everything dated before ' + $day + '.') 'White'
+    }
+    if ($seconds -gt 0) {
         Write-Wrapped '  ' ((Format-Sentence (Format-About $seconds)) + ' of deleting. It cannot be undone.') 'White'
     } else {
-        Write-Wrapped '  ' ('Ready. This ' + $verb + ' the rows dated before ' + $day + '. It cannot be undone.') 'White'
+        Write-Out '  It cannot be undone.' 'White' -NoLog
     }
     if ($Ctx.Mode -ne 'FULL' -or $Ctx.Depth -ne 'ALL') {
         Write-Out ('  Mode ' + $Ctx.Mode + ', modules ' + $Ctx.Depth + '.') -NoLog
@@ -3808,12 +3837,14 @@ function Start-Wizard {
     switch ($choice) {
         '1' {
             $script:Cli.Flags['dry-run'] = $true
+            $script:GoalChosen = $true
             Invoke-PurgeAction 'PURGE' -Wizard -NoBanner
         }
         '2' {
             # The purge itself, whatever DRY_RUN of the configuration file says.
             $script:Cli.Flags.Remove('dry-run')
             $script:Config['DRY_RUN'] = 'N'
+            $script:GoalChosen = $true
             Invoke-PurgeAction 'PURGE' -Wizard -NoBanner
         }
         '3' {

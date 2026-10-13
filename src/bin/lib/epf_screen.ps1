@@ -36,6 +36,11 @@ $script:StepNotes = @('LOCK_ACCOUNTS', 'BASELINE', 'RELEASE_INDEXES', 'COMPACT',
 # Warnings the requirements table already says in plain words.
 $script:QuietWarnings = @('REDO_ESTIMATE', 'REDO_SUMMARY', 'UNDO_ESTIMATE', 'REQUIREMENTS', 'REDO_WAITS')
 
+# Lines of a SYS step that puts things back (undo.sql RESTORE, redo_logs.sql
+# RESTORE) which say that something was left as it was: shown on the screen.
+$script:SysNotes = @('REDO_GROUP_KEPT', 'REDO_FILE_KEPT', 'UNDO_APPLIED', 'UNDO_FILE_GONE', 'UNDO_SWAP_KEPT', 'UNDO_SWITCH_FAILED',
+                     'UNDO_SWITCH_PENDING', 'UNDO_SWITCH_SKIPPED', 'UNDO_SIZE_KEPT', 'TEMP_SIZE_KEPT')
+
 # Events the steps prepared by SYS print themselves (undo.sql, redo_logs.sql).
 $script:SysEvents = @('REDO_ENLARGED', 'REDO_UNCHANGED', 'REDO_RESTORED', 'UNDO_RETENTION_SET', 'UNDO_GROWTH_LIMITED',
                       'UNDO_RETENTION_RESTORED', 'UNDO_GROWTH_RESTORED', 'UNDO_CAP')
@@ -55,6 +60,7 @@ $script:ReqActions = @{
     'PURGE.TEMP' = 'let the temporary tablespace grow, or add a temporary file (the DBA), then run again'
     'PURGE.INDEX_SPACE' = 'nothing is required: a table without its temporary index is read once per batch, which is slower. Room in the tool''s tablespace removes that'
     'PURGE.REDO_LOGS' = 'the tool can enlarge them for the purge: 4 logs of 1 GB replace the present ones while it runs (up to 4 GB more disk in the directory of the online logs), and the present ones are put back under the same names at its end. Needs SYS. A purge asks; --redo-logs says yes beforehand'
+    'PURGE.REDO_LOGS.PDB' = 'nothing is required: the purge waits for them at times. The online redo logs of a pluggable database belong to its container database, so this tool does not enlarge them here; the DBA of the container can'
     'PURGE.BACKUP' = 'take an RMAN backup, then run again. When a backup exists that RMAN does not know (storage snapshot, export), or this database is a copy that can be lost, a purge asks and goes on (--backup confirmed, --backup none)'
     'RECLAIM.RECYCLEBIN' = 'the DBA purges them (PURGE TABLESPACE name); or the reclaim purges them when you say so (--confirm RECYCLEBIN): FLASHBACK TABLE can then no longer restore them'
     'RECLAIM.ARCHIVE' = 'free space in the archive destination (the DBA backs up and deletes archived logs), then run again'
@@ -290,8 +296,8 @@ function Get-ModuleLine {
     param($Batch)
     $text = '         ' + ([string]$Batch.Module).PadRight(16) + ' ' + (Get-Bar $Batch.Pct) + ' ' +
             ('{0,3}%' -f [int][Math]::Floor($Batch.Pct))
-    if ($Batch.Rows -ne '') { $text = $text + '   ' + $Batch.Rows + ' rows' }
-    if ($Batch.Rate -ne '') { $text = $text + ' . ' + $Batch.Rate + ' rows a second' }
+    if ($Batch.Rows -ne '') { $text = $text + '   ' + $Batch.Rows + ' ' + $Batch.Unit }
+    if ($Batch.Rate -ne '') { $text = $text + ' . ' + $Batch.Rate + ' ' + $Batch.Unit + ' a second' }
     if ($Batch.Left -gt 0) { $text = $text + ' . ' + (Format-Clock $Batch.Left) + ' left' }
     return $text
 }
@@ -313,7 +319,7 @@ function Get-FlowStatus {
         if ($null -ne $engine -and $engine[2] -eq 'PROCESS_BATCHES' -and [double]::TryParse($engine[4], [ref]$done) -and
             [double]::TryParse($engine[5], [ref]$total) -and $total -gt 0) {
             $batch = [pscustomobject]@{ Module = $batch.Module; Pct = [Math]::Max($batch.Pct, 100.0 * $done / $total);
-                                        Rows = $batch.Rows; Rate = $batch.Rate; Left = $batch.Left }
+                                        Rows = $batch.Rows; Unit = $batch.Unit; Rate = $batch.Rate; Left = $batch.Left }
         }
         return (Get-ModuleLine $batch)
     }
@@ -369,7 +375,7 @@ function Show-FlowEvent {
         } elseif ($step -eq 'PROCESS_BATCHES') {
             $f.Module = $scope
             $f.Phase = 'deleting'
-            $f.Batch = [pscustomobject]@{ Module = $scope; Pct = [double]0; Rows = ''; Rate = ''; Left = 0 }
+            $f.Batch = [pscustomobject]@{ Module = $scope; Pct = [double]0; Rows = ''; Unit = 'rows'; Rate = ''; Left = 0 }
         } elseif ($step -eq 'REBUILD_INDEXES') {
             $f.Rebuilt = 0
         }
@@ -395,13 +401,15 @@ function Show-FlowEvent {
         return
     }
     if ($code -eq 'BATCH_PROGRESS') {
-        if ($message -match '^(\S+) batch \d+/\d+ ([\d.]+)% rows ([\d,]+)(?: ([\d,]+)/s)?.*?(?: ETA (\d\d:\d\d:\d\d))?$') {
+        # "PAYMENTS batch 1,200/2,400 50.0% rows 9,109,274 39,149/s ... ETA 00:03:50";
+        # the unit is rows or LOB values, and the rate is empty at the start.
+        if ($message -match '^(\S+) batch [\d,]+/[\d,]+ ([\d.]+)% (.+?) ([\d,]+) ([\d,]*)/s(?:.*? ETA (\d+:\d\d:\d\d))?') {
             $pct = [double]0
             $null = [double]::TryParse($Matches[2], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$pct)
             $f.Module = $Matches[1]
             $f.Phase = 'deleting'
-            $f.Batch = [pscustomobject]@{ Module = $Matches[1]; Pct = $pct; Rows = $Matches[3]; Rate = [string]$Matches[4];
-                                          Left = (ConvertTo-Seconds ([string]$Matches[5])) }
+            $f.Batch = [pscustomobject]@{ Module = $Matches[1]; Pct = $pct; Rows = $Matches[4]; Unit = $Matches[3]; Rate = [string]$Matches[5];
+                                          Left = (ConvertTo-Seconds ([string]$Matches[6])) }
             # Without a console window the line of the module cannot be
             # rewritten in place: each progress is a line.
             if (-not $script:StatusLine -and $pct -lt 100) { Write-Out (Get-ModuleLine $f.Batch) -NoLog }
@@ -409,24 +417,37 @@ function Show-FlowEvent {
         return
     }
     if ($code -eq 'MODULE_END') {
-        if ($message -match '^(\S+) DONE: ([\d,]+) (.+?) in (\d\d:\d\d:\d\d)') {
+        # "PAYMENTS DONE: 18,218,547 rows deleted in 00:08:49; ..."; STOPPED
+        # or FAILED in place of DONE; LOB values cleared in place of rows
+        # deleted. A dry run has no count (its FORECAST event says it).
+        if ($message -match '^(\S+) (DONE|STOPPED|FAILED): ([\d,]+) (.+?) in (\d+:\d\d:\d\d)') {
             $module = $Matches[1]
-            $count = $Matches[2]
-            $what = $Matches[3]
-            $time = Format-Clock (ConvertTo-Seconds $Matches[4])
-            if ($what.StartsWith('rows')) { $what = 'rows' }
+            $result = $Matches[2]
+            $count = $Matches[3]
+            $what = $Matches[4]
+            $time = Format-Clock (ConvertTo-Seconds $Matches[5])
+            if ($what.StartsWith('rows')) { $what = 'rows' } elseif ($what.StartsWith('LOB values')) { $what = 'LOB values' }
             $f.Rows = $f.Rows + (ConvertTo-Count $count)
-            Write-Out ('         ' + $module.PadRight(16) + ' ' + (Get-Bar 100) + ' 100%   ' + ($count + ' ' + $what).PadRight(24) +
-                       $time.PadLeft(7)) 'Green' -NoLog
+            if ($result -eq 'DONE') {
+                Write-Out ('         ' + $module.PadRight(16) + ' ' + (Get-Bar 100) + ' 100%   ' + ($count + ' ' + $what).PadRight(26) +
+                           $time.PadLeft(7)) 'Green' -NoLog
+            } else {
+                $pct = [double]0
+                if ($null -ne $f.Batch) { $pct = $f.Batch.Pct }
+                $color = 'Yellow'
+                if ($result -eq 'FAILED') { $color = 'Red' }
+                Write-Out ('         ' + $module.PadRight(16) + ' ' + (Get-Bar $pct) + ' ' + ('{0,3}%' -f [int][Math]::Floor($pct)) + '   ' +
+                           ($count + ' ' + $what).PadRight(26) + $time.PadLeft(7) + '  ' + $result.ToLower()) $color -NoLog
+            }
         }
         $f.Phase = ''
         $f.Batch = $null
         return
     }
     if ($code -eq 'FORECAST') {
-        # A dry run: what it counted for the module.
-        if ($message -match '^(\S+): ([\d,]+) rows') {
-            $text = '         ' + $Matches[1].PadRight(16) + ' ' + ($Matches[2] + ' rows').PadLeft(22)
+        # A dry run: what it counted for the module (rows, or LOB values).
+        if ($message -match '^(\S+): ([\d,]+) (rows|LOB values)') {
+            $text = '         ' + $Matches[1].PadRight(16) + ' ' + ($Matches[2] + ' ' + $Matches[3]).PadLeft(26)
             if ($message -match 'about ([\d.]+ \w+) freed') { $text = $text + ('about ' + $Matches[1]).PadLeft(18) }
             Write-Out $text -NoLog
         }
@@ -436,6 +457,8 @@ function Show-FlowEvent {
         $f.PurgeEnd = $message
         return
     }
+    # The end of the run is said by the screen's own last lines.
+    if ($code -eq 'RUN_END' -or $code -eq 'RUN_START') { return }
     if ($code -eq 'INDEX_REBUILT') {
         $f.Rebuilt = $f.Rebuilt + 1
         return
@@ -484,32 +507,48 @@ function Show-FlowEvent {
 }
 
 # What a step run by SYS printed (undo.sql, redo_logs.sql), on the screen of
-# the steps: its warnings and errors, and in one line what it did.
+# the steps. Its lines are "  CODE  message", without a severity. A step that
+# puts things back runs outside the run and logs no event: its lines that say
+# something was left as it was ($script:SysNotes) are shown here; those of a
+# step that prepares the purge come as events of the run. Then one line of
+# what the step did.
 function Show-SysResult {
     param([string]$Output, [string]$What)
     foreach ($line in ($Output -split "`r?`n")) {
-        if ($line -match '\[WARN\]|\[FAIL\]|ORA-\d{5}|SP2-\d{4}') {
-            $color = 'Yellow'
-            if ($line -match '\[FAIL\]|ORA-\d{5}|SP2-\d{4}') { $color = 'Red' }
-            Write-FlowNote $line.Trim() $color
+        if ($line -match 'ORA-\d{5}|SP2-\d{4}') {
+            Write-FlowNote $line.Trim() 'Red'
+        } elseif ($What.EndsWith('_BACK') -and $line -match '^\s+([A-Z][A-Z_]+)\s+(\S.*)$' -and $script:SysNotes -contains $Matches[1]) {
+            Write-FlowNote $Matches[2].Trim() 'Yellow'
         }
     }
     switch ($What) {
         'REDO' {
-            if ($Output -match 'REDO_ENLARGED') { Write-FlowNote 'online redo logs: 4 x 1 GB for the purge; the present ones are put back at its end' }
-            elseif ($Output -match 'REDO_UNCHANGED') { Write-FlowNote 'online redo logs: large enough already, left as they are' }
+            if ($Output -match '(?m)^\s+REDO_ENLARGED\s') {
+                Write-FlowNote 'online redo logs: 4 x 1 GB for the purge; the present ones are put back at its end'
+            } elseif ($Output -match '(?m)^\s+REDO_UNCHANGED\s+(.+?)\s*$') {
+                Write-FlowNote ('online redo logs left as they are: ' + $Matches[1])
+            }
         }
         'UNDO' {
+            $kept = '60 s'
+            if ($Output -match '(?m)^\s+UNDO_RETENTION_SET\s.*-> (\d+ s)') { $kept = $Matches[1] }
             $cap = ''
-            if ($Output -match 'UNDO_CAP \S+ limited to (\d+) MB') { $cap = ' and its tablespace under ' + (Format-Bytes ([double]$Matches[1] * 1048576)) }
-            if ($Output -match 'UNDO_RETENTION_SET') { Write-FlowNote ('undo kept 60 s' + $cap + ' while rows are deleted; put back at the end') }
+            if ($Output -match '(?m)^\s+UNDO_CAP\s+\S+ limited to (\d+) MB') { $cap = ' and its tablespace under ' + (Format-Bytes ([double]$Matches[1] * 1048576)) }
+            if ($Output -match '(?m)^\s+UNDO_ALREADY_APPLIED\s') {
+                Write-FlowNote 'undo tuning was applied already: kept as it is; put back at the end'
+            } elseif ($Output -match '(?m)^\s+(UNDO_RETENTION_SET|UNDO_CAP)\s') {
+                Write-FlowNote ('undo kept ' + $kept + $cap + ' while rows are deleted; put back at the end')
+            }
         }
         'REDO_BACK' {
-            if ($Output -match 'REDO_RESTORED') { Write-FlowNote 'online redo logs: the present ones are back, under the same names' }
+            if ($Output -match '(?m)^\s+REDO_RESTORED\s') { Write-FlowNote 'online redo logs: as they were before the purge' }
         }
         'UNDO_BACK' {
-            if ($Output -match 'UNDO_SWITCH|UNDO_SWITCHED') { Write-FlowNote 'undo tablespace: created again under the same names and sizes, to give its space back' }
-            elseif ($Output -match 'UNDO_RETENTION_RESTORED') { Write-FlowNote 'undo tablespace: settings as before' }
+            if ($Output -match '(?m)^\s+UNDO_SWITCHED\s+(.+?)\s*$') {
+                Write-FlowNote ('undo tablespace created again to give its space back: ' + $Matches[1])
+            } elseif ($Output -match '(?m)^\s+UNDO_RETENTION_RESTORED\s') {
+                Write-FlowNote 'undo tablespace: settings as before'
+            }
         }
     }
 }
@@ -577,6 +616,7 @@ function Show-Requirements {
         if ($state -eq 'NOT MET') {
             if ($item.Why -ne '') { Write-Wrapped '       What happens: ' $item.Why $color 7 }
             $key = $Kind + '.' + $code
+            if ($key -eq 'PURGE.REDO_LOGS' -and $script:Database.Pdb) { $key = 'PURGE.REDO_LOGS.PDB' }
             if ($script:ReqActions.ContainsKey($key)) { Write-Wrapped '       What to do:   ' ($script:ReqActions[$key] + '.') '' 7 }
         }
     }
@@ -597,17 +637,34 @@ function Show-Requirements {
 # ----------------------------------------------------------------------------
 
 # The modules of a table of the report (ESTIMATE, SIMULATION): Module, Rows,
-# Seconds of deleting and Bytes freed of each.
+# Roots (top-level records), Seconds of deleting and Bytes freed of each; 0
+# for what the table does not say (a preflight counts the roots only: its
+# rows and space freed are "-").
 function Read-ForecastTable {
     param([string]$Report, [string]$Title)
     $list = New-Object 'System.Collections.Generic.List[object]'
+    $size = '(?:-|\d+(?:\.\d+)? [KMGT]?B)'
     foreach ($line in (Get-TableLines $Report $Title)) {
-        if ($line -match '^  (?!Total |Module )([A-Z][A-Z_]*)\s+([\d,]+)\s+[\d,]+\s+[\d,]+\s+\S+(?: [KMGT]?B)?\s+\S+(?: [KMGT]?B)?\s+(\d+:\d\d:\d\d|-)\s+(\d+(?:\.\d+)? [KMGT]?B|-)\s*$') {
-            $list.Add([pscustomobject]@{ Module = $Matches[1]; Rows = (ConvertTo-Count $Matches[2]);
-                                         Seconds = (ConvertTo-Seconds $Matches[3]); Bytes = (ConvertTo-SizeBytes $Matches[4]) })
+        if ($line -match ('^  (?!Total |Module )([A-Z][A-Z_]*)\s+([\d,]+|-)\s+([\d,]+|-)\s+(?:[\d,]+|-)\s+' + $size + '\s+' + $size +
+                          '\s+(\d+:\d\d:\d\d|-)\s+(' + $size + ')\s*$')) {
+            $list.Add([pscustomobject]@{ Module = $Matches[1]; Rows = (ConvertTo-Count $Matches[2]); Roots = (ConvertTo-Count $Matches[3]);
+                                         Seconds = (ConvertTo-Seconds $Matches[4]); Bytes = (ConvertTo-SizeBytes $Matches[5]) })
         }
     }
     return ,$list.ToArray()
+}
+
+# The lines of a section of the report as the report prints them.
+function Show-ReportLines {
+    param([string]$Report, [string]$Title)
+    $lines = Get-TableLines $Report $Title
+    if ($lines.Count -eq 0) { return }
+    Write-Out '' -NoLog
+    $first = $true
+    foreach ($line in $lines) {
+        if ($first) { Write-Out $line 'White' -NoLog } else { Write-Out $line -NoLog }
+        $first = $false
+    }
 }
 
 # The checks of a report in short: Status, Id, Title and Value of each.
@@ -686,10 +743,10 @@ function Show-RetentionOptions {
             $count = $Matches[4]
             $rest = $Matches[5]
             $freed = ''
-            # Redo, archive need and space freed follow the rows; the space
-            # freed is the last size before "Fits".
-            $sizes = @([regex]::Matches($rest, '\d+(?:\.\d+)? [KMGT]?B') | ForEach-Object { $_.Value })
-            if ($sizes.Count -gt 0) { $freed = 'about ' + $sizes[$sizes.Count - 1] }
+            # Redo, archive need and space freed follow the rows, each a size
+            # or "-" (a preflight has no rows and no space freed).
+            if ($rest -match '^\s+(?:-|[\d.]+ [KMGT]?B)\s+(?:-|[\d.]+ [KMGT]?B)\s+([\d.]+ [KMGT]?B)\s') { $freed = 'about ' + $Matches[1] }
+            if ($count -eq '-') { continue }
             $mark = ''
             if ($rest.Contains('(requested)')) { $mark = '   (yours)' }
             $rows.Add('     ' + ($days + ' days kept').PadRight(20) + ('before ' + $cutoff).PadRight(20) + $count.PadLeft(14) +
@@ -714,9 +771,17 @@ function Show-DryRunEnd {
     $day = Format-Day (Get-CutoffDay $Ctx)
     $expected = ''
     if ($Report -match '(?m)^EPF_EXPECTED\|[^|]*\|([A-Z_]+)\|') { $expected = $Matches[1] }
+    if ($Status -ne 'FAILED' -and $modules.Count -eq 0) {
+        # Not the table this screen knows: the report's own lines.
+        Show-ReportLines $Report 'SIMULATION'
+        foreach ($line in (Get-ExpectedLines $Report)) { Write-Out $line -NoLog }
+        Show-ReportBlock $Report 'DISK WHILE THE PURGE RUNS' 'Disk used while the purge runs (given back at its end)'
+        Show-ReportLines $Report 'RETENTION OPTIONS'
+        return
+    }
     Write-Out '' -NoLog
     Write-Rule
-    if ($Status -eq 'FAILED' -or $modules.Count -eq 0) {
+    if ($Status -eq 'FAILED') {
         Write-Out '  The dry run did not finish: see the errors above. Nothing was changed.' 'Red' -NoLog
         Write-Rule
         return
@@ -750,7 +815,8 @@ function Show-PurgeEnd {
     $rows = [double]0
     if ($null -ne $script:Flow) { $rows = $script:Flow.Rows }
     $what = (Format-Count $rows) + ' rows deleted'
-    if ($Ctx.Mode -eq 'CLOB') { $what = 'the LOB values of ' + (Format-Count $rows) + ' rows cleared' }
+    if ($Ctx.Mode -eq 'CLOB') { $what = (Format-Count $rows) + ' LOB values cleared' }
+    elseif ($Ctx.Mode -eq 'CLOB_N_LOGS') { $what = (Format-Count $rows) + ' rows deleted or LOB values cleared' }
     Write-Out '' -NoLog
     if ($Refused) {
         Write-Rule 'Red'
@@ -777,12 +843,12 @@ function Show-PurgeEnd {
         Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
     } elseif ($Status -eq 'STOPPED') {
         Write-Rule 'Yellow'
-        Write-Wrapped '  STOPPED   ' ('on request after ' + (Format-Count $rows) + ' rows, in ' + $Total + '. What was deleted stays deleted; nothing is half done.') 'Yellow'
+        Write-Wrapped '  STOPPED   ' ('on request: ' + $what + ' so far, in ' + $Total + '. What was deleted stays deleted; nothing is half done.') 'Yellow'
         Write-Rule 'Yellow'
         Write-Wrapped '  ' 'The same command goes on from here.'
     } else {
         Write-Rule 'Red'
-        Write-Wrapped '  FAILED   ' ('after ' + (Format-Count $rows) + ' rows, in ' + $Total + '. What was deleted stays deleted; each batch is its own transaction, so nothing is half done.') 'Red'
+        Write-Wrapped '  FAILED   ' ($what + ' before it failed, in ' + $Total + '. What was deleted stays deleted; each batch is its own transaction, so nothing is half done.') 'Red'
         Write-Rule 'Red'
         if ($null -ne $script:Flow) {
             foreach ($e in $script:Flow.Errors) { Write-Wrapped '   - ' $e 'Red' }
@@ -923,7 +989,8 @@ function Show-ReclaimEnd {
     Show-GoodToKnow $checks $notes
 }
 
-# The end of a preflight: the estimate per module and the other retentions.
+# The end of a preflight: its estimate per module, the disk a purge takes and
+# the other retentions.
 function Show-PreflightEnd {
     param($Ctx, [string]$Report, [string]$Status)
     if ($Status -eq 'FAILED') {
@@ -931,18 +998,10 @@ function Show-PreflightEnd {
         Write-Out '  The checks found errors: see above. Nothing was changed.' 'Red' -NoLog
         return
     }
-    $modules = Read-ForecastTable $Report 'ESTIMATE'
-    if ($modules.Count -gt 0) {
-        Write-Out '' -NoLog
-        Write-Out ('   ' + 'What (estimates)'.PadRight(20) + 'Rows to delete'.PadLeft(16) + 'Space freed (about)'.PadLeft(22) + 'Deleting'.PadLeft(12)) 'White' -NoLog
-        foreach ($m in $modules) {
-            Write-Out ('   ' + $m.Module.PadRight(20) + (Format-Count $m.Rows).PadLeft(16) + (Format-Bytes $m.Bytes).PadLeft(22) +
-                       (Format-Clock $m.Seconds).PadLeft(12)) -NoLog
-        }
-        Write-Wrapped '   ' 'A dry run counts the rows exactly: epf_purge.bat purge --dry-run.' 'DarkGray'
-    }
+    Show-ReportLines $Report 'ESTIMATE'
+    Write-Wrapped '  ' 'Roots are the top-level records old enough to purge; a dry run counts the rows under them and the space they free: epf_purge.bat purge --dry-run.' 'DarkGray'
     Show-ReportBlock $Report 'DISK WHILE THE PURGE RUNS' 'Disk used while the purge runs (given back at its end)'
-    Show-RetentionOptions $Report
+    Show-ReportLines $Report 'RETENTION OPTIONS'
     Write-Out '' -NoLog
     Write-Out '  Nothing was changed.' 'Green' -NoLog
 }

@@ -1425,6 +1425,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         l_member VARCHAR2(600);
         l_last   VARCHAR2(128);
         l_seg    NUMBER := 0;
+        -- Connected to a pluggable database: its online redo logs belong to
+        -- the container database.
+        l_pdb    BOOLEAN := NVL(TO_NUMBER(SYS_CONTEXT('USERENV', 'CON_ID')), 0) > 1;
 
         -- The files of a tablespace, the first three by name.
         FUNCTION files_of(p_ts IN VARCHAR2, p_temp IN BOOLEAN DEFAULT FALSE) RETURN VARCHAR2 IS
@@ -1496,7 +1499,9 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                 ELSE
                     line('REDO', 'Online redo logs', l_now, 0,
                          l_logs || ' logs reused, the first: ' || l_member
-                         || CASE WHEN q.status = 'NOT_MET' THEN
+                         || CASE WHEN q.status = 'NOT_MET' AND l_pdb THEN
+                                '; they belong to the container database, whose DBA can enlarge them'
+                                 WHEN q.status = 'NOT_MET' THEN
                                 '; a purge can enlarge them for its time (4 x 1 GB, up to 4.0 GB more)' END);
                 END IF;
             ELSIF q.req_code = 'ARCHIVE' AND NVL(q.met_by, '-') <> 'NOARCHIVELOG' AND NVL(q.needed_bytes, 0) > 0 THEN

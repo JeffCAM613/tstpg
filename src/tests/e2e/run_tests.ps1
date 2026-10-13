@@ -1094,13 +1094,13 @@ function Invoke-Suite {
         Assert-Match $r 'Requirement +Needed +Now'
         Assert-Match $r 'Online redo logs +optional +(ok|NOT MET)'
         Assert-Match $r 'Backup +required +(ok|NOT MET|not needed)'
-        Assert-Match $r 'Rows to delete +Space freed'
+        Assert-Match $r 'ESTIMATE \(rows before the cutoff'
         Assert-Match $r 'Nothing was changed'
         Assert-Match $r '(?m)^ +Report +\S.*report\.html'
         Assert-NoMatch $r 'ROOTS_ELIGIBLE'
         Assert-NoMatch $r 'STEP_START'
         Assert-NoMatch $r 'STEP_END'
-        Assert-NoMatch $r 'RETENTION OPTIONS'
+        Assert-Match $r 'RETENTION OPTIONS'
         Assert-NoMatch $r '(?m)^ STEPS'
         Assert-NoMatch $r '(?m)^ SUMMARY '
         Assert-NoMatch $r '(?m)^EPF_REQ\|'
@@ -1263,12 +1263,13 @@ function Invoke-Suite {
                 Assert-Match $s 'Stop requested'
             }
         }
-        # Answers: the days of data to keep, then the typed confirmation.
-        # --redo-logs, --backup none and undo tuning (part of every purge,
-        # without --undo-tuning) meet the requirements, so no question is
-        # asked about them; the batch size is the recommendation for 1 GB
-        # logs. The purge is stopped: it does not ask about removing the tool.
-        $answers = @($script:Retention, 'yes')
+        # Answers: the days of data to keep, the mode, dry run (no), compact
+        # (no), then the typed confirmation. --redo-logs, --backup none and
+        # undo tuning (part of every purge, without --undo-tuning) meet the
+        # requirements, so no question is asked about them; the batch size is
+        # the recommendation for 1 GB logs. The purge is stopped: it does not
+        # ask about removing the tool.
+        $answers = @($script:Retention, 'FULL', 'N', 'N', 'yes')
         $r = Invoke-Wrapper @('purge', '--depth', 'PAYMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -OnLine $onLine -StopOnTimeout
         Add-Check $script:State.StopSent ('stop requested after ' + $script:StopAfter + ' BATCH_PROGRESS lines')
@@ -1573,9 +1574,10 @@ function Invoke-Suite {
     }
 
     Invoke-Test 'T16' 'BANK_STATEMENTS purge through the menu wizard (redo sizing already done)' {
-        # Menu answers: 2 Purge, the days of data to keep, the typed
-        # confirmation, and no to removing the tool afterwards.
-        $answers = @('2', $script:Retention, 'yes', 'N')
+        # Menu answers: 2 Purge (so no question on a dry run), the days of
+        # data to keep, the mode, compact (no), the typed confirmation, and
+        # no to removing the tool afterwards.
+        $answers = @('2', $script:Retention, 'FULL', 'N', 'yes', 'N')
         $r = Invoke-Wrapper @('--depth', 'BANK_STATEMENTS', '--redo-logs', '--backup', 'none') -Answers $answers `
                             -TimeoutMin 120 -StopOnTimeout
         Assert-Exit $r @(0, 2)

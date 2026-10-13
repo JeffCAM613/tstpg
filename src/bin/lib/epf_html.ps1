@@ -119,9 +119,10 @@ function Write-HtmlReport {
             $cutoff = $Matches[2]
             $count = $Matches[3]
             $rest = $Matches[4]
-            $sizes = @([regex]::Matches($rest, '\d+(?:\.\d+)? [KMGT]?B') | ForEach-Object { $_.Value })
-            $freed = ''
-            if ($sizes.Count -gt 0) { $freed = $sizes[$sizes.Count - 1] }
+            # Redo, archive need and space freed follow the rows, each a size
+            # or "-" (a preflight has no rows and no space freed).
+            $freed = '-'
+            if ($rest -match '^\s+(?:-|[\d.]+ [KMGT]?B)\s+(?:-|[\d.]+ [KMGT]?B)\s+([\d.]+ [KMGT]?B)\s') { $freed = $Matches[1] }
             $options.Add(@{ Days = $days; Cutoff = $cutoff; Rows = $count; Freed = $freed; Yours = $rest.Contains('(requested)') })
         }
     }
