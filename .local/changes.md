@@ -2,6 +2,33 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.5: the questions of a purge after their first run on a database: mode and depth with their tables and sizes, a divider before each question, the skipped tables named, "Extra disk needed", the other retentions as examples
+
+Why: the user, after X1 and X2 on TANM7883 (.local\TX.log): "x2: mode should list the tables involved per option and the size estimate. just like from the original script. it's important to help user decide but show it nicely so it is not hard to read. and add a little divider between prompts so it's easy to separate them and know that a new prompt is there. right now, it's just a crowded bunch of texts. there is LOGS in mode and depth, tell me the difference. in x2 dry run, it says 'table no present in this database; it is skipped' but doesn't mention which one. and from report, what does 'More than now' mean? it's a little vague for me. also: 'Other retentions' -- need to make it clear that these are examples that users can also try." Then: "before i continue, fix the changes (and in similar changes in succeeding steps if needed)".
+
+The questions on the mode and the depth:
+- New `epf_report.print_scope(cutoff)` and `src\sql\run\scope.sql` (EPFPG, read-only): `EPF_SCOPE` lines with the modules, each table of the tool's list (module, role, its root, present or not, its size with its indexes and LOB segments, the size of its LOB segments, whether its LOBs are emptied), each root with its rows and those dated before the cutoff (one COUNT per root), and the size of the application's schemas. A failure prints `EPF_SCOPE|ERROR`.
+- Get-ScopeFacts (epf.ps1) reads it once, before the question on the mode; Show-ModeChoices and Show-DepthChoices (epf_screen.ps1) show a table of the choices (tables, size now, what it frees, what it does or holds), then the tables once, by module and largest first, with their large values in brackets; in a module of more than 6 tables those under 3% of the module share a line. The tables this database does not have are named. "Frees" is the size by the share of the root's rows dated before the cutoff: rough, and said to be; a dry run counts.
+- With `--mode` given, the depth question lists the tables itself. When scope.sql fails, both questions say what their choices mean, without figures.
+- LOGS as a mode is FULL with the module LOGS alone (epf_control.scope_depth returns LOGS for it); the table of the modes says so, and the README.
+
+Every question:
+- Write-Ask: a blank line and the question's name on a rule; Read-Prompt: the prompt after " > ", in colour. Read-Value, Get-Input, Read-YesNo, Get-Choice and Read-Secret take the name (-Title) and write the divider only when they do prompt. What a question needs said first is under its divider, indented and wrapped to the screen. So for the database, the passwords, the install and the upgrade, the days to keep, the mode, the depth, dry run, compaction, each requirement's question of a purge and of a reclaim, the dry run's "Requirements not met", the removal of the tool (after a run and in `uninstall`).
+- An input that is a file or a pipe and has no more lines ends the run with a usage error where it used to ask for ever.
+
+The warnings on the screen:
+- The tables of the tool's list that a database does not have (REG_TABLE_MISSING, one warning each) are one note under the step, with their names, when the check ends (REG_SUMMARY); any other warning with an object says it in brackets. A note waits for its step's line and is wrapped under its text. A purge checks twice: each note is said once.
+
+The report (epf_report, epf_html.ps1):
+- DISK WHILE THE PURGE RUNS: "At most" is now "Uses at most" and "More than now" is "Extra disk needed", with a line that says what it is: what the file has to grow by, beyond its size today; 0 B when it has the room already. "In all": "of free disk space needed where these files are". The rows of the tablespaces purged say "none". The table is narrower, so that a datafile's path stays on its row at 100 columns; a row too wide for the screen goes on under "Where", or below the row when that is one long path.
+- "Other retentions, as examples of what else could be kept": columns "Days kept", "Purges rows dated", "Rows deleted", "Space freed"; the row of the run is marked "(this dry run)"; a line says that any number of days can be tried the same way, with the command.
+
+Also: tool_version 0.9.5 (a database with 0.9.4 is upgraded by the next run; TANM7883 has no tool since X2 and gets it installed). The suite: T18 runs scope.sql and checks its lines. The simulator (epf_sim.ps1) uses the same words for the disk a purge takes and for the other retentions.
+
+Checked here: 37 scenarios through the real wrapper against the stand-in sqlplus, which now plays scope.sql and logs the two missing tables as TANM7883 does (309 checks on their screens: the questions with their dividers, the mode and depth tables, the depth alone with --mode given, the fallback without figures, uninstall, and every earlier scenario); the suite's T00, T01, T06 and T07 pass against the stand-in, and T18's scope.sql checks; the PowerShell files parse with no undefined command; the static checks of the PL/SQL pass. print_scope has not been compiled on a database: the next run's install does it, and T18 runs it.
+
+How to test (set X on the status page, from X2 on TANM7883): push; `src\bin\epf_purge.bat purge` and answer the questions (Enter takes each default; answer Y to the dry run): the tool installs itself as 0.9.5, each question is under its divider, the mode and the depth show their tables with sizes; in the dry run the note names the two tables skipped, the disk table says "Uses at most" and "Extra disk needed", and the other retentions are said to be examples. Then `src\tests\e2e\run_tests.bat --digest`. X3 (the purge) and X4 (the reclaim) follow as before; their questions have the same dividers.
+
 ## 2026-10-13 - 0.9.4 before its first run: mode, depth, dry run and compaction are questions again; no enlargement of the online redo logs in a pluggable database; the screen read against the engine's own messages
 
 Why: the user, on the summary of the flow: "mode, depth, dry run, and compaction should be questions still. only batch size is auto from those. please verify your implementation then i'll test on small databses for faster tests. enlarge the online redo logs (default yes); -- should check if pbd and no option to enlarge if so."

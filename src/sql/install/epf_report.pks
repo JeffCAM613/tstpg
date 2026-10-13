@@ -118,11 +118,26 @@ CREATE OR REPLACE PACKAGE epf_report AUTHID DEFINER AS
     --                                      (- when none was measured)
     --   EPF_ADVICE|REQ|<requirement>|<status>|<blocking>|<met by>
     --   EPF_ADVICE|REQTEXT|<requirement>|<title>|<measured>
+    --   EPF_ADVICE|REQWHY|<requirement>|<why it matters>
     --   EPF_ADVICE|OPT|<requirement>|<option>|<met Y|N>|<detail>
     --   EPF_ADVICE|RUN_BATCH|<n>           batch size of the run
     --   EPF_ADVICE|UNDO_MAX_BATCH|<n>      largest batch whose undo the undo
     --                                      tablespace holds 4 times
     PROCEDURE print_advice(p_run_id IN NUMBER);
+
+    -- Prints what a purge covers in this database, for the wrapper's
+    -- questions on the mode and the depth (reads only, no run needed):
+    --   EPF_SCOPE|CUTOFF|<YYYY-MM-DD>
+    --   EPF_SCOPE|MODULE|<module>|<description>
+    --   EPF_SCOPE|TABLE|<module>|<owner.table>|<ROOT|DEPENDENT>|<owner.root>|
+    --             <present Y|N>|<bytes>|<LOB bytes>|<LOB values cleared Y|N>
+    --             bytes: the table with its indexes and LOB segments
+    --   EPF_SCOPE|ROOT|<owner.table>|<rows>|<rows dated before the cutoff>
+    --             (both empty when the table could not be counted)
+    --   EPF_SCOPE|SCHEMAS|<bytes of every segment of the application schemas>
+    --   EPF_SCOPE|ERROR|<message>          when it could not be measured
+    -- p_cutoff: the day before which rows are purged, YYYY-MM-DD.
+    PROCEDURE print_scope(p_cutoff IN VARCHAR2);
 
     -- Prints the other sessions of the tool schema (wait event, blocker,
     -- SQL_ID), then the state of the active run (or the latest one): status,

@@ -307,24 +307,26 @@ summary{cursor:pointer;font-weight:600}.foot{color:var(--muted);font-size:.88rem
         $null = $h.Append('</tbody></table></div></div>')
     }
     if ($disk.Count -gt 0) {
-        $null = $h.Append('<div class="card"><h2>Disk used while the purge runs</h2><div class="tw"><table><thead><tr><th>What</th><th class="n">At most</th><th class="n">More than now</th><th>Where</th></tr></thead><tbody>')
+        $null = $h.Append('<div class="card"><h2>Disk used while the purge runs</h2><div class="tw"><table><thead><tr><th>What</th><th class="n">Uses at most</th><th class="n">Extra disk needed</th><th>Where</th></tr></thead><tbody>')
         $sum = 0.0
         foreach ($x in $disk) {
             $sum += $x.More
             $null = $h.Append('<tr><td>' + $x.Name + '</td><td class="n">' + (Format-HtmlBytes $x.Most) + '</td><td class="n">' + (Format-HtmlBytes $x.More) +
                               '</td><td>' + (ConvertTo-HtmlText $x.Where) + '</td></tr>')
         }
-        $null = $h.Append('</tbody></table></div><div class="muted">In all ' + (Format-HtmlBytes $sum) + ' of free space needed next to these files; given back at the end of the purge. ' +
+        $null = $h.Append('</tbody></table></div><div class="muted">Extra disk needed: what the file has to grow by, beyond its size today (0 when it has the room already). ' +
+                          'In all ' + (Format-HtmlBytes $sum) + ' of free disk space needed where these files are; given back at the end of the purge. ' +
                           'The datafiles of the tables purged keep their size until a reclaim.</div></div>')
     }
     if ($options.Count -gt 1) {
-        $null = $h.Append('<div class="card"><h2>Other retentions</h2><div class="tw"><table><thead><tr><th>Days of data kept</th><th>Rows dated before</th><th class="n">Rows deleted</th><th class="n">Space freed (about)</th></tr></thead><tbody>')
+        $null = $h.Append('<div class="card"><h2>Other retentions, as examples</h2><div class="tw"><table><thead><tr><th>Days of data kept</th><th>Purges rows dated before</th><th class="n">Rows deleted</th><th class="n">Space freed (about)</th></tr></thead><tbody>')
         foreach ($x in $options) {
             $mark = ''
             if ($x.Yours) { $mark = ' (this run)' }
             $null = $h.Append('<tr><td>' + $x.Days + $mark + '</td><td>' + $x.Cutoff + '</td><td class="n">' + $x.Rows + '</td><td class="n">' + $x.Freed + '</td></tr>')
         }
-        $null = $h.Append('</tbody></table></div></div>')
+        $null = $h.Append('</tbody></table></div><div class="muted">Examples of what else could be kept. Any number of days can be tried the same way: ' +
+                          '<code>epf_purge.bat purge --dry-run --retention DAYS</code>.</div></div>')
     }
     if ($spaces.Count -gt 0) {
         $max = 0.0

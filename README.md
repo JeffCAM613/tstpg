@@ -41,8 +41,10 @@ The mode decides what happens to the eligible rows:
 |---|---|
 | FULL | Deletes the eligible rows of the modules chosen with `--depth` (ALL by default). |
 | CLOB | Keeps the rows and empties their large text and binary values (LOB columns). |
-| LOGS | Deletes the eligible rows of the LOGS module only. |
+| LOGS | Deletes the eligible rows of the LOGS module only: the same as FULL with `--depth LOGS`. The depth is not asked for then. |
 | CLOB_N_LOGS | Deletes the eligible rows of the LOGS module, and empties the LOB values of the other modules. |
+
+The mode says what is done to the rows; the depth says in which modules (PAYMENTS, LOGS, BANK_STATEMENTS, or ALL). LOGS is the name of a module, and also of the mode that is a shorthand for that module alone.
 
 A purge works in batches: each batch is one transaction, committed before the next one starts. It does not lock the application's accounts.
 
@@ -64,7 +66,7 @@ There is nothing to install by hand. Every purge and every reclaim gets ready by
  Getting ready
    sqlplus            C:\oracle\product\19.0.0\client_1\bin\sqlplus.exe
    Database           EPFPDB: connected (EPFPDB)
-   Tool in database   version 0.9.4
+   Tool in database   version 0.9.5
 ```
 
 - **The first time on a database** the tool's own objects are missing. The run says so, explains what they are (an account EPFPG and a tablespace EPFPG_DATA next to the application's data, with the tool's tables and packages), and asks whether to install them. It then asks for the SYS password and for the password to give the EPFPG account (twice), and goes on with what it was asked. At the question for the EPFPG password, press Enter alone when the tool was never installed there.
@@ -138,6 +140,26 @@ A purge alone frees no disk space: the rows are gone, and the datafiles keep the
 
 Every run asks what its options do not say: the database, the passwords and the days of data to keep; for a purge also the mode, the modules (depth), whether it is a dry run and whether to compact the purged tables afterwards. Only the batch size is never asked: it is what the checks recommend, unless `--batch-size` gives one.
 
+Each question stands under a divider with its name, and its prompt is marked `>`. The questions on the mode and the depth show what each choice works on in this database with the cutoff given: the tables, their size today and a rough estimate of what the choice frees (that size by the share of top-level records dated before the cutoff; a dry run replaces it by a count). The tables are listed once, largest first, with their large values in brackets (the part the mode CLOB empties), and the tables of the tool's list that this database does not have are named:
+
+```text
+ -- Mode: what is done to the rows dated before 13 Oct 2025 --------------------
+   Mode             Tables   Size now   Frees (about)   What it does
+   FULL                 25     7.5 GB          6.1 GB   deletes the rows, in the modules chosen next
+   CLOB                  6     3.4 GB          2.9 GB   keeps the rows, empties their large values
+   LOGS                  3     1.1 GB        310.0 MB   same as FULL with the module LOGS alone
+   CLOB_N_LOGS           8     4.2 GB          3.1 GB   CLOB, and deletes the rows of module LOGS
+
+   The tables, largest first. In brackets: the large values of a table (LOB columns: documents,
+   messages), the part that CLOB empties.
+   PAYMENTS         20 tables, 3.6 GB
+       PAYMENT_ADDITIONAL_INFO               1.2 GB
+       TRANSMISSION_EXECUTION_AUDIT        640.0 MB   [520.0 MB]
+       ...
+   Not in this database, and skipped: APPROBATION_EXECUTION_OPT, WORKFLOW_EXECUTION_OPT.
+ > Mode (FULL, CLOB, LOGS, CLOB_N_LOGS) [FULL]:
+```
+
 The screen shows the steps of the run by what they do, each with its time. While rows are deleted there is one line per module, with its progress, the rows, the speed and the time left:
 
 ```text
@@ -162,8 +184,8 @@ A dry run checks the database, counts exactly what a purge would delete, and cha
 
 - the requirements as a table (below);
 - the rows to delete and the space freed, per module, and how long the deleting would take;
-- the disk a purge takes while it runs and where: the undo tablespace up to its limit, the temporary space, the temporary indexes and the online redo logs, each with its file and how much more than now, then the tablespaces whose tables are purged;
-- the same figures for other retentions, so that the days to keep can be chosen by the space they free;
+- the disk a purge takes while it runs and where: the undo tablespace up to its limit, the temporary space, the temporary indexes and the online redo logs, each with its file, what it uses at most and the extra disk it needs (what its file has to grow by, beyond its size today), then the tablespaces whose tables are purged;
+- the same figures for other retentions, as examples, so that the days to keep can be chosen by the space they free; any number of days can be tried the same way;
 - whether the purge would complete as things are, and the command that runs it.
 
 ### 2. Purge
@@ -373,6 +395,7 @@ The tool runs the scripts of `src\sql\run`. Some of them can be run directly in 
 |---|---|---|
 | `report.sql <run_id or LATEST>` | EPFPG | The report of a run |
 | `status.sql` | EPFPG | The status, as `epf_purge.bat status` |
+| `scope.sql <YYYY-MM-DD>` | EPFPG | What a purge covers with that cutoff, as `EPF_SCOPE` lines: the tables of each module with their sizes, and the rows of each root with those dated before the cutoff. Read-only; the questions on the mode and the depth show it |
 | `stop.sql <run_id or ACTIVE>` | EPFPG | A graceful stop |
 | `preflight.sql NEW` | EPFPG | A standalone preflight with the default parameters |
 | `undo.sql APPLY, RESTORE or STATUS` | SYS AS SYSDBA | Undo tuning by hand (APPLY before `purge.sql`, which does not start without it); RESTORE also gives back what undo and temp grew |

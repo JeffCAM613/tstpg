@@ -41,7 +41,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:CliArgs = @($args)
 $script:RepoDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
-$script:Version = '0.9.4'
+$script:Version = '0.9.5'
 $script:Inv = [Globalization.CultureInfo]::InvariantCulture
 $script:Opt = @{ Action = ''; DryRun = $false; Cutoff = ''; Retention = ''; Tns = ''; Interactive = $true;
                  Config = ''; Sim = 'slow'; Fast = $false; Open = $true; Color = $true; Yes = $false; Redo = $false }
@@ -631,9 +631,9 @@ function Invoke-Purge {
         Out-Line '   The space is freed inside the tables. The datafile keeps its size until a reclaim.'
         Out-Line ''
         Out-Line '   Disk used while the purge runs (given back at its end)' 'White'
-        Out-Line ('     Undo               up to 4.0 GB   ' + $script:Dir + $script:Opt.Tns + '/undotbs01.dbf     3.4 GB more than now')
-        Out-Line ('     Temporary space    about 1.1 GB   ' + $script:Dir + $script:Opt.Tns + '/temp01.dbf        fits in what is allocated')
-        Out-Line ('     Temporary indexes  about 1.4 GB   ' + $script:Dir + $script:Opt.Tns + '/epfpg_data01.dbf  1.3 GB more than now')
+        Out-Line ('     Undo               up to 4.0 GB   ' + $script:Dir + $script:Opt.Tns + '/undotbs01.dbf     extra disk needed: 3.4 GB')
+        Out-Line ('     Temporary space    about 1.1 GB   ' + $script:Dir + $script:Opt.Tns + '/temp01.dbf        extra disk needed: none')
+        Out-Line ('     Temporary indexes  about 1.4 GB   ' + $script:Dir + $script:Opt.Tns + '/epfpg_data01.dbf  extra disk needed: 1.3 GB')
         Out-Line '     Online redo logs   reused; nothing is kept (NOARCHIVELOG)'
         if ($script:Opt.Sim -ne 'ready') {
             Out-Line ('                        enlarged for the purge if you say so: 3.6 GB more in ' + $script:Dir + $script:Opt.Tns)
@@ -641,7 +641,8 @@ function Invoke-Purge {
         Out-Line ('     In all: about 4.7 GB free needed in ' + $script:Dir + $script:Opt.Tns + ' while it runs') 'White'
         if ($script:Opt.Sim -ne 'ready') { Out-Line '     (8.3 GB with the larger online redo logs).' 'White' }
         Out-Line ''
-        Out-Line ('   ' + 'Other retentions'.PadRight(24) + 'Rows deleted'.PadLeft(14) + 'Space freed (about)'.PadLeft(22)) 'White'
+        Out-Line '   Other retentions, as examples of what else could be kept' 'White'
+        Out-Line ('     ' + 'Days kept'.PadRight(22) + 'Rows deleted'.PadLeft(14) + 'Space freed (about)'.PadLeft(22)) 'DarkGray'
         $options = New-Object 'System.Collections.Generic.List[int]'
         foreach ($d in @(($scope.Kept + 200), $scope.Kept, ($scope.Kept - 200), ($scope.Kept - 335))) {
             if ($d -gt 0 -and -not $options.Contains([int]$d)) { $options.Add([int]$d) }
@@ -649,7 +650,7 @@ function Invoke-Purge {
         foreach ($d in $options) {
             $r = Get-RowsOlder $d
             $mark = ''
-            if ($d -eq $scope.Kept) { $mark = '   (yours)' }
+            if ($d -eq $scope.Kept) { $mark = '   (this dry run)' }
             Out-Line ('     ' + ((Format-Int $d) + ' days kept').PadRight(22) + (Format-Int $r).PadLeft(14) + (Format-Gb ($r * 390.0 / 1073741824)).PadLeft(22) + $mark)
         }
         Out-Line ''

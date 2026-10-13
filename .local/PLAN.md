@@ -963,7 +963,7 @@ Each test database is a dump of one client's database. How fast the tool runs an
 | EPFPG783 | SONEPARUAT, DATA in 4 datafiles created before the import | the remote server | P |
 | EPFPG784 | RFS6528, a fourth source: 48.5 GB of application data, the schema of the CLUBMED copies (738 tables, 1000 indexes) | the remote server | U |
 | a fresh SONEPARUAT copy (EPFPG782 loaded again) | SONEPARUAT | the remote server | Q: cutoff 2016-05-10, a fifth of the PAYMENTS rows; V: the same purge, then one reclaim with scratch space |
-| TANM7883 | CLUBMED8 | a remote server close to the database | K, O |
+| TANM7883 | CLUBMED8 | a remote server close to the database | K, O; X on a fresh copy (OP 10,099 MB, OPPAYMENTS 7,326 MB; DATA 18.0 GB, the tables the tool purges 7.5 GB of it) |
 | TANM7884 | CLUBMEDEPF | a remote server close to the database | M |
 
 State on 2026-10-09: EPFPG781 and EPFPG782 hold fresh SONEPARUAT dumps; EPFPG783 is new and empty; EPFPG784 is being emptied for later runs. Set L runs set K's steps on EPFPG781 (the suite, a dry run, one reclaim with `--scratch`): a like-for-like comparison, and the one result no SONEPARUAT run has shown yet, DATA down to its segments in one reclaim. Set M runs the same steps on TANM7884 (CLUBMEDEPF), a third source. Set N asks how the reclaim does with little freed space: on EPFPG782, a purge that keeps 1800 days (`--retention 1800`, rows dated before 2021-11-04; the other sets keep 30, which deletes nearly everything), then the reclaim in place only, then with scratch space.
@@ -1005,6 +1005,14 @@ Every test set's durations are recorded here, with what the time bought (rows de
 | Q1 to Q8 in all | | 2 h 59 min | of which the two reclaims 2 h 47 min; 3 h 52 min on the clock |
 
 **Set U in all** (EPFPG784, RFS6528, 0.9.2): the suite 1 h 1 min 38 s, the reclaim's dry run 29 s, the reclaim 11 min 55 s: 1 h 14 min 2 s of runs, 1 h 36 min on the clock (16:39 to 18:16).
+
+**Set X, first steps** (TANM7883, a fresh CLUBMED8 copy, 0.9.4, online logs 3 x 150 MB, retention 365):
+
+| Step | Run | Time | What it did |
+|---|---|---|---|
+| X1, the suite's part without a purge | 12 tests | 11 min 37 s | T01 4 s, T03 (install) 14 s, T06 16 s, T07 1 min 25 s, T08 21 s, T08B 2 min 28 s, T10B 45 s; the reclaim lab T18A 45 s, T18B 1 min 12 s, T18C 1 min 15 s, T18D 1 min 27 s, T18H 1 min 26 s |
+| X2, the checks | R-000021 | 42 s | 3.58 M roots found in 4 s (ELIGIBLE_ROOTS); the other steps 1 to 2 s |
+| X2, the dry run | R-000022 | 1 min 45 s | 15.16 M rows counted: PAYMENTS 11.08 M in 34 s (keys 18 s, count 16 s), LOGS 3.14 M in 51 s (keys 38 s for 2,093 batches, count 13 s), BANK_STATEMENTS 0.95 M in 12 s; forecast: 5 min 18 s of deleting, 6.1 GB freed, 3.8 GB of extra disk meanwhile |
 
 **Other sets** (details in 12.7):
 
@@ -1150,6 +1158,12 @@ To settle when it is built: a purge beside the application is said to be possibl
 - **After a purge or a reclaim that ended well**: whether to remove the tool's objects (default no; UNINSTALL_AFTER=Y without prompts); not asked while a plan of several runs is in progress.
 - **The report** (epf_report, 0.9.4): a dry run and a preflight print DISK WHILE THE PURGE RUNS: undo up to the limit undo tuning sets, the work keys in the temporary tablespace, the temporary indexes, the online redo logs, the archived logs in ARCHIVELOG mode, each with what it takes at most, how much more than now and its files; the sum; then the tablespaces whose tables are purged with their datafiles (a dry run, from its space baseline). Lines EPF_DISK for the wrapper. RETENTION OPTIONS already gave the space freed per retention: the screen shows it as "Other retentions", and report.html has both as tables.
 - A purge beside a working application is not said to be safe anywhere: the help says "run it in a quiet period", as decided ("only if we can run the purge safely when app is online").
+
+**After its first run on a database (2026-10-13, 0.9.5).** X1 and X2 on TANM7883 passed; the user's reading of the screens gave these changes:
+- **Mode and depth show what they work on**: a table of the choices with the tables each takes, their size today and a rough estimate of what it frees with the cutoff given (the size by the share of the root's rows dated before it), then the tables by module, largest first, with their large values in brackets; the tables a database does not have are named. Measured by `epf_report.print_scope` (`scope.sql`), read-only, one COUNT per root. LOGS as a mode is FULL with the module LOGS alone, and the screen says so.
+- **A divider before each question**, with its name, and the prompt marked ">" in colour; what the question needs said first under the divider.
+- **A warning names its object**; the tables skipped are one note with their names.
+- **The disk table**: "Uses at most" and "Extra disk needed", with what that is; the other retentions are said to be examples, with the command that tries another.
 
 Checked without a database: 28 scenarios through the real wrapper against the stand-in sqlplus (152 checks on their screens: first run, upgrade, each requirement not met with each answer, refusals, the menu, purge and reclaim with and without prompts, `--verbose`), the suite's T00, T06 and T07, its default-screen test T08 and its menu test T16 as far as the stand-in goes. Not yet run on a database: the first runs there are the user's practice runs (sets O and V), and the new report section needs one dry run to show its figures.
 

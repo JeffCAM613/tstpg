@@ -1456,7 +1456,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
         PROCEDURE line(p_code IN VARCHAR2, p_what IN VARCHAR2, p_most IN NUMBER, p_more IN NUMBER,
                        p_where IN VARCHAR2) IS
         BEGIN
-            put('  ' || l(p_what, 22) || r(b(p_most), 12) || r(b(p_more), 16) || '  ' || p_where);
+            put('  ' || l(p_what, 19) || r(b(p_most), 13) || r(b(p_more), 19) || '  ' || p_where);
             put('EPF_DISK|' || l_label || '|' || p_code || '|' || ROUND(p_most) || '|' || ROUND(p_more) || '|' || p_where);
             l_total := l_total + NVL(p_more, 0);
         END line;
@@ -1466,7 +1466,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             RETURN;
         END IF;
         title('DISK WHILE THE PURGE RUNS (given back at its end)');
-        put('  ' || l('What', 22) || r('At most', 12) || r('More than now', 16) || '  Where');
+        put('  ' || l('What', 19) || r('Uses at most', 13) || r('Extra disk needed', 19) || '  Where');
         SELECT MAX(default_tablespace), MAX(temporary_tablespace)
           INTO l_tool, l_temp
           FROM dba_users
@@ -1509,7 +1509,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                      'the archive destination; kept until the DBA backs them up and deletes them');
             END IF;
         END LOOP;
-        put('  ' || l('In all', 22) || r(' ', 12) || r(b(l_total), 16) || '  free space needed next to these files');
+        put('  ' || l('In all', 19) || r(' ', 13) || r(b(l_total), 19) || '  of free disk space needed where these files are');
         -- The tablespaces of the tables purged, from the space baseline.
         FOR t IN (SELECT ss.tablespace_name, ss.module_code, SUM(ss.bytes) AS bytes
                     FROM epf_segment_snap ss
@@ -1518,7 +1518,7 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    ORDER BY ss.tablespace_name, ss.module_code) LOOP
             CONTINUE WHEN NOT in_depth(t.module_code);
             IF l_last IS NOT NULL AND l_last <> t.tablespace_name THEN
-                put('  ' || l('Tablespace purged', 22) || r(b(l_now), 12) || r('-', 16) || '  ' || l_last || ': '
+                put('  ' || l('Tablespace purged', 19) || r(b(l_now), 13) || r('none', 19) || '  ' || l_last || ': '
                     || files_of(l_last) || '; its tables to purge take ' || b(l_seg));
                 l_seg := 0;
             END IF;
@@ -1529,8 +1529,11 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             l_seg  := l_seg + NVL(t.bytes, 0);
         END LOOP;
         IF l_last IS NOT NULL THEN
-            put('  ' || l('Tablespace purged', 22) || r(b(l_now), 12) || r('-', 16) || '  ' || l_last || ': '
+            put('  ' || l('Tablespace purged', 19) || r(b(l_now), 13) || r('none', 19) || '  ' || l_last || ': '
                 || files_of(l_last) || '; its tables to purge take ' || b(l_seg));
+        END IF;
+        put('  Extra disk needed: what the file has to grow by, beyond its size today; 0 B when it has the room already.');
+        IF l_last IS NOT NULL THEN
             put('  The space is freed inside the tables: the datafiles of these tablespaces keep their size until a reclaim.');
         END IF;
     EXCEPTION
@@ -2403,6 +2406,95 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
             END IF;
         END LOOP;
     END print_advice;
+
+    -- What a purge covers in this database: the tables of the registry with
+    -- their module, their root, whether they are present and the size of
+    -- their segments (the table, its indexes, its LOB segments and their
+    -- indexes), each root with its rows and those dated before the cutoff,
+    -- and the size of the application's schemas. Lines EPF_SCOPE for the
+    -- wrapper's questions on the mode and the depth. Reads only; what cannot
+    -- be measured is said in a line and never raised.
+    PROCEDURE print_scope(p_cutoff IN VARCHAR2) IS
+        TYPE t_sizes IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+        l_cutoff  DATE := TO_DATE(p_cutoff, 'YYYY-MM-DD');
+        l_bytes   t_sizes;
+        l_lobs    t_sizes;
+        l_size    NUMBER;
+        l_lob     NUMBER;
+        l_all     NUMBER;
+        l_old     NUMBER;
+        l_total   NUMBER;
+        l_present BOOLEAN;
+        l_apps    SYS.ODCIVARCHAR2LIST := epf_util.split_list(epf_util.setting('app_schemas'));
+    BEGIN
+        put('EPF_SCOPE|CUTOFF|' || TO_CHAR(l_cutoff, 'YYYY-MM-DD'));
+        FOR mo IN (SELECT module_code, description FROM epf_module ORDER BY display_order) LOOP
+            put('EPF_SCOPE|MODULE|' || mo.module_code || '|' || REPLACE(mo.description, '|', '/'));
+        END LOOP;
+        FOR sz IN (SELECT x.table_id, SUM(g.bytes) AS seg_bytes,
+                          SUM(CASE WHEN x.is_lob = 1 THEN g.bytes ELSE 0 END) AS lob_bytes
+                     FROM (SELECT e.table_id, e.owner AS seg_owner, e.table_name AS seg_name, 0 AS is_lob
+                             FROM epf_table e
+                            WHERE e.active = 'Y'
+                           UNION ALL
+                           SELECT e.table_id, i.owner, i.index_name, 0
+                             FROM epf_table e
+                             JOIN dba_indexes i ON i.table_owner = e.owner AND i.table_name = e.table_name
+                            WHERE e.active = 'Y'
+                              AND i.index_type <> 'LOB'
+                           UNION ALL
+                           SELECT e.table_id, lb.owner, lb.segment_name, 1
+                             FROM epf_table e
+                             JOIN dba_lobs lb ON lb.owner = e.owner AND lb.table_name = e.table_name
+                            WHERE e.active = 'Y'
+                           UNION ALL
+                           SELECT e.table_id, lb.owner, lb.index_name, 1
+                             FROM epf_table e
+                             JOIN dba_lobs lb ON lb.owner = e.owner AND lb.table_name = e.table_name
+                            WHERE e.active = 'Y') x
+                     JOIN dba_segments g ON g.owner = x.seg_owner AND g.segment_name = x.seg_name
+                    GROUP BY x.table_id) LOOP
+            l_bytes(sz.table_id) := sz.seg_bytes;
+            l_lobs(sz.table_id)  := sz.lob_bytes;
+        END LOOP;
+        FOR t IN (SELECT e.table_id, e.module_code, e.owner, e.table_name, e.role, e.lob_clear, e.date_column,
+                         rt.owner AS root_owner, rt.table_name AS root_name
+                    FROM epf_table e
+                    JOIN epf_table rt ON rt.table_id = e.root_table_id
+                    JOIN epf_module mo ON mo.module_code = e.module_code
+                   WHERE e.active = 'Y'
+                   ORDER BY mo.display_order, e.root_table_id, e.delete_order, e.table_id) LOOP
+            l_present := epf_util.table_exists(t.owner, t.table_name);
+            l_size := 0;
+            l_lob  := 0;
+            IF l_bytes.EXISTS(t.table_id) THEN
+                l_size := l_bytes(t.table_id);
+                l_lob  := l_lobs(t.table_id);
+            END IF;
+            put('EPF_SCOPE|TABLE|' || t.module_code || '|' || t.owner || '.' || t.table_name || '|' || t.role || '|'
+                || t.root_owner || '.' || t.root_name || '|' || CASE WHEN l_present THEN 'Y' ELSE 'N' END || '|'
+                || l_size || '|' || l_lob || '|' || t.lob_clear);
+            IF t.role = 'ROOT' AND l_present AND t.date_column IS NOT NULL THEN
+                BEGIN
+                    EXECUTE IMMEDIATE 'SELECT COUNT(*), COUNT(CASE WHEN x.' || DBMS_ASSERT.ENQUOTE_NAME(t.date_column, FALSE)
+                                      || ' < :c THEN 1 END) FROM ' || epf_util.qname(t.owner, t.table_name) || ' x'
+                        INTO l_all, l_old USING l_cutoff;
+                    put('EPF_SCOPE|ROOT|' || t.owner || '.' || t.table_name || '|' || l_all || '|' || l_old);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        put('EPF_SCOPE|ROOT|' || t.owner || '.' || t.table_name || '||');
+                END;
+            END IF;
+        END LOOP;
+        SELECT NVL(SUM(bytes), 0)
+          INTO l_total
+          FROM dba_segments
+         WHERE owner IN (SELECT column_value FROM TABLE(l_apps));
+        put('EPF_SCOPE|SCHEMAS|' || l_total);
+    EXCEPTION
+        WHEN OTHERS THEN
+            put('EPF_SCOPE|ERROR|' || SQLERRM);
+    END print_scope;
 
     PROCEDURE print_status IS
         l_active NUMBER := epf_control.active_run_id;

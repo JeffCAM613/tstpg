@@ -202,6 +202,7 @@ function Start-Flow {
         Module = ''; Phase = ''; Batch = $null; EngineStep = ''; EngineScope = '';
         Rebuilt = 0; Indexes = 0; Parked = 0; Returned = 0; Rows = [double]0; PurgeEnd = '';
         Pending = (New-Object 'System.Collections.Generic.List[object]');
+        Missing = (New-Object 'System.Collections.Generic.List[string]');
         Notes = (New-Object 'System.Collections.Generic.List[string]');
         Errors = (New-Object 'System.Collections.Generic.List[string]')
     }
@@ -274,21 +275,34 @@ function Complete-FlowStep {
         return
     }
     Write-Out (Get-FlowLine $State $time) $color -NoLog
-    foreach ($note in $f.Pending) { Write-Out ('         ' + $note.Text) $note.Color -NoLog }
+    foreach ($note in $f.Pending) { Write-FlowLine $note }
     $f.Pending.Clear()
+}
+
+# One line under a step: as it is, or after its label and wrapped under its
+# text.
+function Write-FlowLine {
+    param($Note)
+    if ($Note.Label -ne '') {
+        Write-Wrapped ('         ' + $Note.Label) $Note.Text $Note.Color
+    } else {
+        Write-Out ('         ' + $Note.Text) $Note.Color -NoLog
+    }
 }
 
 # A line under the running step. The line of a step is written when it ends:
 # what it says meanwhile waits for it; under a heading it is written at once.
+# $Label: what goes before the text ("note   "); the text is then wrapped.
 function Write-FlowNote {
-    param([string]$Text, [string]$Color = '')
+    param([string]$Text, [string]$Color = '', [string]$Label = '')
     if (-not (Test-Flow)) { return }
     $f = $script:Flow
+    $note = [pscustomobject]@{ Text = $Text; Color = $Color; Label = $Label }
     if ($f.Open -and -not $f.Steps[$f.N - 1].Header) {
-        $f.Pending.Add([pscustomobject]@{ Text = $Text; Color = $Color })
+        $f.Pending.Add($note)
         return
     }
-    Write-Out ('         ' + $Text) $Color -NoLog
+    Write-FlowLine $note
 }
 
 # The line of the module whose rows are deleted now.
@@ -501,8 +515,27 @@ function Show-FlowEvent {
         return
     }
     if ($severity -eq 'WARN' -and $script:QuietWarnings -notcontains $code) {
-        $f.Notes.Add($message)
-        Write-Wrapped '         note   ' $message 'Yellow'
+        # The check of the tool's list of tables: the ones a database does not
+        # have are named together, once, when the check ends.
+        if ($code -eq 'REG_TABLE_MISSING') {
+            if ($Field[6] -ne '' -and -not $f.Missing.Contains($Field[6])) { $f.Missing.Add($Field[6]) }
+            return
+        }
+        $text = $message
+        if ($code -eq 'REG_SUMMARY') {
+            $others = 0
+            if ($message -match '(\d+) warnings') { $others = [int]$Matches[1] - $f.Missing.Count }
+            if ($f.Missing.Count -gt 0) {
+                $text = [string]$f.Missing.Count + ' of the tables this tool can purge are not in this database and are skipped: ' + ($f.Missing.ToArray() -join ', ')
+                if ($others -gt 0) { $text = $text + '. ' + $message }
+            }
+        } elseif ($Field[6] -ne '' -and $message.IndexOf($Field[6]) -lt 0) {
+            $text = $text + '  [' + $Field[6] + ']'
+        }
+        # A purge checks twice (its check, then the run itself): said once.
+        if ($f.Notes.Contains($text)) { return }
+        $f.Notes.Add($text)
+        Write-FlowNote $text 'Yellow' 'note   '
     }
 }
 
@@ -633,6 +666,178 @@ function Show-Requirements {
 }
 
 # ----------------------------------------------------------------------------
+# What a purge covers: the questions on the mode and the depth
+# ----------------------------------------------------------------------------
+
+# The name of a table on the screen: without its owner when that is the owner
+# of most tables.
+function Get-ScopeName {
+    param($Facts, $Table)
+    if ($Table.Name.StartsWith($Facts.Owner + '.')) { return $Table.Name.Substring($Facts.Owner.Length + 1) }
+    return $Table.Name
+}
+
+# The tables a mode works on in the modules $Modules, as Kind (DELETE: the
+# rows are deleted; CLEAR: their large values are emptied) and Table. Mode
+# LOGS is the module LOGS alone; CLOB_N_LOGS always takes it, to delete.
+function Get-ScopeTables {
+    param($Facts, [string]$Mode, [string[]]$Modules)
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($t in $Facts.Tables) {
+        if ($t.Present -ne 'Y') { continue }
+        $kind = ''
+        if ($Mode -eq 'FULL' -and $Modules -contains $t.Module) { $kind = 'DELETE' }
+        elseif ($Mode -eq 'LOGS' -and $t.Module -eq 'LOGS') { $kind = 'DELETE' }
+        elseif ($Mode -eq 'CLOB_N_LOGS' -and $t.Module -eq 'LOGS') { $kind = 'DELETE' }
+        elseif (($Mode -eq 'CLOB' -or $Mode -eq 'CLOB_N_LOGS') -and $Modules -contains $t.Module -and $t.Clear -eq 'Y' -and $t.Lob -gt 0) { $kind = 'CLEAR' }
+        if ($kind -ne '') { $list.Add([pscustomobject]@{ Kind = $kind; Table = $t }) }
+    }
+    return ,$list.ToArray()
+}
+
+# The tables of a choice in figures: Count, Bytes (the tables with their
+# indexes and large values, or the large values alone where they are
+# emptied) and Frees: those bytes by the share of the rows of each table's
+# root that are dated before the cutoff; -1 when a root could not be counted.
+function Measure-Scope {
+    param($Facts, [object[]]$Items)
+    $bytes = [double]0
+    $frees = [double]0
+    $known = $true
+    foreach ($item in $Items) {
+        $size = $item.Table.Bytes
+        if ($item.Kind -eq 'CLEAR') { $size = $item.Table.Lob }
+        $bytes += $size
+        if ($Facts.Roots.ContainsKey($item.Table.Root) -and $Facts.Roots[$item.Table.Root].All -gt 0) {
+            $frees += $size * $Facts.Roots[$item.Table.Root].Old / $Facts.Roots[$item.Table.Root].All
+        } elseif (-not $Facts.Roots.ContainsKey($item.Table.Root)) {
+            $known = $false
+        }
+    }
+    if (-not $known) { $frees = [double]-1 }
+    return [pscustomobject]@{ Count = $Items.Count; Bytes = $bytes; Frees = $frees }
+}
+
+# What a choice frees, for a column headed "Frees (about)"; "?" when a root
+# could not be counted.
+function Format-Frees {
+    param([double]$Bytes)
+    if ($Bytes -lt 0) { return '?' }
+    return (Format-Bytes $Bytes)
+}
+
+# The heading of the table of a question on the mode or the depth, and one
+# of its rows: a choice, the tables it works on, their size today, what it
+# frees, then what it is, wrapped under its column.
+function Write-ScopeHeader {
+    param([string]$Name, [string]$Text)
+    Write-Out ('   ' + $Name.PadRight(17) + 'Tables'.PadLeft(6) + 'Size now'.PadLeft(11) + 'Frees (about)'.PadLeft(16) + '   ' + $Text) 'White' -NoLog
+}
+
+function Write-ScopeRow {
+    param([string]$Name, $Measure, [string]$Text)
+    Write-Wrapped ('   ' + $Name.PadRight(17) + $Measure.Count.ToString().PadLeft(6) + (Format-Bytes $Measure.Bytes).PadLeft(11) +
+                   (Format-Frees $Measure.Frees).PadLeft(16) + '   ') $Text
+}
+
+# The tables of each module, largest first: the size of each today and, in
+# brackets, that of its large values (what the mode CLOB empties). In a
+# module of many tables the small ones share a line.
+function Show-ScopeTables {
+    param($Facts)
+    Write-Out '' -NoLog
+    Write-Wrapped '   ' 'The tables, largest first. In brackets: the large values of a table (LOB columns: documents, messages), the part that CLOB empties.' 'DarkGray'
+    foreach ($module in @($Facts.Modules.Keys)) {
+        $mine = @($Facts.Tables | Where-Object { $_.Module -eq $module -and $_.Present -eq 'Y' } | Sort-Object -Property Bytes -Descending)
+        if ($mine.Count -eq 0) { continue }
+        $total = [double]0
+        foreach ($t in $mine) { $total += $t.Bytes }
+        Write-Out ('   ' + $module.PadRight(17) + $mine.Count.ToString() + ' tables, ' + (Format-Bytes $total)) 'White' -NoLog
+        $small = New-Object 'System.Collections.Generic.List[string]'
+        $smallBytes = [double]0
+        foreach ($t in $mine) {
+            $name = Get-ScopeName $Facts $t
+            $lob = ''
+            if ($t.Clear -eq 'Y' -and $t.Lob -gt 0) { $lob = '[' + (Format-Bytes $t.Lob) + ']' }
+            if ($mine.Count -gt 6 -and $t.Bytes -lt 0.03 * $total) {
+                if ($lob -ne '') { $name = $name + ' ' + $lob }
+                $small.Add($name)
+                $smallBytes += $t.Bytes
+                continue
+            }
+            Write-Out ('       ' + $name.PadRight(34) + (Format-Bytes $t.Bytes).PadLeft(10) + '   ' + $lob).TrimEnd() -NoLog
+        }
+        if ($small.Count -gt 0) {
+            Write-Wrapped '       ' ($small.Count.ToString() + ' smaller, ' + (Format-Bytes $smallBytes) + ' in all: ' + ($small -join ', ')) 'DarkGray' 9
+        }
+    }
+}
+
+# What the figures of these questions are, and what they leave out.
+function Show-ScopeNotes {
+    param($Facts)
+    Write-Out '' -NoLog
+    $missing = @($Facts.Tables | Where-Object { $_.Present -ne 'Y' } | ForEach-Object { Get-ScopeName $Facts $_ })
+    if ($missing.Count -gt 0) {
+        Write-Wrapped '   ' ('Not in this database, and skipped: ' + ($missing -join ', ') + '.') 'DarkGray'
+    }
+    Write-Wrapped '   ' ('Size now: the tables today, with their indexes and large values (the large values alone where they are emptied). ' +
+                         'Frees: that size by the share of top-level records dated before ' + (Format-Day $Facts.Day) +
+                         '; a rough estimate, which a dry run replaces by a count.') 'DarkGray'
+    $covered = [double]0
+    foreach ($t in $Facts.Tables) { $covered += $t.Bytes }
+    if ($Facts.Schemas -gt $covered) {
+        Write-Wrapped '   ' ((Format-Bytes ($Facts.Schemas - $covered)) + ' of the application''s ' + (Format-Bytes $Facts.Schemas) +
+                             ' is in tables this tool does not purge.') 'DarkGray'
+    }
+}
+
+# The question on the mode: each mode with the tables it works on in this
+# database, their size today and a rough estimate of what it frees with the
+# cutoff $Facts.Day; then the tables themselves.
+function Show-ModeChoices {
+    param($Facts)
+    $modules = @($Facts.Modules.Keys)
+    Write-ScopeHeader 'Mode' 'What it does'
+    Write-ScopeRow 'FULL' (Measure-Scope $Facts (Get-ScopeTables $Facts 'FULL' $modules)) `
+                   'deletes the rows, in the modules chosen next'
+    Write-ScopeRow 'CLOB' (Measure-Scope $Facts (Get-ScopeTables $Facts 'CLOB' $modules)) `
+                   'keeps the rows, empties their large values'
+    Write-ScopeRow 'LOGS' (Measure-Scope $Facts (Get-ScopeTables $Facts 'LOGS' $modules)) `
+                   'same as FULL with the module LOGS alone'
+    Write-ScopeRow 'CLOB_N_LOGS' (Measure-Scope $Facts (Get-ScopeTables $Facts 'CLOB_N_LOGS' $modules)) `
+                   'CLOB, and deletes the rows of module LOGS'
+    Show-ScopeTables $Facts
+    Show-ScopeNotes $Facts
+}
+
+# The question on the depth: each module with what it holds and what the
+# mode chosen works on and frees in it. -WithTables: the tables too (the
+# question on the mode was not asked, so they were not listed).
+function Show-DepthChoices {
+    param($Facts, [string]$Mode, [switch]$WithTables)
+    $modules = @($Facts.Modules.Keys)
+    Write-ScopeHeader 'Module' 'What it holds'
+    $all = Get-ScopeTables $Facts $Mode $modules
+    Write-ScopeRow 'ALL' (Measure-Scope $Facts $all) 'every module'
+    foreach ($module in $modules) {
+        $what = [string]$Facts.Modules[$module]
+        if ($Mode -eq 'CLOB_N_LOGS' -and $module -eq 'LOGS') { $what = 'always part of this mode: its rows are deleted' }
+        Write-ScopeRow $module (Measure-Scope $Facts @($all | Where-Object { $_.Table.Module -eq $module })) $what
+    }
+    if ($WithTables) {
+        Show-ScopeTables $Facts
+        Show-ScopeNotes $Facts
+    } else {
+        Write-Out '' -NoLog
+    }
+    if ($Mode -ne 'FULL') {
+        Write-Wrapped '   ' ('Mode ' + $Mode + ': the tables counted are those with large values, and the sizes are those values.') 'DarkGray'
+    }
+    Write-Wrapped '   ' 'Several modules: their names separated by commas, such as PAYMENTS,LOGS.' 'DarkGray'
+}
+
+# ----------------------------------------------------------------------------
 # The end of a run
 # ----------------------------------------------------------------------------
 
@@ -717,17 +922,29 @@ function Show-ReportBlock {
     if ($lines.Count -lt 2) { return }
     Write-Out '' -NoLog
     Write-Out ('   ' + $Heading) 'White' -NoLog
-    # A line wider than the screen goes on under its last column.
+    # A row wider than the screen goes on under its last column ("Where"),
+    # or below the row when that column is one long word; a line that is not
+    # a row of the table (what a column means) is a sentence, wrapped.
     $width = Get-WrapWidth
+    $column = (' ' + $lines[1]).IndexOf('Where')
     for ($i = 1; $i -lt $lines.Count; $i++) {
         $text = ' ' + $lines[$i]
-        $cut = -1
-        if ($text.Length -gt $width) { $cut = $text.LastIndexOf(' ', $width - 1) }
-        if ($cut -lt 56) {
+        # Said by the lines that follow the block on the screen.
+        if ($lines[$i].StartsWith('  The space is freed inside the tables')) { continue }
+        $row = ($column -gt 2 -and $text.Length -gt $column -and $text.Substring($column - 2, 2) -eq '  ')
+        if ($i -gt 1 -and -not $row) {
+            Write-Wrapped '   ' $text.Trim() 'DarkGray'
+        } elseif ($text.Length -le $width) {
             Write-Out $text -NoLog
         } else {
-            Write-Out $text.Substring(0, $cut) -NoLog
-            Write-Wrapped (' ' * 55) $text.Substring($cut + 1)
+            $cut = $text.LastIndexOf(' ', $width - 1)
+            if ($cut -gt $column) {
+                Write-Out $text.Substring(0, $cut) -NoLog
+                Write-Wrapped (' ' * $column) $text.Substring($cut + 1)
+            } else {
+                Write-Out $text.Substring(0, $column).TrimEnd() -NoLog
+                Write-Wrapped '       ' $text.Substring($column)
+            }
         }
     }
 }
@@ -748,15 +965,17 @@ function Show-RetentionOptions {
             if ($rest -match '^\s+(?:-|[\d.]+ [KMGT]?B)\s+(?:-|[\d.]+ [KMGT]?B)\s+([\d.]+ [KMGT]?B)\s') { $freed = 'about ' + $Matches[1] }
             if ($count -eq '-') { continue }
             $mark = ''
-            if ($rest.Contains('(requested)')) { $mark = '   (yours)' }
+            if ($rest.Contains('(requested)')) { $mark = '   (this dry run)' }
             $rows.Add('     ' + ($days + ' days kept').PadRight(20) + ('before ' + $cutoff).PadRight(20) + $count.PadLeft(14) +
                       $freed.PadLeft(20) + $mark)
         }
     }
     if ($rows.Count -lt 2) { return }
     Write-Out '' -NoLog
-    Write-Out ('   ' + 'Other retentions'.PadRight(22) + 'Rows dated'.PadRight(20) + 'Rows deleted'.PadLeft(14) + 'Space freed'.PadLeft(20)) 'White' -NoLog
+    Write-Out '   Other retentions, as examples of what else could be kept' 'White' -NoLog
+    Write-Out ('     ' + 'Days kept'.PadRight(20) + 'Purges rows dated'.PadRight(20) + 'Rows deleted'.PadLeft(14) + 'Space freed'.PadLeft(20)) 'DarkGray' -NoLog
     foreach ($row in $rows) { Write-Out $row -NoLog }
+    Write-Wrapped '   ' 'Any number of days can be tried the same way: epf_purge.bat purge --dry-run --retention DAYS.' 'DarkGray'
 }
 
 # The end of a dry run of a purge: what a purge would delete, how long, per

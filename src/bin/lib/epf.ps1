@@ -526,11 +526,34 @@ function Get-Hint {
     return $Hint
 }
 
+# A divider before a question, so that each one stands apart: a blank line,
+# then its title on a rule. Only with prompts.
+function Write-Ask {
+    param([string]$Title)
+    if (-not $script:Interactive) { return }
+    $text = ' -- ' + $Title + ' '
+    Write-Out ''
+    Write-Out ($text + ('-' * [Math]::Max(3, $script:Width - $text.Length))) 'DarkCyan'
+}
+
+# Writes a prompt, marked ">" and in colour so that it is seen among the
+# text, and reads the answer; -Secure: masked (a keyboard is needed).
+function Read-Prompt {
+    param([string]$Label, [switch]$Secure)
+    Clear-Status
+    $text = ' > ' + $Label + ': '
+    if ($script:UseColor) { Write-Host $text -NoNewline -ForegroundColor Cyan } else { Write-Host $text -NoNewline }
+    if ($Secure) { return (Read-Host -AsSecureString) }
+    return (Read-Host)
+}
+
 # Prompts until a valid value is entered; Enter takes the default. Without
-# prompts the default must be valid.
+# prompts the default must be valid. $Title: the divider of the question
+# (Write-Ask); without one the caller has written it, with what the question
+# needs said first.
 function Read-Value {
     param([string]$Prompt, [string]$Default = '', [string[]]$Allowed = @(), [int]$Min = 0, [int]$Max = 0,
-          [string]$Pattern = '', [string]$Hint = 'a value is required')
+          [string]$Pattern = '', [string]$Hint = 'a value is required', [string]$Title = '')
     if (-not $script:Interactive) {
         $value = Test-Value $Default $Allowed $Min $Max $Pattern
         if ($null -eq $value) {
@@ -538,17 +561,20 @@ function Read-Value {
         }
         return $value
     }
+    if ($Title -ne '') { Write-Ask $Title }
     $label = $Prompt
     if ($Default -ne '') { $label = $label + ' [' + $Default + ']' }
     while ($true) {
-        Clear-Status
-        $answer = Read-Host -Prompt (' ' + $label)
+        $answer = Read-Prompt $label
+        $ended = ($null -eq $answer)
         if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
         $value = Test-Value $answer $Allowed $Min $Max $Pattern
         if ($null -ne $value) {
             Write-Log (' ' + $label + ': ' + $value)
             return $value
         }
+        # An input that is a file or a pipe and has no more lines cannot answer.
+        if ($ended) { Exit-Tool $script:ExitUsage ($Prompt + ': no answer (' + (Get-Hint $Allowed $Min $Max $Hint) + ').') }
         Write-Out ('   ' + (Get-Hint $Allowed $Min $Max $Hint)) 'Yellow' -NoLog
     }
 }
@@ -557,7 +583,7 @@ function Read-Value {
 # prompt; a configuration value is the prompt's default.
 function Get-Input {
     param([string]$Name, [string]$Key, [string]$Prompt, [string]$Default = '', [string[]]$Allowed = @(),
-          [int]$Min = 0, [int]$Max = 0, [string]$Pattern = '', [string]$Hint = 'a value is required')
+          [int]$Min = 0, [int]$Max = 0, [string]$Pattern = '', [string]$Hint = 'a value is required', [string]$Title = '')
     if ($script:Cli.Options.ContainsKey($Name)) {
         $value = Test-Value ([string]$script:Cli.Options[$Name]) $Allowed $Min $Max $Pattern
         if ($null -eq $value) {
@@ -566,25 +592,25 @@ function Get-Input {
         return $value
     }
     $initial = Get-Option $Name $Key $Default
-    return (Read-Value -Prompt $Prompt -Default $initial -Allowed $Allowed -Min $Min -Max $Max -Pattern $Pattern -Hint $Hint)
+    return (Read-Value -Prompt $Prompt -Default $initial -Allowed $Allowed -Min $Min -Max $Max -Pattern $Pattern -Hint $Hint -Title $Title)
 }
 
 function Read-YesNo {
-    param([string]$Prompt, [bool]$Default = $false)
+    param([string]$Prompt, [bool]$Default = $false, [string]$Title = '')
     if (-not $script:Interactive) { return $Default }
     $text = 'N'
     if ($Default) { $text = 'Y' }
-    $answer = Read-Value -Prompt ($Prompt + ' (Y/N)') -Default $text -Allowed @('Y', 'N', 'YES', 'NO')
+    $answer = Read-Value -Prompt ($Prompt + ' (Y/N)') -Default $text -Allowed @('Y', 'N', 'YES', 'NO') -Title $Title
     return ($answer -eq 'Y' -or $answer -eq 'YES')
 }
 
 # A yes/no option: a command line flag sets it; otherwise the configuration
 # value is the answer, or the default of the prompt with -Ask.
 function Get-Choice {
-    param([string]$Name, [string]$Key, [string]$Prompt, [switch]$Ask)
+    param([string]$Name, [string]$Key, [string]$Prompt, [switch]$Ask, [string]$Title = '')
     if ($script:Cli.Flags.ContainsKey($Name)) { return $true }
     $default = Test-ConfigYes $Key
-    if ($Ask) { return (Read-YesNo $Prompt $default) }
+    if ($Ask) { return (Read-YesNo $Prompt $default $Title) }
     return $default
 }
 
@@ -602,8 +628,8 @@ function ConvertFrom-Secure {
 # the input is a file or a pipe, the line is read from it instead.
 function Read-Masked {
     param([string]$Text)
-    if (-not [Console]::IsInputRedirected) { return (Read-Host -Prompt (' ' + $Text) -AsSecureString) }
-    $line = Read-Host -Prompt (' ' + $Text)
+    if (-not [Console]::IsInputRedirected) { return (Read-Prompt $Text -Secure) }
+    $line = Read-Prompt $Text
     $secure = New-Object System.Security.SecureString
     if ($null -ne $line) {
         foreach ($c in $line.ToCharArray()) { $secure.AppendChar($c) }
@@ -614,10 +640,11 @@ function Read-Masked {
 # Password from the environment, the configuration file or a masked prompt
 # (entered twice with -Twice), kept as a SecureString. -Optional: Enter
 # alone, or no password given without prompts, returns $null. -Ask: the
-# prompt only (the password given before was refused).
+# prompt only (the password given before was refused). $Title: the divider
+# of the question, written only when the password is asked for.
 function Read-Secret {
     param([string]$Prompt, [string]$EnvName, [string]$ConfigKey, [switch]$Twice, [switch]$Optional, [switch]$Ask,
-          [string]$Label = '')
+          [string]$Label = '', [string]$Title = '')
     if (-not $Ask) {
         $fromEnv = [Environment]::GetEnvironmentVariable($EnvName)
         if (-not [string]::IsNullOrEmpty($fromEnv)) { return (ConvertTo-SecureString $fromEnv -AsPlainText -Force) }
@@ -630,10 +657,10 @@ function Read-Secret {
         Exit-Tool $script:ExitUsage ('Missing ' + $Prompt + ': set ' + $EnvName + ' in the environment or ' + $ConfigKey +
                                      ' in the configuration file (non-interactive).')
     }
+    if ($Title -ne '') { Write-Ask $Title }
     $text = $Prompt
     if ($Label -ne '') { $text = $Label }
     while ($true) {
-        Clear-Status
         $first = Read-Masked $text
         if ($first.Length -eq 0 -and $Optional) { return $null }
         if ($first.Length -eq 0) {
@@ -661,8 +688,7 @@ function Read-Typed {
     }
     $text = $Prompt + '. Type yes to proceed'
     if ($Label -ne '') { $text = $Label }
-    Clear-Status
-    $answer = Read-Host -Prompt (' ' + $text)
+    $answer = Read-Prompt $text
     Write-Log (' ' + $text + ': ' + $answer)
     if ($answer -ne 'yes') { Exit-Tool $script:ExitAborted 'Stopped: you did not type yes. Nothing was changed.' }
 }
@@ -1924,7 +1950,7 @@ function Get-ExpectedVersion {
 }
 
 function Get-Tns {
-    return (Get-Input -Name 'tns' -Key 'TNS' -Prompt 'Database (its alias in tnsnames.ora, or host:port/service)' `
+    return (Get-Input -Name 'tns' -Key 'TNS' -Title 'Database' -Prompt 'Database (its alias in tnsnames.ora, or host:port/service)' `
                       -Hint 'the alias of the database in tnsnames.ora, or host:port/service: --tns NAME, or TNS in the configuration file')
 }
 
@@ -1998,12 +2024,12 @@ function Connect-Tool {
     while ($true) {
         $attempt++
         if ($attempt -gt 1) {
-            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Ask
+            $secret = Read-Secret -Prompt 'EPFPG password' -Title 'The tool''s own account (EPFPG)' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Ask
         } elseif ($Ready -and $script:Interactive) {
-            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Optional `
+            $secret = Read-Secret -Prompt 'EPFPG password' -Title 'The tool''s own account (EPFPG)' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Optional `
                                   -Label 'EPFPG password (Enter alone if the tool was never installed on this database)'
         } else {
-            $secret = Read-Secret -Prompt 'EPFPG password' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
+            $secret = Read-Secret -Prompt 'EPFPG password' -Title 'The tool''s own account (EPFPG)' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD'
         }
         if ($null -ne $secret) {
             $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
@@ -2036,15 +2062,14 @@ function Connect-Tool {
         }
         Write-Out ('   Database           ' + $tns + ': connected as SYS (' + $script:Database.Container + ')')
         Write-Out '   Tool in database   not installed yet' 'Yellow'
-        Write-Out ''
-        Write-Out ' The tool keeps its own objects in the database: an account EPFPG and a'
-        Write-Out ' tablespace EPFPG_DATA, with the history of its runs and what they measured.'
-        Write-Out ' Installing them changes nothing else.'
+        Write-Ask 'Install the tool'
+        Write-Wrapped '   ' ('The tool keeps its own objects in the database: an account EPFPG and a tablespace EPFPG_DATA, with the ' +
+                             'history of its runs and what they measured. Installing them changes nothing else.') -Log
         if (-not (Read-YesNo 'Install them now' $true)) {
             Exit-Tool $script:ExitAborted 'Stopped: the tool is not installed. Nothing was changed.'
         }
         $secret = Read-Secret -Prompt 'EPFPG password to set' -EnvName 'EPF_PASSWORD' -ConfigKey 'EPF_PASSWORD' -Twice `
-                              -Label 'Password to give the EPFPG account'
+                              -Label 'Password to give the EPFPG account' -Title 'Password of the new account'
         $seconds = Install-Tool $sys $secret
         $login = New-Login -User 'epfpg' -Secret $secret -Tns $tns
         $test = Test-DbConnection $login -WithVersion
@@ -2079,12 +2104,12 @@ function Connect-Tool {
             Exit-Tool $script:ExitUsage ('The tool in the database is newer than these scripts: use the scripts of version ' +
                                          $test.Version + ', or put this version back with epf_purge.bat install.')
         }
-        if (-not (Read-YesNo ('Install version ' + $expected + ' of these scripts over it (SYS; the history of the runs is kept)') $false)) {
+        if (-not (Read-YesNo ('Install version ' + $expected + ' of these scripts over it (SYS; the history of the runs is kept)') $false 'Version of the tool')) {
             Exit-Tool $script:ExitAborted 'Stopped: the tool in the database is of another version than these scripts. Nothing was changed.'
         }
     } else {
         Write-Out ('   Tool in database   version ' + $test.Version + '; these scripts are version ' + $expected) 'Yellow'
-        if (-not (Read-YesNo 'Upgrade it now (SYS; the history of the runs is kept)' $true)) {
+        if (-not (Read-YesNo 'Upgrade it now (SYS; the history of the runs is kept)' $true 'Version of the tool')) {
             Exit-Tool $script:ExitAborted 'Stopped: the tool in the database is of another version than these scripts. Nothing was changed.'
         }
     }
@@ -2109,7 +2134,7 @@ function Connect-Sys {
     if ($known -and -not $WithTool) { return $script:SysLogin }
     $sys = $script:SysLogin
     if (-not $known) {
-        $secret = Read-Secret -Prompt 'SYS password' -EnvName 'EPF_SYS_PASSWORD' -ConfigKey 'SYS_PASSWORD'
+        $secret = Read-Secret -Prompt 'SYS password' -Title 'SYS password' -EnvName 'EPF_SYS_PASSWORD' -ConfigKey 'SYS_PASSWORD'
         $sys = New-Login -User 'sys' -Secret $secret -Tns $Tns -Sysdba
     }
     $test = Test-DbConnection $sys -WithTool:$WithTool
@@ -2126,6 +2151,51 @@ function Connect-Sys {
     if ($WithTool) { $script:ToolState = $test.Version }
     $script:SysLogin = $sys
     return $sys
+}
+
+# What a purge covers in this database, for the questions on the mode and
+# the depth (scope.sql): the modules with what they hold; each table of the
+# tool's list with its module, its root, whether it is present, its size (with
+# its indexes and LOB segments) and the size of its LOB segments; for each
+# root its rows and those dated before $Day; the size of the application's
+# schemas. $null when it could not be measured (the questions then say what
+# the choices mean, without figures).
+function Get-ScopeFacts {
+    param($Login, [string]$Day)
+    if ($script:StatusLine) { Show-Status '   Measuring the tables of each module ...' }
+    $result = Invoke-SqlScript $Login (Join-Path $script:RunSqlDir 'scope.sql') @($Day)
+    Clear-Status
+    $facts = [pscustomobject]@{ Day = $Day; Modules = [ordered]@{}; Tables = (New-Object 'System.Collections.Generic.List[object]');
+                                Roots = @{}; Schemas = [double]0; Owner = '' }
+    $owners = @{}
+    foreach ($line in ($result.Output -split "`r?`n")) {
+        if ($line -match '^EPF_SCOPE\|MODULE\|([A-Z_]+)\|(.*)$') {
+            $facts.Modules[$Matches[1]] = $Matches[2].Trim()
+        } elseif ($line -match '^EPF_SCOPE\|TABLE\|([A-Z_]+)\|([^|]+)\|([A-Z]+)\|([^|]+)\|([YN])\|(\d*)\|(\d*)\|([YN])\s*$') {
+            $table = [pscustomobject]@{ Module = $Matches[1]; Name = $Matches[2]; Role = $Matches[3]; Root = $Matches[4]; Present = $Matches[5];
+                                        Bytes = (ConvertTo-Number $Matches[6]); Lob = (ConvertTo-Number $Matches[7]); Clear = $Matches[8] }
+            $facts.Tables.Add($table)
+            $owner = $table.Name.Split('.')[0]
+            if ($owners.ContainsKey($owner)) { $owners[$owner] = $owners[$owner] + 1 } else { $owners[$owner] = 1 }
+        } elseif ($line -match '^EPF_SCOPE\|ROOT\|([^|]+)\|(\d+)\|(\d+)\s*$') {
+            $facts.Roots[$Matches[1]] = [pscustomobject]@{ All = (ConvertTo-Number $Matches[2]); Old = (ConvertTo-Number $Matches[3]) }
+        } elseif ($line -match '^EPF_SCOPE\|SCHEMAS\|(\d+)') {
+            $facts.Schemas = ConvertTo-Number $Matches[1]
+        } elseif ($line -match '^EPF_SCOPE\|ERROR\|(.*)$') {
+            Write-Log (' The tables of each module could not be measured: ' + $Matches[1])
+            return $null
+        }
+    }
+    if ($result.ExitCode -ne 0 -or $facts.Tables.Count -eq 0) {
+        Write-Log (' The tables of each module could not be measured (scope.sql, exit ' + $result.ExitCode + ').')
+        return $null
+    }
+    # The owner of most tables is left out of their names on the screen.
+    $most = 0
+    foreach ($owner in $owners.Keys) {
+        if ($owners[$owner] -gt $most) { $most = $owners[$owner]; $facts.Owner = $owner }
+    }
+    return $facts
 }
 
 # Sets the cutoff of $Ctx to the day $Text (YYYY-MM-DD, before today on the
@@ -2184,7 +2254,12 @@ function Get-PurgeContext {
         }
         $default = '30'
         if ($given -ne '') { $default = $given }
-        $answer = Read-Value -Prompt 'Days of data to keep; older rows are purged (or a date as YYYY-MM-DD)' -Default $default `
+        Write-Ask 'Days of data to keep'
+        if ($script:Interactive) {
+            Write-Wrapped '   ' ('Rows older than that are purged. A number of days such as 365, or the day itself as YYYY-MM-DD: ' +
+                                 'rows dated before it are purged.') -Log
+        }
+        $answer = Read-Value -Prompt 'Days of data to keep' -Default $default `
                              -Pattern '^(\d{1,6}|\d{4}-\d{2}-\d{2})$' -Hint 'a number of days such as 365, or a date such as 2025-10-13'
         if ($answer.Contains('-')) {
             Set-Cutoff $ctx $answer 'The date'
@@ -2211,19 +2286,37 @@ function Get-PurgeContext {
     if ($null -eq $Plan) {
         # What to do with the old rows, and of which modules: asked for when
         # the options do not say.
+        # Each question shows what its choices work on in this database: the
+        # tables, their size and a rough estimate of what they free with this
+        # cutoff (Get-ScopeFacts); without those figures, what they mean.
+        $day = Get-CutoffDay $ctx
+        $facts = $null
+        $listed = $false
         if ($script:Interactive -and -not $script:Cli.Options.ContainsKey('mode')) {
-            Write-Out ''
-            Write-Out ' Mode: FULL deletes the old rows. CLOB keeps the rows and empties their large'
-            Write-Out ' values (LOB columns). LOGS deletes the logs only. CLOB_N_LOGS deletes the logs'
-            Write-Out ' and empties the large values of the other modules.'
+            $facts = Get-ScopeFacts $Login $day
+            Write-Ask ('Mode: what is done to the rows dated before ' + (Format-Day $day))
+            if ($null -ne $facts) {
+                Show-ModeChoices $facts
+                $listed = $true
+            } else {
+                Write-Wrapped '   ' ('FULL deletes the old rows. CLOB keeps the rows and empties their large values (LOB columns). ' +
+                                     'LOGS deletes the rows of the module LOGS only, as FULL with that module alone. ' +
+                                     'CLOB_N_LOGS does both: CLOB for the other modules, the rows of LOGS deleted.') -Log
+            }
         }
         $ctx.Mode = Get-Input -Name 'mode' -Key 'MODE' -Prompt 'Mode (FULL, CLOB, LOGS, CLOB_N_LOGS)' -Default 'FULL' -Allowed $script:Modes
         if ($ctx.Mode -eq 'LOGS') {
             $ctx.Depth = 'LOGS'
         } else {
             if ($script:Interactive -and -not $script:Cli.Options.ContainsKey('depth')) {
-                Write-Out ' Modules: PAYMENTS (bulk payments, file integrations), LOGS (audit trail,'
-                Write-Out ' technical logs), BANK_STATEMENTS (bank statement dispatching).'
+                if ($null -eq $facts) { $facts = Get-ScopeFacts $Login $day }
+                Write-Ask ('Depth: in which modules (mode ' + $ctx.Mode + ')')
+                if ($null -ne $facts) {
+                    Show-DepthChoices $facts $ctx.Mode -WithTables:(-not $listed)
+                } else {
+                    Write-Wrapped '   ' ('PAYMENTS (bulk payments, file integrations), LOGS (audit trail, technical logs), ' +
+                                         'BANK_STATEMENTS (bank statement dispatching); ALL for every one.') -Log
+                }
             }
             $ctx.Depth = (Get-Input -Name 'depth' -Key 'DEPTH' -Prompt 'Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS)' `
                                     -Default 'ALL' -Pattern '^[A-Z_]+(,[A-Z_]+)*$' -Hint 'ALL, or module names separated by commas').ToUpper()
@@ -2245,12 +2338,12 @@ function Get-PurgeContext {
         # for when the options do not say (the menu has said which of a dry
         # run and a purge it is).
         $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('dry-run') -and -not $script:GoalChosen
-        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask
+        $ctx.DryRun = Get-Choice 'dry-run' 'DRY_RUN' 'Dry run (simulation with the expected outcome, nothing is deleted)' -Ask:$ask -Title 'Dry run'
         if ($ctx.DryRun) {
             if ($script:Cli.Flags.ContainsKey('compact')) { Exit-Tool $script:ExitUsage '--compact does not apply to a dry run.' }
         } else {
             $ask = $script:Interactive -and -not $script:Cli.Flags.ContainsKey('compact')
-            $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask
+            $ctx.Compact = Get-Choice 'compact' 'COMPACT' 'Compact the purged tables afterwards (returns the freed space to the tablespace)' -Ask:$ask -Title 'Compaction'
         }
     }
     # Applied by a purge that deletes; a preflight or dry run checks the
@@ -2683,7 +2776,7 @@ function Invoke-PlanAction {
         Show-PlanSummary $plan -Choices
         if (-not $script:Cli.Flags.ContainsKey('yes')) {
             if (-not $script:Interactive) { Exit-Tool $script:ExitUsage 'Closing a plan: --yes is required with --non-interactive.' }
-            if (-not (Read-YesNo ('Close plan ' + $plan.Label + ' (its completed steps stay done)') $false)) {
+            if (-not (Read-YesNo ('Close plan ' + $plan.Label + ' (its completed steps stay done)') $false 'Plan')) {
                 Exit-Tool $script:ExitAborted 'Nothing was changed.'
             }
         }
@@ -2821,7 +2914,13 @@ function Read-Requirement {
     param($Ctx, $Advice, [string]$Code)
     $item = $Advice.Req[$Code]
     $name = Get-ReqName 'PURGE' $Code $item
+    # A requirement that is optional has no question, the online logs excepted.
+    if ($Code -ne 'REDO_LOGS' -and $item.Blocking -ne 'Y') { return 'SAME' }
+    Write-Ask $name
     if ($Code -eq 'REDO_LOGS') {
+        Write-Wrapped '   ' ('The tool can enlarge them for the purge: 4 logs of 1 GB replace the present ones while it runs (up to ' +
+                             '4 GB more disk in their directory), and the present ones are put back under the same names at its end. ' +
+                             'Needs SYS.') -Log
         if (Read-YesNo 'Enlarge the online redo logs for this purge' $true) {
             $Ctx.RedoLogs = $true
             Write-Out '   The online redo logs will be 4 x 1 GB during the purge, then as they are now.' 'Green'
@@ -2899,16 +2998,19 @@ function Invoke-Choices {
     $blocking = @($unmet | Where-Object { $advice.Req[$_].Blocking -eq 'Y' })
     $optional = @($unmet | Where-Object { $advice.Req[$_].Blocking -ne 'Y' })
     if ($Ctx.DryRun) {
-        if ($optional -contains 'REDO_LOGS' -and -not $script:Database.Pdb) {
-            Write-Out '   A purge asks whether to enlarge the online redo logs for its time (--redo-logs says yes beforehand).'
-        }
-        if ($blocking.Count -gt 0) {
-            Write-Out '   A purge would ask before it starts. The dry run itself changes nothing.'
-        }
-        if ($unmet.Count -gt 0 -and -not (Read-YesNo 'Go on with the dry run' $true)) {
-            Write-Out ''
-            Write-Out ' Stopped: you chose to stop at the requirements.' 'Yellow'
-            return $false
+        if ($unmet.Count -gt 0) {
+            Write-Ask 'Requirements not met'
+            if ($optional -contains 'REDO_LOGS' -and -not $script:Database.Pdb) {
+                Write-Wrapped '   ' 'A purge asks whether to enlarge the online redo logs for its time (--redo-logs says yes beforehand).' -Log
+            }
+            if ($blocking.Count -gt 0) {
+                Write-Wrapped '   ' 'A purge would ask before it starts. The dry run itself changes nothing.' -Log
+            }
+            if (-not (Read-YesNo 'Go on with the dry run' $true)) {
+                Write-Out ''
+                Write-Out ' Stopped: you chose to stop at the requirements.' 'Yellow'
+                return $false
+            }
         }
     } else {
         foreach ($code in @($optional + @($blocking | Where-Object { $_ -ne 'UNDO' }))) {
@@ -3064,13 +3166,12 @@ function Invoke-UninstallQuestion {
     if ($null -ne $plan -and $plan.Status -eq 'IN_PROGRESS') { return }
     $auto = Test-ConfigYes 'UNINSTALL_AFTER'
     if ($script:Interactive) {
-        Write-Out ''
-        Write-Out ' The tool''s own objects stay in the database for the next run: the account EPFPG'
-        Write-Out ' and its tablespace EPFPG_DATA, with the history of the runs and what they'
-        Write-Out ' measured. Removing them frees that space; the next run installs them again, and'
-        Write-Out ' its estimates start from statistics. The reports on this machine stay.'
+        Write-Ask 'The tool in the database'
+        Write-Wrapped '   ' ('The tool''s own objects stay in the database for the next run: the account EPFPG and its tablespace ' +
+                             'EPFPG_DATA, with the history of the runs and what they measured. Removing them frees that space; the ' +
+                             'next run installs them again, and its estimates start from statistics. The reports on this machine stay.') -Log
         if (-not (Read-YesNo 'Remove the tool from the database now' $auto)) {
-            Write-Out ' Kept.'
+            Write-Out '   Kept.'
             return
         }
     } elseif (-not $auto) {
@@ -3180,7 +3281,7 @@ function Invoke-PurgeAction {
         Write-Out ''
         Show-PlanSummary $plan
         $text = Format-Choices $plan.Batch $plan.Undo $plan.Redo $plan.Backup $plan.Confirm
-        if (Read-YesNo ('Check the plan again with its choices (' + $text + ')') $true) { Use-PlanChoices $ctx $plan }
+        if (Read-YesNo ('Check the plan again with its choices (' + $text + ')') $true 'Plan') { Use-PlanChoices $ctx $plan }
     } elseif ($follow) {
         # The purge follows the plan's choices and reuses the root counts of
         # its preflight while they are valid (same cutoff, recent, nothing
@@ -3543,7 +3644,7 @@ function Invoke-ReclaimChoices {
         $key = 'RECLAIM.' + $code
         $do = 'meet the requirement, then run the reclaim again.'
         if ($script:ReqActions.ContainsKey($key)) { $do = $script:ReqActions[$key] + '.' }
-        Write-Out ''
+        Write-Ask $name
         if ($code -eq 'RECYCLEBIN') {
             Write-Out '   Recycle bin: the reclaim purges the dropped objects of these tablespaces first.' 'Red'
             Write-Out '   FLASHBACK TABLE ... TO BEFORE DROP can then no longer restore them.' 'Red'
@@ -3660,7 +3761,7 @@ function Invoke-ReclaimAction {
         if ($script:Interactive -and -not $confirmed) {
             $pending = Invoke-SqlScript $login (Join-Path $script:RunSqlDir 'status.sql') @()
             Show-Lines $pending.Output -Indent
-            if (-not (Read-YesNo 'Restore what reclaims left pending (parked tables, indexes, datafile growth settings, accounts)' $true)) {
+            if (-not (Read-YesNo 'Restore what reclaims left pending (parked tables, indexes, datafile growth settings, accounts)' $true 'Restore')) {
                 Exit-Tool $script:ExitAborted 'Nothing was changed.'
             }
         }
@@ -3798,10 +3899,9 @@ function Invoke-InstallAction {
     $sys = Connect-Sys $tns
     if ($Uninstall) {
         if ($script:Interactive) {
-            Write-Out ''
-            Write-Out ' This removes the tool''s own objects from the database: the account EPFPG and'
-            Write-Out ' its tablespace EPFPG_DATA, with the history of the runs. The application''s'
-            Write-Out ' data is not touched, and the reports on this machine stay.'
+            Write-Ask 'Remove the tool'
+            Write-Wrapped '   ' ('This removes the tool''s own objects from the database: the account EPFPG and its tablespace EPFPG_DATA, ' +
+                                 'with the history of the runs. The application''s data is not touched, and the reports on this machine stay.') -Log
         }
         Read-Typed 'The EPFPG schema and the EPFPG_DATA tablespace will be removed'
         $result = Invoke-SqlScript $sys (Join-Path $script:InstallDir 'uninstall.sql')
@@ -3856,7 +3956,7 @@ function Start-Wizard {
             Invoke-ReclaimAction -NoBanner
         }
         '5' {
-            $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST'
+            $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST' -Title 'Report'
             Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST')
         }
         '6' { Invoke-SimpleScript 'status.sql' @() }

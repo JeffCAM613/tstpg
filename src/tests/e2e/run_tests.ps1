@@ -846,7 +846,7 @@ $script:TestList = @(
     'T15  BANK_STATEMENTS LOB clearing (mode CLOB), non-interactive',
     'T16  BANK_STATEMENTS purge through the menu wizard (redo sizing already done)',
     'T17  Reports through the wrapper: latest, and the stopped run',
-    'T18  SQL entry scripts: report.sql, status.sql, advice.sql',
+    'T18  SQL entry scripts: report.sql, status.sql, advice.sql, scope.sql',
     'T18A Reclaim lab: a scratch tablespace; its assessment (dry run) changes nothing',
     'T18B Reclaim lab: compaction in place; requirement gate, room making, R1-R9, everything restored',
     'T18C Reclaim lab: a stop during the compaction ends STOPPED with everything restored',
@@ -1603,12 +1603,23 @@ function Invoke-Suite {
         }
     }
 
-    Invoke-Test 'T18' 'SQL entry scripts: report.sql, status.sql, advice.sql' {
+    Invoke-Test 'T18' 'SQL entry scripts: report.sql, status.sql, advice.sql, scope.sql' {
         $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'report.sql') @('LATEST')))
         Assert-Exit $r @(0, 2)
         Assert-Match $r 'EPF_CHECK\|'
         $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'status.sql')))
         Assert-Exit $r @(0)
+        # What a purge covers here, for the wrapper's questions on the mode
+        # and the depth: the tables with their sizes, the roots counted.
+        $day = (Get-Date).AddDays(-1 * [int]$script:Retention).ToString('yyyy-MM-dd')
+        $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'scope.sql') @($day)))
+        Assert-Exit $r @(0)
+        Assert-Match $r ('EPF_SCOPE\|CUTOFF\|' + $day)
+        Assert-Match $r 'EPF_SCOPE\|MODULE\|PAYMENTS\|'
+        Assert-Match $r 'EPF_SCOPE\|TABLE\|PAYMENTS\|OPPAYMENTS\.BULK_PAYMENT\|ROOT\|OPPAYMENTS\.BULK_PAYMENT\|Y\|\d+\|\d+\|[YN]'
+        Assert-Match $r 'EPF_SCOPE\|ROOT\|OPPAYMENTS\.BULK_PAYMENT\|\d+\|\d+'
+        Assert-Match $r 'EPF_SCOPE\|SCHEMAS\|\d+'
+        Assert-NoMatch $r 'EPF_SCOPE\|ERROR'
         if ($script:State.PreflightRun -ne '') {
             $id = Get-RunNumber $script:State.PreflightRun
             $r = Invoke-Sql 'EPFPG' @((Get-ScriptLine (Join-Path $script:RunSqlDir 'advice.sql') @($id)))
