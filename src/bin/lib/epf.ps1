@@ -21,6 +21,20 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:CliArgs     = @($args)
+# The launcher as it can be typed from the current directory: its path from
+# there when it lies below (src\bin\epf_purge.bat from the tool's folder), its
+# full path otherwise. Every command the tool tells the user to type begins
+# with it (Format-Launcher).
+$script:Launcher    = Join-Path (Split-Path -Parent $PSScriptRoot) 'epf_purge.bat'
+try {
+    $here = (Get-Location).ProviderPath.TrimEnd('\') + '\'
+    if ($script:Launcher.StartsWith($here, [StringComparison]::OrdinalIgnoreCase)) {
+        $script:Launcher = $script:Launcher.Substring($here.Length)
+    }
+} catch {
+    $script:Launcher = 'epf_purge.bat'
+}
+if ($script:Launcher.Contains(' ')) { $script:Launcher = '"' + $script:Launcher + '"' }
 $script:SrcDir      = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $script:RepoDir     = Split-Path -Parent $script:SrcDir
 $script:RunSqlDir   = Join-Path $script:SrcDir 'sql\run'
@@ -113,8 +127,18 @@ function Write-Log {
 
 # Writes a line to the console (in colour unless --no-color) and to the log.
 # -Detail: on the console only with --verbose; the log has it either way.
+# A text in which the tool names its own command, with that command as it can
+# be typed here: "epf_purge.bat" becomes the launcher's path from the current
+# directory. A name that already has its path is left as it is.
+function Format-Launcher {
+    param([string]$Text)
+    if ($script:Launcher -eq 'epf_purge.bat' -or $Text.IndexOf('epf_purge.bat') -lt 0) { return $Text }
+    return [regex]::Replace($Text, '(?<![\\/\w."])epf_purge\.bat', $script:Launcher.Replace('$', '$$'))
+}
+
 function Write-Out {
     param([string]$Text = '', [string]$Color = '', [switch]$NoLog, [switch]$Detail)
+    $Text = Format-Launcher $Text
     if ($script:Verbose -or -not $Detail) {
         Clear-Status
         if ($script:UseColor -and $Color -ne '') {
@@ -225,7 +249,7 @@ Where to start
        epf_purge.bat purge --dry-run --retention 365     what it would do
        epf_purge.bat purge --retention 365               delete the rows
        epf_purge.bat reclaim                             free the disk space
-                                                         (database not in use)
+     The reclaim needs the database not in use.
   3. Be guided: the menu asks what you want and the questions that go with it:
        epf_purge.bat
 
@@ -297,6 +321,9 @@ Options
   --compact            accepted, changes nothing: every purge that deletes
                        compacts the tables it purged afterwards, so that
                        the space of the deleted rows can be used again
+  --reclaim            with purge and no other option of a purge: runs the
+                       reclaim, as the action reclaim does (--dry-run: its
+                       dry run). The reclaim is a command of its own
   --tablespaces LIST   reclaim: tablespaces separated by commas (default: every
                        tablespace holding segments of the application schemas)
   --scratch SIZE       reclaim: the most temporary space, such as 2G, for the
@@ -423,7 +450,7 @@ Output
 Exit codes: 0 PASS, 1 FAIL, 2 PASS WITH WARNINGS, 3 aborted or stopped,
 4 usage or configuration error.
 '@
-    Write-Host $text
+    Write-Host (Format-Launcher $text)
 }
 
 # ----------------------------------------------------------------------------
@@ -4031,13 +4058,30 @@ function Invoke-Main {
         $script:ReconnectS = [int]$seconds
     }
 
-    # The reclaim was an option of the purge in the previous tool. It is a
-    # command of its own: the answer is the command to type.
+    # The reclaim was an option of the purge in the previous tool. Here it is
+    # a command of its own: "purge --reclaim" runs it (its dry run with
+    # --dry-run) and says which command that is. With the options of a purge
+    # it is refused: the purge and the reclaim are run one after the other.
     if ($script:Cli.Flags.ContainsKey('reclaim')) {
         $command = 'epf_purge.bat reclaim'
         if ($script:Cli.Flags.ContainsKey('dry-run')) { $command = 'epf_purge.bat reclaim --dry-run' }
-        Exit-Tool $script:ExitUsage ('--reclaim is not an option: the reclaim is a command of its own, not part of purge. Type this instead:' +
-                                     [Environment]::NewLine + '     ' + $command)
+        if ($null -ne $script:Cli.Action -and @('purge', 'reclaim') -notcontains $script:Cli.Action) {
+            Exit-Tool $script:ExitUsage ('--reclaim does not go with ' + $script:Cli.Action + '. The reclaim is a command of its own:' +
+                                         [Environment]::NewLine + '     ' + $command)
+        }
+        $given = @(@('retention', 'cutoff', 'mode', 'depth', 'batch-size', 'backup', 'max-redo') |
+                   Where-Object { $script:Cli.Options.ContainsKey($_) }) +
+                 @(@('compact', 'redo-logs', 'new') | Where-Object { $script:Cli.Flags.ContainsKey($_) })
+        if ($given.Count -gt 0) {
+            Exit-Tool $script:ExitUsage ('--reclaim with the options of a purge (--' + ($given -join ', --') + '): the purge and the reclaim ' +
+                                         'are two commands, run one after the other. First the purge, without --reclaim; then:' +
+                                         [Environment]::NewLine + '     ' + $command)
+        }
+        Write-Out ''
+        Write-Out (' --reclaim: the reclaim is a command of its own. This runs it, as this command does:') 'Yellow'
+        Write-Out ('     ' + $command) 'Cyan'
+        $script:Cli.Action = 'reclaim'
+        $null = $script:Cli.Flags.Remove('reclaim')
     }
     if ($script:Cli.Flags.ContainsKey('resume')) {
         Exit-Tool $script:ExitUsage '--resume is not needed: a new reclaim continues from the current state of the datafiles.'

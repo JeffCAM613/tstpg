@@ -222,14 +222,16 @@ The purge asks the same questions, plus whether it is a dry run (no). Then:
   7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
   disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
   not be in use during a reclaim). To see how much a reclaim gives back:
-      epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim --dry-run
 ```
 
 A required condition that is not met is a strong warning. Going on is your choice, and the default answer is no.
 
 When nothing is old enough (an earlier purge took it), the purge says so before the typed `yes` and at its end, in place of a count of zero.
 
-The reclaim is a command of its own, not an option of purge: `src\bin\epf_purge.bat reclaim`, as in step 3.
+Every command the tool shows can be typed as it is: it begins with the path of the tool from where you are.
+
+The reclaim is a command of its own: `src\bin\epf_purge.bat reclaim`, as in step 3. Typed as an option of purge, as in the previous tool (`purge --reclaim`, with `--dry-run` for its dry run), it runs the reclaim too, and says which command that is.
 
 ### Step 3: give the space back to the disk
 
@@ -467,6 +469,7 @@ They also apply to `preflight`. "Asked" means: a run with questions asks when th
 | `--confirm LIST` | CONFIRM | Go on although these requirements are not met: ARCHIVE, UNDO, TEMP, separated by commas. Asked (no) |
 | `--max-redo SIZE` | MAX_REDO | The most redo one run may write, such as `500M` or `20G`: the purge is planned in several runs |
 | `--new` | | Start over: close the open plan and follow the options given |
+| `--reclaim` | | With `purge` and no other option of a purge: runs the reclaim, as the action `reclaim` does (`--dry-run`: its dry run). With options of a purge it is refused: the two are run one after the other |
 | `--undo-tuning` | UNDO_TUNING | Accepted and ignored: every purge keeps undo in check for its time (see [undo tuning](docs/REFERENCE.md#undo-tuning-every-purge)) |
 
 ### Options of a reclaim

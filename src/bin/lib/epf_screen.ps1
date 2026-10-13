@@ -174,6 +174,8 @@ function Get-WrapWidth {
 # the log, in one line.
 function Write-Wrapped {
     param([string]$First, [string]$Text, [string]$Color = '', [int]$Indent = -1, [switch]$Log)
+    # The tool's command as it can be typed here, before the lines are cut.
+    $Text = Format-Launcher $Text
     if ($Log) { Write-Log ($First + $Text) }
     $width = Get-WrapWidth
     $pad = ' ' * $First.Length

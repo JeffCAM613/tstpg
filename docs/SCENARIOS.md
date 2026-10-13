@@ -50,7 +50,7 @@ The commands and their options are in the [user guide](../README.md#parameters).
 | [19](#19-after-an-update-of-the-tools-files) | After an update of the tool's files | `epf_purge.bat purge --dry-run --retention 365 --tns EPFDB` |
 | [20](#20-not-everything-a-mode-and-some-modules) | Not everything: a mode and some modules | `epf_purge.bat purge --dry-run --retention 365 --mode CLOB_N_LOGS --tns EPFDB` |
 | [21](#21-a-purge-that-empties-large-values) | A purge that empties large values | `epf_purge.bat purge --non-interactive --retention 365 --mode CLOB --depth BANK_STATEMENTS --tns EPFDB` |
-| [22](#22-the-reclaim-is-a-command-not-an-option-of-purge) | The reclaim is a command, not an option of purge | `epf_purge.bat purge --reclaim --dry-run` |
+| [22](#22-the-reclaim-typed-as-an-option-of-purge) | The reclaim typed as an option of purge | `epf_purge.bat purge --reclaim --dry-run --tns EPFDB` |
 | [23](#23-removing-the-tool-from-the-database) | Removing the tool from the database | `epf_purge.bat uninstall --tns EPFDB` |
 
 ## Part 1: the everyday path
@@ -143,7 +143,7 @@ src\bin\epf_purge.bat --tns EPFDB
  > Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS) [ALL]: <Enter>
 
  Dry run of a purge of everything dated before 13 October 2025. Nothing is changed.
- Run R-000040   C:\epf\logs\2026-10-13_182506_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_185956_R-000040
  1 of 2  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -176,7 +176,7 @@ src\bin\epf_purge.bat --tns EPFDB
    beforehand).
  > Go on with the dry run (Y/N) [Y]: Y
    Batch size: 120 top-level rows per transaction, as the checks recommend.
- Run R-000041   C:\epf\logs\2026-10-13_182518_R-000041
+ Run R-000041   C:\epf\logs\2026-10-13_190008_R-000041
  2 of 2  Counting what the purge would delete
          PAYMENTS                    18,218,547 rows      about 6.6 GB
          LOGS                           125,517 rows     about 21.0 MB
@@ -216,16 +216,17 @@ src\bin\epf_purge.bat --tns EPFDB
      365 days kept       before 2025-10-13       19,279,194        about 7.0 GB   (this dry run)
      270 days kept       before 2026-01-16       24,112,000        about 8.8 GB
      180 days kept       before 2026-04-16       41,870,000       about 15.2 GB
-   Any number of days can be tried the same way: epf_purge.bat purge --dry-run --retention DAYS.
+   Any number of days can be tried the same way: src\bin\epf_purge.bat purge --dry-run --retention
+   DAYS.
 
   Good to know (1)
    - Undo kept within 4.0 GB by undo tuning; about a quarter of the time waiting for the 150.0 MB
      online logs
 
   Nothing was changed.
-  Next     epf_purge.bat purge --retention 365     the purge itself
-  Report   C:\epf\logs\2026-10-13_182518_R-000041\report.html
-  Files    C:\epf\logs\2026-10-13_182518_R-000041   (report.txt, console.log)
+  Next     src\bin\epf_purge.bat purge --retention 365     the purge itself
+  Report   C:\epf\logs\2026-10-13_190008_R-000041\report.html
+  Files    C:\epf\logs\2026-10-13_190008_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -395,7 +396,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  > Dry run (simulation with the expected outcome, nothing is deleted) (Y/N) [N]: N
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\epf\logs\2026-10-13_184404_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190134_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -440,7 +441,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  ===============================================================================
  > Type yes to start the purge: yes
 
- Run R-000041   C:\epf\logs\2026-10-13_184415_R-000041
+ Run R-000041   C:\epf\logs\2026-10-13_190146_R-000041
  2 of 5  Preparing the database for the purge (SYS)                done    0:11
          online redo logs: 4 x 1 GB for the purge; the present ones are put back at its end
          undo kept 60 s and its tablespace under 4.0 GB while rows are deleted; put back at the end
@@ -463,15 +464,15 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
   7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
   disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
   not be in use during a reclaim). To see how much a reclaim gives back:
-      epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim --dry-run
 
   Good to know (2)
    - Some rows already had no parent row before the purge, and the purge added none (the report
      lists them under "Orphans on registry links"): 23 links (14 by FK, 9 scanned)
    - 2 of the tables this tool can purge are not in this database and are skipped:
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
-  Report   C:\epf\logs\2026-10-13_184415_R-000041\report.html
-  Files    C:\epf\logs\2026-10-13_184415_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190146_R-000041\report.html
+  Files    C:\epf\logs\2026-10-13_190146_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -513,7 +514,7 @@ src\bin\epf_purge.bat reclaim --dry-run --tns EPFDB
  A reclaim runs as SYS.
 
  Dry run of a reclaim: what it would give back to the disk. Nothing is changed.
- Run R-000040   C:\epf\logs\2026-10-13_182739_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190228_R-000040
  Measuring what a reclaim gives back (read-only)                   done    0:07
 
    Requirement                       Needed     Now
@@ -557,9 +558,9 @@ src\bin\epf_purge.bat reclaim --dry-run --tns EPFDB
      No datafile grows above its size at the start.
 
   Nothing was changed.
-  Next     epf_purge.bat reclaim     the reclaim itself (it measures again, then asks)
-  Report   C:\epf\logs\2026-10-13_182739_R-000040\report.html
-  Files    C:\epf\logs\2026-10-13_182739_R-000040   (report.txt, console.log)
+  Next     src\bin\epf_purge.bat reclaim     the reclaim itself (it measures again, then asks)
+  Report   C:\epf\logs\2026-10-13_190228_R-000040\report.html
+  Files    C:\epf\logs\2026-10-13_190228_R-000040   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -598,7 +599,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
  A reclaim runs as SYS.
 
  Reclaim: compacting the datafiles to give disk space back.
- Run R-000040   C:\epf\logs\2026-10-13_182747_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190236_R-000040
  1 of 7  Measuring what a reclaim gives back (read-only)           done    0:07
 
    Requirement                       Needed     Now
@@ -638,7 +639,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
 
  > The application is not available until the reclaim ends. Type yes to start it: yes
 
- Run R-000041   C:\epf\logs\2026-10-13_182754_R-000041
+ Run R-000041   C:\epf\logs\2026-10-13_190244_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -669,8 +670,8 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\epf\logs\2026-10-13_182754_R-000041\report.html
-  Files    C:\epf\logs\2026-10-13_182754_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190244_R-000041\report.html
+  Files    C:\epf\logs\2026-10-13_190244_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -705,7 +706,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions on the mode, the depth and dry run, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\epf\logs\2026-10-13_182851_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190340_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -807,7 +808,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\epf\logs\2026-10-13_182957_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190446_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -885,7 +886,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\epf\logs\2026-10-13_183021_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190510_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -904,7 +905,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  ===============================================================================
  > Type yes to start the purge: yes
 
- Run R-000041   C:\epf\logs\2026-10-13_183033_R-000041
+ Run R-000041   C:\epf\logs\2026-10-13_190522_R-000041
  2 of 5  Preparing the database for the purge (SYS)                done    0:11
          undo kept 60 s and its tablespace under 4.0 GB while rows are deleted; put back at the end
  3 of 5  Deleting
@@ -923,15 +924,15 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
   If an earlier purge deleted rows, the disk does not have their space back yet: the datafiles keep
   their size until a reclaim (the database must not be in use during a reclaim). To see how much a
   reclaim gives back:
-      epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim --dry-run
 
   Good to know (2)
    - Some rows already had no parent row before the purge, and the purge added none (the report
      lists them under "Orphans on registry links"): 21 links (13 by FK, 8 scanned)
    - 2 of the tables this tool can purge are not in this database and are skipped:
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
-  Report   C:\epf\logs\2026-10-13_183033_R-000041\report.html
-  Files    C:\epf\logs\2026-10-13_183033_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190522_R-000041\report.html
+  Files    C:\epf\logs\2026-10-13_190522_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -988,8 +989,8 @@ src\bin\epf_purge.bat stop --tns EPFDB
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
    - Time waiting for the online redo logs: log switches 00:02:05 of 00:08:24 in batches (25%),
      online logs 3 x 150.0 MB: larger online logs make fewer switches (--redo-logs)
-  Report   C:\epf\logs\2026-10-13_183056_R-000040\report.html
-  Files    C:\epf\logs\2026-10-13_183056_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190545_R-000040\report.html
+  Files    C:\epf\logs\2026-10-13_190545_R-000040   (report.txt, console.log)
 ```
 
 Exit code 3: stopped, or the answer was no.
@@ -1069,7 +1070,7 @@ src\bin\epf_purge.bat purge --non-interactive --dry-run --retention 365 --tns EP
    Tool in database   version 0.9.7
 
  Dry run of a purge of everything dated before 13 October 2025. Nothing is changed.
- Run R-000040   C:\epf\logs\2026-10-13_183128_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190617_R-000040
  1 of 2  Checking the database (read-only)                         done    0:09
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1103,9 +1104,9 @@ src\bin\epf_purge.bat purge --non-interactive --dry-run --retention 365 --tns EP
      online logs
 
   Nothing was changed.
-  Next     epf_purge.bat purge --retention 365     the purge itself
-  Report   C:\epf\logs\2026-10-13_183128_R-000040\report.html
-  Files    C:\epf\logs\2026-10-13_183128_R-000040   (report.txt, console.log)
+  Next     src\bin\epf_purge.bat purge --retention 365     the purge itself
+  Report   C:\epf\logs\2026-10-13_190617_R-000040\report.html
+  Files    C:\epf\logs\2026-10-13_190617_R-000040   (report.txt, console.log)
 ```
 
 What to notice:
@@ -1134,7 +1135,7 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
 
  Purge of everything dated before 13 October 2025.
 
- Run R-000040   C:\epf\logs\2026-10-13_184458_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190638_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1164,7 +1165,7 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
   7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
   disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
   not be in use during a reclaim). To see how much a reclaim gives back:
-      epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim --dry-run
 
   Good to know (3)
    - Some rows already had no parent row before the purge, and the purge added none (the report
@@ -1173,8 +1174,8 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
    - Time waiting for the online redo logs: log switches 00:02:05 of 00:08:24 in batches (25%),
      online logs 3 x 150.0 MB: larger online logs make fewer switches (--redo-logs)
-  Report   C:\epf\logs\2026-10-13_184458_R-000040\report.html
-  Files    C:\epf\logs\2026-10-13_184458_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190638_R-000040\report.html
+  Files    C:\epf\logs\2026-10-13_190638_R-000040   (report.txt, console.log)
 ```
 
 What to notice:
@@ -1195,7 +1196,7 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
 ```text
  Purge of everything dated before 13 October 2025.
 
- Run R-000040   C:\epf\logs\2026-10-13_183231_R-000040
+ Run R-000040   C:\epf\logs\2026-10-13_190721_R-000040
  1 of 5  Checking the database (read-only)                         done    0:09
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1218,8 +1219,8 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
  ===============================================================================
   NOT STARTED   A required condition is not met (above). Nothing was changed.
  ===============================================================================
-  Report   C:\epf\logs\2026-10-13_183231_R-000040\report.html
-  Files    C:\epf\logs\2026-10-13_183231_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190721_R-000040\report.html
+  Files    C:\epf\logs\2026-10-13_190721_R-000040   (report.txt, console.log)
 ```
 
 Exit code 1: failed, or not started.
@@ -1271,7 +1272,7 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
 
   No question (--non-interactive or --yes): the reclaim starts.
 
- Run R-000041   C:\epf\logs\2026-10-13_183254_R-000041
+ Run R-000041   C:\epf\logs\2026-10-13_190743_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -1302,8 +1303,8 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\epf\logs\2026-10-13_183254_R-000041\report.html
-  Files    C:\epf\logs\2026-10-13_183254_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-13_190743_R-000041\report.html
+  Files    C:\epf\logs\2026-10-13_190743_R-000041   (report.txt, console.log)
 ```
 
 What to notice:
@@ -1413,26 +1414,40 @@ What to notice:
 - Nothing is compacted: the compaction is for the tables whose rows were deleted.
 - The last step says when the undo tablespace was created again to give its space back.
 
-### 22. The reclaim is a command, not an option of purge
+### 22. The reclaim typed as an option of purge
 
-Somebody who knows the previous tool types the reclaim as an option of the purge.
+Somebody who knows the previous tool types the reclaim as an option of the purge, right after a purge.
 
 ```bat
-src\bin\epf_purge.bat purge --reclaim --dry-run
+src\bin\epf_purge.bat purge --reclaim --dry-run --tns EPFDB
 ```
 
-**Typed:** Nothing.
+**Typed:** Nothing until the end of the dry run.
 
 ```text
- --reclaim is not an option: the reclaim is a command of its own, not part of purge. Type this instead:
-     epf_purge.bat reclaim --dry-run
-```
+ --reclaim: the reclaim is a command of its own. This runs it, as this command does:
+     src\bin\epf_purge.bat reclaim --dry-run
 
-Exit code 4: a mistake in the command; nothing was changed.
+ EPF Data Purge 0.9.7                                           reclaim, dry run
+ -------------------------------------------------------------------------------
+
+ Getting ready
+   sqlplus            C:\oracle\product\19.0.0\client_1\bin\sqlplus.exe
+   Database           EPFDB: connected (EPFDB)
+   Tool in database   version 0.9.7
+
+ A reclaim runs as SYS.
+
+ Dry run of a reclaim: what it would give back to the disk. Nothing is changed.
+
+   [... the dry run of the reclaim goes on as in scenario 5 ...]
+```
 
 What to notice:
 
-- The answer is the command to type. Purge and reclaim stay two commands: a purge runs in a quiet period, a reclaim needs the application stopped.
+- The tool runs the reclaim, and says which command that is.
+- Every command the tool shows can be typed as it is from where the user is: it begins with the path of the tool.
+- With the options of a purge as well (`purge --retention 365 --reclaim`) it is refused, with the two commands to type: the purge and the reclaim are run one after the other, the purge in a quiet period, the reclaim with the application stopped.
 
 ### 23. Removing the tool from the database
 

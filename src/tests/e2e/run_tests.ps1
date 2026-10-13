@@ -1044,7 +1044,7 @@ function Invoke-Suite {
     Invoke-Test 'T06' 'Wrapper basics: --help, status, stop without an active run' {
         $r = Invoke-Wrapper @('--help')
         Assert-Exit $r @(0)
-        Assert-Match $r 'Usage: epf_purge.bat'
+        Assert-Match $r 'Usage: \S*epf_purge\.bat'
         $r = Invoke-Wrapper @('status', '--non-interactive')
         Assert-Exit $r @(0)
         $r = Invoke-Wrapper @('stop', '--non-interactive')
@@ -1137,7 +1137,7 @@ function Invoke-Suite {
         Assert-Exit $r @(0, 2)
         Assert-Match $r $script:ChoicesSection
         Assert-Match $r 'Requirement +Needed +Now'
-        Assert-Match $r 'Next    epf_purge.bat purge'
+        Assert-Match $r 'Next    \S*epf_purge\.bat purge'
         $saved = ''
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'batch_size' '^200$'
@@ -1490,7 +1490,7 @@ function Invoke-Suite {
         Assert-Exit $r @(0, 2)
         Assert-Match $r ' Plan       runs of at most '
         Assert-Match $r 'CHANGES SINCE R-\d+'
-        Assert-Match $r ('Next    epf_purge\.bat purge carries out step 1 of \d+ of plan ' + [regex]::Escape($label))
+        Assert-Match $r ('Next    \S*epf_purge\.bat purge carries out step 1 of \d+ of plan ' + [regex]::Escape($label))
         $run = Get-Run $r 'PREFLIGHT'
         Assert-Manifest $run 'plan' ('^' + [regex]::Escape($label) + '$')
         Assert-Manifest $run 'plan_steps' '^([2-9]|\d\d+)$'
@@ -1958,7 +1958,7 @@ function Invoke-Suite {
             $spaces = @($run.Keys | Where-Object { $_ -like 'tablespace.*' })
             Add-Check ($spaces.Count -gt 0) ('tablespaces assessed: ' + ($spaces -join ', '))
         }
-        Write-Note $r 'Next +epf_purge\.bat reclaim' 'the assessment finds the compaction ready'
+        Write-Note $r 'Next +\S*epf_purge\.bat reclaim' 'the assessment finds the compaction ready'
     }
 
     Invoke-Test 'T18F' 'Reclaim lab removed' {

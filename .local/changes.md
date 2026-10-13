@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-13 - 0.9.7, continued: "purge --reclaim" runs the reclaim; every command the tool shows can be typed as it is
+
+Why: the user, with the screen of a purge on EPFPG784 (R-000044, 5,337,624 rows) followed by `src\bin\epf_purge.bat purge --reclaim --dry-run` and its refusal: "this is proof that i cant run reclaim earlier". They typed the same command after 0.9.6 had answered "Type this instead: epf_purge.bat reclaim --dry-run": the answer looks like what was typed, and as shown it cannot be typed from the tool's folder (no path).
+
+- `purge --reclaim` (also without an action) runs the reclaim, `--dry-run` its dry run, after two lines that say which command that is. With options of a purge (--retention, --cutoff, --mode, --depth, --batch-size, --backup, --max-redo, --compact, --redo-logs, --new) it is refused with the command of the reclaim: the two are run one after the other. With another action it is refused too.
+- $script:Launcher: the launcher as it can be typed from the current directory (src\bin\epf_purge.bat from the tool's folder, epf_purge.bat from src\bin, its full path from elsewhere, quoted when it has a space). Format-Launcher puts it wherever the tool writes "epf_purge.bat": in Write-Out and Write-Wrapped (before the lines are cut), and in --help. The suite's four checks on such lines accept a path before the name.
+- --help lists --reclaim; README and docs\SCENARIOS.md (scenario 22) say the same.
+
+Recorded from the same paste (PLAN.md 12.8): that purge took 19 min 25 s, of which 14 min 53 s for the compaction of 21 tables, against 3 min 27 s of batches. Said to the user, since they made the compaction part of every purge the same day.
+
+Checked here: 40 scenarios through the real wrapper against the stand-in sqlplus (364 checks on their screens, with `purge --reclaim --dry-run` running the reclaim's dry run and `purge --retention 365 --reclaim` refused); the suite's T00, T01, T06 and T07 against the stand-in. Not run on a database.
+
+How to test: after a purge, `src\bin\epf_purge.bat purge --reclaim --dry-run` runs the dry run of the reclaim; the last lines of any run show commands that begin with src\bin\.
+
 ## 2026-10-13 - 0.9.7: the compaction is part of every purge that deletes: no option, no question
 
 Why: the user: "compact should not be optional. it always run after purges. i see no reason to skip it." (decision D28, PLAN.md 6.7).
