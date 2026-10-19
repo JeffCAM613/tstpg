@@ -52,7 +52,10 @@ header.top .kicker { margin: 0 0 12px; font-size: 0.78rem; font-weight: 700; let
 header.top .kicker::before { content: ""; display: inline-block; width: 28px; height: 3px; margin-right: 10px; border-radius: 2px; background: var(--pink); vertical-align: middle; }
 header.top h1 { margin: 0 0 14px; font-size: 2.4rem; line-height: 1.15; font-weight: 700; letter-spacing: -0.01em; color: var(--violet); text-wrap: balance; }
 header.top p.intro { margin: 0; max-width: 70ch; font-size: 1.16rem; line-height: 1.6; color: var(--fuchsia); }
-.toc { position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow-y: auto; font-size: 0.92rem; }
+.toc {
+  position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow-y: auto; font-size: 0.92rem;
+  scrollbar-width: thin; scrollbar-color: var(--lilac-strong) transparent;
+}
 .toc .toc-title { margin: 0 0 10px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
 .toc ol { list-style: none; margin: 0; padding: 0; }
 .toc ol ol { padding-left: 12px; margin: 2px 0 6px; font-size: 0.88rem; }
@@ -110,13 +113,20 @@ td code { white-space: normal; -webkit-box-decoration-break: clone; box-decorati
 tbody tr:nth-child(even) td { background: var(--row-alt); }
 tbody tr:hover td { background: var(--lilac); }
 tbody tr:last-child td { border-bottom: none; }
-footer { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; border-top: 1px solid var(--line); padding-top: 18px; color: var(--muted); font-size: 0.85rem; }
-footer .wordmark { font-size: 0.95rem; }
+/* The footer: under the page and the width of the window, as the brand bar;
+   outside the layout, so that the contents stop above it. */
+.pagefoot { border-top: 1px solid var(--line); background: var(--row-alt); }
+.pagefoot-in {
+  max-width: 1180px; margin: 0 auto; padding: 20px 24px 28px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  color: var(--muted); font-size: 0.85rem;
+}
+.pagefoot .wordmark { font-size: 0.95rem; }
 
 @media (max-width: 900px) {
   .brandbar-in { padding: 12px 16px 15px; }
   .docs { margin-left: 0; width: 100%; }
   .layout { grid-template-columns: minmax(0, 1fr); gap: 24px; padding: 28px 16px 48px; }
+  .pagefoot-in { padding: 18px 16px 24px; }
   header.top h1 { font-size: 2rem; }
   .toc { position: static; max-height: none; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--surface); }
 }
@@ -137,6 +147,7 @@ footer .wordmark { font-size: 0.95rem; }
 }
 @media print {
   .brandbar { box-shadow: none; }
+  .pagefoot { background: none; }
   .docs, .toc, .copy, .anchor { display: none; }
   .wordmark { background: none; color: var(--violet); -webkit-text-fill-color: var(--violet); }
   .layout { display: block; max-width: none; padding: 0; }

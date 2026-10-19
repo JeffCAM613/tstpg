@@ -2,6 +2,15 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - The end of the documents' pages: the contents no longer slide over the footer
+
+Why: the user, with a screenshot of the end of the user guide: "the bottom of the file doesn't look good". The contents, which stay in view as a page scrolls, and the footer were in the same grid: at the end of the page the contents slid down over the footer, its scrollbar across the footer's text.
+
+- The footer lies outside the layout now, under the page and the width of the window as the brand bar, on the light tint of the table rows: the contents stop above it. The skeleton of finastra_template.md shows it so.
+- The contents, when taller than the window, scroll with a thin lilac scrollbar, and keep the entry of the section being read in sight (the script of the pages).
+
+Checked here in Edge, the page put in a box scrolled to its end (a headless screenshot of a scrolled window comes out blank): before, the contents over the footer as in the user's screenshot; after, the contents end above it on the three pages; at "If something goes wrong" the contents had scrolled to show it.
+
 ## 2026-10-19 - The Finastra template: light only, and written down
 
 Why: the user: "let's stick to the light mode only and note the design. for consistency. I may use it in another project soon".

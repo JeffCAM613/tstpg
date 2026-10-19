@@ -169,12 +169,23 @@ document.querySelectorAll('.copy').forEach(function (button) {
   var heads = document.querySelectorAll('main h2[id], main h3[id]');
   if (!('IntersectionObserver' in window) || !heads.length) { return; }
   var current = null;
+  // The contents scroll on their own when taller than the window: the entry
+  // of the section in view is kept in sight there.
+  var toc = document.querySelector('.toc');
+  function reveal(a) {
+    if (!toc || toc.scrollHeight <= toc.clientHeight) { return; }
+    var top = a.offsetTop;
+    var bottom = top + a.offsetHeight;
+    if (top < toc.scrollTop + 8) { toc.scrollTop = Math.max(0, top - 8); }
+    else if (bottom > toc.scrollTop + toc.clientHeight - 8) { toc.scrollTop = bottom - toc.clientHeight + 8; }
+  }
   var observer = new IntersectionObserver(function (entries) {
     entries.forEach(function (entry) {
       if (entry.isIntersecting && links[entry.target.id]) {
         if (current) { current.classList.remove('active'); }
         current = links[entry.target.id];
         current.classList.add('active');
+        reveal(current);
       }
     });
   }, { rootMargin: '0px 0px -75% 0px' });
@@ -205,10 +216,12 @@ for (const doc of docs) {
     '<!-- Generated from ' + doc.source + ' by .local/gen_readme_html.js: change that file, then run it again. -->\n' +
     '<style>' + css + '</style>\n</head>\n<body>\n' + brand + '<div class="layout">\n' +
     '<header class="top">\n<p class="kicker">' + doc.kicker + '</p>\n<h1>' + esc(p.title) + '</h1>\n<p class="intro">' + p.intro + '</p>\n</header>\n' +
-    p.nav + '\n<main>\n' + p.body + '\n</main>\n' +
-    '<footer><span class="wordmark">FINASTRA</span><span>EPF Data Purge. This page is the HTML version of ' + doc.source + ' in the tool\'s folder.' +
-    (others ? ' See also: ' + others + '.' : '') + '</span></footer>\n' +
-    '</div>\n<script>' + js + '</script>\n</body>\n</html>\n';
+    p.nav + '\n<main>\n' + p.body + '\n</main>\n</div>\n' +
+    // The footer lies outside the layout: the contents, which stay in view
+    // as the page scrolls, stop above it instead of sliding over it.
+    '<footer class="pagefoot">\n<div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>EPF Data Purge. This page is the HTML version of ' +
+    doc.source + ' in the tool\'s folder.' + (others ? ' See also: ' + others + '.' : '') + '</span></div>\n</footer>\n' +
+    '<script>' + js + '</script>\n</body>\n</html>\n';
   if (/[^\x00-\x7F]/.test(html)) { throw new Error(doc.source + ': non-ASCII in the page'); }
   ids[doc.target] = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
   const missing = [...new Set(p.anchors)].filter((a) => !ids[doc.target].has(a));

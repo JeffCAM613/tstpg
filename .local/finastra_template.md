@@ -49,14 +49,14 @@ Neutrals and tints of violet:
 
 - **Brand bar**: white, a light shadow, its lower edge the gradient (3 px). In it the wordmark, a thin rule, the product's name in charcoal (weight 600), and on the right the documents as rounded tabs; the current one violet on lilac strong.
 - **Page header**: the label, the title, the introduction, then a rule.
-- **Contents**: a column of 240 px on the left that stays in view; its entries muted, violet under the pointer; the section in view violet on lilac with a pink bar on its left.
+- **Contents**: a column of 240 px on the left that stays in view; its entries muted, violet under the pointer; the section in view violet on lilac with a pink bar on its left. Taller than the window, it scrolls on its own with a thin lilac scrollbar, and keeps the entry of the section in view in sight.
 - **Links**: violet, underlined (1 px, 2 px below the text); under the pointer deep violet, underline 2 px. Focus: a violet ring of 2 px.
 - **Lists**: their markers violet, numbers bold.
 - **Bold text**: fuchsia, weight 650 (white in a table head).
 - **Inline code**: a lilac chip with a lilac-strong border, corners 4 px.
 - **Commands and screens**: corners 10 px, a light shadow. A command has a label bar ("COMMAND", capitals, with a dot of the gradient) and a Copy button: translucent, violet under the pointer, fuchsia with "Copied" once used. A screen has no label bar.
 - **Tables**: a border and corners of 10 px, a light shadow; the head row violet with white text, weight 600; every other row tinted; the row under the pointer lilac. A long command in a cell wraps at its spaces.
-- **Footer**: a rule, the wordmark small, the rest muted.
+- **Footer**: under the page and the width of the window, as the brand bar; the row tint, a rule above; the wordmark small, the rest muted. It lies outside the layout: inside it, the contents that stay in view would slide over it at the end of the page.
 
 ## Layout
 
@@ -106,10 +106,10 @@ Neutrals and tints of violet:
 <div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>a command</code></pre></div>
 <div class="table-wrap"><table><thead><tr><th>Name</th><th>Meaning</th></tr></thead><tbody><tr><td data-label="Name">a</td><td data-label="Meaning">b</td></tr></tbody></table></div>
 </main>
-<footer><span class="wordmark">FINASTRA</span><span>Name of the product.</span></footer>
 </div>
+<footer class="pagefoot"><div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>Name of the product.</span></div></footer>
 </body>
 </html>
 ```
 
-The Copy buttons and the contents that follow the reading need the small script at the end of the pages that `.local/gen_readme_html.js` writes (the `js` constant there).
+The Copy buttons, and the contents that mark and keep in sight the section being read, need the small script at the end of the pages that `.local/gen_readme_html.js` writes (the `js` constant there).
