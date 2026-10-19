@@ -1,6 +1,6 @@
 # EPF Data Purge: reference
 
-What lies behind the [user guide](../README.md): how a purge chooses its rows, the requirements it checks, undo tuning, a purge planned in several runs, how a reclaim works, the files of a run, what can be left pending and what clears it, the settings, the SQL*Plus scripts and the tests. Start with the user guide; come here for the detail.
+What lies behind the [user guide](../README.md): how a purge chooses its rows, the requirements it checks, undo tuning, a purge planned in several runs, how a reclaim works, the files of a run, what can be left pending and what clears it, the settings and the SQL*Plus scripts. Start with the user guide; come here for the detail.
 
 This reference is also available as a web page: [REFERENCE.html](REFERENCE.html).
 
@@ -15,8 +15,7 @@ This reference is also available as a web page: [REFERENCE.html](REFERENCE.html)
 - [Status and recovery](#status-and-recovery)
 - [Settings](#settings)
 - [SQL*Plus scripts](#sqlplus-scripts)
-- [Repository layout](#repository-layout)
-- [Testing](#testing)
+- [Files of the tool](#files-of-the-tool)
 
 ## What it does
 
@@ -257,28 +256,17 @@ sqlplus -L -S "epfpg@EPFPDB" @src/sql/run/report.sql LATEST
 sqlplus -L "sys@EPFPDB AS SYSDBA" @src/sql/run/undo.sql RESTORE
 ```
 
-## Repository layout
+## Files of the tool
 
 ```text
 README.md                the user guide
+RELEASE.txt              in a release: its version, and each of its files with its SHA-256
 src\bin\epf_purge.bat    the tool (its code is in src\bin\lib: epf.ps1, the screen in
                          epf_screen.ps1, the HTML report in epf_html.ps1)
 src\config\              the configuration example
 src\sql\install\         installer, tables and packages of the EPFPG schema
 src\sql\run\             the SQL*Plus scripts the tool runs
-src\tests\               end-to-end tests, test labs and the parity check
 docs\                    this reference (REFERENCE.md), the scenarios (SCENARIOS.md), and
                          the user guide, the reference and the scenarios as web pages
-legacy\                  the previous tool, kept for reference
-logs\                    run folders (not part of the repository)
+logs\                    run folders, made by the first run
 ```
-
-## Testing
-
-The end-to-end test suite runs every feature against a test database, and changes it: it purges every module, clears LOB values, compacts tables, enlarges the online redo logs during the purges (put back after each) and changes undo_retention during them. Its reclaim tests work on tablespaces they create and remove. Run it only on a copy that can be discarded.
-
-1. Copy `src\tests\e2e\test.conf.example` to `src\tests\e2e\test.conf`, and set TNS, EXPECTED_DB and DESTRUCTIVE_OK=YES.
-2. Run `src\tests\e2e\run_tests.bat` for the whole suite (about 3 hours), or a part of it, such as `src\tests\e2e\run_tests.bat --only T18A,T18B`.
-3. `src\tests\e2e\run_tests.bat --digest` writes a short summary of the last test session and of the runs after it to `logs\digest.txt` and copies it to the clipboard: each run with its checks, every step with its duration, key events (a large move with the time it took), restore lines and summary, and the time of the runs in all. With the SYS password at hand (EPF_SYS_PASSWORD, or SYS_PASSWORD in test.conf) it adds the database as it is now: how the instance started, the tool installed and whether its objects are valid, the online logs, and every datafile and temporary file with its size, the free space inside it and the step it grows by.
-4. `src\tests\e2e\run_tests.bat --sys redo_logs.sql SET 200 3` runs a SYS script of `src\sql\run` (`redo_logs.sql`, `undo.sql`) on the test database of test.conf with the arguments that follow, as typed in SQL*Plus, after checking the database name. Its output is shown and kept in `logs\sys\`, and the digest lists what the script did. Test steps use it in place of SQL*Plus by hand, so that the digest carries them too.
-5. `src\tests\sim\epf_sim.bat` plays the screens and questions of a purge and a reclaim with scripted figures, as they were designed before the tool followed them: it connects to nothing and needs no database. `epf_sim.bat --help` lists what it takes; `--sim` chooses the state the database is found in (a requirement not met, the tool not installed, a run that fails). It writes a sample `report.html` under `logs\sim\`.

@@ -143,7 +143,7 @@ src\bin\epf_purge.bat --tns EPFDB
  > Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS) [ALL]: <Enter>
 
  Dry run of a purge of everything dated before 17 May 2016. Nothing is changed.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122937_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122937_R-000040
  1 of 2  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -176,7 +176,7 @@ src\bin\epf_purge.bat --tns EPFDB
    beforehand).
  > Go on with the dry run (Y/N) [Y]: Y
    Batch size: 120 top-level rows per transaction, as the checks recommend.
- Run R-000041   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122949_R-000041
+ Run R-000041   C:\epf\logs\2026-10-19_122949_R-000041
  2 of 2  Counting what the purge would delete
          PAYMENTS                    18,218,547 rows      about 6.6 GB
          LOGS                           125,517 rows     about 21.0 MB
@@ -226,8 +226,8 @@ src\bin\epf_purge.bat --tns EPFDB
 
   Nothing was changed.
   Next     src\bin\epf_purge.bat purge --retention 365     the purge itself
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122949_R-000041\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122949_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122949_R-000041\report.html
+  Files    C:\epf\logs\2026-10-19_122949_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -398,7 +398,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  > Dry run (simulation with the expected outcome, nothing is deleted) (Y/N) [N]: N
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122336_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122336_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -443,7 +443,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  ===============================================================================
  > Type yes to start the purge: yes
 
- Run R-000041   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122348_R-000041
+ Run R-000041   C:\epf\logs\2026-10-19_122348_R-000041
  2 of 5  Preparing the database for the purge (SYS)                done    0:11
          online redo logs: 4 x 1 GB for the purge; the present ones are put back at its end
          undo kept 60 s and its tablespace under 4.0 GB while rows are deleted; put back at the end
@@ -475,8 +475,8 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
      lists them under "Orphans on registry links"): 23 links (14 by FK, 9 scanned)
    - 2 of the tables this tool can purge are not in this database and are skipped:
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122348_R-000041\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122348_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122348_R-000041\report.html
+  Files    C:\epf\logs\2026-10-19_122348_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -519,7 +519,7 @@ src\bin\epf_purge.bat reclaim --dry-run --tns EPFDB
  A reclaim runs as SYS.
 
  Dry run of a reclaim: what it would give back to the disk. Nothing is changed.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122516_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122516_R-000040
  Measuring what a reclaim gives back (read-only)                   done    0:07
 
    Requirement                       Needed     Now
@@ -564,8 +564,8 @@ src\bin\epf_purge.bat reclaim --dry-run --tns EPFDB
 
   Nothing was changed.
   Next     src\bin\epf_purge.bat reclaim     the reclaim itself (it measures again, then asks)
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122516_R-000040\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122516_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122516_R-000040\report.html
+  Files    C:\epf\logs\2026-10-19_122516_R-000040   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -604,7 +604,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
  A reclaim runs as SYS.
 
  Reclaim: compacting the datafiles to give disk space back.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122627_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122627_R-000040
  1 of 7  Measuring what a reclaim gives back (read-only)           done    0:07
 
    Requirement                       Needed     Now
@@ -644,7 +644,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
 
  > The application is not available until the reclaim ends. Type yes to start it: yes
 
- Run R-000041   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122635_R-000041
+ Run R-000041   C:\epf\logs\2026-10-19_122635_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -675,8 +675,8 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122635_R-000041\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122635_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122635_R-000041\report.html
+  Files    C:\epf\logs\2026-10-19_122635_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -711,7 +711,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions on the mode, the depth and dry run, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122540_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122540_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -813,7 +813,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122031_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122031_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -891,7 +891,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
    [... the questions, as in scenario 4 ...]
 
  Purge of everything dated before 13 October 2025.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122443_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122443_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -910,7 +910,7 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
  ===============================================================================
  > Type yes to start the purge: yes
 
- Run R-000041   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122455_R-000041
+ Run R-000041   C:\epf\logs\2026-10-19_122455_R-000041
  2 of 5  Preparing the database for the purge (SYS)                done    0:11
          undo kept 60 s and its tablespace under 4.0 GB while rows are deleted; put back at the end
  3 of 5  Deleting
@@ -938,8 +938,8 @@ src\bin\epf_purge.bat purge --retention 365 --tns EPFDB
      lists them under "Orphans on registry links"): 21 links (13 by FK, 8 scanned)
    - 2 of the tables this tool can purge are not in this database and are skipped:
      OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122455_R-000041\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122455_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122455_R-000041\report.html
+  Files    C:\epf\logs\2026-10-19_122455_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -999,8 +999,8 @@ src\bin\epf_purge.bat stop --tns EPFDB
    - The purge waited 2:05 of its 8:24 of deleting for the online redo logs, which are small (3 x
      150.0 MB). Enlarged for the time of the next purge, they save most of that wait: answer yes
      when it asks, or add --redo-logs.
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122424_R-000040\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122424_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122424_R-000040\report.html
+  Files    C:\epf\logs\2026-10-19_122424_R-000040   (report.txt, console.log)
 ```
 
 Exit code 3: stopped, or the answer was no.
@@ -1080,7 +1080,7 @@ src\bin\epf_purge.bat purge --non-interactive --dry-run --retention 365 --tns EP
    Tool in database   version 0.9.8
 
  Dry run of a purge of everything dated before 13 October 2025. Nothing is changed.
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_121950_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_121950_R-000040
  1 of 2  Checking the database (read-only)                         done    0:09
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1116,8 +1116,8 @@ src\bin\epf_purge.bat purge --non-interactive --dry-run --retention 365 --tns EP
 
   Nothing was changed.
   Next     src\bin\epf_purge.bat purge --retention 365     the purge itself
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_121950_R-000040\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_121950_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_121950_R-000040\report.html
+  Files    C:\epf\logs\2026-10-19_121950_R-000040   (report.txt, console.log)
 ```
 
 What to notice:
@@ -1146,7 +1146,7 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
 
  Purge of everything dated before 13 October 2025.
 
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122253_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122253_R-000040
  1 of 5  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1188,8 +1188,8 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
    - The purge waited 2:05 of its 8:24 of deleting for the online redo logs, which are small (3 x
      150.0 MB). Enlarged for the time of the next purge, they save most of that wait: answer yes
      when it asks, or add --redo-logs.
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122253_R-000040\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122253_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122253_R-000040\report.html
+  Files    C:\epf\logs\2026-10-19_122253_R-000040   (report.txt, console.log)
 ```
 
 What to notice:
@@ -1210,7 +1210,7 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
 ```text
  Purge of everything dated before 13 October 2025.
 
- Run R-000040   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122526_R-000040
+ Run R-000040   C:\epf\logs\2026-10-19_122526_R-000040
  1 of 5  Checking the database (read-only)                         done    0:09
          note   2 of the tables this tool can purge are not in this database and are skipped:
                 OPPAYMENTS.APPROBATION_EXECUTION_OPT, OPPAYMENTS.WORKFLOW_EXECUTION_OPT
@@ -1233,8 +1233,8 @@ src\bin\epf_purge.bat purge --non-interactive --retention 365 --tns EPFDB
  ===============================================================================
   NOT STARTED   A required condition is not met (above). Nothing was changed.
  ===============================================================================
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122526_R-000040\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_A\2026-10-19_122526_R-000040   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122526_R-000040\report.html
+  Files    C:\epf\logs\2026-10-19_122526_R-000040   (report.txt, console.log)
 ```
 
 Exit code 1: failed, or not started.
@@ -1286,7 +1286,7 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
 
   No question (--non-interactive or --yes): the reclaim starts.
 
- Run R-000041   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122532_R-000041
+ Run R-000041   C:\epf\logs\2026-10-19_122532_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -1317,8 +1317,8 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122532_R-000041\report.html
-  Files    C:\Users\Asus\AppData\Local\Temp\claude\c--Users-Asus-Desktop-Projects-db-purge\25d9757c-014e-4a6c-8ef8-0a3c48262026\scratchpad\ux2\out\logs_B\2026-10-19_122532_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-19_122532_R-000041\report.html
+  Files    C:\epf\logs\2026-10-19_122532_R-000041   (report.txt, console.log)
 ```
 
 What to notice:

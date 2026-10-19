@@ -2,6 +2,21 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - The release for a client: tools\make_release.bat
+
+Why: the user: "write a script that generates a release version of this tool. but git ignored. this tool copies only the relevant file for release that is appropriate as version to release to the client. script version is the same as the tool version. at the end of the script's run, it will zip the created clone. zip is not git ignored." (PLAN.md 4.3).
+
+- `tools\make_release.bat` (and make_release.ps1) builds `release\epf_purge_<version>\`, git-ignored (`release/*/` in .gitignore) and built again each time, then zips it with its folder into `release\epf_purge_<version>.zip`, which is not ignored: it is committed when the version is released. The version is the tool's, read from registry_data.sql as the wrapper reads it; `--version` prints it.
+- What it copies: the files git tracks in README.md, docs\, src\bin\, src\config\ (the example; a `*.conf` never), src\sql\install\ and src\sql\run\, in the layout of the repository, so that the paths the guide and the screens show stay right; plus RELEASE.txt (the version, the commit, each file with its SHA-256). Left out: src\tests\, legacy\, .local\, tools\, logs\ and every untracked file, a real configuration with its passwords among them.
+- It refuses, and zips nothing, when a file of the release is changed and not committed or new and not added (a release is a commit), holds a character that is not ASCII, names a test database, another client's data, a test server's path or account, the development repository or a path of the building machine, links to a file the release does not have, or when the release's own launcher does not answer `--help`. A zip that exists for the version is replaced only with `--force`. A document that shows another version than the tool's gets a note.
+- The documents a client reads no longer speak of what a release leaves out: the reference's "Testing" moved to the new src\tests\README.md, its "Repository layout" became "Files of the tool" (with RELEASE.txt), and the guide no longer links to the tests. The guide's sample screen shows version 0.9.8.
+
+A fault of the 0.9.8 commit, already pushed: docs\SCENARIOS.md and SCENARIOS.html showed the run folders of the scenarios as the paths of the machine that played them, because the scenarios ran in two batches whose folders (logs_A, logs_B) the generator's rule did not cover. The generator covers them now and refuses a document with a local path; both documents are regenerated (35 lines each, the paths only). The 0.9.8 commit keeps those lines in the history.
+
+Checked here, in a throwaway clone with these changes committed: the release of 0.9.8 built in 3 s, 52 files and RELEASE.txt, a zip of 394 KB whose entries all lie under epf_purge_0.9.8/; extracted, its launcher ran a whole dry run against the stand-in sqlplus (exit 0, the run folder under the release's own logs\); .bat and .ps1 keep CRLF, .sql, .pkb and .md LF. Refused as expected: uncommitted documents, the zip already there (then built again with --force), a test database's name and a link to src\tests\ added to the reference. `--version` prints 0.9.8, an unknown option exits 4.
+
+How to test: on a clean working tree, `tools\make_release.bat`; release\epf_purge_0.9.8.zip appears (git status shows it, not the folder). Unzip it elsewhere and run `src\bin\epf_purge.bat --help` from the folder it holds.
+
 ## 2026-10-19 - 0.9.8: what a purge took on disk, at the most and after it; its waits for the online logs in plain words
 
 Why: the user: "on the report after a dry run, I see "28% waiting for the online redo logs" -- very unclear. I dont know what that part of the report is. fix ti. remove if unnecessary. and if at all possible, on reports for purge (already existing in reclaim), show peak disk use and disk use after the purge." (decision D29, PLAN.md 6.8).

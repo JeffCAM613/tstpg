@@ -3,3 +3,7 @@ src/config/epf_purge.conf
 epf_environment.txt
 *.lst
 src/tests/e2e/test.conf
+
+# The folder of a release (tools/make_release.bat), built again each time;
+# its zip is kept.
+release/*/

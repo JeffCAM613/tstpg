@@ -869,6 +869,7 @@ function Invoke-Suite {
         Test-Script (Join-Path $lib 'epf_screen.ps1') @((Join-Path $lib 'epf.ps1'))
         Test-Script (Join-Path $script:SrcDir 'tests\sim\epf_sim.ps1')
         Test-Script (Join-Path $script:TestDir 'run_tests.ps1')
+        Test-Script (Join-Path $script:RepoDir 'tools\make_release.ps1')
     }
 
     Invoke-Test 'T01' 'Precheck: database identity, non-CDB, redo logs, undo (SYS; safety gate)' -Required -Always {

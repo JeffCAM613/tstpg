@@ -122,7 +122,7 @@ At the question for the EPFPG password, press Enter alone. The run then asks for
  > Password to give the EPFPG account:
  > Password to give the EPFPG account (again):
    Database           EPFDB: connected (EPFDB)
-   Tool in database   version 0.9.7 (installed now, 0:02)
+   Tool in database   version 0.9.8 (installed now, 0:02)
 ```
 
 The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.
@@ -538,6 +538,5 @@ The [reference](docs/REFERENCE.md) has what lies behind this guide:
 - [Runs, reports and logs](docs/REFERENCE.md#runs-reports-and-logs): the files of a run folder.
 - [Status and recovery](docs/REFERENCE.md#status-and-recovery): what can be left pending and what clears it.
 - [Settings](docs/REFERENCE.md#settings) kept in the database, and the [SQL*Plus scripts](docs/REFERENCE.md#sqlplus-scripts).
-- [Testing](docs/REFERENCE.md#testing): the test suite and the simulator.
 
 [Scenarios](docs/SCENARIOS.md) walks through the tool screen by screen, without a database: what is typed and what the tool answers, in the everyday cases and when something is not as it should be.
