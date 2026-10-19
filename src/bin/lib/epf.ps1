@@ -1232,6 +1232,10 @@ function Update-LiveView {
             if ($field.Count -eq 7) { $steps.Add($field) }
         } elseif ($line.StartsWith('RUN|')) {
             $State.RunStatus = $line.Split('|')[1]
+        } elseif ($line.StartsWith('DK|')) {
+            # What the database's files take now, while a purge deletes.
+            $bytes = [double]0
+            if ([double]::TryParse($line.Substring(3), [ref]$bytes) -and $bytes -gt $State.DiskPeak) { $State.DiskPeak = $bytes }
         } elseif ($line -match 'ORA-\d{5}|SP2-\d{4}') {
             Write-Out (' ..       monitor: ' + $line) 'Yellow'
         }
@@ -1249,6 +1253,36 @@ function Update-LiveView {
     } elseif ($beats.Count -gt 0 -and ((Get-Date) - $State.LastOutput).TotalSeconds -ge 15) {
         foreach ($beat in $beats) { Show-Heartbeat $beat }
         $State.LastOutput = Get-Date
+    }
+}
+
+# What the database's files take on disk now (disk.sql NOW, in the monitor
+# session): bytes, or -1 when it could not be measured.
+function Measure-Disk {
+    param($State)
+    try {
+        $lines = Invoke-MonitorCommand $State.Monitor (Get-ScriptLine (Join-Path $script:RunSqlDir 'disk.sql') @('NOW', '-', '-')) 60000
+        foreach ($line in $lines) {
+            if ($line -match '^EPF_DISK\|NOW\|(\d+)') { return [double]$Matches[1] }
+        }
+    } catch {
+        Write-Log (' The disk could not be measured: ' + $_.Exception.Message)
+    }
+    return [double]-1
+}
+
+# Records what a purge took on disk (DISK_PEAK): the size at its start, the
+# most the polls saw, the size now that the database is put back; then the
+# event is read like the others (console.log, report.html).
+function Write-DiskPeak {
+    param($State)
+    try {
+        $line = Get-ScriptLine (Join-Path $script:RunSqlDir 'disk.sql') @([string]$State.RunId, [string][int64]$State.DiskStart,
+                                                                          [string][int64]$State.DiskPeak)
+        $null = Invoke-MonitorCommand $State.Monitor $line 60000
+        Update-LiveView $State
+    } catch {
+        Write-Log (' What the purge took on disk was not recorded: ' + $_.Exception.Message)
     }
 }
 
@@ -1494,7 +1528,8 @@ function Invoke-ToolRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue;
+        DiskStart = [double]-1; DiskPeak = [double]0
     }
     $dry = 'N'
     if ($Ctx.DryRun) { $dry = 'Y' }
@@ -1669,7 +1704,12 @@ function Invoke-ToolRun {
                 if ($result.Output -match 'ORA-\d{5}|SP2-\d{4}') { Show-Lines $result.Output -Indent }
                 $status = 'FAILED'
             } else {
-                if (-not $Ctx.DryRun) { Start-FlowStep 'PREPARE' }
+                if (-not $Ctx.DryRun) {
+                    # What the database's files take before the purge prepares it:
+                    # the start of what it took on disk (DISK_PEAK).
+                    $state.DiskStart = Measure-Disk $state
+                    Start-FlowStep 'PREPARE'
+                }
                 # Larger online logs for the purge only when one batch does not
                 # fit in the smallest (the run's own preflight measured it); the
                 # original groups are put back after the purge.
@@ -1743,6 +1783,8 @@ function Invoke-ToolRun {
                 Write-Out ' The online redo logs were NOT put back: run src\sql\run\redo_logs.sql RESTORE as SYS.' 'Red'
             }
         }
+        # What the purge took on disk, now that the database is put back.
+        if ($state.DiskStart -ge 0) { Write-DiskPeak $state }
         $closeCode = Close-Run $state $status
         if ($undoApplied -or $redoRan) { Complete-FlowStep } else { Complete-FlowStep $ended }
     }
@@ -1795,7 +1837,11 @@ function Invoke-ToolRun {
     $nextLine = ''
     if ($Action -eq 'PURGE' -and ($status -eq 'SUCCESS' -or $status -eq 'WARNING')) {
         if (-not $Ctx.DryRun) {
-            $nextLine = ' Next    the purged tables were compacted and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
+            # Tables compacted (P8): none when the purge only empties large
+            # values, or when no table has enough free space inside.
+            $first = 'the space of what was purged is free inside the tables'
+            if ($report.Output -match '(?m)^EPF_CHECK\|[^|]*\|P8\|[^|]*\|[1-9]\d* tables compacted') { $first = 'the purged tables were compacted' }
+            $nextLine = ' Next    ' + $first + ' and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
                         'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
         } elseif ($Ctx.PlanId -eq '') {
             $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' runs this purge; the dry run changed nothing'
@@ -1829,9 +1875,7 @@ function Invoke-ToolRun {
         if ($status -ne 'FAILED') {
             # The notes of the expected outcome follow its first line; the
             # warnings counted by P5 are the ones the requirements say.
-            $notes = @()
-            $expected = Get-ExpectedLines $report.Output
-            for ($i = 1; $i -lt $expected.Count; $i++) { $notes += (Format-Sentence $expected[$i].Trim()) }
+            $notes = @(Get-ExpectedNotes $report.Output)
             $checks = Read-Checks $report.Output
             Show-GoodToKnow @($checks | Where-Object { $_.Id -ne 'P5' -or $_.Status -eq 'FAIL' }) $notes
             Write-Out '' -NoLog
@@ -2673,7 +2717,7 @@ function Get-DiskLines {
     param([string]$Report)
     $out = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in ($Report -split "`r?`n")) {
-        if ($line -match '^ (DISK|WAITS)  ') { $out.Add($line.TrimEnd()) }
+        if ($line -match '^ (DISK|ON DISK|WAITS)  ') { $out.Add($line.TrimEnd()) }
     }
     return ,$out.ToArray()
 }
@@ -3554,7 +3598,8 @@ function Invoke-ReclaimRun {
     $state = [pscustomobject]@{
         Cred = $Ctx.Cred; Monitor = $null; RunId = [long]0; LastEvent = [long]0; LastOutput = (Get-Date);
         RunStatus = ''; Folder = $null; Live = $true; StopKeys = $false; StopRequested = $false; Started = (Get-Date);
-        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue
+        Stopped = $false; WorkerSeen = $false; PollsWithout = 0; LastSuspended = [datetime]::MinValue;
+        DiskStart = [double]-1; DiskPeak = [double]0
     }
     $confirmArg = '-'
     $scopeArg = '-'

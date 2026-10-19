@@ -2,6 +2,33 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - 0.9.8: what a purge took on disk, at the most and after it; its waits for the online logs in plain words
+
+Why: the user: "on the report after a dry run, I see "28% waiting for the online redo logs" -- very unclear. I dont know what that part of the report is. fix ti. remove if unnecessary. and if at all possible, on reports for purge (already existing in reclaim), show peak disk use and disk use after the purge." (decision D29, PLAN.md 6.8).
+
+The waits for the online logs:
+- report.html no longer shows the figure "28%" under "waiting for the online redo logs" (the time the batches of a purge waited for log switches, against the time of its batches). report.txt keeps its WAITS line, which the reference explains.
+- The end of a purge and report.html (under Next) say it in a sentence, only when it is worth acting on: a tenth of the deleting time or more, with online logs smaller than the 1 GB the tool puts in place. "The purge waited 2:05 of its 8:24 of deleting for the online redo logs, which are small (3 x 150.0 MB). Enlarged for the time of the next purge, they save most of that wait: answer yes when it asks, or add --redo-logs." In a pluggable database: "They belong to the container database: enlarged by its DBA, they save most of that wait." It replaces the note "Time waiting for the online redo logs: log switches 00:02:05 of 00:08:24 in batches (25%), ...".
+- A dry run says it in advance in the same words, from the note of its expected outcome "slower: one batch writes more redo than an online log holds": "A purge would wait at times for the online redo logs: one batch writes more redo than one of them holds. Enlarged for the time of the purge, they save most of that wait: answer yes when the purge asks, or add --redo-logs." The notes of the expected outcome are now a line each under Good to know (they were one line joined by ";").
+
+What a purge took on disk:
+- epf_util.files_bytes: what the database's files take on disk, its datafiles, temporary files and the members of its online log groups (archived logs are not counted).
+- The monitor session measures it before the purge prepares the database (new src\sql\run\disk.sql NOW), at every poll of a purge that deletes (epf_log.poll prints DK|bytes; the wrapper keeps the most), and once the database is put back (disk.sql <run> <start> <most>: epf_purge.record_disk logs DISK_PEAK). A measure that fails records nothing, and a poll goes on without its DK line; the purge is not affected.
+- The report of the purge has a line ON DISK after DISK: "at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start, 22.0 GB at the end (datafiles, temporary files and online redo logs)", the words of the reclaim's "On disk". The end of the purge shows it as "On disk: ...", summary.txt has it, and report.html has two figures: "most on disk during the purge" and "on disk after the purge".
+- The end of a reclaim says "On disk:" too, in place of "Most held on disk: at most ...", which said "most" twice.
+
+Seen in the same report, for a purge that only empties large values (mode CLOB): report.html said "rows deleted" and "The purged tables were compacted", and its Next line too, although no table is compacted then. report.html now says "LOB values cleared" (or "rows deleted or LOB values cleared" when a run does both), and both say that the purged tables were compacted only when P8 counts tables compacted; otherwise that the space is free inside the tables.
+
+The documents: README (the end of a purge with its "On disk" line, and the sentence on the waits), docs\REFERENCE.md (the WAITS and ON DISK lines of the report, what report.html shows), docs\SCENARIOS.md played again (it showed the stand-in's own note on the online logs, "about a quarter of the time waiting for the 150.0 MB online logs", which the engine never wrote), and their web pages.
+
+The suite: T13 asserts the report's ON DISK line and notes it for the digest; the digest of a purge lists DISK_PEAK. T00 checks epf_html.ps1 with the functions of the two scripts it is loaded with (it now calls Get-WaitSentence of epf_screen.ps1).
+
+tool_version 0.9.8: epf_util, epf_log, epf_purge and epf_report changed; the next run upgrades the objects (SYS).
+
+Checked here: 41 scenarios through the real wrapper against the stand-in sqlplus (386 checks on their screens; status, whose output the stand-in does not have, is not checked), which now prints DK lines for a purge that deletes and answers disk.sql; its replays have DISK_PEAK and the report's ON DISK line, and the dry run's note as the engine writes it (the replay had one of its own, "about a quarter of the time waiting for the 150.0 MB online logs"). The suite's T00, T01, T06 and T07 against the stand-in; the static checks of the PL/SQL and of the wrapper.
+
+How to test: a purge that deletes (T13, or X3 on a copy that still has rows to purge): its end shows "On disk: at most ... during the purge (... more than at its start); ... at the start, ... at the end"; report.html shows "most on disk during the purge" and "on disk after the purge" and no percentage of waits; `run_tests.bat --digest` lists DISK_PEAK with the purge's events. A dry run on a database with online logs of 150 or 200 MB says "A purge would wait at times for the online redo logs" under Good to know.
+
 ## 2026-10-13 - 0.9.7, continued: "purge --reclaim" runs the reclaim; every command the tool shows can be typed as it is
 
 Why: the user, with the screen of a purge on EPFPG784 (R-000044, 5,337,624 rows) followed by `src\bin\epf_purge.bat purge --reclaim --dry-run` and its refusal: "this is proof that i cant run reclaim earlier". They typed the same command after 0.9.6 had answered "Type this instead: epf_purge.bat reclaim --dry-run": the answer looks like what was typed, and as shown it cannot be typed from the tool's folder (no path).

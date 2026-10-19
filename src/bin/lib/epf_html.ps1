@@ -7,8 +7,9 @@
 #           the duration by step, the checks, the requirements, warnings and
 #           errors, what to do next, and the full text report. One file with
 #           its styles inside: it can be opened, printed and sent as it is.
-# Usage   : dot-sourced by epf.ps1; Write-HtmlReport <run folder> returns the
-#           path written, '' when the folder has no manifest.
+# Usage   : dot-sourced by epf.ps1, with epf_screen.ps1 (Get-WaitSentence);
+#           Write-HtmlReport <run folder> returns the path written, '' when
+#           the folder has no manifest.
 # Requires: Windows PowerShell 5.1.
 # ============================================================================
 
@@ -221,12 +222,32 @@ function Write-HtmlReport {
             if ($word.ContainsKey($expected[0])) { $lead = $lead + ' ' + $word[$expected[0]] }
         }
     } elseif ($action -eq 'PURGE') {
-        $lead = '<strong>' + $rowsText + ' rows deleted</strong>'
+        # Rows deleted, LOB values cleared (mode CLOB), or both, as the
+        # modules say it (MODULE_END).
+        $unit = 'rows deleted'
+        $units = @($modules | ForEach-Object { $_.What } | Select-Object -Unique)
+        if ($units.Count -eq 1 -and $units[0] -eq 'LOB values cleared') { $unit = 'LOB values cleared' }
+        elseif ($units.Count -gt 1) { $unit = 'rows deleted or LOB values cleared' }
+        $lead = '<strong>' + $rowsText + ' ' + $unit + '</strong>'
         if ($scope -ne '') { $lead = $lead + ' (' + $scope + ')' }
-        $lead = $lead + '. The purged tables were compacted; the datafiles keep their size until a reclaim.'
-        $tiles.Add(@('rows deleted', $rowsText))
+        # Tables compacted (P8: "9 tables compacted, 0 skipped, ..."): none
+        # when the purge only empties large values, or when no table has
+        # enough free space inside.
+        if ($checks.ContainsKey('P8') -and $checks['P8'].Value -match '^[1-9]\d* tables compacted') {
+            $lead = $lead + '. The purged tables were compacted; the datafiles keep their size until a reclaim.'
+        } else {
+            $lead = $lead + '. The space is free inside the tables; the datafiles keep their size until a reclaim.'
+        }
+        $tiles.Add(@($unit, $rowsText))
         if ($checks.ContainsKey('P7') -and $checks['P7'].Value -match 'freed (\d+(?:\.\d+)? [KMGT]?B)') { $tiles.Add(@('space freed', $Matches[1])) }
-        if ($waits -match 'log switches (\d+:\d\d:\d\d) of \d+:\d\d:\d\d in batches \((\d+)%\)') { $tiles.Add(@('waiting for the online redo logs', ($Matches[2] + '%'))) }
+        # What the database's files took on disk: the most during the purge,
+        # and at its end (DISK_PEAK).
+        if ($peak -match '^at most (\S+ \S+) ') { $tiles.Add(@('most on disk during the purge', $Matches[1])) }
+        if ($peak -match '(\S+ \S+) at the end') { $tiles.Add(@('on disk after the purge', $Matches[1])) }
+        # The time waited for the online redo logs, as advice for the next
+        # purge when it is worth acting on (Get-WaitSentence).
+        $wait = Get-WaitSentence (' WAITS     ' + $waits)
+        if ($wait -ne '') { $next.Add($wait) }
     } elseif ($action -eq 'PREFLIGHT') {
         $lead = '<strong>The database was checked and the purge estimated.</strong> Nothing was changed.'
     } elseif ($mode -eq 'ASSESS') {

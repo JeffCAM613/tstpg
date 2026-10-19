@@ -620,7 +620,7 @@ function Test-Script {
     foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
         $defined[$f.Name.ToLower()] = $true
     }
-    # The functions of the scripts it loads ($Also) are defined for it too.
+    # The functions of the scripts loaded with it ($Also) are defined for it too.
     foreach ($other in $Also) {
         $otherTokens = $null
         $otherErrors = $null
@@ -865,7 +865,7 @@ function Invoke-Suite {
     Invoke-Test 'T00' 'Static checks of the wrapper and of this suite (no database)' {
         $lib = Join-Path $script:SrcDir 'bin\lib'
         Test-Script (Join-Path $lib 'epf.ps1') @((Join-Path $lib 'epf_html.ps1'), (Join-Path $lib 'epf_screen.ps1'))
-        Test-Script (Join-Path $lib 'epf_html.ps1')
+        Test-Script (Join-Path $lib 'epf_html.ps1') @((Join-Path $lib 'epf.ps1'), (Join-Path $lib 'epf_screen.ps1'))
         Test-Script (Join-Path $lib 'epf_screen.ps1') @((Join-Path $lib 'epf.ps1'))
         Test-Script (Join-Path $script:SrcDir 'tests\sim\epf_sim.ps1')
         Test-Script (Join-Path $script:TestDir 'run_tests.ps1')
@@ -1379,6 +1379,10 @@ function Invoke-Suite {
         Assert-Match $r ' WAITS +log switches \d\d:\d\d:\d\d of \d\d:\d\d:\d\d in batches \(\d+%\)'
         if ($r.Output -match '(?m)MODULE_END +(PAYMENTS DONE: .*?)\s*$') { Write-TestLog ('  note ' + $Matches[1]) }
         if ($r.Output -match '(?m)^ WAITS +(.*?)\s*$') { Write-TestLog ('  note ' + $Matches[1]) }
+        # What the database's files took on disk: at its start, at the most
+        # while it ran, at its end once put back (DISK_PEAK).
+        Assert-Match $r ' ON DISK +at most \S+ \S+ during the purge'
+        if ($r.Output -match '(?m)^ ON DISK +(.*?)\s*$') { Write-TestLog ('  note on disk ' + $Matches[1]) }
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
@@ -2138,7 +2142,7 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
                           'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
                           'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK')
-$script:DigestPurge = @('MODULE_END', 'DISK_USE', 'REDO_WAITS', 'STOP_HONORED')
+$script:DigestPurge = @('MODULE_END', 'DISK_USE', 'DISK_PEAK', 'REDO_WAITS', 'STOP_HONORED')
 # The runs added to the digest and their durations in all (Add-DigestRun).
 $script:DigestRunSeconds = 0
 $script:DigestRunCount = 0

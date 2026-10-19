@@ -1128,15 +1128,68 @@ function Show-PurgeEnd {
         }
         Write-Wrapped '  ' 'epf_purge.bat status shows whether anything is left pending. Once the cause is removed, the same command goes on from here.'
     }
+    # What the purge took on disk (DISK_PEAK): the database's files at its
+    # start, at the most while it ran, and at its end.
+    foreach ($line in (Get-DiskLines $Report)) {
+        if ($line -match '^ ON DISK\s+(.+)$') { Write-Wrapped '  ' ('On disk: ' + $Matches[1] + '.') }
+    }
     # The warnings P5 counts are the notes of the run, shown as they came.
     $notes = @()
     if ($null -ne $script:Flow) { $notes += $script:Flow.Notes.ToArray() }
-    # The time the batches waited for the online logs, when larger logs would
-    # save some of it (the engine says so in its WAITS line).
-    foreach ($line in (Get-DiskLines $Report)) {
-        if ($line -match '^ WAITS\s+(.+larger online logs.+)$') { $notes += ('Time waiting for the online redo logs: ' + $Matches[1]) }
-    }
+    $wait = Get-WaitSentence $Report
+    if ($wait -ne '') { $notes += $wait }
     Show-GoodToKnow @($checks | Where-Object { $_.Id -ne 'P5' -or $_.Status -eq 'FAIL' }) $notes
+}
+
+# The time a purge waited for its online redo logs, in plain words, when it
+# is worth acting on: a tenth of the deleting or more, with logs smaller than
+# the ones the tool puts in place for a purge (larger logs would save it, the
+# engine's WAITS line says). Empty otherwise.
+function Get-WaitSentence {
+    param([string]$Report)
+    foreach ($line in (Get-DiskLines $Report)) {
+        if ($line -match '^ WAITS\s+log switches (\d+:\d\d:\d\d) of (\d+:\d\d:\d\d) in batches \((\d+)%\), online logs (.+?): larger online logs') {
+            $waited = ConvertTo-Seconds $Matches[1]
+            $batches = ConvertTo-Seconds $Matches[2]
+            $pct = [int]$Matches[3]
+            $logs = $Matches[4]
+            # The groups by size, the smallest first: "3 x 150.0 MB".
+            if ($pct -lt 10 -or $logs -match '^\d+ x [\d.]+ [GT]B') { return '' }
+            return ('The purge waited ' + (Format-Clock $waited) + ' of its ' + (Format-Clock $batches) + ' of deleting for the online redo logs, ' +
+                    'which are small (' + $logs + '). ' + (Get-RedoAdvice -Next))
+        }
+    }
+    return ''
+}
+
+# What saves a purge the waits for its online redo logs: the tool enlarges
+# them for the time of a purge; those of a pluggable database belong to its
+# container database.
+function Get-RedoAdvice {
+    param([switch]$Next)
+    if ($null -ne $script:Database -and $script:Database.Pdb) {
+        return 'They belong to the container database: enlarged by its DBA, they save most of that wait.'
+    }
+    if ($Next) { return 'Enlarged for the time of the next purge, they save most of that wait: answer yes when it asks, or add --redo-logs.' }
+    return 'Enlarged for the time of the purge, they save most of that wait: answer yes when the purge asks, or add --redo-logs.'
+}
+
+# The notes of a dry run's expected outcome (the line under EXPECTED), a
+# sentence each; the one on the online redo logs in plain words.
+function Get-ExpectedNotes {
+    param([string]$Report)
+    $notes = @()
+    $expected = Get-ExpectedLines $Report
+    for ($i = 1; $i -lt $expected.Count; $i++) {
+        foreach ($note in ($expected[$i].Trim() -split '; ')) {
+            if ($note -eq 'slower: one batch writes more redo than an online log holds') {
+                $notes += ('A purge would wait at times for the online redo logs: one batch writes more redo than one of them holds. ' + (Get-RedoAdvice))
+            } elseif ($note -ne '') {
+                $notes += (Format-Sentence $note)
+            }
+        }
+    }
+    return $notes
 }
 
 # The accounts a reclaim locks, from the ACCOUNTS section of its report.
@@ -1256,7 +1309,7 @@ function Show-ReclaimEnd {
             foreach ($e in $script:Flow.Errors) { Write-Wrapped '   - ' $e 'Red' }
         }
     }
-    if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { Write-Wrapped '  ' ('Most held on disk: ' + $Matches[1] + '.') }
+    if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { Write-Wrapped '  ' ('On disk: ' + $Matches[1] + '.') }
     $notes = @()
     if (($Status -eq 'SUCCESS' -or $Status -eq 'WARNING') -and $back -gt 0) {
         $notes += 'Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a little larger than above. Nothing to do.'

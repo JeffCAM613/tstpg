@@ -48,5 +48,10 @@ CREATE OR REPLACE PACKAGE epf_util AUTHID DEFINER AS
     FUNCTION container_name RETURN VARCHAR2;
     FUNCTION is_cdb_root RETURN BOOLEAN;
 
+    -- The disk the database's own files take: its datafiles, its temporary
+    -- files and the members of its online redo log groups (archived logs are
+    -- not counted).
+    FUNCTION files_bytes RETURN NUMBER;
+
 END epf_util;
 /

@@ -175,5 +175,16 @@ CREATE OR REPLACE PACKAGE BODY epf_util AS
         RETURN SYS_CONTEXT('USERENV', 'CON_NAME') = 'CDB$ROOT';
     END is_cdb_root;
 
+    FUNCTION files_bytes RETURN NUMBER IS
+        l_data NUMBER;
+        l_temp NUMBER;
+        l_logs NUMBER;
+    BEGIN
+        SELECT NVL(SUM(bytes), 0) INTO l_data FROM dba_data_files;
+        SELECT NVL(SUM(bytes), 0) INTO l_temp FROM dba_temp_files;
+        SELECT NVL(SUM(bytes * members), 0) INTO l_logs FROM v$log;
+        RETURN l_data + l_temp + l_logs;
+    END files_bytes;
+
 END epf_util;
 /

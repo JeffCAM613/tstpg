@@ -241,8 +241,19 @@ CREATE OR REPLACE PACKAGE BODY epf_log AS
                                  || h.blocker || '|' || h.sql_id || '|' || NVL(h.longops, '||') || '|'
                                  || REPLACE(REPLACE(h.suspended, CHR(13), ' '), CHR(10), ' '));
         END LOOP;
-        FOR x IN (SELECT status, stop_requested FROM epf_run WHERE run_id = p_run_id) LOOP
+        FOR x IN (SELECT status, stop_requested, action, dry_run FROM epf_run WHERE run_id = p_run_id) LOOP
             DBMS_OUTPUT.PUT_LINE('RUN|' || x.status || '|' || x.stop_requested);
+            -- What the database's files take on disk while a purge deletes:
+            -- the wrapper keeps the most it sees (DISK_PEAK at the end). The
+            -- poll goes on without it when it cannot be read.
+            IF x.action = 'PURGE' AND x.dry_run = 'N' THEN
+                BEGIN
+                    DBMS_OUTPUT.PUT_LINE('DK|' || epf_util.files_bytes);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        NULL;
+                END;
+            END IF;
         END LOOP;
     END poll;
 

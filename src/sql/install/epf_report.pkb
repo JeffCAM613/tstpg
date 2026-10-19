@@ -1754,8 +1754,10 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
     END print_forecast_result;
 
     -- What a purge kept on disk while it ran (DISK_USE): the most undo it held
-    -- against the undo tablespace's limit, and where its redo went; then the
-    -- time its batches waited for log switches (REDO_WAITS).
+    -- against the undo tablespace's limit, and where its redo went; what the
+    -- database's files took at the start, at the most and at the end
+    -- (DISK_PEAK, recorded once the database is put back); then the time its
+    -- batches waited for log switches (REDO_WAITS).
     PROCEDURE print_disk IS
         l_first BOOLEAN := TRUE;
     BEGIN
@@ -1763,14 +1765,17 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                     FROM (SELECT event_code, message,
                                  ROW_NUMBER() OVER (PARTITION BY event_code ORDER BY event_id DESC) AS rn
                             FROM epf_event
-                           WHERE run_id = g_run.run_id AND event_code IN ('DISK_USE', 'REDO_WAITS'))
+                           WHERE run_id = g_run.run_id AND event_code IN ('DISK_USE', 'DISK_PEAK', 'REDO_WAITS'))
                    WHERE rn = 1
-                   ORDER BY CASE event_code WHEN 'DISK_USE' THEN 1 ELSE 2 END) LOOP
+                   ORDER BY CASE event_code WHEN 'DISK_USE' THEN 1 WHEN 'DISK_PEAK' THEN 2 ELSE 3 END) LOOP
             IF l_first THEN
                 put;
                 l_first := FALSE;
             END IF;
-            put(CASE d.event_code WHEN 'DISK_USE' THEN ' DISK      ' ELSE ' WAITS     ' END || d.message);
+            put(CASE d.event_code WHEN 'DISK_USE' THEN ' DISK      '
+                                  WHEN 'DISK_PEAK' THEN ' ON DISK   '
+                                  ELSE ' WAITS     ' END
+                || REPLACE(d.message, ' on disk during the purge', ' during the purge'));
         END LOOP;
     END print_disk;
 

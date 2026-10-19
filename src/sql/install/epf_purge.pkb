@@ -3104,6 +3104,21 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- Requirements and forecasts
     -- ------------------------------------------------------------------
 
+    PROCEDURE record_disk(p_run_id IN NUMBER, p_start IN NUMBER, p_peak IN NUMBER) IS
+        l_end  NUMBER := epf_util.files_bytes;
+        l_peak NUMBER := GREATEST(NVL(p_start, 0), NVL(p_peak, 0), l_end);
+    BEGIN
+        epf_log.event(epf_log.c_info, 'DISK_PEAK',
+                      'at most ' || epf_util.fmt_bytes(l_peak) || ' on disk during the purge'
+                      || CASE WHEN p_start IS NULL THEN NULL
+                              WHEN l_peak > p_start THEN ' (' || epf_util.fmt_bytes(l_peak - p_start) || ' more than at its start)'
+                              ELSE ' (its size at the start)' END
+                      || '; ' || CASE WHEN p_start IS NOT NULL THEN epf_util.fmt_bytes(p_start) || ' at the start, ' END
+                      || epf_util.fmt_bytes(l_end) || ' at the end (datafiles, temporary files and online redo logs)',
+                      p_bytes => l_peak, p_run_id => p_run_id);
+        DBMS_OUTPUT.PUT_LINE('EPF_DISK|END|' || l_end);
+    END record_disk;
+
     PROCEDURE archive_room(p_room OUT NUMBER, p_where OUT VARCHAR2) IS
         TYPE t_dests IS TABLE OF VARCHAR2(4000);
         l_dests      t_dests;

@@ -223,7 +223,11 @@ The purge asks the same questions, plus whether it is a dry run (no). Then:
   disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
   not be in use during a reclaim). To see how much a reclaim gives back:
       src\bin\epf_purge.bat reclaim --dry-run
+  On disk: at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start,
+  22.0 GB at the end (datafiles, temporary files and online redo logs).
 ```
+
+The "On disk" line is what the database's files took on disk: the most while the purge ran, and what they take after it, once the database is put back. When the purge waited a tenth of its deleting time or more for small online redo logs, a note says how long, and that enlarging them for the time of the next purge saves most of that wait.
 
 A required condition that is not met is a strong warning. Going on is your choice, and the default answer is no.
 

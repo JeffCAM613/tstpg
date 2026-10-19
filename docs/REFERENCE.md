@@ -80,7 +80,9 @@ More options for the purge:
 - `--redo-logs` gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).
 - `--mode` and `--depth` limit the purge to some modules, or to emptying LOB values (see [What it does](#what-it-does)).
 
-The end of a purge says how long the batches waited for log switches, for example `log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB`. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs could save.
+The report of a purge says how long its batches waited for log switches (WAITS), for example `log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB`. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs could save. When it is a tenth of the deleting time or more and the logs are smaller than 1 GB, the end of the purge and report.html say so in a sentence, with what saves it next time: the purge's question on the online logs, or `--redo-logs`; in a pluggable database, the DBA of the container database. A dry run says the same in advance when one batch writes more redo than an online log holds.
+
+The report of a purge also says what the database's files took on disk (ON DISK): their size at the start, the most while the purge ran and their size at its end, once the database is put back, for example `at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start, 22.0 GB at the end`. The files counted are the datafiles, the temporary files and the members of the online redo log groups; archived logs are not. The most is the largest size measured while the purge ran (the monitor measures it every few seconds). The end of the purge shows that line, and report.html the most and the size after.
 
 ### The checks alone (preflight)
 
@@ -169,7 +171,7 @@ Every action that works on the database creates a run, such as R-000123, recorde
 | manifest.txt | A key=value summary: status, verdict, exit code, checks |
 | requirements.txt, plan.txt | The requirements and the plan, when the run has them |
 | summary.txt | The report in short: the estimate or the simulation, the disk a purge takes while it runs, the requirements, the tablespaces, the checks that did not pass and the verdict; for a reclaim, also its datafiles at the start and at the end |
-| report.html | The run in a browser: the result in one sentence, the main figures, the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
+| report.html | The run in a browser: the result in one sentence, the main figures (for a purge also the most its database's files took on disk and their size after it), the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
 | sqlplus_*.log | The output of the SQL*Plus sessions |
 
 Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:
