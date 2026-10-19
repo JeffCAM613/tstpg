@@ -2,6 +2,20 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - The web pages of the documents in Finastra's template
+
+Why: the user, with the Finastra logo attached: "make the html file readme files into a finastra template ... use finastra color pallete (charcoal - main body content, violet - headings and hyperlinks, fuchsia - introductory statements and higlighted text, pink-supporting brand accent, used sparingly and other known finastra colors.). on headers and objects. show me how it will look like too.", then "you may use text instead of pasting the logo image itself. just use it as reference".
+
+- .local\gen_readme_html.js builds docs\README.html, REFERENCE.html and SCENARIOS.html in that template. A brand bar on every page: the wordmark FINASTRA as text in the logo's gradient (fuchsia to violet), the product, and the three documents with the current one marked; its lower edge is the same gradient. Charcoal for the text; violet for the title, the headings, the links, the list markers and the heads of the tables; fuchsia for the introduction and for bold text; pink only for the short bar before the document's name, the current entry of the contents and a heading's link on hover. Commands and screens stay dark, their label with a dot of the gradient; Copy turns violet, then fuchsia once copied.
+- The colours: fuchsia #C137A2 and violet #694ED6, as measured on the logo (#BF38A1 to #C23AA3 at its left, #6A4FD9 at its right); charcoal #414141; pink #EF5DA8, the one value not taken from the logo, to replace by the brand guide's if it differs. The wordmark is set in Futura or Century Gothic where installed, otherwise Segoe UI Black, the closest of the fonts every Windows has; the pages still load nothing from outside.
+- Kept from before: a dark variant for a dark system setting, the layout for a phone, the print styles; the wordmark turns plain violet where a browser cannot fill text with a gradient, and in print.
+- A long command in a table now wraps at its spaces, so the text beside it keeps its width (the scenarios at a glance had a column of one word per line).
+- docs\SCENARIOS.md: the cutoff of scenario 1 (3807 days back from the day it is played) is shown as the example date too; played on 19 October it was 17 May 2016, which the generator did not map.
+
+Checked here: the three pages in Edge, headless, at 1440 pixels wide in light and dark, and at 390 in frames; the generator's own checks (ASCII, every link to a section).
+
+How to test: open docs\README.html in a browser; the links of the brand bar go to the reference and the scenarios.
+
 ## 2026-10-19 - The release for a client: tools\make_release.bat
 
 Why: the user: "write a script that generates a release version of this tool. but git ignored. this tool copies only the relevant file for release that is appropriate as version to release to the client. script version is the same as the tool version. at the end of the script's run, it will zip the created clone. zip is not git ignored." (PLAN.md 4.3).

@@ -95,7 +95,7 @@ src\bin\epf_purge.bat --tns EPFDB
    rows dated before it are purged.
  > Days of data to keep [30]: 365
 
- -- Mode: what is done to the rows dated before 17 May 2016 --------------------
+ -- Mode: what is done to the rows dated before 13 October 2025 ----------------
    Mode             Tables   Size now   Frees (about)   What it does
    FULL                 25    22.0 GB          6.9 GB   deletes the rows, in the modules chosen next
    CLOB                  6    13.8 GB          1.6 GB   keeps the rows, empties their large values
@@ -126,7 +126,7 @@ src\bin\epf_purge.bat --tns EPFDB
 
    Not in this database, and skipped: APPROBATION_EXECUTION_OPT, WORKFLOW_EXECUTION_OPT.
    Size now: the tables today, with their indexes and large values (the large values alone where
-   they are emptied). Frees: that size by the share of top-level records dated before 17 May 2016; a
+   they are emptied). Frees: that size by the share of top-level records dated before 13 October 2025; a
    rough estimate, which a dry run replaces by a count.
    17.6 GB of the application's 39.6 GB is in tables this tool does not purge.
  > Mode (FULL, CLOB, LOGS, CLOB_N_LOGS) [FULL]: <Enter>
@@ -142,7 +142,7 @@ src\bin\epf_purge.bat --tns EPFDB
    Several modules: their names separated by commas, such as PAYMENTS,LOGS.
  > Depth (ALL, or modules such as PAYMENTS,LOGS,BANK_STATEMENTS) [ALL]: <Enter>
 
- Dry run of a purge of everything dated before 17 May 2016. Nothing is changed.
+ Dry run of a purge of everything dated before 13 October 2025. Nothing is changed.
  Run R-000040   C:\epf\logs\2026-10-19_122937_R-000040
  1 of 2  Checking the database (read-only)                         done    0:11
          note   2 of the tables this tool can purge are not in this database and are skipped:
@@ -183,7 +183,7 @@ src\bin\epf_purge.bat --tns EPFDB
          BANK_STATEMENTS                935,130 rows    about 380.0 MB
 
  ===============================================================================
-  A purge would delete 19,279,194 rows, about 7.0 GB, dated before 17 May 2016.
+  A purge would delete 19,279,194 rows, about 7.0 GB, dated before 13 October 2025.
   It would take about 8 minutes of deleting, and would complete as things are.
  ===============================================================================
    What                  Rows to delete   Space freed (about)    Deleting
@@ -320,7 +320,7 @@ src\bin\epf_purge.bat purge
    rows dated before it are purged.
  > Days of data to keep [30]: 365
 
- -- Mode: what is done to the rows dated before 17 May 2016 --------------------
+ -- Mode: what is done to the rows dated before 13 October 2025 ----------------
    Mode             Tables   Size now   Frees (about)   What it does
    FULL                 25    22.0 GB          6.9 GB   deletes the rows, in the modules chosen next
    CLOB                  6    13.8 GB          1.6 GB   keeps the rows, empties their large values
