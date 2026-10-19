@@ -83,6 +83,8 @@ The report of a purge says how long its batches waited for log switches (WAITS),
 
 The report of a purge also says what the database's files took on disk (ON DISK): their size at the start, the most while the purge ran and their size at its end, once the database is put back, for example `at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start, 22.0 GB at the end`. The files counted are the datafiles, the temporary files and the members of the online redo log groups; archived logs are not. The most is the largest size measured while the purge ran (the monitor measures it every few seconds). The end of the purge shows that line, and report.html the most and the size after.
 
+And it says what a reclaim could give back to the disk now (RECLAIM), for example `up to about 35.4 GB could go back to the disk with a reclaim, free in DATA: 35.4 of 50.1 GB (71%)`: for each tablespace the purge worked in, the free space in its datafiles and the space still free inside the segments of the purged tables, which the moves and rebuilds of a reclaim recover, as measured at the end of the purge. It is an upper bound: the segments a reclaim cannot move and the margin it leaves are not counted; `reclaim --dry-run` measures what it gives back. From 1 GB on, the end of the purge recommends a reclaim, at a time the database can be out of use, with its two commands; below that it says the gain is small. report.html shows the figure and the recommendation.
+
 ### The checks alone (preflight)
 
 ```bat
@@ -170,7 +172,7 @@ Every action that works on the database creates a run, such as R-000123, recorde
 | manifest.txt | A key=value summary: status, verdict, exit code, checks |
 | requirements.txt, plan.txt | The requirements and the plan, when the run has them |
 | summary.txt | The report in short: the estimate or the simulation, the disk a purge takes while it runs, the requirements, the tablespaces, the checks that did not pass and the verdict; for a reclaim, also its datafiles at the start and at the end |
-| report.html | The run in a browser: the result in one sentence, the main figures (for a purge also the most its database's files took on disk and their size after it), the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
+| report.html | The run in a browser: the result in one sentence, the main figures (for a purge also the most its database's files took on disk, their size after it and what a reclaim could give back), the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console |
 | sqlplus_*.log | The output of the SQL*Plus sessions |
 
 Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:

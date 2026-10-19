@@ -141,6 +141,7 @@ function Write-HtmlReport {
     $troubles = New-Object 'System.Collections.Generic.List[string]'
     $next = New-Object 'System.Collections.Generic.List[string]'
     $peak = ''
+    $reclaimText = ''
     $waits = ''
     $consolePath = Join-Path $Folder 'console.log'
     if (Test-Path -LiteralPath $consolePath) {
@@ -155,6 +156,8 @@ function Write-HtmlReport {
                     $forecasts.Add(@{ Name = $Matches[1]; Rows = $Matches[2]; Redo = $Matches[3]; Undo = $Matches[4]; Time = $Matches[5]; Freed = $Matches[6] })
                 } elseif ($code -eq 'DISK_PEAK') {
                     $peak = $text
+                } elseif ($code -eq 'RECLAIMABLE') {
+                    $reclaimText = $text
                 } elseif ($code -eq 'REDO_WAITS') {
                     $waits = $text
                 }
@@ -238,12 +241,17 @@ function Write-HtmlReport {
         } else {
             $lead = $lead + '. The space is free inside the tables; the datafiles keep their size until a reclaim.'
         }
+        # What a reclaim could give back to the disk now (RECLAIMABLE, an
+        # upper bound); the recommendation to run it is under Next.
+        $reclaim = Get-ReclaimEstimate (' RECLAIM   ' + $reclaimText)
+        if ($null -ne $reclaim) { $lead = $lead + ' A reclaim could give back up to about ' + $reclaim.Size + ' to the disk.' }
         $tiles.Add(@($unit, $rowsText))
         if ($checks.ContainsKey('P7') -and $checks['P7'].Value -match 'freed (\d+(?:\.\d+)? [KMGT]?B)') { $tiles.Add(@('space freed', $Matches[1])) }
         # What the database's files took on disk: the most during the purge,
         # and at its end (DISK_PEAK).
         if ($peak -match '^at most (\S+ \S+) ') { $tiles.Add(@('most on disk during the purge', $Matches[1])) }
         if ($peak -match '(\S+ \S+) at the end') { $tiles.Add(@('on disk after the purge', $Matches[1])) }
+        if ($null -ne $reclaim) { $tiles.Add(@('a reclaim could give back, up to', $reclaim.Size)) }
         # The time waited for the online redo logs, as advice for the next
         # purge when it is worth acting on (Get-WaitSentence).
         $wait = Get-WaitSentence (' WAITS     ' + $waits)
@@ -283,7 +291,7 @@ function Write-HtmlReport {
 .verdict.ok{background:var(--oks)}.verdict.warn{background:var(--warns)}.verdict.bad{background:var(--bads)}
 .badge{flex:none;color:var(--card);font-weight:800;border-radius:999px;padding:4px 16px}
 .ok .badge{background:var(--ok)}.warn .badge{background:var(--warn)}.bad .badge{background:var(--bad)}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
 .num{font-size:1.45rem;font-weight:800;font-variant-numeric:tabular-nums}.cap{color:var(--muted);font-size:.88rem}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;display:grid;gap:10px;min-width:0}

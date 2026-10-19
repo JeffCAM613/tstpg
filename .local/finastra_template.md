@@ -39,7 +39,7 @@ Neutrals and tints of violet:
 ## Type
 
 - **Text**: Roboto where installed, otherwise Segoe UI (then the system's sans-serif); 16 px, line height 1.65; lines of 75 characters at most.
-- **Wordmark**: "FINASTRA" in capitals, weight 900, letter spacing 0.08 em, filled with the gradient. The logo's face is a geometric sans: Futura or Century Gothic where installed, otherwise Segoe UI Black, the closest of the fonts every Windows has. Where a browser cannot fill text with a gradient, and in print and in high-contrast mode, it is plain violet (or the system's text colour).
+- **Wordmark**: "FINASTRA" in capitals, weight 900, as SVG text stretched to the logo's proportions: `textLength="520"` with `lengthAdjust="spacingAndGlyphs"` in a view 76 high (`viewBox="0 -74 520 76"`, letters 100 px, letter spacing 12 px), so that its letters are as wide and heavy as the logo's whatever font the machine has; filled with the gradient (an SVG `linearGradient`, its id unique in the page). The logo's face is a geometric sans: Futura or Century Gothic where installed, otherwise Segoe UI Black, the closest of the fonts every Windows has. 1.6 rem high in the brand bar, 0.95 rem in the footer; the system's text colour in high-contrast mode. Set as plain CSS text, the letters came out narrow and far apart: the user found it too thin.
 - **Page title** (h1): 2.4 rem, weight 700, violet. **Section** (h2): 1.55 rem, weight 700, violet, under a bar of the gradient 40 x 3 px. **Subsection** (h3): 1.15 rem, weight 600, violet.
 - **Label above the title**: 0.78 rem, weight 700, capitals spaced 0.1 em, violet, after a pink bar 28 x 3 px.
 - **Introduction**: 1.16 rem, fuchsia, 70 characters at most.
@@ -63,13 +63,13 @@ Neutrals and tints of violet:
 - Content at most 1180 px wide; 40 px above, 24 px at the sides; the contents (240 px) and the text side by side, 40 px apart.
 - Up to 900 px wide: one column; the contents in a bordered box above the text; the document tabs on their own line.
 - Up to 640 px wide: each table row becomes a block whose cells carry their column's name as a small violet label.
-- Print: the wordmark plain violet; the tabs, the contents and the Copy buttons left out; commands and screens on a light background.
+- Print: the tabs, the contents and the Copy buttons left out; commands and screens on a light background.
 
 ## Rules
 
 - **Light only.** No dark variant: `color-scheme: light` in the stylesheet and the meta element in the page.
 - **Nothing loaded from outside**: no web font, image or script from another site, so that a page opens the same on a client's network that blocks them.
-- **The logo is not embedded.** The wordmark is text, with the logo as a reference.
+- **The logo is not embedded.** The wordmark is text (in an SVG), with the logo as a reference.
 - **Pink is never text**, and appears a few times a page at most. Links are violet, never fuchsia, so that they stay apart from the highlighted words.
 - **ASCII only** in the stylesheet and the pages.
 
@@ -88,7 +88,7 @@ Neutrals and tints of violet:
 <body>
 <header class="brandbar">
 <div class="brandbar-in">
-<span class="wordmark">FINASTRA</span>
+<svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra"><defs><linearGradient id="wm-top"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs><text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#wm-top)">FINASTRA</text></svg>
 <span class="product">Name of the product</span>
 <nav class="docs" aria-label="Documents"><a href="README.html" aria-current="page">User guide</a><a href="REFERENCE.html">Reference</a></nav>
 </div>
@@ -107,7 +107,7 @@ Neutrals and tints of violet:
 <div class="table-wrap"><table><thead><tr><th>Name</th><th>Meaning</th></tr></thead><tbody><tr><td data-label="Name">a</td><td data-label="Meaning">b</td></tr></tbody></table></div>
 </main>
 </div>
-<footer class="pagefoot"><div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>Name of the product.</span></div></footer>
+<footer class="pagefoot"><div class="pagefoot-in"><svg class="wordmark" ...>(as above, with its own gradient id: wm-foot)</svg><span>Name of the product.</span></div></footer>
 </body>
 </html>
 ```

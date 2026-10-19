@@ -1760,6 +1760,56 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         RETURN l_text;
     END disk_summary;
 
+    -- What a reclaim could give back to the disk after this purge, as text
+    -- (RECLAIMABLE), from the run's latest snapshot (POST_COMPACT, otherwise
+    -- POST_PURGE): for each permanent tablespace the purge worked in, the free
+    -- space in its datafiles and the space still free inside the segments of
+    -- the purged tables, which the moves and rebuilds of a reclaim recover.
+    -- An upper bound: the segments a reclaim cannot move and the margin it
+    -- leaves are not counted (reclaim --dry-run measures them). p_bytes: the
+    -- total; NULL without a snapshot or when nothing is free.
+    FUNCTION reclaimable_text(p_bytes OUT NUMBER) RETURN VARCHAR2 IS
+        l_phase VARCHAR2(20);
+        l_list  VARCHAR2(4000);
+        l_total NUMBER := 0;
+    BEGIN
+        p_bytes := NULL;
+        SELECT MAX(phase) KEEP (DENSE_RANK LAST ORDER BY captured_at)
+          INTO l_phase
+          FROM epf_file_snap
+         WHERE run_id = g_run.run_id AND phase IN (epf_space.c_post_purge, epf_space.c_post_compact);
+        IF l_phase IS NULL THEN
+            RETURN NULL;
+        END IF;
+        FOR t IN (SELECT f.tablespace_name, f.bytes, LEAST(f.bytes, f.free_bytes + NVL(s.inside_bytes, 0)) AS back_bytes
+                    FROM (SELECT fs.tablespace_name, SUM(fs.bytes) AS bytes, SUM(NVL(fs.free_bytes, 0)) AS free_bytes
+                            FROM epf_file_snap fs
+                            JOIN dba_tablespaces d ON d.tablespace_name = fs.tablespace_name AND d.contents = 'PERMANENT'
+                           WHERE fs.run_id = g_run.run_id AND fs.phase = l_phase
+                           GROUP BY fs.tablespace_name) f
+                    LEFT JOIN (SELECT ss.tablespace_name, SUM(GREATEST(NVL(u.free_bytes, 0), 0)) AS inside_bytes
+                                 FROM epf_space_usage u
+                                 JOIN epf_segment_snap ss
+                                   ON ss.run_id = u.run_id AND ss.phase = u.phase AND ss.owner = u.owner
+                                  AND ss.segment_name = u.segment_name
+                                  AND NVL(ss.partition_name, '-') = NVL(u.partition_name, '-')
+                                WHERE u.run_id = g_run.run_id AND u.phase = l_phase
+                                GROUP BY ss.tablespace_name) s
+                      ON s.tablespace_name = f.tablespace_name
+                   ORDER BY 3 DESC, 1) LOOP
+            CONTINUE WHEN t.back_bytes <= 0;
+            l_total := l_total + t.back_bytes;
+            l_list := l_list || CASE WHEN l_list IS NOT NULL THEN ', ' END || t.tablespace_name || ': '
+                      || of_bytes(t.back_bytes, t.bytes);
+        END LOOP;
+        IF l_total <= 0 THEN
+            RETURN NULL;
+        END IF;
+        p_bytes := l_total;
+        RETURN 'up to about ' || epf_util.fmt_bytes(l_total) || ' could go back to the disk with a reclaim, free in '
+               || l_list;
+    END reclaimable_text;
+
     -- Processes the batches of the module's trees. p_processed, p_table_redo
     -- and p_table_undo add up per table (index: table_id) the rows, redo and
     -- undo of its statements in the committed batches.
@@ -4115,6 +4165,8 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
         l_start    TIMESTAMP := epf_util.now_ts;
         l_unmet    VARCHAR2(400);
         l_disk     VARCHAR2(400);
+        l_reclaim  VARCHAR2(4000);
+        l_back     NUMBER;
     BEGIN
         init(p_run_id, 'PURGE');
         epf_log.set_phase('PURGE');
@@ -4273,6 +4325,19 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
             IF l_disk IS NOT NULL THEN
                 epf_log.info('DISK_USE', l_disk);
             END IF;
+        END IF;
+        -- What a reclaim could give back to the disk now, for the report and
+        -- the end of the purge (RECLAIM). Never a reason to fail the purge.
+        IF g_run.dry_run = 'N' AND NOT l_failed THEN
+            BEGIN
+                l_reclaim := reclaimable_text(l_back);
+                IF l_reclaim IS NOT NULL THEN
+                    epf_log.event(epf_log.c_info, 'RECLAIMABLE', l_reclaim, p_bytes => l_back);
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    epf_log.info('RECLAIMABLE', 'not estimated: ' || SQLERRM);
+            END;
         END IF;
         p_status := CASE WHEN l_failed THEN 'FAILED'
                          WHEN l_stopped THEN 'STOPPED'

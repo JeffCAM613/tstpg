@@ -12,8 +12,9 @@
    The design is described in finastra_template.md, beside this file:
    charcoal for the text, violet for the headings and the links, fuchsia for
    the introduction and the highlighted words, pink as an accent used
-   sparingly; the wordmark is text with the logo's gradient, fuchsia to
-   violet. .local/gen_readme_html.js puts this file into the pages of docs\.
+   sparingly; the wordmark is text stretched to the logo's proportions, in
+   the logo's gradient, fuchsia to violet (an SVG, see .wordmark).
+   .local/gen_readme_html.js puts this file into the pages of docs\.
    ASCII only; no font, image or other file is loaded from outside.
    ============================================================================ */
 :root {
@@ -40,13 +41,12 @@ body {
 .brandbar { position: relative; background: var(--surface); box-shadow: var(--shadow); }
 .brandbar::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--brand); }
 .brandbar-in { max-width: 1180px; margin: 0 auto; padding: 16px 24px 19px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
-.wordmark {
-  font: 900 1.6rem/1 "Futura", "Century Gothic", "Segoe UI Black", "Segoe UI", "Arial Black", sans-serif;
-  letter-spacing: 0.08em; color: var(--violet); white-space: nowrap;
-}
-@supports ((-webkit-background-clip: text) or (background-clip: text)) {
-  .wordmark { background: var(--brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
-}
+/* The wordmark: the text FINASTRA in an SVG whose text is stretched to the
+   logo's proportions (textLength 520 in a view 76 high, lengthAdjust
+   spacingAndGlyphs), so that its letters are as wide as the logo's whatever
+   font the machine has; filled with the logo's gradient. */
+.wordmark { display: block; flex: none; height: 1.6rem; width: calc(1.6rem * 520 / 76); overflow: visible; }
+.wordmark text { font: 900 100px "Futura", "Century Gothic", "Segoe UI Black", "Segoe UI", "Arial Black", sans-serif; letter-spacing: 12px; }
 .product { padding-left: 20px; border-left: 1px solid var(--line); font-weight: 600; font-size: 1.02rem; white-space: nowrap; }
 .docs { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; }
 .docs a { padding: 6px 14px; border-radius: 999px; color: var(--charcoal); font-size: 0.92rem; font-weight: 500; text-decoration: none; }
@@ -128,7 +128,7 @@ tbody tr:last-child td { border-bottom: none; }
   max-width: 1180px; margin: 0 auto; padding: 20px 24px 28px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
   color: var(--muted); font-size: 0.85rem;
 }
-.pagefoot .wordmark { font-size: 0.95rem; }
+.pagefoot .wordmark { height: 0.95rem; width: calc(0.95rem * 520 / 76); }
 
 @media (max-width: 900px) {
   .brandbar-in { padding: 12px 16px 15px; }
@@ -151,13 +151,12 @@ tbody tr:last-child td { border-bottom: none; }
   code { white-space: normal; overflow-wrap: anywhere; }
 }
 @media (forced-colors: active) {
-  .wordmark { background: none; color: CanvasText; -webkit-text-fill-color: CanvasText; }
+  .wordmark text { fill: CanvasText; }
 }
 @media print {
   .brandbar { box-shadow: none; }
   .pagefoot { background: none; }
   .docs, .toc, .copy, .anchor { display: none; }
-  .wordmark { background: none; color: var(--violet); -webkit-text-fill-color: var(--violet); }
   .layout { display: block; max-width: none; padding: 0; }
   header.top { margin: 16px 0 8px; }
   .code, .table-wrap { box-shadow: none; }
@@ -172,7 +171,7 @@ tbody tr:last-child td { border-bottom: none; }
 <body>
 <header class="brandbar">
 <div class="brandbar-in">
-<span class="wordmark">FINASTRA</span>
+<svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra"><defs><linearGradient id="wm-top"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs><text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#wm-top)">FINASTRA</text></svg>
 <span class="product">EPF Data Purge</span>
 <nav class="docs" aria-label="Documents"><a href="README.html">User guide</a><a href="REFERENCE.html" aria-current="page">Reference</a><a href="SCENARIOS.html">Scenarios</a></nav>
 </div>
@@ -207,6 +206,7 @@ tbody tr:last-child td { border-bottom: none; }
 <ul><li>The compaction is part of every purge that deletes, after its last module: the tables it purged that have at least 20 % of free space inside them (setting compact_min_free_pct) are shrunk, largest free space first. Row movement is enabled for the time of the shrink and put back; the table is shrunk online, then its indexes and LOB segments where Oracle allows it. A table Oracle cannot shrink (index-organized, compressed, with a LONG column or a function-based index) is skipped, and the report says why. A dry run does not compact, nor does a purge that was stopped (the run that carries on does). <code>--compact</code> is accepted and changes nothing.</li><li><code>--redo-logs</code> gives the purge online redo logs of 4 x 1 GB when one batch does not fit in the smallest log, and puts the original groups back at the end: the same group numbers, file names and sizes (Oracle-managed and ASM files get new names in the same place). Logs that already hold a batch are left as they are (SYS).</li><li><code>--mode</code> and <code>--depth</code> limit the purge to some modules, or to emptying LOB values (see <a href="#what-it-does">What it does</a>).</li></ul>
 <p>The report of a purge says how long its batches waited for log switches (WAITS), for example <code>log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB</code>. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs could save. When it is a tenth of the deleting time or more and the logs are smaller than 1 GB, the end of the purge and report.html say so in a sentence, with what saves it next time: the purge's question on the online logs, or <code>--redo-logs</code>; in a pluggable database, the DBA of the container database. A dry run says the same in advance when one batch writes more redo than an online log holds.</p>
 <p>The report of a purge also says what the database's files took on disk (ON DISK): their size at the start, the most while the purge ran and their size at its end, once the database is put back, for example <code>at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start, 22.0 GB at the end</code>. The files counted are the datafiles, the temporary files and the members of the online redo log groups; archived logs are not. The most is the largest size measured while the purge ran (the monitor measures it every few seconds). The end of the purge shows that line, and report.html the most and the size after.</p>
+<p>And it says what a reclaim could give back to the disk now (RECLAIM), for example <code>up to about 35.4 GB could go back to the disk with a reclaim, free in DATA: 35.4 of 50.1 GB (71%)</code>: for each tablespace the purge worked in, the free space in its datafiles and the space still free inside the segments of the purged tables, which the moves and rebuilds of a reclaim recover, as measured at the end of the purge. It is an upper bound: the segments a reclaim cannot move and the margin it leaves are not counted; <code>reclaim --dry-run</code> measures what it gives back. From 1 GB on, the end of the purge recommends a reclaim, at a time the database can be out of use, with its two commands; below that it says the gain is small. report.html shows the figure and the recommendation.</p>
 <h3 id="the-checks-alone-preflight">The checks alone (preflight)<a class="anchor" href="#the-checks-alone-preflight" aria-label="Link to this section">#</a></h3>
 <div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat preflight --retention 365</code></pre></div>
 <p>The preflight is the first step of every purge, run alone: it validates the tool's table registry against the database, counts the top-level records old enough to purge (the roots; a dry run counts the rows under them), estimates the redo, undo and time of the purge, checks the requirements with their questions, and plans the purge. It changes nothing. The answers are saved with the plan, and the purges of the plan follow them.</p>
@@ -239,7 +239,7 @@ src\bin\epf_purge.bat reclaim</code></pre></div>
 <p>If a reclaim is interrupted, what it changed is undone: at once after Ctrl+C or <code>stop</code>; in the same run when its session is lost; otherwise by <code>src\bin\epf_purge.bat reclaim --restore</code>. <code>status</code> shows anything left pending.</p>
 <h2 id="runs-reports-and-logs">Runs, reports and logs<a class="anchor" href="#runs-reports-and-logs" aria-label="Link to this section">#</a></h2>
 <p>Every action that works on the database creates a run, such as R-000123, recorded in the EPFPG tables, and a folder <code>logs\&lt;date&gt;_&lt;time&gt;_R-000123</code>:</p>
-<div class="table-wrap"><table><thead><tr><th>File</th><th>Content</th></tr></thead><tbody><tr><td data-label="File">console.log</td><td data-label="Content">Every line of the run as <code>--verbose</code> shows it: every event and the whole report</td></tr><tr><td data-label="File">report.txt</td><td data-label="Content">The run's report: parameters, steps, results, checks and verdict</td></tr><tr><td data-label="File">manifest.txt</td><td data-label="Content">A key=value summary: status, verdict, exit code, checks</td></tr><tr><td data-label="File">requirements.txt, plan.txt</td><td data-label="Content">The requirements and the plan, when the run has them</td></tr><tr><td data-label="File">summary.txt</td><td data-label="Content">The report in short: the estimate or the simulation, the disk a purge takes while it runs, the requirements, the tablespaces, the checks that did not pass and the verdict; for a reclaim, also its datafiles at the start and at the end</td></tr><tr><td data-label="File">report.html</td><td data-label="Content">The run in a browser: the result in one sentence, the main figures (for a purge also the most its database's files took on disk and their size after it), the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console</td></tr><tr><td data-label="File">sqlplus_*.log</td><td data-label="Content">The output of the SQL*Plus sessions</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Content</th></tr></thead><tbody><tr><td data-label="File">console.log</td><td data-label="Content">Every line of the run as <code>--verbose</code> shows it: every event and the whole report</td></tr><tr><td data-label="File">report.txt</td><td data-label="Content">The run's report: parameters, steps, results, checks and verdict</td></tr><tr><td data-label="File">manifest.txt</td><td data-label="Content">A key=value summary: status, verdict, exit code, checks</td></tr><tr><td data-label="File">requirements.txt, plan.txt</td><td data-label="Content">The requirements and the plan, when the run has them</td></tr><tr><td data-label="File">summary.txt</td><td data-label="Content">The report in short: the estimate or the simulation, the disk a purge takes while it runs, the requirements, the tablespaces, the checks that did not pass and the verdict; for a reclaim, also its datafiles at the start and at the end</td></tr><tr><td data-label="File">report.html</td><td data-label="Content">The run in a browser: the result in one sentence, the main figures (for a purge also the most its database's files took on disk, their size after it and what a reclaim could give back), the modules or tablespaces, for a dry run the disk a purge takes while it runs and the other retentions, the duration by step, the checks, the requirements, warnings and errors, what to do next, and the full text report. One file with its styles inside. It opens at the end of the run when somebody is at the console</td></tr><tr><td data-label="File">sqlplus_*.log</td><td data-label="Content">The output of the SQL*Plus sessions</td></tr></tbody></table></div>
 <p>Each run ends with its checks and a verdict: PASS, PASS WITH WARNINGS or FAIL. To show a report again:</p>
 <div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat report
 src\bin\epf_purge.bat report --run 123</code></pre></div>
@@ -275,7 +275,7 @@ logs\                    run folders, made by the first run</code></pre></div>
 </main>
 </div>
 <footer class="pagefoot">
-<div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>EPF Data Purge. This page is the HTML version of docs/REFERENCE.md in the tool's folder. See also: <a href="README.html">User guide</a> &middot; <a href="SCENARIOS.html">Scenarios</a>.</span></div>
+<div class="pagefoot-in"><svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra"><defs><linearGradient id="wm-foot"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs><text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#wm-foot)">FINASTRA</text></svg><span>EPF Data Purge. This page is the HTML version of docs/REFERENCE.md in the tool's folder. See also: <a href="README.html">User guide</a> &middot; <a href="SCENARIOS.html">Scenarios</a>.</span></div>
 </footer>
 <script>
 document.querySelectorAll('.copy').forEach(function (button) {

@@ -122,7 +122,7 @@ At the question for the EPFPG password, press Enter alone. The run then asks for
  > Password to give the EPFPG account:
  > Password to give the EPFPG account (again):
    Database           EPFDB: connected (EPFDB)
-   Tool in database   version 0.9.8 (installed now, 0:02)
+   Tool in database   version 0.9.9 (installed now, 0:02)
 ```
 
 The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.
@@ -220,12 +220,17 @@ The purge asks the same questions, plus whether it is a dry run (no). Then:
   DONE   19,279,194 rows deleted in 12:42. The checks passed, with 1 note.
  ===============================================================================
   7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
-  disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
-  not be in use during a reclaim). To see how much a reclaim gives back:
+  disk does not have it back yet: the datafiles keep their size until a reclaim. A reclaim could
+  give back up to about 35.4 GB, the space free in DATA: 35.4 of 50.1 GB (71%). Recommended next, at
+  a time the database can be out of use (a reclaim locks the application's accounts while it runs):
+  see what it gives back, then run it:
       src\bin\epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim
   On disk: at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start,
   22.0 GB at the end (datafiles, temporary files and online redo logs).
 ```
+
+The end says how much a reclaim could give back to the disk at most: the space free now in the tablespaces the purge worked in. From 1 GB on it recommends one, with its two commands: the dry run measures what it gives back, then the reclaim gives it back while the database is out of use. Below 1 GB it says the gain is small.
 
 The "On disk" line is what the database's files took on disk: the most while the purge ran, and what they take after it, once the database is put back. When the purge waited a tenth of its deleting time or more for small online redo logs, a note says how long, and that enlarging them for the time of the next purge saves most of that wait.
 

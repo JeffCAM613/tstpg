@@ -1084,13 +1084,16 @@ function Show-PurgeEnd {
         $color = 'Green'
         if ($failed.Count -gt 0) { $color = 'Red' }
         Write-Rule $color
+        # What a reclaim could give back now, and whether it is worth it.
+        $reclaim = Get-ReclaimEstimate $Report
         if ($rows -eq 0 -and $failed.Count -eq 0) {
             # Nothing was old enough: said as such, with what may still be
             # worth doing (an earlier purge freed space a reclaim gives back).
             Write-Wrapped '  DONE   ' ('Nothing to purge: no row dated before ' + (Format-Day (Get-CutoffDay $Ctx)) + ' was found (' + $Total +
                                        '). ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
-            Write-Wrapped '  ' 'If an earlier purge deleted rows, the disk does not have their space back yet: the datafiles keep their size until a reclaim (the database must not be in use during a reclaim). To see how much a reclaim gives back:'
+            Write-Wrapped '  ' ('If an earlier purge deleted rows, the disk does not have their space back yet: the datafiles keep their size until a reclaim. ' +
+                                (Get-ReclaimAdvice $reclaim))
         } else {
             Write-Wrapped '  DONE   ' ((Format-Sentence $what) + ' in ' + $Total + '. ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
@@ -1111,9 +1114,10 @@ function Show-PurgeEnd {
                 $first = 'The purged tables were compacted: the database can use the space of the deleted rows again.'
                 if ($freed -ne '') { $first = $freed + ' was freed, and the purged tables were compacted: the database can use that space again.' }
             }
-            Write-Wrapped '  ' ($first + ' The disk does not have it back yet: the datafiles keep their size until a reclaim (the database must not be in use during a reclaim). To see how much a reclaim gives back:')
+            Write-Wrapped '  ' ($first + ' The disk does not have it back yet: the datafiles keep their size until a reclaim. ' + (Get-ReclaimAdvice $reclaim))
         }
         Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
+        if ($null -ne $reclaim -and $reclaim.Worth) { Write-Out '      epf_purge.bat reclaim' 'Cyan' -NoLog }
     } elseif ($Status -eq 'STOPPED') {
         Write-Rule 'Yellow'
         Write-Wrapped '  STOPPED   ' ('on request: ' + $what + ' so far, in ' + $Total + '. What was deleted stays deleted; nothing is half done.') 'Yellow'
@@ -1160,6 +1164,37 @@ function Get-WaitSentence {
         }
     }
     return ''
+}
+
+# What a reclaim could give back to the disk after a purge, from the
+# report's RECLAIM line (RECLAIMABLE, an upper bound): Size ("35.4 GB"),
+# Bytes, Where ("DATA: 35.4 of 50.1 GB (71%)"), and Worth: 1 GB or more,
+# worth a run during which the database must not be in use. $null without
+# the line.
+function Get-ReclaimEstimate {
+    param([string]$Report)
+    foreach ($line in (Get-DiskLines $Report)) {
+        if ($line -match '^ RECLAIM\s+up to about (\d+(?:\.\d+)? [KMGT]?B) could go back to the disk with a reclaim, free in (.+)$') {
+            $bytes = ConvertTo-SizeBytes $Matches[1]
+            return [pscustomobject]@{ Size = $Matches[1]; Bytes = $bytes; Where = $Matches[2]; Worth = ($bytes -ge 1073741824) }
+        }
+    }
+    return $null
+}
+
+# After a purge: what a reclaim could give back and whether it is worth it,
+# ending on the commands the screen shows next (the reclaim's dry run, and
+# the reclaim itself when worth it).
+function Get-ReclaimAdvice {
+    param($Estimate)
+    if ($null -eq $Estimate) {
+        return 'The database must not be in use during a reclaim. To see how much a reclaim gives back:'
+    }
+    $text = 'A reclaim could give back up to about ' + $Estimate.Size + ', the space free in ' + $Estimate.Where + '.'
+    if ($Estimate.Worth) {
+        return $text + ' Recommended next, at a time the database can be out of use (a reclaim locks the application''s accounts while it runs): see what it gives back, then run it:'
+    }
+    return $text + ' That is little for a run during which the database must not be in use. To see what it would give back:'
 }
 
 # What saves a purge the waits for its online redo logs: the tool enlarges

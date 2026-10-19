@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - 0.9.9: after a purge, what a reclaim could give back and the advice to run it; the wordmark as wide as the logo's
+
+Why: the user: "on the purge report, it mentions the "most on disk during the purge" and the "on disk after the purge" but it would be nice if the estimate of reclaimable space is also indicated and a recommendation to run reclaim. also, make the FINASTRA LOGO TEXT wider. this is too thin. just like in the logo. unless not possible" (decision D30).
+
+What a reclaim could give back:
+- The purge ends, when it deletes and did not fail, with event RECLAIMABLE (`epf_purge.reclaimable_text`): from its latest snapshot (POST_COMPACT, otherwise POST_PURGE), for each permanent tablespace it worked in, the free space in the datafiles (EPF_FILE_SNAP) and the space still free inside the segments of the purged tables (EPF_SPACE_USAGE), which the moves and rebuilds of a reclaim recover: "up to about 35.4 GB could go back to the disk with a reclaim, free in DATA: 35.4 of 50.1 GB (71%)". An upper bound: the reclaim's own forecast runs as SYS in a reclaim of its own and knows the segments that cannot move and the margin it leaves. An error there is logged and changes nothing else.
+- The report's RECLAIM line, after ON DISK (summary.txt has it too).
+- The end of the purge says it in a sentence, and from 1 GB on recommends a reclaim at a time the database can be out of use, with `reclaim --dry-run` then `reclaim` (both shown); below 1 GB it says the gain is small and shows the dry run only. A purge with nothing old enough says the same about the space an earlier purge freed. A stopped purge recommends nothing (its command goes on).
+- report.html: the figure in the lead, a tile "a reclaim could give back, up to", and the recommendation under Next (the run's Next line). Its tiles fit six to a row (minimum width 170 to 140 px): the sixth was alone on a second row.
+- The suite: T13 asserts the RECLAIM line and notes it; the digest of a purge lists RECLAIMABLE.
+
+The wordmark of the documents' pages:
+- Set as plain text, its letters came out narrow and far apart. It is now SVG text stretched to the logo's proportions (`textLength` 520 in a view 76 high, `lengthAdjust="spacingAndGlyphs"`, letters 100 with a spacing of 12), so its letters are as wide and heavy as the logo's whatever font the machine has; the gradient is an SVG `linearGradient`. The design note and the stylesheet say so.
+
+tool_version 0.9.9: epf_purge and epf_report changed; the next run upgrades the objects (SYS).
+
+How to test: a purge that deletes: its end says "A reclaim could give back up to about ..." and, from 1 GB, recommends a reclaim with its two commands; report.html has the tile and the recommendation; report.txt the RECLAIM line; `run_tests.bat --digest` lists RECLAIMABLE. Then `reclaim --dry-run` should give back a little less than that figure.
+
 ## 2026-10-19 - The end of the documents' pages: the contents no longer slide over the footer
 
 Why: the user, with a screenshot of the end of the user guide: "the bottom of the file doesn't look good". The contents, which stay in view as a page scrolls, and the footer were in the same grid: at the end of the page the contents slid down over the footer, its scrollbar across the footer's text.

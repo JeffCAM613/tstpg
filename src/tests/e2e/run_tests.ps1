@@ -1384,6 +1384,9 @@ function Invoke-Suite {
         # while it ran, at its end once put back (DISK_PEAK).
         Assert-Match $r ' ON DISK +at most \S+ \S+ during the purge'
         if ($r.Output -match '(?m)^ ON DISK +(.*?)\s*$') { Write-TestLog ('  note on disk ' + $Matches[1]) }
+        # What a reclaim could give back now, an upper bound (RECLAIMABLE).
+        Assert-Match $r ' RECLAIM +up to about \S+ \S+ could go back to the disk with a reclaim, free in '
+        if ($r.Output -match '(?m)^ RECLAIM +(.*?)\s*$') { Write-TestLog ('  note reclaim ' + $Matches[1]) }
         Assert-Match $r 'UNDO_CAP'
         Assert-Match $r 'UNDO_GROWTH_LIMITED|UNDO_GROWTH_KEPT'
         Assert-Match $r 'UNDO TUNING RESTORE \(SYS\)'
@@ -2143,7 +2146,7 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
                           'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
                           'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK')
-$script:DigestPurge = @('MODULE_END', 'DISK_USE', 'DISK_PEAK', 'REDO_WAITS', 'STOP_HONORED')
+$script:DigestPurge = @('MODULE_END', 'DISK_USE', 'DISK_PEAK', 'RECLAIMABLE', 'REDO_WAITS', 'STOP_HONORED')
 # The runs added to the digest and their durations in all (Add-DigestRun).
 $script:DigestRunSeconds = 0
 $script:DigestRunCount = 0

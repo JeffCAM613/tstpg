@@ -193,6 +193,15 @@ document.querySelectorAll('.copy').forEach(function (button) {
 })();
 `;
 
+// The wordmark: the text FINASTRA stretched to the logo's proportions (its
+// letters as wide as the logo's whatever the font) and filled with the logo's
+// gradient; id names the gradient, once per page.
+function wordmark(id) {
+  return '<svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra">' +
+    '<defs><linearGradient id="' + id + '"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs>' +
+    '<text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#' + id + ')">FINASTRA</text></svg>';
+}
+
 // The pages, each checked: ASCII only, and every link to a section finds it,
 // in its own page or in another.
 const ids = {};
@@ -203,9 +212,9 @@ for (const doc of docs) {
   const p = parse(doc);
   const present = docs.filter((d) => fs.existsSync(path.join(repo, d.source)));
   const others = present.filter((d) => d !== doc).map((d) => '<a href="' + d.target + '">' + d.kicker + '</a>').join(' &middot; ');
-  // The brand bar: the wordmark (text, with the logo's gradient), the product,
-  // and the three documents with the current one marked.
-  const brand = '<header class="brandbar">\n<div class="brandbar-in">\n<span class="wordmark">FINASTRA</span>\n' +
+  // The brand bar: the wordmark, the product, and the three documents with
+  // the current one marked.
+  const brand = '<header class="brandbar">\n<div class="brandbar-in">\n' + wordmark('wm-top') + '\n' +
     '<span class="product">EPF Data Purge</span>\n<nav class="docs" aria-label="Documents">' +
     present.map((d) => '<a href="' + d.target + '"' + (d === doc ? ' aria-current="page"' : '') + '>' + d.kicker + '</a>').join('') +
     '</nav>\n</div>\n</header>\n';
@@ -219,7 +228,7 @@ for (const doc of docs) {
     p.nav + '\n<main>\n' + p.body + '\n</main>\n</div>\n' +
     // The footer lies outside the layout: the contents, which stay in view
     // as the page scrolls, stop above it instead of sliding over it.
-    '<footer class="pagefoot">\n<div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>EPF Data Purge. This page is the HTML version of ' +
+    '<footer class="pagefoot">\n<div class="pagefoot-in">' + wordmark('wm-foot') + '<span>EPF Data Purge. This page is the HTML version of ' +
     doc.source + ' in the tool\'s folder.' + (others ? ' See also: ' + others + '.' : '') + '</span></div>\n</footer>\n' +
     '<script>' + js + '</script>\n</body>\n</html>\n';
   if (/[^\x00-\x7F]/.test(html)) { throw new Error(doc.source + ': non-ASCII in the page'); }

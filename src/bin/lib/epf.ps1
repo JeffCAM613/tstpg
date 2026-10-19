@@ -1841,8 +1841,18 @@ function Invoke-ToolRun {
             # values, or when no table has enough free space inside.
             $first = 'the space of what was purged is free inside the tables'
             if ($report.Output -match '(?m)^EPF_CHECK\|[^|]*\|P8\|[^|]*\|[1-9]\d* tables compacted') { $first = 'the purged tables were compacted' }
-            $nextLine = ' Next    ' + $first + ' and the datafiles keep their size: epf_purge.bat reclaim --dry-run ' +
-                        'shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
+            # What a reclaim could give back (RECLAIM), and whether it is
+            # worth a run during which the database must not be in use.
+            $then = 'epf_purge.bat reclaim --dry-run shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
+            $reclaim = Get-ReclaimEstimate $report.Output
+            if ($null -ne $reclaim -and $reclaim.Worth) {
+                $then = 'a reclaim could give back up to about ' + $reclaim.Size + ' to the disk. Recommended, at a time the database can be out of use: ' +
+                        'epf_purge.bat reclaim --dry-run shows what it gives back, then epf_purge.bat reclaim gives it back'
+            } elseif ($null -ne $reclaim) {
+                $then = 'a reclaim could give back up to about ' + $reclaim.Size + ', little for a run during which the database must not be in use; ' +
+                        'epf_purge.bat reclaim --dry-run shows what it would give back'
+            }
+            $nextLine = ' Next    ' + $first + ' and the datafiles keep their size: ' + $then
         } elseif ($Ctx.PlanId -eq '') {
             $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' runs this purge; the dry run changed nothing'
         }
@@ -2717,7 +2727,7 @@ function Get-DiskLines {
     param([string]$Report)
     $out = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in ($Report -split "`r?`n")) {
-        if ($line -match '^ (DISK|ON DISK|WAITS)  ') { $out.Add($line.TrimEnd()) }
+        if ($line -match '^ (DISK|ON DISK|RECLAIM|WAITS)  ') { $out.Add($line.TrimEnd()) }
     }
     return ,$out.ToArray()
 }

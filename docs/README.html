@@ -12,8 +12,9 @@
    The design is described in finastra_template.md, beside this file:
    charcoal for the text, violet for the headings and the links, fuchsia for
    the introduction and the highlighted words, pink as an accent used
-   sparingly; the wordmark is text with the logo's gradient, fuchsia to
-   violet. .local/gen_readme_html.js puts this file into the pages of docs\.
+   sparingly; the wordmark is text stretched to the logo's proportions, in
+   the logo's gradient, fuchsia to violet (an SVG, see .wordmark).
+   .local/gen_readme_html.js puts this file into the pages of docs\.
    ASCII only; no font, image or other file is loaded from outside.
    ============================================================================ */
 :root {
@@ -40,13 +41,12 @@ body {
 .brandbar { position: relative; background: var(--surface); box-shadow: var(--shadow); }
 .brandbar::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--brand); }
 .brandbar-in { max-width: 1180px; margin: 0 auto; padding: 16px 24px 19px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
-.wordmark {
-  font: 900 1.6rem/1 "Futura", "Century Gothic", "Segoe UI Black", "Segoe UI", "Arial Black", sans-serif;
-  letter-spacing: 0.08em; color: var(--violet); white-space: nowrap;
-}
-@supports ((-webkit-background-clip: text) or (background-clip: text)) {
-  .wordmark { background: var(--brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
-}
+/* The wordmark: the text FINASTRA in an SVG whose text is stretched to the
+   logo's proportions (textLength 520 in a view 76 high, lengthAdjust
+   spacingAndGlyphs), so that its letters are as wide as the logo's whatever
+   font the machine has; filled with the logo's gradient. */
+.wordmark { display: block; flex: none; height: 1.6rem; width: calc(1.6rem * 520 / 76); overflow: visible; }
+.wordmark text { font: 900 100px "Futura", "Century Gothic", "Segoe UI Black", "Segoe UI", "Arial Black", sans-serif; letter-spacing: 12px; }
 .product { padding-left: 20px; border-left: 1px solid var(--line); font-weight: 600; font-size: 1.02rem; white-space: nowrap; }
 .docs { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; }
 .docs a { padding: 6px 14px; border-radius: 999px; color: var(--charcoal); font-size: 0.92rem; font-weight: 500; text-decoration: none; }
@@ -128,7 +128,7 @@ tbody tr:last-child td { border-bottom: none; }
   max-width: 1180px; margin: 0 auto; padding: 20px 24px 28px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
   color: var(--muted); font-size: 0.85rem;
 }
-.pagefoot .wordmark { font-size: 0.95rem; }
+.pagefoot .wordmark { height: 0.95rem; width: calc(0.95rem * 520 / 76); }
 
 @media (max-width: 900px) {
   .brandbar-in { padding: 12px 16px 15px; }
@@ -151,13 +151,12 @@ tbody tr:last-child td { border-bottom: none; }
   code { white-space: normal; overflow-wrap: anywhere; }
 }
 @media (forced-colors: active) {
-  .wordmark { background: none; color: CanvasText; -webkit-text-fill-color: CanvasText; }
+  .wordmark text { fill: CanvasText; }
 }
 @media print {
   .brandbar { box-shadow: none; }
   .pagefoot { background: none; }
   .docs, .toc, .copy, .anchor { display: none; }
-  .wordmark { background: none; color: var(--violet); -webkit-text-fill-color: var(--violet); }
   .layout { display: block; max-width: none; padding: 0; }
   header.top { margin: 16px 0 8px; }
   .code, .table-wrap { box-shadow: none; }
@@ -172,7 +171,7 @@ tbody tr:last-child td { border-bottom: none; }
 <body>
 <header class="brandbar">
 <div class="brandbar-in">
-<span class="wordmark">FINASTRA</span>
+<svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra"><defs><linearGradient id="wm-top"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs><text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#wm-top)">FINASTRA</text></svg>
 <span class="product">EPF Data Purge</span>
 <nav class="docs" aria-label="Documents"><a href="README.html" aria-current="page">User guide</a><a href="REFERENCE.html">Reference</a><a href="SCENARIOS.html">Scenarios</a></nav>
 </div>
@@ -241,7 +240,7 @@ tbody tr:last-child td { border-bottom: none; }
  &gt; Password to give the EPFPG account:
  &gt; Password to give the EPFPG account (again):
    Database           EPFDB: connected (EPFDB)
-   Tool in database   version 0.9.8 (installed now, 0:02)</code></pre></div>
+   Tool in database   version 0.9.9 (installed now, 0:02)</code></pre></div>
 <p>The run then goes on with what it was asked. Keep the EPFPG password: the next runs ask for it. After an update of the tool's files, a run asks the same way whether to upgrade the objects in the database; the history of the runs is kept.</p>
 <h3 id="step-1-see-what-a-purge-would-delete">Step 1: see what a purge would delete<a class="anchor" href="#step-1-see-what-a-purge-would-delete" aria-label="Link to this section">#</a></h3>
 <div class="code"><div class="code-head"><span>Command</span><button class="copy" type="button">Copy</button></div><pre><code>src\bin\epf_purge.bat purge --dry-run --retention 365</code></pre></div>
@@ -307,11 +306,15 @@ tbody tr:last-child td { border-bottom: none; }
   DONE   19,279,194 rows deleted in 12:42. The checks passed, with 1 note.
  ===============================================================================
   7.0 GB was freed, and the purged tables were compacted: the database can use that space again. The
-  disk does not have it back yet: the datafiles keep their size until a reclaim (the database must
-  not be in use during a reclaim). To see how much a reclaim gives back:
+  disk does not have it back yet: the datafiles keep their size until a reclaim. A reclaim could
+  give back up to about 35.4 GB, the space free in DATA: 35.4 of 50.1 GB (71%). Recommended next, at
+  a time the database can be out of use (a reclaim locks the application's accounts while it runs):
+  see what it gives back, then run it:
       src\bin\epf_purge.bat reclaim --dry-run
+      src\bin\epf_purge.bat reclaim
   On disk: at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start,
   22.0 GB at the end (datafiles, temporary files and online redo logs).</code></pre></div>
+<p>The end says how much a reclaim could give back to the disk at most: the space free now in the tablespaces the purge worked in. From 1 GB on it recommends one, with its two commands: the dry run measures what it gives back, then the reclaim gives it back while the database is out of use. Below 1 GB it says the gain is small.</p>
 <p>The &quot;On disk&quot; line is what the database's files took on disk: the most while the purge ran, and what they take after it, once the database is put back. When the purge waited a tenth of its deleting time or more for small online redo logs, a note says how long, and that enlarging them for the time of the next purge saves most of that wait.</p>
 <p>A required condition that is not met is a strong warning. Going on is your choice, and the default answer is no.</p>
 <p>When nothing is old enough (an earlier purge took it), the purge says so before the typed <code>yes</code> and at its end, in place of a count of zero.</p>
@@ -424,7 +427,7 @@ src\bin\epf_purge.bat status</code></pre></div>
 </main>
 </div>
 <footer class="pagefoot">
-<div class="pagefoot-in"><span class="wordmark">FINASTRA</span><span>EPF Data Purge. This page is the HTML version of README.md in the tool's folder. See also: <a href="REFERENCE.html">Reference</a> &middot; <a href="SCENARIOS.html">Scenarios</a>.</span></div>
+<div class="pagefoot-in"><svg class="wordmark" viewBox="0 -74 520 76" role="img" aria-label="Finastra"><defs><linearGradient id="wm-foot"><stop offset="0" stop-color="#c137a2"/><stop offset="1" stop-color="#694ed6"/></linearGradient></defs><text x="0" y="0" textLength="520" lengthAdjust="spacingAndGlyphs" fill="url(#wm-foot)">FINASTRA</text></svg><span>EPF Data Purge. This page is the HTML version of README.md in the tool's folder. See also: <a href="REFERENCE.html">Reference</a> &middot; <a href="SCENARIOS.html">Scenarios</a>.</span></div>
 </footer>
 <script>
 document.querySelectorAll('.copy').forEach(function (button) {
