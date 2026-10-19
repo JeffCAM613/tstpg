@@ -245,6 +245,9 @@ legacy/                      previous implementation (bin/, sql/, config/), unch
 .local/
   PLAN.md                    this plan
   changes.md                 change history of the plan and of each phase
+  gen_readme_html.js         builds the web pages of docs/ from README.md, docs/REFERENCE.md and docs/SCENARIOS.md
+  finastra_template.css      the styles of those pages: the Finastra template, light only
+  finastra_template.md       that template's design (colours and their roles, type, parts, rules), to use it elsewhere
 .gitattributes               CRLF for .bat/.ps1, LF for .sh/.sql/.md
 .gitignore                   logs/, src/config/epf_purge.conf, release/*/
 ```

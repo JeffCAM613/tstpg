@@ -2,6 +2,14 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-19 - The Finastra template: light only, and written down
+
+Why: the user: "let's stick to the light mode only and note the design. for consistency. I may use it in another project soon".
+
+- The pages of docs\ have no dark variant any more: the stylesheet declares `color-scheme: light` and each page `<meta name="color-scheme" content="light">`, so a system set to dark shows them as they are (checked in Edge with the system in dark mode).
+- The styles left .local\gen_readme_html.js for .local\finastra_template.css, which the generator reads; .local\finastra_template.md describes the template so that it can be used in another project: the colours with their roles and their contrast on white, the type, each part of a page, the layout at each width, the rules (light only, nothing loaded from outside, the logo not embedded, pink never text, links never fuchsia) and the skeleton of a page.
+- The pages are the same as before in light mode.
+
 ## 2026-10-19 - The web pages of the documents in Finastra's template
 
 Why: the user, with the Finastra logo attached: "make the html file readme files into a finastra template ... use finastra color pallete (charcoal - main body content, violet - headings and hyperlinks, fuchsia - introductory statements and higlighted text, pink-supporting brand accent, used sparingly and other known finastra colors.). on headers and objects. show me how it will look like too.", then "you may use text instead of pasting the logo image itself. just use it as reference".
