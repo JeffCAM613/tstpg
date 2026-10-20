@@ -243,10 +243,11 @@ CREATE OR REPLACE PACKAGE BODY epf_log AS
         END LOOP;
         FOR x IN (SELECT status, stop_requested, action, dry_run FROM epf_run WHERE run_id = p_run_id) LOOP
             DBMS_OUTPUT.PUT_LINE('RUN|' || x.status || '|' || x.stop_requested);
-            -- What the database's files take on disk while a purge deletes:
-            -- the wrapper keeps the most it sees (DISK_PEAK at the end). The
-            -- poll goes on without it when it cannot be read.
-            IF x.action = 'PURGE' AND x.dry_run = 'N' THEN
+            -- What the database's files take on disk while a purge or a
+            -- reclaim changes the database: the wrapper keeps the most it sees
+            -- (epf_purge.record_disk at the end). The poll goes on without it
+            -- when it cannot be read.
+            IF x.action IN ('PURGE', 'RECLAIM') AND x.dry_run = 'N' THEN
                 BEGIN
                     DBMS_OUTPUT.PUT_LINE('DK|' || epf_util.files_bytes);
                 EXCEPTION

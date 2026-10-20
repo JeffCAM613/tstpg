@@ -1271,9 +1271,10 @@ function Measure-Disk {
     return [double]-1
 }
 
-# Records what a purge took on disk (DISK_PEAK): the size at its start, the
-# most the polls saw, the size now that the database is put back; then the
-# event is read like the others (console.log, report.html).
+# Records what a purge or a reclaim took on disk (DISK_PEAK, DB_FILES for a
+# reclaim): the size at its start, the most the polls saw, the size now that
+# the database is put back; then the event is read like the others
+# (console.log, report.html).
 function Write-DiskPeak {
     param($State)
     try {
@@ -2850,8 +2851,10 @@ function Get-ReclaimLines {
         }
         $out.Add($line)
     }
-    # The most a compaction held on disk, its scratch tablespace included.
+    # The most a compaction held on disk, its scratch tablespace included;
+    # the database's files at the start, at the most and at the end.
     if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { $out.Add('  ' + 'On disk'.PadRight(22) + ' ' + $Matches[1]) }
+    if ($Report -match '(?m)^\s+Database files: (.+?)\s*$') { $out.Add('  ' + 'Database files'.PadRight(22) + ' ' + $Matches[1]) }
     return ,$out.ToArray()
 }
 
@@ -3662,6 +3665,9 @@ function Invoke-ReclaimRun {
     }
     try {
         Write-Section ('RECLAIM  ' + $what.ToUpper()) -Detail
+        # What the database's files take before the compaction: the start of
+        # what the reclaim took on disk (DB_FILES), as for a purge.
+        if ($Mode -eq 'COMPACT') { $state.DiskStart = Measure-Disk $state }
         # The steps of a compaction follow the engine's (Start-ReclaimFlow).
         switch ($Mode) {
             'ASSESS'  { Start-FlowStep 'MEASURE' }
@@ -3695,6 +3701,8 @@ function Invoke-ReclaimRun {
         $status = 'FAILED'
     } finally {
         Disable-StopKey $state
+        # What the reclaim took on disk, now that everything is put back.
+        if ($state.DiskStart -ge 0) { Write-DiskPeak $state }
         $closeCode = Close-Run $state $status
         if ($status -eq 'FAILED') { Complete-FlowStep 'FAILED' } elseif ($status -eq 'STOPPED') { Complete-FlowStep 'stopped' } else { Complete-FlowStep }
     }

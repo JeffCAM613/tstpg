@@ -270,7 +270,13 @@ The reclaim itself measures again, shows the same, and waits for you to type `ye
   DONE   DATA went from 50.1 GB to 15.5 GB: 34.6 GB given back to the disk.
          11:55. The application accounts are unlocked. The checks passed, with 1 note.
  ===============================================================================
+  On disk: at most 62.3 GB during the reclaim (0.7 GB more than at its start); 61.6 GB at the start,
+  27.0 GB at the end (datafiles, temporary files and online redo logs).
+  Its tablespaces: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start,
+  15.5 GB at the end.
 ```
+
+"On disk" is the database's files as a whole, as at the end of a purge, so the two can be compared: what they take after the reclaim is what the disk holds now.
 
 A reclaim takes time with the amount of data it has to move, from minutes to more than an hour. It changes no row of the application: the row counts and the objects are compared before and after.
 

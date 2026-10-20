@@ -607,7 +607,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
  A reclaim runs as SYS.
 
  Reclaim: compacting the datafiles to give disk space back.
- Run R-000040   C:\epf\logs\2026-10-19_181350_R-000040
+ Run R-000040   C:\epf\logs\2026-10-20_174755_R-000040
  1 of 7  Measuring what a reclaim gives back (read-only)           done    0:07
 
    Requirement                       Needed     Now
@@ -647,7 +647,7 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
 
  > The application is not available until the reclaim ends. Type yes to start it: yes
 
- Run R-000041   C:\epf\logs\2026-10-19_181357_R-000041
+ Run R-000041   C:\epf\logs\2026-10-20_174803_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -671,15 +671,17 @@ src\bin\epf_purge.bat reclaim --tns EPFDB
   DONE   DATA went from 50.1 GB to 15.5 GB: 34.6 GB given back to the disk.
          0:55. The application accounts are unlocked. The checks passed, with 1 note.
  ===============================================================================
-  On disk: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start, 15.5 GB at
-  the end.
+  On disk: at most 62.3 GB during the reclaim (0.7 GB more than at its start); 61.6 GB at the start,
+  27.0 GB at the end (datafiles, temporary files and online redo logs).
+  Its tablespaces: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start,
+  15.5 GB at the end.
 
   Good to know (2)
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\epf\logs\2026-10-19_181357_R-000041\report.html
-  Files    C:\epf\logs\2026-10-19_181357_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-20_174803_R-000041\report.html
+  Files    C:\epf\logs\2026-10-20_174803_R-000041   (report.txt, console.log)
 
  -- The tool in the database ---------------------------------------------------
    The tool's own objects stay in the database for the next run: the account EPFPG and its
@@ -694,6 +696,7 @@ What to notice:
 
 - Seven steps: the measurement, the locking of the accounts, the state recorded, the compaction, the tables set aside brought back, the indexes rebuilt, the comparison and the unlocking.
 - The end says what came back to the disk, that the accounts are unlocked, and that everything was compared with the state recorded at the start.
+- "On disk" is the database's files as a whole, as at the end of the purge in scenario 4: the most during the reclaim and what they take now. "Its tablespaces" is the reclaim's own figure.
 - The last note is there so that nobody is surprised: Oracle adds about 5% of free space back to a datafile that can grow.
 
 ## Part 2: when something is not as it should be
@@ -1294,7 +1297,7 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
 
   No question (--non-interactive or --yes): the reclaim starts.
 
- Run R-000041   C:\epf\logs\2026-10-19_181254_R-000041
+ Run R-000041   C:\epf\logs\2026-10-20_174659_R-000041
  2 of 7  Measuring again, locking the application accounts         done    0:06
          5 accounts locked, 0 sessions disconnected
  3 of 7  Recording the state to compare afterwards                 done    0:02
@@ -1318,15 +1321,17 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
   DONE   DATA went from 50.1 GB to 15.5 GB: 34.6 GB given back to the disk.
          0:55. The application accounts are unlocked. The checks passed, with 1 note.
  ===============================================================================
-  On disk: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start, 15.5 GB at
-  the end.
+  On disk: at most 62.3 GB during the reclaim (0.7 GB more than at its start); 61.6 GB at the start,
+  27.0 GB at the end (datafiles, temporary files and online redo logs).
+  Its tablespaces: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start,
+  15.5 GB at the end.
 
   Good to know (2)
    - A tablespace ends above the size of its tables and indexes: DATA 15.5 GB vs 14.7 GB of segments
    - Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a
      little larger than above. Nothing to do.
-  Report   C:\epf\logs\2026-10-19_181254_R-000041\report.html
-  Files    C:\epf\logs\2026-10-19_181254_R-000041   (report.txt, console.log)
+  Report   C:\epf\logs\2026-10-20_174659_R-000041\report.html
+  Files    C:\epf\logs\2026-10-20_174659_R-000041   (report.txt, console.log)
 ```
 
 What to notice:

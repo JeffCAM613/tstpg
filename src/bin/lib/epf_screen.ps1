@@ -1344,7 +1344,17 @@ function Show-ReclaimEnd {
             foreach ($e in $script:Flow.Errors) { Write-Wrapped '   - ' $e 'Red' }
         }
     }
-    if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { Write-Wrapped '  ' ('On disk: ' + $Matches[1] + '.') }
+    # On disk: the database's files, as after a purge (Database files,
+    # DB_FILES); then the reclaim's own figure, its tablespaces and scratch
+    # space (On disk, DISK_PEAK), which is the only one an earlier report has.
+    $own = ''
+    if ($Report -match '(?m)^\s+On disk: (.+?)\s*$') { $own = $Matches[1] }
+    if ($Report -match '(?m)^\s+Database files: (.+?)\s*$') {
+        Write-Wrapped '  ' ('On disk: ' + $Matches[1] + '.')
+        if ($own -ne '') { Write-Wrapped '  ' ('Its tablespaces: ' + $own + '.') }
+    } elseif ($own -ne '') {
+        Write-Wrapped '  ' ('On disk: ' + $own + '.')
+    }
     $notes = @()
     if (($Status -eq 'SUCCESS' -or $Status -eq 'WARNING') -and $back -gt 0) {
         $notes += 'Within minutes Oracle adds about 5% of free space back to a datafile that can grow: expect it a little larger than above. Nothing to do.'

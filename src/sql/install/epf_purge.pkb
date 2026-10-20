@@ -3155,11 +3155,16 @@ CREATE OR REPLACE PACKAGE BODY epf_purge AS
     -- ------------------------------------------------------------------
 
     PROCEDURE record_disk(p_run_id IN NUMBER, p_start IN NUMBER, p_peak IN NUMBER) IS
-        l_end  NUMBER := epf_util.files_bytes;
-        l_peak NUMBER := GREATEST(NVL(p_start, 0), NVL(p_peak, 0), l_end);
+        l_end    NUMBER := epf_util.files_bytes;
+        l_peak   NUMBER := GREATEST(NVL(p_start, 0), NVL(p_peak, 0), l_end);
+        l_action VARCHAR2(30);
     BEGIN
-        epf_log.event(epf_log.c_info, 'DISK_PEAK',
-                      'at most ' || epf_util.fmt_bytes(l_peak) || ' on disk during the purge'
+        SELECT action INTO l_action FROM epf_run WHERE run_id = p_run_id;
+        -- A reclaim's own DISK_PEAK is its tablespaces and scratch space
+        -- (epf_reclaim): the database's files are DB_FILES there.
+        epf_log.event(epf_log.c_info, CASE l_action WHEN 'RECLAIM' THEN 'DB_FILES' ELSE 'DISK_PEAK' END,
+                      'at most ' || epf_util.fmt_bytes(l_peak) || ' on disk during the '
+                      || CASE l_action WHEN 'RECLAIM' THEN 'reclaim' ELSE 'purge' END
                       || CASE WHEN p_start IS NULL THEN NULL
                               WHEN l_peak > p_start THEN ' (' || epf_util.fmt_bytes(l_peak - p_start) || ' more than at its start)'
                               ELSE ' (its size at the start)' END

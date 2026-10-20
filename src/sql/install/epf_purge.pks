@@ -178,11 +178,12 @@ CREATE OR REPLACE PACKAGE epf_purge AUTHID DEFINER AS
     -- used by the reclaim's requirement ARCHIVE.
     PROCEDURE archive_room(p_room OUT NUMBER, p_where OUT VARCHAR2);
 
-    -- What the database's files took on disk during purge run p_run_id
-    -- (epf_util.files_bytes), recorded once the database is put back as it
-    -- was (DISK_PEAK): p_start before the purge prepared the database, p_peak
-    -- the most the monitor saw while it ran, and the size now. Prints
-    -- EPF_DISK|END|<bytes>.
+    -- What the database's files took on disk during run p_run_id, a purge
+    -- (event DISK_PEAK) or a reclaim (event DB_FILES; its DISK_PEAK is the
+    -- reclaim's own, its tablespaces and scratch space), from
+    -- epf_util.files_bytes, recorded once the database is put back: p_start
+    -- before the run changed it, p_peak the most the monitor saw while it
+    -- ran, and the size now. Prints EPF_DISK|END|<bytes>.
     PROCEDURE record_disk(p_run_id IN NUMBER, p_start IN NUMBER, p_peak IN NUMBER);
 
 END epf_purge;

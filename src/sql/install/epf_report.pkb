@@ -2078,6 +2078,15 @@ CREATE OR REPLACE PACKAGE BODY epf_report AS
                    ORDER BY event_id) LOOP
             put('  On disk: ' || REPLACE(e.message, ' on disk during the run', ' during the run'));
         END LOOP;
+        -- The database's files as a whole, as a purge reports them (DB_FILES,
+        -- recorded by the wrapper once the run is over).
+        FOR e IN (SELECT message
+                    FROM (SELECT message, ROW_NUMBER() OVER (ORDER BY event_id DESC) AS rn
+                            FROM epf_event
+                           WHERE run_id = g_run.run_id AND event_code = 'DB_FILES')
+                   WHERE rn = 1) LOOP
+            put('  Database files: ' || REPLACE(e.message, ' on disk during the reclaim', ' during the reclaim'));
+        END LOOP;
         put('  Tables: tables that move with their LOB segments; Indexes: released and rebuilt; Pins: segments that '
             || 'stay (a datafile cannot shrink below the highest of them).');
         FOR t IN (SELECT tablespace_name, status, start_bytes, end_bytes, peak_bytes, est_final_bytes, unit_count,

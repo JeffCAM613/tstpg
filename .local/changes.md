@@ -2,6 +2,24 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-20 - 0.9.9, continued: a reclaim says what the database's files take after it, as a purge does
+
+Why: the user, after a heavy purge and its reclaim on the expanded SONEPARUAT copy (EPFPG781, 0.9.8): "on reclaim reports, the current gb on disk after the purge is missing. it's on purge results though. we need that info." The purge's report has the most on disk during the purge and the size after it, for the database's files as a whole (194.2 GB after R-000021); the reclaim's had only its own peak, its tablespaces and scratch space (176.4 GB "most held on disk during the run" for R-000042), and no size after.
+
+- A reclaim that compacts is measured as a purge is (D29): `epf_log.poll` prints the DK line for a RECLAIM that is not a dry run too; the wrapper measures the database's files before the compaction (`disk.sql NOW`) and records them once the reclaim is over (`disk.sql <run> <start> <most>`). `epf_purge.record_disk` logs the figure as DB_FILES for a reclaim ("at most X on disk during the reclaim (...); S at the start, E at the end (datafiles, temporary files and online redo logs)"), DISK_PEAK for a purge as before: a reclaim's DISK_PEAK is its own.
+- The reclaim's report: a "Database files:" line after its "On disk:" line; summary.txt has both.
+- The end of a reclaim: "On disk:" is now the database's files, as at the end of a purge; the reclaim's own figure follows as "Its tablespaces:". The report of an earlier reclaim, without the new line, shows its own figure as "On disk:" as before.
+- report.html of a reclaim: "most on disk during the reclaim" and "on disk after the reclaim" (the database's files) beside what was given back, and the size after in the lead; an earlier run keeps its "most held on disk during the run".
+- The suite: T18B asserts the "Database files" line and notes it; the digest of a compaction lists DB_FILES.
+
+Recorded (PLAN.md 12.8, the status page): the purge of 480,875,686 rows in 5 h 40 min 7 s (PAYMENTS 452.6 M rows in 2 h 53 min 29 s, 23.0 us a row) and the reclaim that gave back 169.6 GB in 7 min 41 s.
+
+No new version: 0.9.9 is not pushed yet, and the wrapper upgrades the objects when the versions differ.
+
+Checked here: the reclaim scenarios against the stand-in (which prints DK for a reclaim now; its replay has DB_FILES and the report's line), 398 checks on the screens of 40 scenarios; report.html of the replayed reclaim with its five figures.
+
+How to test: the next reclaim (after the light purge): its end shows "On disk: ... at the end" and "Its tablespaces: ..."; report.html "on disk after the reclaim"; `run_tests.bat --digest` lists DB_FILES. That size should be about the purge's size after, minus what the reclaim gave back.
+
 ## 2026-10-19 - 0.9.9: after a purge, what a reclaim could give back and the advice to run it; the wordmark as wide as the logo's
 
 Why: the user: "on the purge report, it mentions the "most on disk during the purge" and the "on disk after the purge" but it would be nice if the estimate of reclaimable space is also indicated and a recommendation to run reclaim. also, make the FINASTRA LOGO TEXT wider. this is too thin. just like in the logo. unless not possible" (decision D30).

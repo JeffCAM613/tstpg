@@ -142,6 +142,7 @@ function Write-HtmlReport {
     $next = New-Object 'System.Collections.Generic.List[string]'
     $peak = ''
     $reclaimText = ''
+    $dbFiles = ''
     $waits = ''
     $consolePath = Join-Path $Folder 'console.log'
     if (Test-Path -LiteralPath $consolePath) {
@@ -158,6 +159,8 @@ function Write-HtmlReport {
                     $peak = $text
                 } elseif ($code -eq 'RECLAIMABLE') {
                     $reclaimText = $text
+                } elseif ($code -eq 'DB_FILES') {
+                    $dbFiles = $text
                 } elseif ($code -eq 'REDO_WAITS') {
                     $waits = $text
                 }
@@ -271,7 +274,17 @@ function Write-HtmlReport {
                 (Format-HtmlBytes ([Math]::Max($start - $end, 0))) + ' given back to the disk.'
         $tiles.Add(@('given back to the disk', (Format-HtmlBytes ([Math]::Max($start - $end, 0)))))
         $tiles.Add(@('tables that had to move', [string]$moved))
-        if ($peak -match '^at most (\S+ \S+) ') { $tiles.Add(@('most held on disk during the run', $Matches[1])) }
+        # The database's files, as a purge's report has them (DB_FILES); a
+        # run without them has the reclaim's own figure (DISK_PEAK).
+        if ($dbFiles -match '^at most (\S+ \S+) ') {
+            $tiles.Add(@('most on disk during the reclaim', $Matches[1]))
+            if ($dbFiles -match '(\S+ \S+) at the end') {
+                $tiles.Add(@('on disk after the reclaim', $Matches[1]))
+                $lead = $lead + ' The database''s files take ' + $Matches[1] + ' on disk now.'
+            }
+        } elseif ($peak -match '^at most (\S+ \S+) ') {
+            $tiles.Add(@('most held on disk during the run', $Matches[1]))
+        }
     }
     if ($class -eq 'bad') { $lead = '<strong>The run did not complete.</strong> The errors are listed below. ' + $lead }
     elseif ($status -eq 'STOPPED') { $lead = '<strong>The run was stopped.</strong> ' + $lead }

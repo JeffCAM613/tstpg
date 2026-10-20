@@ -337,7 +337,12 @@ src\bin\epf_purge.bat reclaim</code></pre></div>
 <div class="code"><pre class="plain"><code> ===============================================================================
   DONE   DATA went from 50.1 GB to 15.5 GB: 34.6 GB given back to the disk.
          11:55. The application accounts are unlocked. The checks passed, with 1 note.
- ===============================================================================</code></pre></div>
+ ===============================================================================
+  On disk: at most 62.3 GB during the reclaim (0.7 GB more than at its start); 61.6 GB at the start,
+  27.0 GB at the end (datafiles, temporary files and online redo logs).
+  Its tablespaces: at most 50.1 GB during the run (its size at the start); 50.1 GB at the start,
+  15.5 GB at the end.</code></pre></div>
+<p>&quot;On disk&quot; is the database's files as a whole, as at the end of a purge, so the two can be compared: what they take after the reclaim is what the disk holds now.</p>
 <p>A reclaim takes time with the amount of data it has to move, from minutes to more than an hour. It changes no row of the application: the row counts and the objects are compared before and after.</p>
 <h3 id="after-a-run">After a run<a class="anchor" href="#after-a-run" aria-label="Link to this section">#</a></h3>
 <ul><li><strong>The report</strong> opens in the browser at the end of every run: the result in one sentence, the main figures, the time of each step, the checks. <code>src\bin\epf_purge.bat report</code> shows the latest one again.</li><li><strong>The run folder</strong> <code>logs\&lt;date&gt;_&lt;time&gt;_R-000123</code> keeps it, with the text report and every line of the run (report.html, report.txt, console.log).</li><li><strong>The tool's objects</strong>: a purge or a reclaim that ended well asks whether to remove them from the database. The default is to keep them: the next run is then ready at once.</li></ul>

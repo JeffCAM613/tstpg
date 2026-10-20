@@ -157,6 +157,8 @@ Options:
 
 The measurement checks these requirements, shown as a table like those of a purge: the recycle bin, the room for the archived logs, the temporary space and the space quotas of the owners are required (the quotas cannot be gone past: the owners need a space quota where their tables are written again); a backup is optional, and the scratch space is taken by the reclaim itself.
 
+The end of a reclaim, its report and report.html say what it took on disk in two ways. The database's files as a whole, as after a purge (On disk, the report's "Database files"): their size before the compaction, the most while it ran and their size after it, for example `at most 62.3 GB during the reclaim (0.7 GB more than at its start); 61.6 GB at the start, 27.0 GB at the end (datafiles, temporary files and online redo logs)`; report.html shows the most and the size after, beside what was given back. And the reclaim's own figure, its tablespaces and its scratch space (Its tablespaces, the report's "On disk"): the most they held together and their size at the start and at the end.
+
 Some segments cannot move: partitioned tables, queue tables, tables with a LONG column, and a few other kinds. They stay where they are, the assessment lists them, and a datafile cannot shrink below the highest of them.
 
 If a reclaim is interrupted, what it changed is undone: at once after Ctrl+C or `stop`; in the same run when its session is lost; otherwise by `src\bin\epf_purge.bat reclaim --restore`. `status` shows anything left pending.

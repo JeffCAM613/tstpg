@@ -1696,6 +1696,10 @@ function Invoke-Suite {
         Assert-Match $r 'UNIT_MOVED +EPF_RT\.RT_TOP'
         # RT_FAT's INITIAL (40 MB) is more than it needs: its move sets 64 KB.
         Assert-Match $r 'INITIAL_RESET +EPF_RT\.RT_FAT'
+        # The database's files at the start, at the most and at the end, as
+        # after a purge (DB_FILES).
+        Assert-Match $r 'Database files: at most \S+ \S+ during the reclaim'
+        if ($r.Output -match '(?m)Database files: (.*?)\s*$') { Write-TestLog ('  note database files ' + $Matches[1]) }
         foreach ($step in @('LOCK_ACCOUNTS', 'RELEASE_INDEXES', 'FREEZE_FILES', 'REBUILD_INDEXES', 'RESTORE_FILES', 'RESIZE',
                             'VERIFY', 'UNLOCK_ACCOUNTS')) {
             Assert-Manifest $run ('step.RECLAIM.' + $step + '.-') '^DONE\|'
@@ -2145,7 +2149,7 @@ $script:DigestCompact = @('INITIAL_RESET', 'INITIAL_KEPT', 'MAKING_ROOM', 'UNIT_
                           'MOVE_AGAIN_NOT_DONE', 'ROOM_MOVE_NO_ROOM', 'FILE_GROWN', 'FILE_DONE', 'RECLAIM_RESULT',
                           'STOP_HONORED', 'NO_TARGET', 'SCRATCH_CREATED', 'UNIT_PARKED', 'PARK_SKIPPED', 'PARK_FAILED',
                           'SCRATCH_FULL', 'PARK_UNAVAILABLE', 'PARK_UNDONE', 'UNIT_RETURNED', 'RETURN_GREW',
-                          'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK')
+                          'RETURN_FAILED', 'SCRATCH_DROPPED', 'SCRATCH_KEPT', 'DISK_PEAK', 'DB_FILES')
 $script:DigestPurge = @('MODULE_END', 'DISK_USE', 'DISK_PEAK', 'RECLAIMABLE', 'REDO_WAITS', 'STOP_HONORED')
 # The runs added to the digest and their durations in all (Add-DigestRun).
 $script:DigestRunSeconds = 0
