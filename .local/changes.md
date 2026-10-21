@@ -2,6 +2,16 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-22 - Results: a light purge, then a heavy reclaim, on the expanded copy (EPFPG782, 0.9.9)
+
+The user's reports (report.html) of a dry run, a purge and a reclaim on EPFPG782, SONEPARUAT data expanded (DATA 177.7 GB). Recorded in PLAN.md 12.7 and 12.8 and on the status page (Durations, Dry-run accuracy).
+
+- Dry run R-000002, 6 min 52 s: 71,575,495 rows; forecast 24 min 27 s of deleting, 24.7 GB freed.
+- Purge R-000004, 35 min 3 s: the same 71,575,495 rows; 22.8 GB freed (forecast +8%); PAYMENTS 67.5 M rows in 31 min 21 s, 27.9 us a row, the rate of this copy before the expansion (set N). 1 min outside the modules: next to nothing compacted (no table 20% free after a light purge). The database's files at most 191.9 GB, 188.4 GB after; "a reclaim could give back up to 34.3 GB".
+- Reclaim R-000022, 5 h 45 min 19 s: DATA 177.7 to 155.0 GB, 22.7 GB back (two thirds of the estimate); 13 tables moved; up to 72.9 GB parked (its tablespaces and scratch 230.6 GB); the database's files at most 241.2 GB, 165.5 GB after.
+
+0.9.9's new figures held on a real database: the size after the reclaim, 165.5 GB, is the size after the purge less what was given back (165.7 GB), within 0.2 GB. The purge's estimate is an upper bound, as designed: the free space inside tables that do not move is not given back.
+
 ## 2026-10-20 - 0.9.9, continued: a reclaim says what the database's files take after it, as a purge does
 
 Why: the user, after a heavy purge and its reclaim on the expanded SONEPARUAT copy (EPFPG781, 0.9.8): "on reclaim reports, the current gb on disk after the purge is missing. it's on purge results though. we need that info." The purge's report has the most on disk during the purge and the size after it, for the database's files as a whole (194.2 GB after R-000021); the reclaim's had only its own peak, its tablespaces and scratch space (176.4 GB "most held on disk during the run" for R-000042), and no size after.
