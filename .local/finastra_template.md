@@ -10,6 +10,8 @@ Decided with the user on 2026-10-19: light only, for consistency; the logo as a 
 2. Put the stylesheet into the page (inline in a `<style>` element, so the page stays one file), and declare light only: `<meta name="color-scheme" content="light">`.
 3. Build the page on the skeleton below. Its classes are the ones the stylesheet knows.
 
+To have another AI write a document in this look, paste it the whole of `finastra_template_prompt.md` beside this note: the look, the parts of a page with their markup, what a troubleshooting document holds, a skeleton, and the stylesheet and the script as the pages use them. `node .local\make_template_prompt.js` writes it from `finastra_template.css` and `gen_readme_html.js`: run it again after either changes.
+
 ## Colours
 
 | Name | Value | What it is for | On white |

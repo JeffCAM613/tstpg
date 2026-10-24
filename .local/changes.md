@@ -2,6 +2,39 @@
 
 Newest first. Each entry: date, what changed, why, and how to test when relevant.
 
+## 2026-10-24 - 0.9.9, continued: the purge and the reclaim in one go; the database in the name of a run folder
+
+Why: the user: "add the instance name to the log folder of a run. and add another option to do a straight purge and claim in one go." (D31)
+
+- `--reclaim` with an option of a purge (`--retention`, `--cutoff`, `--mode`, `--depth`, `--batch-size`, `--backup`, `--max-redo`, `--redo-logs`, `--new`) runs the purge, then the reclaim, in one command, as the previous tool did. `purge --reclaim` alone stays the reclaim, and says so: "--reclaim alone: the reclaim. This runs it, as this command does (with --retention or --cutoff, the purge comes first)". `--restore` with a purge is refused.
+- The menu: choice 5, "Purge, then reclaim" (not a dry run); report, status and uninstall are 6, 7 and 8.
+- The options of the reclaim are checked before the purge starts. `--tablespaces` and `--scratch` go to the reclaim; `--confirm` takes both lists: ARCHIVE and TEMP for both, UNDO for the purge, RECYCLEBIN for the reclaim.
+- With prompts, one typed yes covers both: the box before it says "Then a reclaim gives the space back to the disk: the application is not available until it ends (its accounts are locked)", and the prompt is "Type yes to start the purge, then the reclaim". The banner says "purge, then reclaim".
+- The reclaim starts when the purge ended as done or done with warnings, with the purge's logins: a rule, "Then the reclaim: compacting the datafiles to give the space back to the disk.", the measurement and what it gives back, then "The reclaim starts: the yes typed before the purge covers it." A required condition of the reclaim that is not met is still asked about (with prompts) or stops it (without). A purge that fails, is stopped or does not start: "The reclaim does not start: the purge did not run to its end (above).", and the purge's exit code.
+- The exit code of the command is the worse of the two runs (`Join-ExitCode`: 1, then 3, then 2). One question about removing the tool, at the end.
+- The end of the purge says "The reclaim follows now (--reclaim): it could give back up to about X", in place of the reclaim's two commands; its Next line in the log and report.html says that a reclaim follows in the same command.
+- A dry run with `--reclaim` is the purge's alone: its Next is "epf_purge.bat purge <scope> --reclaim     the purge, then the reclaim", followed by "The reclaim is not part of this dry run: what it gives back depends on what the purge frees. Its own dry run, epf_purge.bat reclaim --dry-run, measures the database as it is now."
+- `--help`: the text of `--reclaim` and the example "The last two in one go: epf_purge.bat purge --retention 365 --reclaim".
+- Run folders: `<yyyy-MM-dd_HHmmss>_<database>_R-<run>`, such as `2026-10-24_192320_EPFPG781_R-000123`: the database's CON_NAME as the report names it, any character other than a letter, a digit, `_` or `-` written `_` (a `$` would break the path typed in PowerShell). Run ids are those of each database, and one machine runs against several. The suite's digest reads folders named either way.
+- The user guide (the menu, "The purge and the reclaim in one go", the run folder, `--reclaim`, the exit codes), the reference (the run folder, "A purge, then a reclaim, in one command", the exit codes) and the scenarios (25: "The purge and the reclaim in one go" through the menu, "A purge, then the reclaim, in one command"; the references between scenarios are by id, numbered when the document is written) follow.
+- `.local/finastra_template_prompt.md`: the documentation template described for another AI (the look, the parts of a page with their markup, what a troubleshooting document holds, a skeleton, the stylesheet and the script as the pages use them), to paste whole. Written from the files the pages are built from.
+
+No new version: only the wrapper changed; the database's objects are those of 0.9.9.
+
+How to test (TANM7883 or a copy whose application can be stopped; SYS):
+
+```bat
+src\bin\epf_purge.bat purge --dry-run --retention 365 --reclaim
+src\bin\epf_purge.bat purge --retention 365 --reclaim
+src\tests\e2e\run_tests.bat --digest
+```
+
+- The dry run: its Next has `--reclaim`, and the sentence on the reclaim's own dry run follows; no reclaim runs.
+- The purge: one typed yes; after the purge's end, "Then the reclaim" and the reclaim's measurement and compaction, without a second yes; exit code 0 or 2. Four run folders (the purge's checks, the purge, the measurement, the reclaim), each named `<date>_<time>_<database>_R-<run>`.
+- The menu (`src\bin\epf_purge.bat`): choice 5 does the same; 6, 7 and 8 are the report, the status and the uninstall.
+
+Checked here: 44 scenarios against the stand-in (new: the purge then the reclaim by command and through the menu, its dry run, one whose purge does not start); the stand-in's figures for the database's files during a purge now agree with its reclaim (61.5 GB at the start of a purge, 61.6 GB at its end, where the reclaim starts).
+
 ## 2026-10-22 - Results: a light purge, then a heavy reclaim, on the expanded copy (EPFPG782, 0.9.9)
 
 The user's reports (report.html) of a dry run, a purge and a reclaim on EPFPG782, SONEPARUAT data expanded (DATA 177.7 GB). Recorded in PLAN.md 12.7 and 12.8 and on the status page (Durations, Dry-run accuracy).

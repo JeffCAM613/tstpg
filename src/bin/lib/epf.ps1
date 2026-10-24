@@ -62,6 +62,10 @@ $script:SysLogin    = $null
 $script:ToolState   = ''
 # The menu has said whether the purge is a dry run: it is not asked again.
 $script:GoalChosen  = $false
+# A purge, then a reclaim, in one command (purge --reclaim with the options
+# of a purge, or the menu's "Purge, then reclaim"): the purge does not end
+# the program, and its typed yes covers the reclaim.
+$script:ThenReclaim = $false
 
 $script:ExitPass    = 0
 $script:ExitFail    = 1
@@ -249,7 +253,8 @@ Where to start
        epf_purge.bat purge --dry-run --retention 365     what it would do
        epf_purge.bat purge --retention 365               delete the rows
        epf_purge.bat reclaim                             free the disk space
-     The reclaim needs the database not in use.
+     The reclaim needs the database not in use. The last two in one go:
+       epf_purge.bat purge --retention 365 --reclaim
   3. Be guided: the menu asks what you want and the questions that go with it:
        epf_purge.bat
 
@@ -257,7 +262,7 @@ Usage: epf_purge.bat [action] [options]
 
 Actions
   (none)       the menu: dry run of a purge, purge, dry run of a reclaim,
-               reclaim, report, status, uninstall
+               reclaim, purge then reclaim, report, status, uninstall
   purge        delete the rows older than the days of data to keep: checks,
                questions, purge, compaction of the purged tables, report.
                --dry-run counts what it would delete and changes nothing
@@ -321,9 +326,10 @@ Options
   --compact            accepted, changes nothing: every purge that deletes
                        compacts the tables it purged afterwards, so that
                        the space of the deleted rows can be used again
-  --reclaim            with purge and no other option of a purge: runs the
-                       reclaim, as the action reclaim does (--dry-run: its
-                       dry run). The reclaim is a command of its own
+  --reclaim            with purge and the days to keep (or another option of
+                       a purge): the purge, then the reclaim, in one command
+                       and with one yes. Alone (purge --reclaim): the reclaim,
+                       as the action reclaim runs it (--dry-run: its dry run)
   --tablespaces LIST   reclaim: tablespaces separated by commas (default: every
                        tablespace holding segments of the application schemas)
   --scratch SIZE       reclaim: the most temporary space, such as 2G, for the
@@ -1382,10 +1388,19 @@ function Get-YN {
     return 'N'
 }
 
+# The folder of a run: <yyyy-MM-dd_HHmmss>_<database>_R-<run>, the database
+# as the tool is connected to it (its name, or the pluggable database's), so
+# that the runs of several databases can share one log folder. A character
+# other than a letter, a digit, _ or - is written _ (a $ would break the path
+# typed in PowerShell).
 function New-RunFolder {
     param([long]$RunId)
     $base = Get-Option 'log-dir' 'LOG_DIR' (Join-Path $script:RepoDir 'logs')
-    $folder = Join-Path $base ((Get-Date -Format 'yyyy-MM-dd_HHmmss') + '_' + (Get-RunLabel $RunId))
+    $name = ''
+    if ($null -ne $script:Database -and [string]$script:Database.Container -ne '') {
+        $name = ([string]$script:Database.Container -replace '[^A-Za-z0-9_-]', '_') + '_'
+    }
+    $folder = Join-Path $base ((Get-Date -Format 'yyyy-MM-dd_HHmmss') + '_' + $name + (Get-RunLabel $RunId))
     New-Item -ItemType Directory -Path $folder -Force | Out-Null
     $script:LogFile = Join-Path $folder 'console.log'
     foreach ($line in $script:Buffered) {
@@ -1846,7 +1861,9 @@ function Invoke-ToolRun {
             # worth a run during which the database must not be in use.
             $then = 'epf_purge.bat reclaim --dry-run shows what a reclaim gives back to the disk (the database must not be in use during a reclaim)'
             $reclaim = Get-ReclaimEstimate $report.Output
-            if ($null -ne $reclaim -and $reclaim.Worth) {
+            if ($script:ThenReclaim) {
+                $then = 'a reclaim follows in the same command (--reclaim) and gives it back to the disk'
+            } elseif ($null -ne $reclaim -and $reclaim.Worth) {
                 $then = 'a reclaim could give back up to about ' + $reclaim.Size + ' to the disk. Recommended, at a time the database can be out of use: ' +
                         'epf_purge.bat reclaim --dry-run shows what it gives back, then epf_purge.bat reclaim gives it back'
             } elseif ($null -ne $reclaim) {
@@ -1854,6 +1871,8 @@ function Invoke-ToolRun {
                         'epf_purge.bat reclaim --dry-run shows what it would give back'
             }
             $nextLine = ' Next    ' + $first + ' and the datafiles keep their size: ' + $then
+        } elseif ($Ctx.PlanId -eq '' -and $script:ThenReclaim) {
+            $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' --reclaim runs this purge, then the reclaim; the dry run changed nothing'
         } elseif ($Ctx.PlanId -eq '') {
             $nextLine = ' Next    epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' runs this purge; the dry run changed nothing'
         }
@@ -1891,7 +1910,11 @@ function Invoke-ToolRun {
             Show-GoodToKnow @($checks | Where-Object { $_.Id -ne 'P5' -or $_.Status -eq 'FAIL' }) $notes
             Write-Out '' -NoLog
             Write-Out '  Nothing was changed.' 'Green' -NoLog
-            if ($Ctx.PlanId -eq '') {
+            if ($Ctx.PlanId -eq '' -and $script:ThenReclaim) {
+                Write-Out ('  Next     epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + ' --reclaim     the purge, then the reclaim') -NoLog
+                Write-Wrapped '           ' ('The reclaim is not part of this dry run: what it gives back depends on what the purge frees. ' +
+                                           'Its own dry run, epf_purge.bat reclaim --dry-run, measures the database as it is now.')
+            } elseif ($Ctx.PlanId -eq '') {
                 Write-Out ('  Next     epf_purge.bat purge ' + (Get-ScopeOptions $Ctx) + '     the purge itself') -NoLog
             } else {
                 Write-Out '  Next     epf_purge.bat purge     the step of the plan this dry run rehearsed' -NoLog
@@ -2372,12 +2395,15 @@ function Get-PurgeContext {
     $confirmList = Get-Option 'confirm' 'CONFIRM' ''
     if ($confirmList -ne '') {
         $codes = @($confirmList.ToUpper().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        # A purge followed by a reclaim: RECYCLEBIN is the reclaim's.
+        $known = @('ARCHIVE', 'UNDO', 'TEMP')
+        if ($script:ThenReclaim) { $known += 'RECYCLEBIN' }
         foreach ($code in $codes) {
-            if (@('ARCHIVE', 'UNDO', 'TEMP') -notcontains $code) {
-                Exit-Tool $script:ExitUsage ('--confirm: ARCHIVE, UNDO, TEMP separated by commas, got ' + $confirmList + '.')
+            if ($known -notcontains $code) {
+                Exit-Tool $script:ExitUsage ('--confirm: ' + ($known -join ', ') + ' separated by commas, got ' + $confirmList + '.')
             }
         }
-        $ctx.Confirm = (@($codes | Select-Object -Unique) -join ',')
+        $ctx.Confirm = (@($codes | Where-Object { $_ -ne 'RECYCLEBIN' } | Select-Object -Unique) -join ',')
     }
     if ($null -eq $Plan) {
         # What to do with the old rows, and of which modules: asked for when
@@ -3234,10 +3260,13 @@ function Show-Ready {
     if ($Ctx.Mode -eq 'CLOB') { $verb = 'empties the large values (LOB columns) of' }
     Write-Out '' -NoLog
     Write-Rule
+    # A purge followed by a reclaim (--reclaim) says so before the typed yes.
+    $after = 'Then a reclaim gives the space back to the disk: the application is not available until it ends (its accounts are locked).'
     if ($counted -and $roots -eq 0) {
         # The checks counted the top-level records, and none is old enough.
         Write-Wrapped '  ' ('Ready, but there is nothing to purge: no top-level record is dated before ' + $day +
                            '. An earlier purge may have taken them. This run would delete nothing.') 'Yellow'
+        if ($script:ThenReclaim) { Write-Wrapped '  ' $after 'White' }
         Write-Rule
         return
     }
@@ -3261,6 +3290,7 @@ function Show-Ready {
     if ($Ctx.Mode -ne 'FULL' -or $Ctx.Depth -ne 'ALL') {
         Write-Out ('  Mode ' + $Ctx.Mode + ', modules ' + $Ctx.Depth + '.') -NoLog
     }
+    if ($script:ThenReclaim) { Write-Wrapped '  ' $after 'White' }
     Write-Rule
 }
 
@@ -3308,9 +3338,12 @@ function Invoke-PurgeAction {
     if ($script:Cli.Options.ContainsKey('max-redo') -and $Action -eq 'PURGE' -and (-not $Wizard -or $dry)) {
         Exit-Tool $script:ExitUsage '--max-redo applies to preflight and to a purge with prompts (its check plans the runs).'
     }
+    # The reclaim's options are checked now, not once the purge is over.
+    if ($script:ThenReclaim) { $null = Read-ReclaimOptions -Chained }
     if (-not $NoBanner) {
         $what = 'purge'
         if ($Action -eq 'PREFLIGHT') { $what = 'checks of a purge' } elseif ($dry) { $what = 'purge, dry run' }
+        elseif ($script:ThenReclaim) { $what = 'purge, then reclaim' }
         Show-Banner $what
     }
     $login = Connect-Tool -Ready
@@ -3459,16 +3492,42 @@ function Invoke-PurgeAction {
         if ($script:Verbose) { Show-Review $ctx $Action }
         if (-not $ctx.DryRun) {
             if (-not $script:Verbose -and $script:Interactive) { Show-Ready $ctx $estimate }
-            Read-Typed 'Rows before the cutoff will be deleted, or their LOB values cleared' -Label 'Type yes to start the purge' -Straight
+            $label = 'Type yes to start the purge'
+            if ($script:ThenReclaim) { $label = 'Type yes to start the purge, then the reclaim' }
+            Read-Typed 'Rows before the cutoff will be deleted, or their LOB values cleared' -Label $label -Straight
             Write-Out '' -NoLog
         }
     }
     $run = Invoke-ToolRun $ctx $Action
     if ($run.Stopped) { exit $script:ExitAborted }
+    # A purge, then a reclaim: the reclaim starts when the purge ended well,
+    # with the same logins and without asking yes again. A dry run is the
+    # purge's alone (its end says how to measure the reclaim).
+    if ($script:ThenReclaim -and $Action -eq 'PURGE' -and -not $ctx.DryRun) {
+        if ($run.Status -eq 'SUCCESS' -or $run.Status -eq 'WARNING') {
+            Invoke-ReclaimAction -NoBanner -Chained -Login $login -PriorExit $run.ExitCode
+        } else {
+            Write-Out '' -NoLog
+            Write-Out '  The reclaim does not start: the purge did not run to its end (above).' 'Red' -NoLog
+            exit $run.ExitCode
+        }
+    }
     if ($Action -eq 'PURGE' -and ($run.Status -eq 'SUCCESS' -or $run.Status -eq 'WARNING')) {
         Invoke-UninstallQuestion $login.Tns $run.Report
     }
     exit $run.ExitCode
+}
+
+# The exit code of two runs in one command (a purge, then a reclaim): the
+# worse of the two. A failure first, then a stop, then warnings; -1 for no
+# earlier run.
+function Join-ExitCode {
+    param([int]$First, [int]$Second)
+    if ($First -lt 0) { return $Second }
+    foreach ($code in @($script:ExitFail, $script:ExitAborted, $script:ExitWarn)) {
+        if ($First -eq $code -or $Second -eq $code) { return $code }
+    }
+    return $Second
 }
 
 # ----------------------------------------------------------------------------
@@ -3481,15 +3540,19 @@ function Invoke-PurgeAction {
 # space for parked tables (RECLAIM_TABLESPACES, RECLAIM_CONFIRM and
 # RECLAIM_SCRATCH in the configuration file).
 function Read-ReclaimOptions {
-    foreach ($name in @('retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup')) {
-        if ($script:Cli.Options.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
-    }
-    foreach ($name in @('compact', 'redo-logs', 'undo-tuning')) {
-        if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
+    param([switch]$Chained)
+    # After a purge in the same command (-Chained) its options were the purge's.
+    if (-not $Chained) {
+        foreach ($name in @('retention', 'cutoff', 'depth', 'mode', 'batch-size', 'backup')) {
+            if ($script:Cli.Options.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
+        }
+        foreach ($name in @('compact', 'redo-logs', 'undo-tuning')) {
+            if ($script:Cli.Flags.ContainsKey($name)) { Exit-Tool $script:ExitUsage ('--' + $name + ' applies to purge and preflight.') }
+        }
     }
     $ctx = [pscustomobject]@{ Cred = $null; SysCred = $null; Mode = 'COMPACT'; Tablespaces = ''; Confirm = ''; Scratch = '';
                               AssessRun = ''; NoScratch = $false }
-    $dry = $script:Cli.Flags.ContainsKey('dry-run')
+    $dry = $script:Cli.Flags.ContainsKey('dry-run') -and -not $Chained
     $restore = $script:Cli.Flags.ContainsKey('restore')
     if ($dry -and $restore) { Exit-Tool $script:ExitUsage '--dry-run and --restore cannot be combined.' }
     if ($restore) {
@@ -3511,8 +3574,11 @@ function Read-ReclaimOptions {
     if ($confirmList -ne '') {
         $codes = @($confirmList.ToUpper().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         foreach ($code in $codes) {
-            if (@('ARCHIVE', 'TEMP', 'RECYCLEBIN') -notcontains $code) {
-                Exit-Tool $script:ExitUsage ('--confirm: ARCHIVE, TEMP, RECYCLEBIN separated by commas for a reclaim, got ' + $confirmList + '.')
+            # UNDO, after a purge in the same command, was the purge's.
+            if (@('ARCHIVE', 'TEMP', 'RECYCLEBIN') -notcontains $code -and -not ($Chained -and $code -eq 'UNDO')) {
+                $names = 'ARCHIVE, TEMP, RECYCLEBIN separated by commas for a reclaim'
+                if ($Chained) { $names = 'ARCHIVE, UNDO, TEMP, RECYCLEBIN separated by commas for a purge, then a reclaim' }
+                Exit-Tool $script:ExitUsage ('--confirm: ' + $names + ', got ' + $confirmList + '.')
             }
         }
         $ctx.Confirm = (@(@('ARCHIVE', 'TEMP', 'RECYCLEBIN') | Where-Object { $codes -contains $_ }) -join ',')
@@ -3855,15 +3921,20 @@ function Show-ReclaimNext {
 # there. A compaction with prompts then asks about each required one that is
 # not met and for a typed confirmation; without prompts it goes straight on,
 # and the engine refuses it while a required one is not met.
+# -Chained: after a purge in the same command (purge --reclaim): its login
+# ($Login), no typed confirmation (the purge's covered it), and the exit code
+# the worse of the purge's ($PriorExit) and the reclaim's.
 function Invoke-ReclaimAction {
-    param([switch]$NoBanner)
-    $ctx = Read-ReclaimOptions
+    param([switch]$NoBanner, [switch]$Chained, $Login = $null, [int]$PriorExit = -1)
+    $ctx = Read-ReclaimOptions -Chained:$Chained
     $confirmed = $script:Cli.Flags.ContainsKey('yes')
+    $nothing = 'Nothing was changed.'
+    if ($Chained) { $nothing = 'The purge is done; the reclaim changed nothing.' }
     if (-not $NoBanner) {
         $what = @{ 'ASSESS' = 'reclaim, dry run'; 'COMPACT' = 'reclaim'; 'RESTORE' = 'reclaim, restore' }[$ctx.Mode]
         Show-Banner $what
     }
-    $login = Connect-Tool -Ready
+    if ($null -ne $Login) { $login = $Login } else { $login = Connect-Tool -Ready }
     $ctx.Cred = $login
     if ($script:Interactive -and $null -eq $script:SysLogin) {
         Write-Out ''
@@ -3893,6 +3964,9 @@ function Invoke-ReclaimAction {
     Write-Out ''
     if ($ctx.Mode -eq 'ASSESS') {
         Write-Out ' Dry run of a reclaim: what it would give back to the disk. Nothing is changed.' 'White'
+    } elseif ($Chained) {
+        Write-Rule
+        Write-Out ' Then the reclaim: compacting the datafiles to give the space back to the disk.' 'White'
     } else {
         Write-Out ' Reclaim: compacting the datafiles to give disk space back.' 'White'
     }
@@ -3946,11 +4020,11 @@ function Invoke-ReclaimAction {
     # The log of the compaction starts with its own run folder.
     $script:LogFile = $null
     $ctx.AssessRun = Get-RunLabel $assess.RunId
-    if ($assess.Status -eq 'STOPPED') { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+    if ($assess.Status -eq 'STOPPED') { Exit-Tool $script:ExitAborted $nothing }
     if (-not $measured) {
-        Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see above); nothing was changed.')
+        Exit-Tool $script:ExitFail ('The assessment ' + $ctx.AssessRun + ' failed (see above). ' + $nothing)
     }
-    if ($spaces.Count -eq 0) { Exit-Tool $script:ExitPass 'No tablespace to reclaim; nothing was changed.' }
+    if ($spaces.Count -eq 0) { Exit-Tool (Join-ExitCode $PriorExit $script:ExitPass) ('No tablespace to reclaim. ' + $nothing) }
     if (-not $script:Verbose) {
         $null = Show-Requirements $advice 'RECLAIM' $taken
         Show-ReclaimAssess $assess.Report $spaces $ctx.Scratch $file
@@ -3959,9 +4033,10 @@ function Invoke-ReclaimAction {
     # engine refuses the compaction, which records it.
     $refused = (-not ($script:Interactive -and -not $confirmed)) -and (Get-Unmet $advice).Count -gt 0
     if ($script:Interactive -and -not $confirmed) {
-        if (-not (Invoke-ReclaimChoices $ctx $advice)) { Exit-Tool $script:ExitAborted 'Nothing was changed.' }
+        if (-not (Invoke-ReclaimChoices $ctx $advice)) { Exit-Tool $script:ExitAborted $nothing }
         if ($script:Verbose) { Show-ReclaimReview $ctx $spaces }
         Write-Out '' -NoLog
+        if ($Chained) { Write-Out '  The reclaim starts: the yes typed before the purge covers it.' 'DarkGray' -NoLog }
     } elseif (-not $script:Verbose) {
         Write-Out '' -NoLog
         if ($refused) {
@@ -3970,8 +4045,10 @@ function Invoke-ReclaimAction {
             Write-Out '  No question (--non-interactive or --yes): the reclaim starts.' 'DarkGray' -NoLog
         }
     }
-    Read-Typed 'The tables will move and their indexes will be rebuilt; the accounts listed are locked meanwhile' `
-               -Label 'The application is not available until the reclaim ends. Type yes to start it' -Straight
+    if (-not $Chained) {
+        Read-Typed 'The tables will move and their indexes will be rebuilt; the accounts listed are locked meanwhile' `
+                   -Label 'The application is not available until the reclaim ends. Type yes to start it' -Straight
+    }
     Write-Out '' -NoLog
     $run = Invoke-ReclaimRun $ctx 'COMPACT'
     if ($script:Verbose) {
@@ -3981,7 +4058,7 @@ function Invoke-ReclaimAction {
         Show-RunFiles $run
     }
     if ($run.Status -eq 'SUCCESS' -or $run.Status -eq 'WARNING') { Invoke-UninstallQuestion $login.Tns }
-    exit $run.ExitCode
+    exit (Join-ExitCode $PriorExit $run.ExitCode)
 }
 
 function Get-RunArgument {
@@ -4043,11 +4120,14 @@ function Start-Wizard {
     Write-Out '                             changes nothing'
     Write-Out '   4  Reclaim                compacts the datafiles to free disk space; the'
     Write-Out '                             database must not be in use meanwhile'
-    Write-Out '   5  Report of an earlier run'
-    Write-Out '   6  Status: is anything left pending?'
-    Write-Out '   7  Uninstall: remove the tool''s objects from the database'
+    Write-Out '   5  Purge, then reclaim    both in one go: one yes, then the purge and the'
+    Write-Out '                             reclaim; the database must not be in use during'
+    Write-Out '                             the reclaim'
+    Write-Out '   6  Report of an earlier run'
+    Write-Out '   7  Status: is anything left pending?'
+    Write-Out '   8  Uninstall: remove the tool''s objects from the database'
     Write-Out '   Q  Quit'
-    $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7', 'Q')
+    $choice = Read-Value -Prompt 'Choice' -Default '1' -Allowed @('1', '2', '3', '4', '5', '6', '7', '8', 'Q')
     switch ($choice) {
         '1' {
             $script:Cli.Flags['dry-run'] = $true
@@ -4070,11 +4150,19 @@ function Start-Wizard {
             Invoke-ReclaimAction -NoBanner
         }
         '5' {
+            # The purge, then the reclaim: not a dry run, one typed yes.
+            $script:Cli.Flags.Remove('dry-run')
+            $script:Config['DRY_RUN'] = 'N'
+            $script:GoalChosen = $true
+            $script:ThenReclaim = $true
+            Invoke-PurgeAction 'PURGE' -Wizard -NoBanner
+        }
+        '6' {
             $script:Cli.Options['run'] = Read-Value -Prompt 'Run (id or LATEST)' -Default 'LATEST' -Pattern '^(LATEST|R?-?\d+)$' -Hint 'a run id such as 124, or LATEST' -Title 'Report'
             Invoke-SimpleScript 'report.sql' @(Get-RunArgument 'LATEST')
         }
-        '6' { Invoke-SimpleScript 'status.sql' @() }
-        '7' { Invoke-InstallAction -Uninstall -NoBanner }
+        '7' { Invoke-SimpleScript 'status.sql' @() }
+        '8' { Invoke-InstallAction -Uninstall -NoBanner }
         'Q' {
             Write-Out ' Nothing done.'
             exit $script:ExitPass
@@ -4121,10 +4209,10 @@ function Invoke-Main {
         $script:ReconnectS = [int]$seconds
     }
 
-    # The reclaim was an option of the purge in the previous tool. Here it is
-    # a command of its own: "purge --reclaim" runs it (its dry run with
-    # --dry-run) and says which command that is. With the options of a purge
-    # it is refused: the purge and the reclaim are run one after the other.
+    # --reclaim, as in the previous tool. With the options of a purge (the days
+    # to keep, the mode, ...): the purge, then the reclaim, in one command.
+    # Alone ("purge --reclaim"): the reclaim, its dry run with --dry-run, as
+    # the action reclaim runs it; said with the command that is.
     if ($script:Cli.Flags.ContainsKey('reclaim')) {
         $command = 'epf_purge.bat reclaim'
         if ($script:Cli.Flags.ContainsKey('dry-run')) { $command = 'epf_purge.bat reclaim --dry-run' }
@@ -4135,15 +4223,18 @@ function Invoke-Main {
         $given = @(@('retention', 'cutoff', 'mode', 'depth', 'batch-size', 'backup', 'max-redo') |
                    Where-Object { $script:Cli.Options.ContainsKey($_) }) +
                  @(@('compact', 'redo-logs', 'new') | Where-Object { $script:Cli.Flags.ContainsKey($_) })
-        if ($given.Count -gt 0) {
-            Exit-Tool $script:ExitUsage ('--reclaim with the options of a purge (--' + ($given -join ', --') + '): the purge and the reclaim ' +
-                                         'are two commands, run one after the other. First the purge, without --reclaim; then:' +
-                                         [Environment]::NewLine + '     ' + $command)
+        if ($given.Count -gt 0 -and $script:Cli.Action -ne 'reclaim') {
+            if ($script:Cli.Flags.ContainsKey('restore')) {
+                Exit-Tool $script:ExitUsage '--restore does not go with a purge: it restores what an earlier reclaim left pending (epf_purge.bat reclaim --restore).'
+            }
+            $script:ThenReclaim = $true
+            $script:Cli.Action = 'purge'
+        } elseif ($script:Cli.Action -ne 'reclaim') {
+            Write-Out ''
+            Write-Out (' --reclaim alone: the reclaim. This runs it, as this command does (with --retention or --cutoff, the purge comes first):') 'Yellow'
+            Write-Out ('     ' + $command) 'Cyan'
+            $script:Cli.Action = 'reclaim'
         }
-        Write-Out ''
-        Write-Out (' --reclaim: the reclaim is a command of its own. This runs it, as this command does:') 'Yellow'
-        Write-Out ('     ' + $command) 'Cyan'
-        $script:Cli.Action = 'reclaim'
         $null = $script:Cli.Flags.Remove('reclaim')
     }
     if ($script:Cli.Flags.ContainsKey('resume')) {
@@ -4159,9 +4250,10 @@ function Invoke-Main {
     $action = $script:Cli.Action
     if ($script:Cli.Flags.ContainsKey('close') -and $action -ne 'plan') { Exit-Tool $script:ExitUsage '--close applies to plan.' }
     if ($null -ne $action -and $action -ne 'reclaim') {
-        if ($script:Cli.Options.ContainsKey('tablespaces')) { Exit-Tool $script:ExitUsage '--tablespaces applies to reclaim.' }
+        # A purge followed by a reclaim takes the reclaim's own options too.
+        if ($script:Cli.Options.ContainsKey('tablespaces') -and -not $script:ThenReclaim) { Exit-Tool $script:ExitUsage '--tablespaces applies to reclaim.' }
         if ($script:Cli.Flags.ContainsKey('restore')) { Exit-Tool $script:ExitUsage '--restore applies to reclaim.' }
-        if ($script:Cli.Options.ContainsKey('scratch')) { Exit-Tool $script:ExitUsage '--scratch applies to reclaim.' }
+        if ($script:Cli.Options.ContainsKey('scratch') -and -not $script:ThenReclaim) { Exit-Tool $script:ExitUsage '--scratch applies to reclaim.' }
     }
     if ($script:Cli.Options.ContainsKey('scratch') -and ([string]$script:Cli.Options['scratch']).Trim().ToLower() -ne 'none' -and
         $null -eq (ConvertTo-Bytes ([string]$script:Cli.Options['scratch']))) {

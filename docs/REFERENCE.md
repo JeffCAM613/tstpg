@@ -81,7 +81,7 @@ More options for the purge:
 
 The report of a purge says how long its batches waited for log switches (WAITS), for example `log switches 00:02:13 of 00:28:53 in batches (8%), online logs 3 x 200.0 MB`. A full online log is reused only once Oracle has written its changes to the datafiles (a checkpoint), and archived it in ARCHIVELOG mode; small logs make the purge wait for that. That figure is what larger logs could save. When it is a tenth of the deleting time or more and the logs are smaller than 1 GB, the end of the purge and report.html say so in a sentence, with what saves it next time: the purge's question on the online logs, or `--redo-logs`; in a pluggable database, the DBA of the container database. A dry run says the same in advance when one batch writes more redo than an online log holds.
 
-The report of a purge also says what the database's files took on disk (ON DISK): their size at the start, the most while the purge ran and their size at its end, once the database is put back, for example `at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start, 22.0 GB at the end`. The files counted are the datafiles, the temporary files and the members of the online redo log groups; archived logs are not. The most is the largest size measured while the purge ran (the monitor measures it every few seconds). The end of the purge shows that line, and report.html the most and the size after.
+The report of a purge also says what the database's files took on disk (ON DISK): their size at the start, the most while the purge ran and their size at its end, once the database is put back, for example `at most 65.7 GB during the purge (4.2 GB more than at its start); 61.5 GB at the start, 61.6 GB at the end`. The files counted are the datafiles, the temporary files and the members of the online redo log groups; archived logs are not. The most is the largest size measured while the purge ran (the monitor measures it every few seconds). The end of the purge shows that line, and report.html the most and the size after.
 
 And it says what a reclaim could give back to the disk now (RECLAIM), for example `up to about 35.4 GB could go back to the disk with a reclaim, free in DATA: 35.4 of 50.1 GB (71%)`: for each tablespace the purge worked in, the free space in its datafiles and the space still free inside the segments of the purged tables, which the moves and rebuilds of a reclaim recover, as measured at the end of the purge. It is an upper bound: the segments a reclaim cannot move and the margin it leaves are not counted; `reclaim --dry-run` measures what it gives back. From 1 GB on, the end of the purge recommends a reclaim, at a time the database can be out of use, with its two commands; below that it says the gain is small. report.html shows the figure and the recommendation.
 
@@ -163,9 +163,23 @@ Some segments cannot move: partitioned tables, queue tables, tables with a LONG 
 
 If a reclaim is interrupted, what it changed is undone: at once after Ctrl+C or `stop`; in the same run when its session is lost; otherwise by `src\bin\epf_purge.bat reclaim --restore`. `status` shows anything left pending.
 
+### A purge, then a reclaim, in one command
+
+```bat
+src\bin\epf_purge.bat purge --retention 365 --reclaim
+```
+
+`--reclaim` with an option of a purge (`--retention`, `--cutoff`, `--mode`, `--depth`, `--batch-size`, `--backup`, `--max-redo`, `--redo-logs`, `--new`) runs the purge, then the reclaim; the menu has it as choice 5. Without one, `purge --reclaim` is the reclaim alone, as the action `reclaim` runs it.
+
+- The options of both are read before anything starts: a mistake in those of the reclaim stops the command before the purge. `--tablespaces` and `--scratch` apply to the reclaim, and `--confirm` takes the names of both: ARCHIVE and TEMP apply to both runs, UNDO to the purge, RECYCLEBIN to the reclaim. In the configuration file the purge reads CONFIRM and the reclaim RECLAIM_CONFIRM. `--restore` does not go with a purge.
+- With prompts, one typed `yes` covers both; the sentence before it says that a reclaim follows and that the application is not available until it ends.
+- The reclaim starts once the purge has ended as done or done with warnings: a purge that fails, is stopped or does not start ends the command with its own exit code. The reclaim then measures, as every reclaim does, and goes on without a second `yes`. With prompts, a required condition of the reclaim that is not met is still asked about; without prompts it stops the reclaim, as in a reclaim alone. The reclaim logs in with the purge's accounts, without asking for their passwords again.
+- With `--dry-run` it is the dry run of the purge alone: what the reclaim gives back depends on what the purge frees, so its end gives the command of the purge with `--reclaim` and points to `reclaim --dry-run`, which measures the database as it is now.
+- The purge, the reclaim's measurement and the reclaim are runs of their own, each with its folder and report; with prompts the purge's checks are one more, before the purge. The exit code is the worse of the purge's and the reclaim's: FAIL, then aborted or stopped, then PASS WITH WARNINGS.
+
 ## Runs, reports and logs
 
-Every action that works on the database creates a run, such as R-000123, recorded in the EPFPG tables, and a folder `logs\<date>_<time>_R-000123`:
+Every action that works on the database creates a run, such as R-000123, recorded in the EPFPG tables, and a folder `logs\<date>_<time>_<database>_R-000123`, such as `logs\2026-10-24_192320_EPFDB_R-000123`. The database is the name it gives itself (its container name, as the report's "Database" line shows it), with any character other than a letter, a digit, `_` or `-` written `_`. The run ids are those of each database, so the name keeps the folders of two databases apart:
 
 | File | Content |
 |---|---|
@@ -193,6 +207,8 @@ The first shows the latest run. Runs older than 180 days (setting history_retent
 | 2 | PASS WITH WARNINGS |
 | 3 | Aborted or stopped |
 | 4 | Usage or configuration error (nothing was changed) |
+
+A purge followed by a reclaim in one command ends with the worse of the two codes: 1, then 3, then 2.
 
 ## Status and recovery
 

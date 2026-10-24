@@ -29,7 +29,7 @@ The tool does two jobs. Each has a dry run, which shows the result and changes n
 Two things to know:
 
 - **A purge alone does not free disk space.** The rows are gone, but the datafiles keep their size until a reclaim.
-- **The purge comes first, the reclaim after.** They can be run on different days: the purge in a quiet period, the reclaim when the application can be stopped.
+- **The purge comes first, the reclaim after.** They can be run on different days: the purge in a quiet period, the reclaim when the application can be stopped. When it can be stopped for both, they run in one go (see [The purge and the reclaim in one go](#the-purge-and-the-reclaim-in-one-go)).
 
 The data a purge works on is in three groups, called modules:
 
@@ -80,16 +80,19 @@ It asks what you want to do, then the questions that go with your choice:
                              changes nothing
    4  Reclaim                compacts the datafiles to free disk space; the
                              database must not be in use meanwhile
-   5  Report of an earlier run
-   6  Status: is anything left pending?
-   7  Uninstall: remove the tool's objects from the database
+   5  Purge, then reclaim    both in one go: one yes, then the purge and the
+                             reclaim; the database must not be in use during
+                             the reclaim
+   6  Report of an earlier run
+   7  Status: is anything left pending?
+   8  Uninstall: remove the tool's objects from the database
    Q  Quit
  > Choice [1]:
 ```
 
 Every question stands under a line with its name and waits at a prompt marked `>`. The value in brackets is the default: press Enter to take it.
 
-Start with choice 1: it changes nothing. The steps below are the same four choices as commands:
+Start with choice 1: it changes nothing. The steps below are the first four choices as commands; choice 5 runs steps 2 and 3 in one go (see [The purge and the reclaim in one go](#the-purge-and-the-reclaim-in-one-go)):
 
 | Step | Command | What it does |
 |---|---|---|
@@ -226,8 +229,8 @@ The purge asks the same questions, plus whether it is a dry run (no). Then:
   see what it gives back, then run it:
       src\bin\epf_purge.bat reclaim --dry-run
       src\bin\epf_purge.bat reclaim
-  On disk: at most 26.1 GB during the purge (4.2 GB more than at its start); 21.9 GB at the start,
-  22.0 GB at the end (datafiles, temporary files and online redo logs).
+  On disk: at most 65.7 GB during the purge (4.2 GB more than at its start); 61.5 GB at the start,
+  61.6 GB at the end (datafiles, temporary files and online redo logs).
 ```
 
 The end says how much a reclaim could give back to the disk at most: the space free now in the tablespaces the purge worked in. From 1 GB on it recommends one, with its two commands: the dry run measures what it gives back, then the reclaim gives it back while the database is out of use. Below 1 GB it says the gain is small.
@@ -240,7 +243,7 @@ When nothing is old enough (an earlier purge took it), the purge says so before 
 
 Every command the tool shows can be typed as it is: it begins with the path of the tool from where you are.
 
-The reclaim is a command of its own: `src\bin\epf_purge.bat reclaim`, as in step 3. Typed as an option of purge, as in the previous tool (`purge --reclaim`, with `--dry-run` for its dry run), it runs the reclaim too, and says which command that is.
+The reclaim is a command of its own: `src\bin\epf_purge.bat reclaim`, as in step 3. As in the previous tool, `--reclaim` with the days to keep runs it after the purge in the same command (see [The purge and the reclaim in one go](#the-purge-and-the-reclaim-in-one-go)). Alone (`purge --reclaim`, with `--dry-run` for its dry run) it runs the reclaim, and says which command that is.
 
 ### Step 3: give the space back to the disk
 
@@ -280,10 +283,42 @@ The reclaim itself measures again, shows the same, and waits for you to type `ye
 
 A reclaim takes time with the amount of data it has to move, from minutes to more than an hour. It changes no row of the application: the row counts and the objects are compared before and after.
 
+### The purge and the reclaim in one go
+
+When the application can be stopped for the whole time, the purge and the reclaim run in one command: choice 5 of the menu, or
+
+```bat
+src\bin\epf_purge.bat purge --retention 365 --reclaim
+```
+
+The purge asks its questions as in step 2. One typed `yes` then covers both: the sentence before it says that a reclaim follows, and that the application is not available until it ends. Once the purge has run to its end, the reclaim measures, shows what it gives back, and starts without a second `yes` (a requirement of the reclaim that is not met is still asked about, as in step 3):
+
+```text
+ ===============================================================================
+  Ready. This deletes everything dated before 13 October 2025: 197,409 top-level records, with the
+  rows under them (a dry run counts those).
+  About 8 minutes of deleting, then the purged tables are compacted. It cannot be undone.
+  Then a reclaim gives the space back to the disk: the application is not available until it ends
+  (its accounts are locked).
+ ===============================================================================
+ > Type yes to start the purge, then the reclaim: yes
+ ...
+ ===============================================================================
+ Then the reclaim: compacting the datafiles to give the space back to the disk.
+ ...
+  The reclaim starts: the yes typed before the purge covers it.
+```
+
+- A purge that fails, is stopped or does not start is not followed by a reclaim.
+- The purge, the reclaim's measurement and the reclaim are runs of their own, each with its folder and its report (with questions, the purge's checks are one more, before the purge).
+- The exit code is the worse of the two: a failure first, then a stop, then warnings.
+- With `--dry-run` it is the dry run of the purge alone: what the reclaim gives back depends on what the purge frees. `src\bin\epf_purge.bat reclaim --dry-run` measures the database as it is now.
+- With `--non-interactive` nothing is asked, the typed `yes` included: the command a scheduler can start in a maintenance window.
+
 ### After a run
 
 - **The report** opens in the browser at the end of every run: the result in one sentence, the main figures, the time of each step, the checks. `src\bin\epf_purge.bat report` shows the latest one again.
-- **The run folder** `logs\<date>_<time>_R-000123` keeps it, with the text report and every line of the run (report.html, report.txt, console.log).
+- **The run folder** `logs\<date>_<time>_<database>_R-000123`, such as `logs\2026-10-24_192320_EPFDB_R-000123`, keeps it, with the text report and every line of the run (report.html, report.txt, console.log). The database is the one the run worked on, as its report names it.
 - **The tool's objects**: a purge or a reclaim that ended well asks whether to remove them from the database. The default is to keep them: the next run is then ready at once.
 
 ### Stop a run
@@ -333,6 +368,7 @@ src\bin\epf_purge.bat reclaim --non-interactive --tns EPFDB
 ```
 
 - A purge without questions deletes only what it is told to: the days to keep must be given (`--retention`, `--cutoff`, or the configuration file).
+- With `--reclaim` the reclaim follows the purge in the same command, once the purge has run to its end (see [The purge and the reclaim in one go](#the-purge-and-the-reclaim-in-one-go)).
 - The first run on a database installs the tool's objects without asking, and a run after an update upgrades them.
 - When a required condition is not met, the run does not start: it changes nothing, names the condition, and gives the option that goes past it (see [When a requirement is not met](#when-a-requirement-is-not-met)).
 - The exit code says how it ended (see [Exit codes](#exit-codes)).
@@ -484,7 +520,7 @@ They also apply to `preflight`. "Asked" means: a run with questions asks when th
 | `--confirm LIST` | CONFIRM | Go on although these requirements are not met: ARCHIVE, UNDO, TEMP, separated by commas. Asked (no) |
 | `--max-redo SIZE` | MAX_REDO | The most redo one run may write, such as `500M` or `20G`: the purge is planned in several runs |
 | `--new` | | Start over: close the open plan and follow the options given |
-| `--reclaim` | | With `purge` and no other option of a purge: runs the reclaim, as the action `reclaim` does (`--dry-run`: its dry run). With options of a purge it is refused: the two are run one after the other |
+| `--reclaim` | | With the days to keep (or another option of a purge): the purge, then the reclaim, in one command. The reclaim starts once the purge has run to its end, without a second `yes`; the options of a reclaim apply to it. With `--dry-run`: the dry run of the purge alone. With `purge` and no option of a purge: the reclaim, as the action `reclaim` runs it (`--dry-run`: its dry run) |
 | `--undo-tuning` | UNDO_TUNING | Accepted and ignored: every purge keeps undo in check for its time (see [undo tuning](docs/REFERENCE.md#undo-tuning-every-purge)) |
 
 ### Options of a reclaim
@@ -522,6 +558,8 @@ They also apply to `preflight`. "Asked" means: a run with questions asks when th
 | 2 | Done, with warnings |
 | 3 | Stopped, or you answered no |
 | 4 | A mistake in the command or the configuration. Nothing was changed |
+
+A purge followed by a reclaim in one command (`--reclaim`) ends with the worse code of the two runs: 1, then 3, then 2.
 
 ## If something goes wrong
 

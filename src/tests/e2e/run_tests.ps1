@@ -1071,6 +1071,12 @@ function Invoke-Suite {
                             @('purge', '--non-interactive', '--cutoff', '2025-13-01'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--backup', 'maybe'),
                             @('purge', '--non-interactive', '--retention', $script:Retention, '--confirm', 'BACKUP'),
+                            # A purge, then a reclaim (--reclaim): the options of both
+                            # are checked before the purge starts.
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--reclaim', '--restore'),
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--reclaim', '--scratch', 'lots'),
+                            @('purge', '--non-interactive', '--retention', $script:Retention, '--reclaim', '--confirm', 'BACKUP'),
+                            @('status', '--non-interactive', '--reclaim'),
                             @('purge', '--non-interactive', '--retention', '0'),
                             @('purge', '--non-interactive'))) {
             $r = Invoke-Wrapper $case
@@ -2717,7 +2723,7 @@ function Invoke-Digest {
     $later = @()
     if (Test-Path -LiteralPath $logs) {
         $later = @(Get-ChildItem -LiteralPath $logs -Directory | Where-Object {
-                       $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_R-\d+$' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 })
+                       $_.Name -match '^\d{4}-\d\d-\d\d_\d{6}_([A-Za-z0-9_-]+_)?R-\d+$' -and $_.Name.Substring(0, 17).CompareTo($since) -gt 0 })
     }
     if (Test-Path -LiteralPath (Join-Path $logs 'sys')) {
         $later = $later + @(Get-ChildItem -LiteralPath (Join-Path $logs 'sys') -File -Filter '*.log' | Where-Object {

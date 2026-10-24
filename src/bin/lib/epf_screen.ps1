@@ -1084,8 +1084,14 @@ function Show-PurgeEnd {
         $color = 'Green'
         if ($failed.Count -gt 0) { $color = 'Red' }
         Write-Rule $color
-        # What a reclaim could give back now, and whether it is worth it.
+        # What a reclaim could give back now, and whether it is worth it; in a
+        # purge followed by a reclaim (--reclaim), that the reclaim follows.
         $reclaim = Get-ReclaimEstimate $Report
+        $advice = Get-ReclaimAdvice $reclaim
+        if ($script:ThenReclaim) {
+            $advice = 'The reclaim follows now (--reclaim) and gives it back to the disk.'
+            if ($null -ne $reclaim) { $advice = 'The reclaim follows now (--reclaim): it could give back up to about ' + $reclaim.Size + '.' }
+        }
         if ($rows -eq 0 -and $failed.Count -eq 0) {
             # Nothing was old enough: said as such, with what may still be
             # worth doing (an earlier purge freed space a reclaim gives back).
@@ -1093,7 +1099,7 @@ function Show-PurgeEnd {
                                        '). ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
             Write-Wrapped '  ' ('If an earlier purge deleted rows, the disk does not have their space back yet: the datafiles keep their size until a reclaim. ' +
-                                (Get-ReclaimAdvice $reclaim))
+                                $advice)
         } else {
             Write-Wrapped '  DONE   ' ((Format-Sentence $what) + ' in ' + $Total + '. ' + (Get-CheckSentence $checks)) $color
             Write-Rule $color
@@ -1114,10 +1120,12 @@ function Show-PurgeEnd {
                 $first = 'The purged tables were compacted: the database can use the space of the deleted rows again.'
                 if ($freed -ne '') { $first = $freed + ' was freed, and the purged tables were compacted: the database can use that space again.' }
             }
-            Write-Wrapped '  ' ($first + ' The disk does not have it back yet: the datafiles keep their size until a reclaim. ' + (Get-ReclaimAdvice $reclaim))
+            Write-Wrapped '  ' ($first + ' The disk does not have it back yet: the datafiles keep their size until a reclaim. ' + $advice)
         }
-        Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
-        if ($null -ne $reclaim -and $reclaim.Worth) { Write-Out '      epf_purge.bat reclaim' 'Cyan' -NoLog }
+        if (-not $script:ThenReclaim) {
+            Write-Out '      epf_purge.bat reclaim --dry-run' 'Cyan' -NoLog
+            if ($null -ne $reclaim -and $reclaim.Worth) { Write-Out '      epf_purge.bat reclaim' 'Cyan' -NoLog }
+        }
     } elseif ($Status -eq 'STOPPED') {
         Write-Rule 'Yellow'
         Write-Wrapped '  STOPPED   ' ('on request: ' + $what + ' so far, in ' + $Total + '. What was deleted stays deleted; nothing is half done.') 'Yellow'
